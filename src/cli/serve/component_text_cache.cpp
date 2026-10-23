@@ -1143,9 +1143,9 @@ void ComponentTextCache::InitializePin(
     if (disk.Stats().managed_bytes > options.capacity_bytes)
       throw std::runtime_error(
           "pin prefix exceeds its reduced byte budget; not evicted");
-    impl_->pin_entry =
-        impl_->index.Insert(impl_->identity, disk.Describe(existing));
     if (options.lazy) {
+      impl_->pin_entry =
+          impl_->index.Insert(impl_->identity, disk.Describe(existing));
       impl_->lazy_pin = true;
       Logger::Info("cache",
                    "schema=pinned-prefix-v1 event=ready mode=lazy tokens=" +
@@ -1156,13 +1156,33 @@ void ComponentTextCache::InitializePin(
     }
   }
   const auto started = Clock::now();
-  auto lease = Acquire(tokens, {}, {}, true, 0, true);
+  // Lease a cold destination, then restore this particular pin publication.
+  // A general lookup could fall back to an equal/deeper ordinary checkpoint
+  // and accidentally claim warm readiness while the actual pin is corrupt.
+  auto lease = Acquire(tokens, {}, {}, false, 0, true);
   if (!lease)
     throw std::runtime_error("cannot lease pinned-prefix startup slot");
   auto& state = dynamic_cast<TextRunnerState&>(lease->state());
-  if (existing.value && lease->cached_tokens() != tokens.size())
-    throw std::runtime_error(
-        "pinned prefix restore failed; refusing warm readiness");
+  if (existing.value) {
+    cache::TransferTiming timing;
+    if (!impl_->pin_streaming->Restore(
+            existing, impl_->digest, *impl_->resources->adapter,
+            lease->impl_->slot.Execution(), timing, {}, {},
+            [&](bool private_file, cache::DiskFileId file) {
+              disk.InvalidateDependency(private_file, file);
+            }))
+      throw std::runtime_error(
+          "pinned prefix restore failed; refusing warm readiness");
+    lease->impl_->entry->history = std::make_unique<cache::ExecutionHistory>(
+        cache::ExecutionHistory::RestoredUnshared(
+            impl_->ledger, impl_->resources->adapter->Components(),
+            impl_->identity));
+    impl_->runner->SetPromptContext(state, {});
+    impl_->runner->ReconcileComponentState(state, tokens.size());
+    if (!impl_->runner->HasDecodeFrontier(state))
+      throw std::runtime_error("pinned prefix has no complete decode frontier");
+    lease->impl_->cached = tokens.size();
+  }
   auto offset = lease->cached_tokens();
   while (offset < tokens.size()) {
     const auto count = std::min<std::size_t>(4096, tokens.size() - offset);

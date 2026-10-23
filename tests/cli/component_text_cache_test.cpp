@@ -1997,10 +1997,12 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
     }
   }
 }
-void PinnedPrefixPressureIdentityAndAccounting() {
+void PinnedPrefixPressureIdentityAndAccounting(bool record_pressure = false) {
   PinFixture fixture;
   auto runner = std::make_shared<PinRunner>();
-  runner->private_blocks = 3;
+  // Keep separate backing- and record-pressure cases. In the latter, all 128
+  // ordinary records fit simultaneously, in addition to the permanent root.
+  runner->private_blocks = record_pressure ? 256 : 3;
   ComponentTextCache cache(runner, 1, 1 << 22, {}, false, 0, fixture.options);
   const auto published = fixture.Files();
   {
@@ -2018,7 +2020,7 @@ void PinnedPrefixPressureIdentityAndAccounting() {
                                      false, SnapshotPurpose::kContinuation,
                                      prompt));
     auto snapshot = lease->Capture();
-    (void)lease->Commit(prompt, std::move(snapshot), prompt);
+    assert(lease->Commit(prompt, std::move(snapshot), prompt) > 0);
   }
   auto prompt = fixture.tokens;
   prompt.push_back(999);
@@ -2087,6 +2089,44 @@ void PinnedPrefixIdentityReplacementAndBudgets() {
     TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
     assert(runner->prefilled == 0);
   }
+}
+void PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk() {
+  PinFixture fixture;
+  const TextRunnerDiskCacheOptions disk{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20};
+  {
+    auto runner = std::make_shared<PinRunner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk, false, 0,
+                             fixture.options);
+    auto lease = cache.Acquire(fixture.tokens, {}, {}, false, 0, true);
+    auto& state = dynamic_cast<TextRunnerState&>(lease->state());
+    (void)runner->Prefill(state, fixture.tokens, 0, fixture.tokens.size());
+    assert(lease->TryReserveSnapshot(
+        lease->CaptureBytes(), fixture.tokens.size(), false,
+        SnapshotPurpose::kContinuation, fixture.tokens));
+    auto snapshot = lease->Capture();
+    assert(lease->Commit(fixture.tokens, std::move(snapshot), fixture.tokens) >
+           0);
+  }  // drain a compatible equal-depth ordinary publication
+  const auto path = std::filesystem::directory_iterator(
+                        fixture.options.directory / "v2" / "private")
+                        ->path();
+  {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    char byte;
+    file.read(&byte, 1);
+    byte ^= 0x5a;
+    file.seekp(0);
+    file.write(&byte, 1);
+  }
+  bool refused = false;
+  try {
+    ComponentTextCache cache(std::make_shared<PinRunner>(), 1, 1 << 22, disk,
+                             false, 0, fixture.options);
+  } catch (const std::runtime_error&) {
+    refused = true;
+  }
+  assert(refused);
 }
 void PinnedPrefixLazySurvivesRamRefusal() {
   PinFixture fixture;
@@ -2296,8 +2336,10 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
 int main() {
   PinnedPrefixRestartReplayAndNoRewrite();
   PinnedPrefixPressureIdentityAndAccounting();
+  PinnedPrefixPressureIdentityAndAccounting(true);
   PinnedPrefixIdentityReplacementAndBudgets();
   PinnedPrefixCorruptionFailsClosed();
+  PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk();
   PinnedPrefixLazySurvivesRamRefusal();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
