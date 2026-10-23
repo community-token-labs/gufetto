@@ -9,6 +9,7 @@
 #include "src/cache/streaming.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/pinned_prefix.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 
 namespace gufo::server {
@@ -107,6 +108,7 @@ public:
                      std::size_t ram_bytes,
                      const std::optional<TextRunnerDiskCacheOptions>&,
                      bool automatic_ram = false, std::size_t ceiling_bytes = 0,
+                     const TextRunnerPinnedPrefixOptions& pins = {},
                      bool ram_enabled = true);
   ~ComponentTextCache();
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
@@ -126,6 +128,7 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
+  void InitializePin(const TextRunnerPinnedPrefixOptions&);
   std::unique_ptr<Impl> impl_;
 };
 

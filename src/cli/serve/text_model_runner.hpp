@@ -18,6 +18,7 @@
 #include "src/cache/adapter.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/pinned_prefix.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 #include "src/core/sampling.hpp"
@@ -57,6 +58,7 @@ struct TextRunnerRamCacheOptions {
   /// False keeps no RAM checkpoints and reserves no RAM-cache backing, and
   /// capacity_bytes is ignored. Sessions still reuse their own live state.
   bool enabled{true};
+  TextRunnerPinnedPrefixOptions pinned_prefix;
 };
 
 /// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects

@@ -5,10 +5,12 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
@@ -1874,6 +1876,278 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   assert(log.find("event=capture_failed") == std::string::npos);
   std::filesystem::remove_all(directory);
 }
+class PinRunner final : public Runner {
+public:
+  mutable std::size_t prefilled{};
+  TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = Runner::Descriptor();
+    descriptor.persistence = TextRunnerPersistenceDescriptor{{1, 2, 3}, 1};
+    return descriptor;
+  }
+  std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const override {
+    std::istringstream input{std::string(text)};
+    std::vector<TextRunnerToken> tokens;
+    TextRunnerToken token;
+    while (input >> token)
+      tokens.push_back(token);
+    return tokens;
+  }
+  TextPrefillStep Prefill(TextRunnerState& state,
+                          std::span<const TextRunnerToken> prompt,
+                          std::size_t offset,
+                          std::size_t budget) const override {
+    const auto step = Runner::Prefill(state, prompt, offset, budget);
+    prefilled += step.consumed_tokens;
+    return step;
+  }
+  TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& s = dynamic_cast<State&>(state);
+    const auto hash = s.adapter.RecurrentHash(s.slot);
+    std::array<float, 8> logits;
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      logits[i] = static_cast<float>((hash >> (8 * i)) & 255) / 64;
+    return {.token = static_cast<TextRunnerToken>(sampler.Sample(logits)),
+            .piece = "x"};
+  }
+};
+struct PinFixture {
+  std::filesystem::path root;
+  TextRunnerPinnedPrefixOptions options;
+  std::vector<TextRunnerToken> tokens{10, 11, 12, 13, 14, 15, 16, 17};
+  PinFixture() {
+    char pattern[] = "/tmp/gufo-pinned-prefix-test-XXXXXX";
+    root = mkdtemp(pattern);
+    options.file = root / "rendered.txt";
+    options.directory = root / "pins";
+    options.capacity_bytes = 1 << 20;
+    WriteTokens();
+  }
+  ~PinFixture() { std::filesystem::remove_all(root); }
+  void WriteTokens() const {
+    std::ofstream file(options.file);
+    for (const auto token : tokens)
+      file << token << ' ';
+  }
+  auto Files() const {
+    std::map<std::filesystem::path,
+             std::pair<std::uintmax_t, std::filesystem::file_time_type>>
+        result;
+    for (const auto& file :
+         std::filesystem::recursive_directory_iterator(options.directory))
+      if (file.is_regular_file())
+        result[file.path()] = {file.file_size(), file.last_write_time()};
+    return result;
+  }
+};
+void PinnedPrefixRestartReplayAndNoRewrite() {
+  for (const bool ordinary_disk : {false, true}) {
+    PinFixture fixture;
+    std::optional<TextRunnerDiskCacheOptions> disk;
+    if (ordinary_disk)
+      disk = TextRunnerDiskCacheOptions{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20};
+    auto prompt = fixture.tokens;
+    prompt.insert(prompt.end(), {100, 101, 102});
+    std::array<std::vector<TextRunnerToken>, 2> expected;
+    for (std::size_t mode = 0; mode < expected.size(); ++mode) {
+      auto cold_runner = std::make_shared<PinRunner>();
+      TextRunnerPool cold(cold_runner, 1);
+      auto request = cold.Acquire(
+          prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
+      Prefill(request);
+      for (int i = 0; i < 8; ++i)
+        expected[mode].push_back(Generate(request));
+      request.Invalidate();
+    }
+    {
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = fixture.options});
+      assert(runner->prefilled == fixture.tokens.size());
+      for (std::size_t mode = 0; mode < expected.size(); ++mode) {
+        auto request = pool.Acquire(
+            prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
+        assert(request.cached_prompt_tokens() == fixture.tokens.size());
+        assert(!request.cache_disk_hit());
+        Prefill(request);
+        for (const auto token : expected[mode])
+          assert(Generate(request) == token);
+        request.Invalidate();
+      }
+    }
+    const auto published = fixture.Files();
+    for (const bool lazy : {false, true}) {
+      auto options = fixture.options;
+      options.lazy = lazy;
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
+      assert(runner->prefilled == 0);  // restart must not recompute the root
+      for (std::size_t mode = 0; mode < expected.size(); ++mode) {
+        auto request = pool.Acquire(
+            prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
+        assert(request.cached_prompt_tokens() == fixture.tokens.size());
+        assert(request.cache_disk_hit() == (lazy && mode == 0));
+        Prefill(request);
+        for (const auto token : expected[mode])
+          assert(Generate(request) == token);
+        request.Invalidate();
+      }
+      assert(fixture.Files() == published);
+    }
+  }
+}
+void PinnedPrefixPressureIdentityAndAccounting() {
+  PinFixture fixture;
+  auto runner = std::make_shared<PinRunner>();
+  runner->private_blocks = 3;
+  ComponentTextCache cache(runner, 1, 1 << 22, {}, false, 0, fixture.options);
+  const auto published = fixture.Files();
+  {
+    auto lease = cache.Acquire(fixture.tokens, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == fixture.tokens.size());
+    assert(lease->Metrics().spill.foreground_bytes == 0);
+  }
+  for (TextRunnerToken family = 100; family < 240; ++family) {
+    const std::vector<TextRunnerToken> prompt(8, family);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(!lease->cache_hit());
+    auto& state = dynamic_cast<TextRunnerState&>(lease->state());
+    (void)runner->Prefill(state, prompt, 0, prompt.size());
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    auto snapshot = lease->Capture();
+    (void)lease->Commit(prompt, std::move(snapshot), prompt);
+  }
+  auto prompt = fixture.tokens;
+  prompt.push_back(999);
+  {
+    auto lease = cache.Acquire(prompt, {}, {}, true, prompt.size(), true);
+    assert(lease->cached_tokens() == fixture.tokens.size());
+    assert(lease->HasSnapshotFor(fixture.tokens));
+    const auto metrics = lease->Metrics();
+    assert(metrics.ledger.ram_bytes > 0);
+    assert(metrics.ledger.total_bytes == metrics.ledger.ram_bytes + (1 << 20));
+    assert(metrics.ledger.bytes[static_cast<std::size_t>(
+               cache::ResourceCategory::kPrivateState)] > 0);
+    lease->Invalidate();
+  }
+  auto changed = prompt;
+  changed.front() ^= 1;
+  assert(!cache.Acquire(changed, {}, {}, true, 0, true)->cache_hit());
+  auto image = std::make_shared<TextPromptContext>();
+  image->cache_identity = {42};
+  assert(!cache.Acquire(prompt, {}, image, true, 0, true)->cache_hit());
+  image->cache_prefixes = {{fixture.tokens.size(), {}}};
+  assert(cache.Acquire(prompt, {}, image, true, 0, true)->cached_tokens() ==
+         fixture.tokens.size());
+  assert(!cache.Acquire(prompt, {}, {}, false, 0, true)->cache_hit());
+  assert(fixture.Files() == published);
+}
+void PinnedPrefixIdentityReplacementAndBudgets() {
+  PinFixture fixture;
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+  }
+  // Relevant numerics environment changes cannot restore the old checkpoint.
+  const char* previous = std::getenv("GUFO_TEST_PIN_NUMERICS");
+  const std::optional<std::string> saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  setenv("GUFO_TEST_PIN_NUMERICS", "new-build-lane", 1);
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == fixture.tokens.size());
+  }
+  if (saved)
+    setenv("GUFO_TEST_PIN_NUMERICS", saved->c_str(), 1);
+  else
+    unsetenv("GUFO_TEST_PIN_NUMERICS");
+  fixture.tokens.back() = 77;
+  fixture.WriteTokens();
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == fixture.tokens.size());
+  }
+  auto options = fixture.options;
+  options.capacity_bytes = 1;
+  bool refused = false;
+  try {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = options});
+  } catch (const std::runtime_error&) {
+    refused = true;
+  }
+  assert(refused);  // reduced budget never evicts a compatible pin
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == 0);
+  }
+}
+void PinnedPrefixLazySurvivesRamRefusal() {
+  PinFixture fixture;
+  {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  auto options = fixture.options;
+  options.lazy = true;
+  auto runner = std::make_shared<PinRunner>();
+  runner->private_blocks = 0;  // restore fits the slot, but RAM captures cannot
+  TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+  assert(runner->prefilled == 0);
+  for (const TextRunnerToken suffix : {100, 101}) {
+    auto prompt = fixture.tokens;
+    prompt.push_back(suffix);
+    auto request = pool.Acquire(prompt);
+    assert(request.cached_prompt_tokens() == fixture.tokens.size());
+    assert(request.cache_disk_hit());
+    Prefill(request);
+    const auto actual = Generate(request);
+    request.Invalidate();
+    TextRunnerPool cold(std::make_shared<PinRunner>(), 1);
+    auto control = cold.Acquire(prompt);
+    Prefill(control);
+    assert(Generate(control) == actual);
+    control.Invalidate();
+  }
+  assert(fixture.Files() == published);
+}
+void PinnedPrefixCorruptionFailsClosed() {
+  for (const bool truncate : {false, true}) {
+    PinFixture fixture;
+    {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = fixture.options});
+    }
+    const auto path = std::filesystem::directory_iterator(
+                          fixture.options.directory / "v2" / "private")
+                          ->path();
+    if (truncate) {
+      std::filesystem::resize_file(path, 1);
+    } else {
+      std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+      char byte;
+      file.read(&byte, 1);
+      byte ^= 0x5a;
+      file.seekp(0);
+      file.write(&byte, 1);
+    }
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = fixture.options});
+    } catch (const std::runtime_error&) {
+      refused = true;
+    }
+    assert(refused);  // no partial state execution or silent repeated writes
+  }
+}
 }  // namespace
 // An off RAM cache commits no backing, grows none before prefill and takes no
 // capture, yet a session keeps its own live frontier and its metrics stay
@@ -2020,6 +2294,11 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
   }
 }
 int main() {
+  PinnedPrefixRestartReplayAndNoRewrite();
+  PinnedPrefixPressureIdentityAndAccounting();
+  PinnedPrefixIdentityReplacementAndBudgets();
+  PinnedPrefixCorruptionFailsClosed();
+  PinnedPrefixLazySurvivesRamRefusal();
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();

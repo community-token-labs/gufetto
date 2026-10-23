@@ -434,6 +434,27 @@ struct SpeechOptions {
   std::map<std::string, std::string> voice_lang_specs;
 };
 
+void AddPinnedPrefixOptions(ArgParser& parser,
+                            server::TextRunnerPinnedPrefixOptions* options) {
+  parser.AddOption(
+      "", "--pin-prefix-file", "FILE",
+      "Flash-Next: already-rendered UTF-8 system/tools prefix text "
+      "(requires --pin-prefix-dir)",
+      "Cache", &options->file);
+  parser.AddOption(
+      "", "--pin-prefix-dir", "DIR",
+      "Flash-Next: dedicated non-LRU prefix store, separate from --cache-disk "
+      "(requires --pin-prefix-file; default: off)",
+      "Cache", &options->directory);
+  parser.AddOption("", "--pin-prefix-bytes", "N",
+                   "Pinned-prefix byte budget (default: 1073741824)", "Cache",
+                   &options->capacity_bytes);
+  parser.AddFlag("", "--pin-prefix-lazy",
+                 "Keep the pinned prefix disk-only until demand restore "
+                 "(default: eagerly hydrate RAM at startup)",
+                 "Cache", &options->lazy);
+}
+
 void AddSpeechOptions(ArgParser& parser, bool tts, SpeechOptions* options) {
   parser.AddOption("-m", "--model", "DIR",
                    tts ? "Qwen3-TTS 12Hz 1.7B model directory"
@@ -624,6 +645,7 @@ void PrintServeHelp(std::string_view program_name,
     bool enable_yarn = false;
     std::string trace_path;
 
+    server::TextRunnerPinnedPrefixOptions pinned_prefix;
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
@@ -745,6 +767,7 @@ void PrintServeHelp(std::string_view program_name,
         "Other models: RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
+    AddPinnedPrefixOptions(parser, &pinned_prefix);
     parser.AddFlag("", "--log-progress",
                    "Log live prefill and decode progress (needs "
                    "--log-level=info or debug)",
@@ -1235,6 +1258,7 @@ int RunServe(std::span<const char* const> args) {
     bool enable_yarn = false;
     std::string trace_path;
 
+    server::TextRunnerPinnedPrefixOptions pinned_prefix;
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
@@ -1364,6 +1388,7 @@ int RunServe(std::span<const char* const> args) {
         "Other models: RAM limit for queued snapshots and each disk read "
         "(default: 0 = auto, at most the disk budget and 1/8 available RAM)",
         "Cache", &cache_disk_staging_bytes);
+    AddPinnedPrefixOptions(llm_parser, &pinned_prefix);
     llm_parser.AddFlag("", "--log-progress",
                        "Log live prefill and decode progress (needs "
                        "--log-level=info or debug)",
@@ -1380,6 +1405,74 @@ int RunServe(std::span<const char* const> args) {
     if (llm_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "llm");
       return 0;
+    }
+    const bool pin_prefix_supplied =
+        llm_parser.WasSupplied("--pin-prefix-file") ||
+        llm_parser.WasSupplied("--pin-prefix-dir") ||
+        llm_parser.WasSupplied("--pin-prefix-bytes") ||
+        llm_parser.WasSupplied("--pin-prefix-lazy");
+    if (pin_prefix_supplied) {
+      if (pinned_prefix.file.empty() || !pinned_prefix.enabled()) {
+        std::cerr << "Error: pinned prefixes require both --pin-prefix-file "
+                     "FILE and --pin-prefix-dir DIR\n";
+        return 2;
+      }
+      if (pinned_prefix.capacity_bytes == 0) {
+        std::cerr << "Error: --pin-prefix-bytes must be positive\n";
+        return 2;
+      }
+      std::error_code path_error;
+      if (!std::filesystem::is_regular_file(pinned_prefix.file, path_error) ||
+          !std::ifstream(pinned_prefix.file, std::ios::binary)) {
+        std::cerr << "Error: --pin-prefix-file must name a readable regular "
+                     "UTF-8 text file\n";
+        return 2;
+      }
+      auto pin_directory =
+          std::filesystem::absolute(pinned_prefix.directory, path_error);
+      if (!path_error) {
+        pin_directory =
+            std::filesystem::weakly_canonical(pin_directory, path_error);
+      }
+      if (path_error) {
+        std::cerr << "Error: cannot resolve --pin-prefix-dir: "
+                  << path_error.message() << '\n';
+        return 2;
+      }
+      const auto pin_status =
+          std::filesystem::status(pin_directory, path_error);
+      if (path_error && path_error != std::errc::no_such_file_or_directory) {
+        std::cerr << "Error: cannot inspect --pin-prefix-dir: "
+                  << path_error.message() << '\n';
+        return 2;
+      }
+      if (std::filesystem::exists(pin_status) &&
+          !std::filesystem::is_directory(pin_status)) {
+        std::cerr << "Error: --pin-prefix-dir must name a directory\n";
+        return 2;
+      }
+      if (!cache_disk_directory.empty()) {
+        auto disk_directory =
+            std::filesystem::absolute(cache_disk_directory, path_error);
+        if (!path_error) {
+          disk_directory =
+              std::filesystem::weakly_canonical(disk_directory, path_error);
+        }
+        if (path_error) {
+          std::cerr << "Error: cannot resolve --cache-disk: "
+                    << path_error.message() << '\n';
+          return 2;
+        }
+        // Canonical paths also cover directories not created yet; equivalent
+        // catches existing aliases that refer to the same filesystem object.
+        if (pin_directory == disk_directory ||
+            std::filesystem::equivalent(pin_directory, disk_directory,
+                                        path_error)) {
+          std::cerr << "Error: --pin-prefix-dir must be separate from "
+                       "--cache-disk\n";
+          return 2;
+        }
+      }
     }
     if (!llm_parser.WasSupplied("--max-pending-per-client")) {
       max_pending_requests_per_client = max_pending_requests;
@@ -1529,7 +1622,13 @@ int RunServe(std::span<const char* const> args) {
             .staging_capacity_bytes = cache_disk_staging_bytes,
             .model_artifact_fingerprint = {},
         },
-        vision_model_path, cache_ram, enable_yarn);
+        vision_model_path,
+        server::TextRunnerRamCacheOptions{
+            .capacity_bytes = cache_ram.capacity_bytes,
+            .enabled = cache_ram.enabled,
+            .pinned_prefix = std::move(pinned_prefix),
+        },
+        enable_yarn);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

@@ -2420,9 +2420,9 @@ public:
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens) {
     // The typed in-process API owns an immutable loaded model but need not
-    // supply file fingerprints when disk caching is disabled. Its model
-    // lifetime is an exact process-local identity; durable caches still
-    // require the validated full artifact fingerprints below.
+    // supply file fingerprints when disk caching and prefix pins are disabled.
+    // Its model lifetime is an exact process-local identity; durable caches
+    // still require the validated full artifact fingerprints below.
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -3065,6 +3065,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
+  if (ram_cache_config.pinned_prefix.enabled() && architecture != "qwen4exp") {
+    SetError(error,
+             "Pinned prefixes require Qwen3.8-Flash-Next (GGUF architecture "
+             "qwen4exp); this model is unsupported");
+    return false;
+  }
   if (enable_yarn && architecture != "qwen4exp") {
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
@@ -3212,17 +3218,19 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
               " original_context=" + std::to_string(qwen4exp_native_context) +
               " context=" + std::to_string(max_context));
     }
-    // RAM checkpoints cannot outlive this loaded model. Their process-local
-    // identity is sufficient; hashing every shard here adds a complete model
-    // read on each fresh container start even when disk caching is disabled.
-    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+    // Ordinary RAM checkpoints cannot outlive this loaded model and need only
+    // process-local identity. Both durable tiers require full artifact hashes,
+    // even when prefix pins are enabled without the ordinary disk cache.
+    if ((DiskCacheEnabled(resolved_disk_cache_config) ||
+         ram_cache_config.pinned_prefix.enabled()) &&
         resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
         !FingerprintArtifact(
             "Qwen3.8-Flash-Next", *reader,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+    if ((DiskCacheEnabled(resolved_disk_cache_config) ||
+         ram_cache_config.pinned_prefix.enabled()) &&
         speculative_config.backend == TextSpeculativeBackend::kMtp &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
@@ -3293,6 +3301,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
+    return false;
+  }
+  if (ram_cache_config.pinned_prefix.enabled()) {
+    SetError(error,
+             "Pinned prefixes require Qwen3.8-Flash-Next (qwen4exp); "
+             "ordinary Qwen models are unsupported");
     return false;
   }
   if (max_context == 0)
@@ -3438,6 +3452,12 @@ bool InferenceBackend::load(
     SetError(error, "DeepSeek model must not be null");
     return false;
   }
+  if (ram_cache_config.pinned_prefix.enabled()) {
+    SetError(error,
+             "Pinned prefixes require Qwen3.8-Flash-Next (qwen4exp); "
+             "DeepSeek models are unsupported");
+    return false;
+  }
   if (max_context == 0)
     max_context = model->MaxContext();
 
@@ -3551,6 +3571,15 @@ bool InferenceBackend::load(
     SetError(error,
              "Qwen3.8-Flash-Next MTP drafts a fixed chain; custom draft "
              "floors are unsupported");
+    return false;
+  }
+  if (ram_cache_config.pinned_prefix.enabled() &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)))) {
+    SetError(error,
+             "Qwen3.8-Flash-Next pinned prefixes require valid model and "
+             "enabled MTP draft artifact SHA-256 fingerprints");
     return false;
   }
   if (DiskCacheEnabled(disk_cache_config) &&

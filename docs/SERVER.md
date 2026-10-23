@@ -278,6 +278,16 @@ The startup line `event=vision_prepared` reports `resident_bytes`,
 `identity_ms` and `upload_ms`. Startup fails if the upload does not fit. Image
 encoding scratch is still allocated per image.
 
+Flash-Next can explicitly register one persistent system/tools checkpoint with
+`--pin-prefix-file FILE --pin-prefix-dir DIR` (default off). The file contains
+already-rendered text. `--pin-prefix-bytes N` bounds its dedicated non-LRU
+store (default 1 GiB); the checkpoint counts against the RAM budget and is
+materialized before readiness on compatible restarts, without prefix prefill
+or another pin write. `--pin-prefix-lazy` instead restores on demand and warms
+RAM when it fits. This tier works without `--cache-disk`; the directories must
+be separate. See [registered pinned prefixes](fork/PINNED-PREFIX.md) for the
+identity contract, exact-token caveats, corruption handling and limitations.
+
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
 
