@@ -16,6 +16,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "src/core/perf_trace.hpp"
 
 namespace gufo::server {
 
@@ -1584,6 +1585,10 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   } clear_lookahead{state};
   state.SetPrefillLookahead(std::span<const TextRunnerToken>(impl_->prompt)
                                 .subspan(frontier, lookahead_end - frontier));
+  if (perf::current != nullptr) {
+    perf::current->through = in_pass;
+    perf::current->tokens_requested = std::min(remaining, max_input_tokens);
+  }
   auto step =
       in_pass ? impl_->runner->PrefillThrough(
                     state, model_prompt, impl_->prefill_offset,

@@ -608,6 +608,13 @@ if (BUILD_TESTING)
   add_test(NAME json_constraint_test COMMAND json_constraint_test)
   set_tests_properties(json_constraint_test PROPERTIES LABELS "cpu;json;sampling")
 
+  add_executable(perf_trace_test tests/core/perf_trace_test.cpp)
+  target_link_libraries(perf_trace_test PRIVATE gufo_core)
+  add_test(NAME perf_trace_test COMMAND perf_trace_test)
+  add_test(NAME perf_trace_disabled_test COMMAND perf_trace_test --disabled)
+  set_tests_properties(perf_trace_test perf_trace_disabled_test PROPERTIES
+    LABELS "cpu;core")
+
   add_executable(json_test tests/core/json_test.cpp)
   target_link_libraries(json_test PRIVATE gufo_core)
   add_test(NAME json_test COMMAND json_test)

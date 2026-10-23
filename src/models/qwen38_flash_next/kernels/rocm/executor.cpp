@@ -973,6 +973,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   e->context_capacity_ = std::max(c.context_length, options.max_context);
   e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
+  e->perf_events_.Init();
+  if (perf::Enabled() && perf::Sink().moe_every != 0) {
+    // Optional pinned readback, reused by sampled scalar/batched routes.
+    (void)e->host_allocations_.Allocate(
+        &e->perf_ids_host_, std::size_t{e->options_.max_batch} *
+                               c.num_experts_used * sizeof(std::int32_t));
+  }
   const std::size_t T = e->options_.max_batch;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
@@ -1779,6 +1786,35 @@ void Executor::RoutedHints(const DeviceTensor& w,
       RoutedTileCols(n_tokens, config().num_experts_used, w.experts));
 }
 
+void Executor::PerfRoutes(std::uint32_t layer, std::uint32_t rows,
+                          bool counts_available) const {
+  if (!perf::sample_moe || perf::current == nullptr)
+    return;
+  perf::Layer result{perf::forward_id, layer, rows, perf::prompt_rows};
+  const auto set = [&](std::uint32_t expert) {
+    if (expert < 512)
+      result.experts[expert / 64] |= std::uint64_t{1} << (expert % 64);
+  };
+  if (counts_available) {
+    // RouteHints already joined this counts download; no additional wait.
+    for (std::uint32_t e = 0; e < config().num_experts; ++e)
+      if (counts_host_[e] != 0)
+        set(e);
+  } else {
+    if (perf_ids_host_ == nullptr)
+      return;
+    const auto count = std::size_t{rows} * config().num_experts_used;
+    if (hipMemcpyAsync(perf_ids_host_, s_.ids, count * sizeof(std::int32_t),
+                       hipMemcpyDeviceToHost, stream_) != hipSuccess ||
+        hipStreamSynchronize(stream_) != hipSuccess)
+      return;
+    for (std::size_t i = 0; i < count; ++i)
+      if (perf_ids_host_[i] >= 0)
+        set(static_cast<std::uint32_t>(perf_ids_host_[i]));
+  }
+  perf::current->moe.push_back(std::move(result));
+}
+
 bool Executor::RouteHints(std::uint32_t n_tokens,
                           std::string* error_msg) const {
   // Every column tile past an expert's bucket still costs a dispatch and a
@@ -1795,7 +1831,13 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
+  const auto wait_start = perf::current != nullptr && perf::forward_id != 0
+                              ? perf::Now()
+                              : 0;
+  const auto wait_status = hipEventSynchronize(counts_ready_);
+  if (wait_start != 0)
+    perf::RouteWait(perf::Now() - wait_start);
+  if (!Check(wait_status, "expert counts", error_msg)) {
     return false;
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
@@ -3044,6 +3086,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
+  if (synchronize && perf::current != nullptr)
+    perf_events_.Stop(stream_);
   return !synchronize ||
          Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
@@ -3163,7 +3207,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = !prefill_phase && n <= kVecBatch &&
+  // Sampled eager calls observe actual ids; never capture host readbacks or
+  // reuse stale routing from a graph replay. Unsampled calls keep the fast path.
+  perf::Forward perf_forward(mode == ForwardMode::kPrefill);
+  perf_forward.Rows(start_pos, n);
+  perf::HostPhase perf_trunk(mode == ForwardMode::kPrefill
+                                 ? "prefill_trunk_forward"
+                                 : "target_forward");
+  const bool graph = !perf::sample_moe && !prefill_phase && n <= kVecBatch &&
                      pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
@@ -3174,6 +3225,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
+  PerfTarget perf_target(perf_events_, stream_);
   const std::uint32_t first_layer =
       graph && c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0;
   if (first_layer > 0) {
@@ -3199,6 +3251,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
+  perf_target.Finish();
+  perf_trunk.Finish();
+  perf_forward.Finish();
   if (n_logits > 0 && logits != nullptr) {
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
                 logits);
@@ -3212,6 +3267,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     // Every successor except the last one is already known. Consume it while
     // the trunk residual is still in shared scratch. MtpBody reads that
     // residual into xn before reusing res for the predictor output.
+    perf::HostPhase perf_mtp("prefill_mtp_kv_catchup");
     PrefillPhase draft_phase(false);
     if (!MtpForward(session, tokens.subspan(1), 0, {.kv_only = true}, error_msg,
                     s_.res))
@@ -3251,6 +3307,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
+    if (perf::current != nullptr)
+      perf::layer_id = il;
     if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
                                  embeddings_ready, checkpoint)) {
       return false;
@@ -3319,6 +3377,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                  false, no_f32) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
+      if (perf::sample_moe)
+        PerfRoutes(il, rows, ExpertMatrixRows(rows));
       Combine(s_.res, next_norm, rows, next_inject);
       return true;
     };
