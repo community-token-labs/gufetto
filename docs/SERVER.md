@@ -479,10 +479,59 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `GET` | `/v1/models` | List loaded model aliases and capabilities |
 | `POST` | `/v1/responses` | Text/images, structured output, optional SSE streaming |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
+| `POST` | `/v1/cache/lookup` | Read-only prefix query; requires `--cache-lookup-api` |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
+
+### Prefix-cache lookup (opt-in)
+
+Start text serving with `--cache-lookup-api` to expose
+`POST /v1/cache/lookup`. Without the flag the route returns 404. It uses the
+same authentication, body limits, chat parsing and model validation as
+`/v1/chat/completions`; send the **same complete request body**, including tools,
+images and template/reasoning options. `stream` does not enable streaming here.
+The worker renders and tokenizes; the caller must not approximate token or
+hybrid-state boundaries from message hashes.
+
+```json
+{
+  "total_tokens": 104211,
+  "matched_tokens": 98304,
+  "tier": "ram",
+  "restore_estimate_ms": 35.5,
+  "prefill_estimate_ms": 4123.0,
+  "epoch": "opaque-compatibility-digest",
+  "lookup_ms": 2.4
+}
+```
+
+The numbers above illustrate the schema, not measured performance. `tier` is
+`live`, `ram`, `disk` or `none`; registered pins are classified by their current
+storage tier. An unmeasured cost is JSON `null`, not zero. Costs exclude queueing
+and decoding; `prefill_estimate_ms` prices the unmatched tail. `lookup_ms` measures
+server processing through the query, including parsing/rendering/tokenization,
+but not network I/O or response serialization. HTTP clients should measure their
+own elapsed time too. Replies have `Cache-Control: no-store`.
+
+Lookup is read-only: it never submits generation, prefills, mutates a session,
+promotes LRU entries or reserves a slot. Index inspection briefly holds shared
+metadata/read pins against retirement, released before returning; it does not
+protect a later request against eviction. It is a point-in-time
+placement observation, **not a reservation or a restore guarantee**. Busy or
+uncertain state may be conservatively under-reported. Concurrent requests,
+eviction and a failed integrity-checked restore can change actual reuse before
+admission. `cache_prompt: false` reports zero reuse. Unsupported backends or
+request shapes return 501 rather than fabricate a hit. Invalid requests retain
+chat validation errors; an unavailable/lost backend returns 503.
+
+Treat `epoch` as opaque: it binds the build and loaded model/cache execution
+profile, including snapshot compatibility. A changed value invalidates placement
+observations; an equal value does **not** authorize checkpoint transfer between
+hosts. Export/import is not implemented. Lookup bodies are excluded from
+`--trace` request-body capture, and lookup emits no prompt text in logs.
+There is currently no `/v1/cache/stats` endpoint.
 
 ### Other model services
 

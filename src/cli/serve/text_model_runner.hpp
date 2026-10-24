@@ -303,6 +303,9 @@ public:
   TextModelRunner& operator=(TextModelRunner&&) = delete;
 
   [[nodiscard]] virtual TextRunnerDescriptor Descriptor() const = 0;
+  /// Additional loaded-model identity not carried by continuation persistence
+  /// (for example the vision projector). Called only when creating the pool.
+  [[nodiscard]] virtual std::string LookupContextIdentity() const { return {}; }
   [[nodiscard]] virtual TextRunnerResourceClaim ResourceClaim() const = 0;
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
@@ -366,6 +369,12 @@ public:
       return std::nullopt;
     return TextPreparedPrompt{std::move(*tokens), {}};
   }
+  /// Same rendering, identity and boundary planning, without image-cache LRU
+  /// touches. Runners with mutable prompt preparation must override this.
+  [[nodiscard]] virtual std::optional<TextPreparedPrompt> PrepareLookupPrompt(
+      const ChatRequest& request) const {
+    return PreparePrompt(request);
+  }
   /// Size a prompt without execution-context admission or inference. Image
   /// runners override this to include their model's visual token expansion.
   [[nodiscard]] virtual std::optional<std::size_t> CountPromptTokens(
@@ -410,6 +419,9 @@ public:
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const;
   /// Whether restored component state can select its next token. A boundary
   /// captured between prefill passes cannot, so it serves only longer prompts.
+  /// Whether every coherent full checkpoint is decodable without inspecting
+  /// opaque private bytes. Runners with partial-prefill frontiers override.
+  [[nodiscard]] virtual bool LookupFullCheckpointReady() const { return false; }
   [[nodiscard]] virtual bool HasDecodeFrontier(const TextRunnerState&) const {
     return true;
   }
@@ -665,6 +677,12 @@ public:
       bool stop_at_eos = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
+  /// Metadata-only immediate Acquire plan; throws kCacheLookupBusy instead of
+  /// waiting for admission/metadata locks or a free execution slot.
+  [[nodiscard]] TextGenerationBackend::CacheLookupResult Lookup(
+      std::span<const TextRunnerToken>, const TextPromptContext* = nullptr,
+      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0) const;
+
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
   /// leasing a state. An upper bound: Acquire may still prefer a shorter one.
   [[nodiscard]] std::size_t CachedPrefixTokens(
@@ -683,6 +701,8 @@ private:
 
 /// Build output constraints and attach server-authored instructions as framing,
 /// preserving client message content and the model's native prompt layout.
+/// A null sampling pointer prepares framing only, without cached grammar
+/// binding.
 [[nodiscard]] std::optional<ChatRequest> ConstrainChatRequest(
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,

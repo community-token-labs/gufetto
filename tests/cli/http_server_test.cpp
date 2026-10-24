@@ -3131,7 +3131,37 @@ void TestEmbeddingService() {
   }
 }
 
+void TestCacheLookupOptIn() {
+  const std::string input =
+      R"({"model":"test","messages":[{"role":"user","content":"private-lookup-sentinel"}]})";
+  {
+    RunningServer server;
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 404);
+  }
+  {
+    RunningServer server({.cache_lookup_api = true});
+    // The fake backend has no lookup implementation: dispatch works without
+    // falling back to token counting or generating a request.
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 501);
+    assert(server.backend->LastCall().chat.messages.empty());
+    server.backend->lost = true;
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 503);
+  }
+  {
+    RunningServer server(
+        {.api_key = "lookup-test-key", .cache_lookup_api = true});
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 401);
+    const auto reply = server.Send(
+        "POST /v1/cache/lookup HTTP/1.1\r\nAuthorization: Bearer "
+        "lookup-test-key\r\n"
+        "Content-Length: " +
+        std::to_string(input.size()) + "\r\n\r\n" + input);
+    ExpectStatus(reply, 501);
+  }
+}
+
 int main() {
+  TestCacheLookupOptIn();
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
   // tint around the level tag.

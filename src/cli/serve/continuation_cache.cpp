@@ -94,6 +94,112 @@ struct ContinuationCache::Impl {
     return static_cast<bool>(snapshot_support.restore);
   }
 
+  struct Selection {
+    std::size_t source, live_source, selected, cached_tokens;
+  };
+  // The single source of truth for both Acquire and read-only Lookup. Caller
+  // holds mutex. Does not mutate entries or query any execution state.
+  [[nodiscard]] Selection Plan(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity, bool reuse_prompt,
+      std::size_t stable_prefix_tokens,
+      std::span<const ContinuationInputPrefix> input_prefixes,
+      const std::function<void(std::size_t, std::size_t, std::string_view)>&
+          skip = {}) const {
+    const auto no_entry = entries.size();
+    const auto matches_input = [&](const auto& identity, std::size_t count) {
+      return std::ranges::equal(
+          identity, PrefixInputIdentity(input_identity, input_prefixes, count));
+    };
+    // Exact full-prompt hits are safe when a shorter checkpoint remains
+    // available for clients that rewrite the assistant's opening tokens, or
+    // when this full checkpoint was captured after establishing that boundary
+    // (its fallback may now live on disk). Migrate unmarked legacy entries.
+    const bool has_fallback =
+        stable_prefix_tokens == 0 ||
+        std::ranges::any_of(entries, [&](const auto& entry) {
+          return entry->valid && entry->snapshot &&
+                 (entry->tokens.size() <= stable_prefix_tokens ||
+                  (entry->stable_prefix_tokens != 0 &&
+                   entry->stable_prefix_tokens <= stable_prefix_tokens)) &&
+                 matches_input(entry->input_identity, entry->tokens.size()) &&
+                 IsPrefix(entry->tokens, prompt);
+        });
+    const auto can_reuse = [&](std::size_t count) {
+      return has_fallback || count <= stable_prefix_tokens;
+    };
+    std::size_t source = no_entry;
+    std::size_t cached_tokens = 0;
+    for (std::size_t index = 0; reuse_prompt && index < entries.size();
+         ++index) {
+      const auto& entry = *entries[index];
+      // Evaluated in the original order so the first failing guard is also the
+      // reason reported under --log-level=debug.
+      std::string_view skip_reason;
+      if ((!snapshot_mode() && !entry.available) || !entry.valid)
+        skip_reason = "unavailable";
+      else if (!matches_input(entry.input_identity, entry.tokens.size()))
+        skip_reason = "input_identity";
+      else if (!can_reuse(entry.tokens.size()))
+        skip_reason = "stable_prefix_boundary";
+      else if (!IsPrefix(entry.tokens, prompt))
+        skip_reason = "token_prefix";
+      if (!skip_reason.empty()) {
+        if (skip)
+          skip(index, entry.tokens.size(), skip_reason);
+        continue;
+      }
+      if (source == no_entry || entry.tokens.size() > cached_tokens) {
+        source = index;
+        cached_tokens = entry.tokens.size();
+      }
+    }
+    // A live final frontier can extend the immutable prompt snapshot. Prefer
+    // it on equal prefix lengths too: no restoration or D2H copy is needed.
+    std::size_t live_source = no_entry;
+    if (reuse_prompt && snapshot_mode()) {
+      for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = *entries[index];
+        if (entry.available && !entry.live_tokens.empty() &&
+            entry.live_tokens.size() >= cached_tokens &&
+            can_reuse(entry.live_tokens.size()) &&
+            matches_input(entry.live_identity, entry.live_tokens.size()) &&
+            IsPrefix(entry.live_tokens, prompt)) {
+          live_source = index;
+          cached_tokens = entry.live_tokens.size();
+        }
+      }
+    }
+
+    const bool live_hit = live_source != no_entry;
+    const bool cache_hit = live_hit || source != no_entry;
+    std::size_t selected = live_hit ? live_source : source;
+    if ((snapshot_mode() && !live_hit) || !cache_hit) {
+      selected = no_entry;
+      std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+      for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = *entries[index];
+        // Borrowed rows save the restore a copy, never another
+        // conversation's live frontier, whose loss costs its whole prefill.
+        // A prompt inside the frontier retries that conversation and
+        // replaces the reply the frontier holds.
+        if (entry.available &&
+            (entry.live_tokens.empty() ||
+             IsPrefix(prompt, entry.live_tokens)) &&
+            cache_hit && entries[source]->snapshot &&
+            entries[source]->snapshot->PrefersState(*entry.state)) {
+          selected = index;
+          break;
+        }
+        if (entry.available && entry.state_last_used < oldest) {
+          selected = index;
+          oldest = entry.state_last_used;
+        }
+      }
+    }
+    return {source, live_source, selected, cached_tokens};
+  }
+
   // Rank extra copies before the last useful checkpoint of a prefix family.
   // Exact tokens and input identity, not client IDs or hashes, establish that
   // another continuation can keep the family reusable after this removal.
@@ -471,67 +577,20 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     std::unique_lock<std::mutex> lock(impl_->mutex);
 
     const std::size_t no_entry = impl_->entries.size();
-    // Exact full-prompt hits are safe when a shorter checkpoint remains
-    // available for clients that rewrite the assistant's opening tokens, or
-    // when this full checkpoint was captured after establishing that boundary
-    // (its fallback may now live on disk). Migrate unmarked legacy entries.
-    const bool has_fallback =
-        stable_prefix_tokens == 0 ||
-        std::ranges::any_of(impl_->entries, [&](const auto& entry) {
-          return entry->valid && entry->snapshot &&
-                 (entry->tokens.size() <= stable_prefix_tokens ||
-                  (entry->stable_prefix_tokens != 0 &&
-                   entry->stable_prefix_tokens <= stable_prefix_tokens)) &&
-                 matches_input(entry->input_identity, entry->tokens.size()) &&
-                 IsPrefix(entry->tokens, prompt);
-        });
-    const auto can_reuse = [&](std::size_t count) {
-      return has_fallback || count <= stable_prefix_tokens;
-    };
-    std::size_t source = no_entry;
-    std::size_t cached_tokens = 0;
     skipped.clear();
-    for (std::size_t index = 0; reuse_prompt && index < impl_->entries.size();
-         ++index) {
-      const auto& entry = *impl_->entries[index];
-      // Evaluated in the original order so the first failing guard is also the
-      // reason reported under --log-level=debug.
-      std::string_view skip_reason;
-      if ((!impl_->snapshot_mode() && !entry.available) || !entry.valid)
-        skip_reason = "unavailable";
-      else if (!matches_input(entry.input_identity, entry.tokens.size()))
-        skip_reason = "input_identity";
-      else if (!can_reuse(entry.tokens.size()))
-        skip_reason = "stable_prefix_boundary";
-      else if (!IsPrefix(entry.tokens, prompt))
-        skip_reason = "token_prefix";
-      if (!skip_reason.empty()) {
-        if (debug_cache) {
-          skipped.push_back({index, entry.tokens.size(), skip_reason});
-        }
-        continue;
-      }
-      if (source == no_entry || entry.tokens.size() > cached_tokens) {
-        source = index;
-        cached_tokens = entry.tokens.size();
-      }
-    }
-    // A live final frontier can extend the immutable prompt snapshot. Prefer
-    // it on equal prefix lengths too: no restoration or D2H copy is needed.
-    std::size_t live_source = no_entry;
-    if (reuse_prompt && impl_->snapshot_mode()) {
-      for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
-        const auto& entry = *impl_->entries[index];
-        if (entry.available && !entry.live_tokens.empty() &&
-            entry.live_tokens.size() >= cached_tokens &&
-            can_reuse(entry.live_tokens.size()) &&
-            matches_input(entry.live_identity, entry.live_tokens.size()) &&
-            IsPrefix(entry.live_tokens, prompt)) {
-          live_source = index;
-          cached_tokens = entry.live_tokens.size();
-        }
-      }
-    }
+    const auto plan = impl_->Plan(
+        prompt, input_identity, reuse_prompt, stable_prefix_tokens,
+        input_prefixes,
+        debug_cache
+            ? std::function<void(std::size_t, std::size_t, std::string_view)>(
+                  [&](auto index, auto count, auto reason) {
+                    skipped.push_back({index, count, reason});
+                  })
+            : std::function<void(std::size_t, std::size_t,
+                                 std::string_view)>{});
+    const auto source = plan.source;
+    const auto live_source = plan.live_source;
+    const auto cached_tokens = plan.cached_tokens;
 
     const bool live_hit = live_source != no_entry;
     const bool cache_hit = live_hit || source != no_entry;
@@ -561,33 +620,12 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         }
       }
     }
-    std::size_t selected = live_hit ? live_source : source;
+    const auto selected = plan.selected;
     bool evicting = false;
     std::size_t evict_index = 0;
     std::size_t evict_tokens = 0;
     std::size_t evict_stable_prefix_tokens = 0;
     if ((impl_->snapshot_mode() && !live_hit) || !cache_hit) {
-      selected = no_entry;
-      std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-      for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
-        const auto& entry = *impl_->entries[index];
-        // Borrowed rows save the restore a copy, never another
-        // conversation's live frontier, whose loss costs its whole prefill.
-        // A prompt inside the frontier retries that conversation and
-        // replaces the reply the frontier holds.
-        if (entry.available &&
-            (entry.live_tokens.empty() ||
-             IsPrefix(prompt, entry.live_tokens)) &&
-            cache_hit && impl_->entries[source]->snapshot &&
-            impl_->entries[source]->snapshot->PrefersState(*entry.state)) {
-          selected = index;
-          break;
-        }
-        if (entry.available && entry.state_last_used < oldest) {
-          selected = index;
-          oldest = entry.state_last_used;
-        }
-      }
       if (debug_cache && selected != no_entry &&
           impl_->entries[selected]->valid) {
         const auto& slot = *impl_->entries[selected];
@@ -700,6 +738,39 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     lock.lock();
     impl_->condition.wait_for(lock, kCancellationPollInterval);
   }
+}
+
+std::optional<ContinuationReuse> ContinuationCache::Lookup(
+    std::span<const ContinuationToken> prompt,
+    std::span<const std::uint8_t> input_identity, bool reuse_prompt,
+    std::size_t stable_prefix_tokens,
+    std::span<const ContinuationInputPrefix> input_prefixes) const {
+  if (stable_prefix_tokens > prompt.size())
+    throw std::invalid_argument("stable cache prefix exceeds prompt length");
+  std::size_t previous = 0;
+  for (const auto& prefix : input_prefixes) {
+    if (prefix.token_count < previous || prefix.token_count > prompt.size())
+      throw std::invalid_argument("input identity boundaries are invalid");
+    previous = prefix.token_count;
+  }
+  const std::unique_lock lock(impl_->mutex, std::try_to_lock);
+  if (!lock.owns_lock())
+    return std::nullopt;
+  const auto plan = impl_->Plan(prompt, input_identity, reuse_prompt,
+                                stable_prefix_tokens, input_prefixes);
+  if (plan.selected == impl_->entries.size())
+    return std::nullopt;
+  return ContinuationReuse{
+      plan.cached_tokens,
+      plan.live_source != impl_->entries.size() ||
+              (!impl_->snapshot_mode() && plan.cached_tokens)
+          ? "live"
+      : plan.cached_tokens ? "ram"
+                           : "none",
+      plan.live_source == impl_->entries.size() && impl_->snapshot_mode() &&
+              plan.source != impl_->entries.size()
+          ? impl_->entries[plan.source]->snapshot_bytes
+          : 0};
 }
 
 std::size_t ContinuationCache::CachedPrefixTokens(

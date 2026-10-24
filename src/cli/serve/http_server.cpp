@@ -1856,6 +1856,8 @@ void HttpServer::register_routes() {
   // ---- OpenAI ----
   add("POST", "/v1/completions", OpenAiCompletions);
   add("POST", "/v1/chat/completions", HandleOpenAiChat);
+  if (options_.cache_lookup_api)
+    add("POST", "/v1/cache/lookup", HandleCacheLookup);
   add("POST", "/v1/responses", OpenAiResponses);
   add("POST", "/v1/embeddings", NotImplemented);
 

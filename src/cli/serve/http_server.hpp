@@ -100,6 +100,8 @@ struct HttpServerOptions {
   /// generation answer 503 `device_lost` from then on; the hook decides how the
   /// process exits.
   std::function<void()> on_device_lost{};
+  /// Opt-in, read-only engine cache query. Uses the existing API-key policy.
+  bool cache_lookup_api{false};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

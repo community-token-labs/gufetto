@@ -568,8 +568,36 @@ void AdmissionAndValidation() {
   assert(ledger.Snapshot().total_bytes == old_bytes);
   assert(index.Lookup(Query(original)).selected->entry == id);
 }
+void RepeatedReadOnlyPlan() {
+  ResourceLedger ledger{kIndexLimits};
+  PrefixIndex index{ledger};
+  index.Register({1}, kIndexComponents);
+  const Tokens shallow{1, 2}, deep{1, 2, 3, 4}, prompt{1, 2, 3, 4, 5};
+  const auto root =
+      index.Insert(IndexCheckpoint(ledger, shallow), ResidentComponents());
+  const auto selected =
+      index.Insert(IndexCheckpoint(ledger, deep), ResidentComponents());
+  const auto metadata = index.MetadataBytes();
+  const auto bytes = ledger.Snapshot().total_bytes;
+  for (int i = 0; i < 100; ++i) {
+    {
+      const auto plan = index.Lookup(Query(prompt, 2));
+      assert(plan.selected->entry == selected && plan.selected->boundary == 4);
+    }
+    assert(index.MetadataBytes() == metadata);
+    assert(ledger.Snapshot().total_bytes == bytes);
+  }
+  // A common token prefix is not a restorable arbitrary hybrid boundary.
+  const Tokens branch{1, 2, 3, 9};
+  assert(index.Lookup(Query(branch, 2)).selected->entry == root);
+  assert(!index.Lookup(Query(prompt, 2, {9})).selected);
+  auto disabled = Query(prompt, 2);
+  disabled.reuse = false;
+  assert(!index.Lookup(disabled).selected);
+}
 }  // namespace
 int main() {
+  RepeatedReadOnlyPlan();
   SelectionTable();
   CheckpointPresence();
   ImagesAndLearning();

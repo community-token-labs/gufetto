@@ -765,6 +765,10 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    bool cache_lookup_api = false;
+    parser.AddFlag("", "--cache-lookup-api",
+                   "Enable read-only POST /v1/cache/lookup (default: off)",
+                   "Cache", &cache_lookup_api);
     AddCacheRamOption(parser, &cache_ram);
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory "
@@ -878,6 +882,8 @@ int RunServe(std::span<const char* const> args) {
       static_cast<std::size_t>(8) * 1024 * 1024;
   std::string api_key;
   ServerLogOptions log_options;
+
+  bool cache_lookup_api = false;
 
   // Identify the modality only after leading server options. The selected
   // parser consumes every option together, so --served-model-name -v and
@@ -1386,6 +1392,9 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddFlag("", "--cache-lookup-api",
+                       "Enable read-only POST /v1/cache/lookup (default: off)",
+                       "Cache", &cache_lookup_api);
     AddCacheRamOption(llm_parser, &cache_ram);
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory "
@@ -1720,6 +1729,7 @@ int RunServe(std::span<const char* const> args) {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
+          .cache_lookup_api = cache_lookup_api,
       },
       images, embeddings);
   std::string err;

@@ -3911,6 +3911,55 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
       request, backend, chat, max_tokens, sampling, stream, model);
 }
 
+HttpResponse HandleCacheLookup(const HttpRequest& request,
+                               TextGenerationBackend& backend) {
+  const auto started = std::chrono::steady_clock::now();
+  ParsedChatRequest parsed;
+  const auto defaults = backend.sampling_defaults();
+  parsed.max_tokens = defaults.max_tokens;
+  parsed.sampling = defaults.sampling;
+  if (auto error = ParseRequest(request, backend, &parsed))
+    return std::move(*error);
+  if (!backend.ready())
+    return Error(503, "Service Unavailable", "model service is not ready",
+                 "not_ready");
+  try {
+    const auto result = backend.cache_lookup(parsed.chat);
+    if (!result)
+      return Error(501, "Not Implemented",
+                   "cache lookup is not supported by the loaded backend",
+                   "cache_lookup_unsupported");
+    json::Value body = json::Value::object();
+    body["total_tokens"] = result->total_tokens;
+    body["matched_tokens"] = result->matched_tokens;
+    body["tier"] = result->tier;
+    body["restore_estimate_ms"] =
+        result->restore_estimate_ms ? json::Value(*result->restore_estimate_ms)
+                                    : json::Value();
+    body["prefill_estimate_ms"] =
+        result->prefill_estimate_ms ? json::Value(*result->prefill_estimate_ms)
+                                    : json::Value();
+    body["epoch"] = result->epoch;
+    // Includes HTTP body parsing, image decoding, rendering, tokenization and
+    // the index query, but excludes network I/O and JSON response encoding.
+    body["lookup_ms"] = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+    return HttpResponse{
+        .body = body.dump(),
+        .headers = {{"Content-Type", "application/json"},
+                    {"Cache-Control", "no-store"}},
+    };
+  } catch (const TextGenerationError& exception) {
+    return GenerationError(exception);
+  } catch (const std::invalid_argument&) {
+    return Error(400, "Bad Request", "invalid lookup prompt", "invalid_prompt");
+  } catch (const std::length_error&) {
+    return Error(400, "Bad Request", "lookup prompt exceeds context",
+                 "context_length_exceeded");
+  }
+}
+
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend) {
   ParsedChatRequest parsed;

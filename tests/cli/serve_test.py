@@ -86,6 +86,10 @@ def main():
     for value in ("OFF", "-1", "16G"):
         check(["serve", "llm", "--cache-ram-bytes", value], 2,
               "--cache-ram-bytes must be off or a byte count")
+    assert "--cache-lookup-api" in help_text
+    check(["serve", "llm", "--cache-lookup-api", "--model", "missing.gguf"], 1,
+          "Error loading model 'missing.gguf'")
+    check(["serve", "image", "--cache-lookup-api"], 2, "Unknown option")
     assert "it applies to every request" in help_text
     # The flag is a plain switch: it must not swallow the next argument.
     check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,

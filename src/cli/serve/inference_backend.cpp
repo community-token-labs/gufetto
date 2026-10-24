@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -135,7 +136,7 @@ std::optional<std::size_t> CountQwenPromptTokens(
 TextPreparedPrompt PrepareQwenPrompt(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache) {
+    std::uint32_t max_context, models::qwen::vision::ImageCache* image_cache) {
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
   const auto options = QwenChatOptions(request, max_context);
@@ -147,9 +148,9 @@ TextPreparedPrompt PrepareQwenPrompt(
               : std::span<const tokenization::ChatTool>{request.tools},
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
-          max_context, request.cache_prompt ? &image_cache : nullptr));
-  if (has_images && Logger::Enabled(LogLevel::kDebug)) {
-    const auto stats = image_cache.GetStats();
+          max_context, request.cache_prompt ? image_cache : nullptr));
+  if (image_cache && has_images && Logger::Enabled(LogLevel::kDebug)) {
+    const auto stats = image_cache->GetStats();
     Logger::LogFormatted(LogLevel::kDebug, "vision",
                          "event=image_cache enabled=%d entries=%zu "
                          "pixel_bytes=%zu encoded_bytes=%zu "
@@ -1038,6 +1039,10 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
 
 class QwenTextRunner final : public HipTextModelRunner {
 public:
+  std::string LookupContextIdentity() const override {
+    const auto encoder = model_->VisionEncoder();
+    return encoder ? std::string(encoder->identity()) : std::string{};
+  }
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
@@ -1110,6 +1115,9 @@ public:
     if (!qwen.frontier())
       qwen.set_frontier(
           0);  // Partial prefill: the suffix computes its frontier.
+  }
+  [[nodiscard]] bool LookupFullCheckpointReady() const override {
+    return false;
   }
   [[nodiscard]] bool HasDecodeFrontier(
       const TextRunnerState& state) const override {
@@ -1241,7 +1249,13 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             image_cache_);
+                             &image_cache_);
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PrepareLookupPrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->GetTokenizer(),
+                             model_->VisionEncoder(), max_context_, nullptr);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -2407,6 +2421,14 @@ const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
 
 class QwenFlashNextTextRunner final : public HipTextModelRunner {
 public:
+  // Flash-Next's existing HasDecodeFrontier contract treats every coherent
+  // private-state boundary as selectable. PrefixIndex checks exact per-
+  // component positions; it never rounds a hybrid frontier to a token LCP.
+  bool LookupFullCheckpointReady() const override { return true; }
+  std::string LookupContextIdentity() const override {
+    const auto encoder = model_->VisionEncoder();
+    return encoder ? std::string(encoder->identity()) : std::string{};
+  }
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
@@ -2571,7 +2593,13 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->tokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             image_cache_);
+                             &image_cache_);
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PrepareLookupPrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->tokenizer(),
+                             model_->VisionEncoder(), max_context_, nullptr);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -2937,7 +2965,12 @@ private:
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
+    State(TextPrefillPolicy prefill, TextSchedulerPolicy scheduler)
+        : prefill_policy(prefill), scheduler_policy(scheduler) {}
+    TextPrefillPolicy prefill_policy;
+    TextSchedulerPolicy scheduler_policy;
     std::shared_ptr<TextGenerationScheduler> scheduler;
+    std::shared_ptr<TextRunnerPool> runner_pool;
     std::string model_id;
     std::vector<std::string> extra_model_ids;
     SamplingDefaults sampling_defaults;
@@ -3404,7 +3437,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     }
 
     PrepareVision(model->VisionEncoder());
-    auto new_state = std::make_shared<Impl::State>();
+    auto new_state =
+        std::make_shared<Impl::State>(prefill_policy, scheduler_policy);
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
@@ -3425,11 +3459,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     }
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
-    auto runner_pool = std::make_shared<TextRunnerPool>(
+    auto& runner_pool = new_state->runner_pool;
+    runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3499,7 +3534,8 @@ bool InferenceBackend::load(
   }
 
   try {
-    auto new_state = std::make_shared<Impl::State>();
+    auto new_state =
+        std::make_shared<Impl::State>(prefill_policy, scheduler_policy);
     new_state->sampling_defaults.model =
         sampling::TextModelPreset::kDeepSeekV4Flash;
     new_state->sampling_defaults.supplied = {};
@@ -3518,11 +3554,12 @@ bool InferenceBackend::load(
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
+    auto& runner_pool = new_state->runner_pool;
+    runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3594,7 +3631,8 @@ bool InferenceBackend::load(
   }
   try {
     PrepareVision(model->VisionEncoder());
-    auto new_state = std::make_shared<Impl::State>();
+    auto new_state =
+        std::make_shared<Impl::State>(prefill_policy, scheduler_policy);
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
@@ -3614,11 +3652,12 @@ bool InferenceBackend::load(
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
+    auto& runner_pool = new_state->runner_pool;
+    runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -4002,6 +4041,46 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
 #else
   (void)text;
   return 0;
+#endif
+}
+
+std::optional<InferenceBackend::CacheLookupResult>
+InferenceBackend::cache_lookup(const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto started = Clock::now();
+  const auto state = impl_->Snapshot();
+  if (!state || !state->runner_pool)
+    return std::nullopt;
+  const auto& runner = state->scheduler->runner();
+  // Share framing with generation, but do not bind/touch cached grammars.
+  auto constrained = ConstrainChatRequest(request, runner, nullptr);
+  const auto& effective = constrained ? *constrained : request;
+  auto prompt = runner.PrepareLookupPrompt(effective);
+  if (!prompt || prompt->tokens.empty())
+    return std::nullopt;
+  auto result = state->runner_pool->Lookup(
+      prompt->tokens, prompt->context.get(), request.cache_prompt,
+      prompt->cache_prefix_tokens);
+  const auto& policy = state->scheduler_policy;
+  std::ostringstream flags;
+  flags << policy.max_pending_requests << ':'
+        << policy.max_pending_requests_per_client << ':'
+        << policy.max_output_bytes_per_request << ':'
+        << policy.max_buffered_output_bytes_per_request << ':'
+        << policy.max_buffered_output_bytes_total << ':'
+        << policy.request_timeout.count() << ':' << policy.stall_timeout.count()
+        << ':' << policy.device_probe_interval.count() << ':'
+        << policy.stream_start_delay.count() << ':' << policy.log_progress;
+  result.epoch =
+      CacheLookupConfiguredEpoch(result.epoch, state->reasoning_defaults,
+                                 state->prefill_policy.decode_active_tokens,
+                                 flags.str(), state->build_info);
+  result.lookup_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+  return result;
+#else
+  (void)request;
+  return std::nullopt;
 #endif
 }
 

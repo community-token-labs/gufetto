@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "src/cache/retention.hpp"
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -47,6 +48,7 @@ public:
   cache::Rows rows_per_chunk{4};
   mutable std::size_t through_calls{};
   bool UsesComponentCache() const override { return true; }
+  bool LookupFullCheckpointReady() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
     return {.model_id = "component-fake",
             .state_abi = "component-fake-v1",
@@ -739,6 +741,7 @@ void PartialFrontierDoesNotServeAnEqualPrompt() {
         ready.push_back(CheckpointPosition(state));
       return step;
     }
+    bool LookupFullCheckpointReady() const override { return false; }
     bool HasDecodeFrontier(const TextRunnerState& state) const override {
       return std::ranges::find(ready, CheckpointPosition(state)) != ready.end();
     }
@@ -761,7 +764,10 @@ void PartialFrontierDoesNotServeAnEqualPrompt() {
     }
     const std::vector<TextRunnerToken> equal(prompt.begin(),
                                              prompt.begin() + 16);
+    const auto lookup = pool.Lookup(equal);
+    assert(lookup.matched_tokens < equal.size());
     auto resend = pool.Acquire(equal, {}, {}, {}, true, 0);
+    assert(resend.cached_prompt_tokens() == lookup.matched_tokens);
     assert(resend.cached_prompt_tokens() < equal.size());
     Prefill(resend);
     (void)Generate(resend);
@@ -1009,7 +1015,14 @@ void RestartAndCorruption() {
   {
     auto runner = std::make_shared<Runner>();
     TextRunnerPool pool(runner, 1, disk);
+    const auto lookup = pool.Lookup(prompt);
+    assert(lookup.tier == "disk" && lookup.matched_tokens == prompt.size());
+    const auto captures = runner->captures;
+    for (int i = 0; i < 20; ++i)
+      assert(pool.Lookup(prompt).matched_tokens == prompt.size());
+    assert(runner->captures == captures);
     auto retry = pool.Acquire(prompt);
+    assert(retry.cached_prompt_tokens() == lookup.matched_tokens);
     assert(retry.cache_disk_hit());
     assert(retry.cached_prompt_tokens() == prompt.size());
     assert(Generate(retry) == token);
@@ -1980,6 +1993,9 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
       auto runner = std::make_shared<PinRunner>();
       TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = fixture.options});
       assert(runner->prefilled == fixture.tokens.size());
+      const auto lookup = pool.Lookup(prompt);
+      assert(lookup.tier == "ram" &&
+             lookup.matched_tokens == fixture.tokens.size());
       for (std::size_t mode = 0; mode < expected.size(); ++mode) {
         auto request = pool.Acquire(
             prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
@@ -1998,6 +2014,10 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
       auto runner = std::make_shared<PinRunner>();
       TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
       assert(runner->prefilled == 0);  // restart must not recompute the root
+      const auto lookup = pool.Lookup(prompt);
+      assert(lookup.tier == (lazy ? "disk" : "ram"));
+      assert(lookup.matched_tokens == fixture.tokens.size());
+      assert(fixture.Files() == published);
       for (std::size_t mode = 0; mode < expected.size(); ++mode) {
         auto request = pool.Acquire(
             prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
@@ -2562,8 +2582,12 @@ void PinnedPrefixLazySurvivesRamRefusal() {
   for (const TextRunnerToken suffix : {100, 101}) {
     auto prompt = fixture.tokens;
     prompt.push_back(suffix);
+    const auto lookup = pool.Lookup(prompt);
+    assert(lookup.tier == "disk");
+    assert(lookup.matched_tokens == fixture.tokens.size());
+    assert(fixture.Files() == published);
     auto request = pool.Acquire(prompt);
-    assert(request.cached_prompt_tokens() == fixture.tokens.size());
+    assert(request.cached_prompt_tokens() == lookup.matched_tokens);
     assert(request.cache_disk_hit());
     Prefill(request);
     const auto actual = Generate(request);
@@ -2606,6 +2630,7 @@ void PinnedPrefixCorruptionFailsClosed() {
     assert(refused);  // no partial state execution or silent repeated writes
   }
 }
+#include "tests/cli/cache_lookup_checks.hpp"
 }  // namespace
 // An off RAM cache commits no backing, grows none before prefill and takes no
 // capture, yet a session keeps its own live frontier and its metrics stay
@@ -2752,6 +2777,9 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
   }
 }
 int main() {
+  LookupIsReadOnlyAndMatchesAcquire();
+  LookupReturnsBusyWithoutWaitingForAdmission();
+  LookupMeasuredRatesAndEpoch();
   MultiplePinsChooseLongestAndRestart();
   MultiplePinsAggregateDiskBudget();
   MultiplePinsAggregateRamAndIndependentLazyWarming();

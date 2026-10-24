@@ -1363,7 +1363,34 @@ void TestNewBranchPreservesSharedSourceUnderBytePressure() {
          "the oldest unrelated continuation yields to the shared branch point");
 }
 
+void TestReadOnlyLookupKeepsLruAndUsesAcquirePlan() {
+  using namespace gufo::server;
+  using Tokens = std::vector<ContinuationToken>;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next = 0;
+  ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next++, &invalidations); });
+  const Tokens a{1, 2}, b{5, 6}, c{8, 9};
+  cache.Acquire(a).Commit(a);
+  cache.Acquire(b).Commit(b);
+  const auto before = invalidations;
+  for (int i = 0; i < 100; ++i) {
+    const auto lookup = cache.Lookup(a);
+    Expect(lookup && lookup->matched_tokens == 2 && lookup->tier == "live",
+           "metadata predicts exact live continuation");
+  }
+  Expect(invalidations == before, "lookup never invalidates a state");
+  cache.Acquire(c).Commit(c);
+  Expect(cache.Lookup(a)->matched_tokens == 0 &&
+             cache.Lookup(b)->matched_tokens == 2,
+         "lookup does not protect the oldest state from eviction");
+  auto first = cache.Acquire(a);
+  auto second = cache.Acquire(b);
+  Expect(!cache.Lookup(c), "all leased states report busy without waiting");
+}
+
 int main() {
+  TestReadOnlyLookupKeepsLruAndUsesAcquirePlan();
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();
   TestColdMissThenExactExtensionHit();

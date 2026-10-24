@@ -18,6 +18,11 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
 HttpResponse HandleApplyTemplate(const HttpRequest& request,
                                  TextGenerationBackend& backend);
 
+/// Same parsing/defaults as Chat Completions, but never admits generation.
+/// Lookup requests are intentionally excluded from prompt tracing.
+HttpResponse HandleCacheLookup(const HttpRequest& request,
+                               TextGenerationBackend& backend);
+
 /// Responses nests output schema under text.format and effort under reasoning.
 /// Shared controls stay validated as in Chat Completions, but the Responses
 /// adapter tolerates standard Responses fields with no native effect (hosted

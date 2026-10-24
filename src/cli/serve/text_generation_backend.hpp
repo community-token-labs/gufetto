@@ -33,6 +33,7 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kSchedulerStopping,
   kToolChoiceUnsatisfied,
   kDeviceLost,
+  kCacheLookupBusy,
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.
@@ -56,6 +57,7 @@ public:
       case TextGenerationErrorCode::kOutputBackpressure:
       case TextGenerationErrorCode::kSchedulerStopping:
       case TextGenerationErrorCode::kDeviceLost:
+      case TextGenerationErrorCode::kCacheLookupBusy:
         return 503;
       case TextGenerationErrorCode::kToolChoiceUnsatisfied:
         return 502;
@@ -80,6 +82,8 @@ public:
         return "tool_choice_unsatisfied";
       case TextGenerationErrorCode::kDeviceLost:
         return "device_lost";
+      case TextGenerationErrorCode::kCacheLookupBusy:
+        return "cache_lookup_busy";
     }
     return "generation_error";
   }
@@ -132,6 +136,22 @@ struct ChatRequest {
 /// generated text pieces and aggregate request metrics.
 class TextGenerationBackend {
 public:
+  /// Point-in-time local reuse hint, not a reservation or transferable state
+  /// identity. Predicts selection from trusted single-owner cache metadata;
+  /// disk bytes are NOT read/verified. Concurrent state changes, external file
+  /// modification, corruption, I/O or restore failures can change actual reuse
+  /// (RAM/device restores can fail too). Opaque full checkpoints whose decode
+  /// readiness is unknown are conservatively omitted.
+  struct CacheLookupResult {
+    std::size_t total_tokens{0};
+    std::size_t matched_tokens{0};
+    std::string tier{"none"};
+    std::string epoch;
+    std::optional<double> restore_estimate_ms;
+    std::optional<double> prefill_estimate_ms;
+    double lookup_ms{0.0};
+  };
+
   using CancellationCheck = std::function<bool()>;
   using TokenCallback = std::function<bool(std::string_view)>;
 
@@ -389,6 +409,14 @@ public:
 
   [[nodiscard]] virtual std::size_t count_tokens(
       std::string_view text) const = 0;
+
+  /// No admission, prefill, state restore, LRU touch, or disk payload reads.
+  /// Busy implementations throw kCacheLookupBusy rather than wait for
+  /// generation.
+  [[nodiscard]] virtual std::optional<CacheLookupResult> cache_lookup(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
 
   /// Prompt tokens a chat request would use after template rendering, without
   /// generating. Empty when the backend cannot tell.

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -110,6 +111,13 @@ struct ContinuationLookup {
   std::string_view miss_reason;
   std::size_t common_prefix_tokens{0};
   std::size_t checkpoint_tokens{0};
+};
+
+/// Metadata-only plan. An absent value means the metadata/slots are busy.
+struct ContinuationReuse {
+  std::size_t matched_tokens{0};
+  std::string_view tier{"none"};
+  std::size_t restore_bytes{0};
 };
 
 /// Bounded exact-prefix cache over opaque model continuation states.
@@ -250,6 +258,13 @@ public:
       const std::function<void(ContinuationState&)>& prepare_state = {},
       bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
       std::span<const ContinuationInputPrefix> input_prefixes = {});
+
+  /// Uses Acquire's selection plan without leasing, restoring or touching LRU.
+  [[nodiscard]] std::optional<ContinuationReuse> Lookup(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
 
   /// Longest retained prefix of prompt with a matching input identity,
   /// ignoring stable-prefix fallback rules. Leases nothing.

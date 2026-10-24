@@ -248,6 +248,7 @@ struct ComponentTextCache::Impl {
     // Acquisition order; cold assignment replaces the oldest live frontier.
     std::uint64_t used{};
     bool busy{};
+    bool decode_ready{};
   };
   std::shared_ptr<TextModelRunner> runner;
   cache::ResourceLedger ledger;
@@ -266,6 +267,19 @@ struct ComponentTextCache::Impl {
   mutable std::mutex mutex;
   std::vector<std::unique_ptr<Entry>> entries;
   std::uint64_t clock{};
+  struct Readiness {
+    std::weak_ptr<const cache::Checkpoint> checkpoint;
+    bool decode_ready{};
+  };
+  // Weak metadata follows retained payload lifetime; never keeps an evicted
+  // checkpoint alive. Disk-only descriptions cannot attest decode readiness.
+  std::vector<Readiness> readiness;
+
+  cache::PrefixLookup Plan(std::span<const ContinuationToken> prompt,
+                           const cache::InputIdentity& input,
+                           std::size_t stable, bool reuse) const {
+    return index.Lookup({identity, prompt, input, stable, reuse});
+  }
   std::unique_ptr<cache::DiskCatalog> catalog;
   std::unique_ptr<cache::StreamedStore> streaming;
   std::unique_ptr<cache::PersistenceQueue> queue;
@@ -1336,8 +1350,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     const std::lock_guard lock(impl_->mutex);
     if (impl_->catalog)
       impl_->catalog->Reconcile();
-    found =
-        impl_->index.Lookup({impl_->identity, prompt, input, stable, reuse});
+    found = impl_->Plan(prompt, input, stable, reuse);
     // A miss reports how far a stored prompt agreed, so an empty cache can
     // be told apart from one holding only incompatible boundaries.
     if (reuse && !found.selected)
@@ -1839,6 +1852,58 @@ std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
   return selected;
 }
 
+std::span<const std::uint8_t> ComponentTextCache::CompatibilityIdentity()
+    const {
+  return impl_->identity;
+}
+
+std::optional<ContinuationReuse> ComponentTextCache::Lookup(
+    std::span<const ContinuationToken> prompt, const TextPromptContext* context,
+    bool reuse, std::size_t stable) const {
+  auto input = Inputs(prompt.size(), context);
+  const std::unique_lock lock(impl_->mutex, std::try_to_lock);
+  if (!lock.owns_lock() ||
+      std::ranges::none_of(impl_->entries,
+                           [](const auto& e) { return !e->busy; }))
+    return std::nullopt;
+  // No catalog Reconcile/Touch: those retire entries. The trusted single-owner
+  // store publishes immutable manifests. This is the selection that Acquire
+  // would attempt, not an integrity/I/O/restore-success guarantee. External
+  // file modification, corruption and concurrent publication/eviction can
+  // invalidate the prediction; only actual restore verifies payload bytes.
+  const auto found = impl_->Plan(prompt, input, stable, reuse);
+  if (found.selected && found.selected->live) {
+    const auto& entry =
+        *impl_->entries.at(found.selected->live->slot.value - 1);
+    if (!entry.busy &&
+        (found.selected->boundary < prompt.size() || entry.decode_ready))
+      return ContinuationReuse{found.selected->boundary, "live"};
+  }
+  // Same ordered fallback list as Acquire, including ordinary disk and pins.
+  for (const auto& candidate : found.candidates) {
+    if (candidate.live)
+      continue;
+    if (candidate.boundary == prompt.size()) {
+      const auto ready =
+          impl_->runner->LookupFullCheckpointReady() ||
+          (candidate.checkpoint &&
+           std::ranges::any_of(impl_->readiness, [&](const auto& r) {
+             return r.decode_ready &&
+                    r.checkpoint.lock() == candidate.checkpoint;
+           }));
+      if (!ready)
+        continue;  // Opaque full checkpoints may have no selectable logits.
+    }
+    if (candidate.checkpoint)
+      return ContinuationReuse{candidate.boundary, "ram",
+                               candidate.transfer_bytes};
+    if (candidate.durable)
+      return ContinuationReuse{candidate.boundary, "disk",
+                               candidate.transfer_bytes};
+  }
+  return ContinuationReuse{};
+}
+
 std::size_t ComponentTextCache::CachedPrefixTokens(
     std::span<const ContinuationToken> prompt, const TextPromptContext* context,
     bool common) const {
@@ -2120,6 +2185,13 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   request.metrics.captured_bytes += captured_capacity;
   request.metrics.borrowed_capacity_bytes += borrowed_capacity;
   request.metrics.copied_payload_bytes += copied_payload;
+  {
+    const auto ready = cache.runner->HasDecodeFrontier(*request.state);
+    const std::lock_guard lock(cache.mutex);
+    std::erase_if(cache.readiness,
+                  [](const auto& r) { return r.checkpoint.expired(); });
+    cache.readiness.push_back({checkpoint, ready});
+  }
   auto snapshot = std::make_unique<ComponentSnapshot>();
   snapshot->checkpoint = std::move(checkpoint);
   snapshot->bytes = bytes;
@@ -2184,9 +2256,12 @@ std::size_t ComponentTextCache::Lease::Commit(
   auto positions =
       impl_->cache->resources->adapter->Positions(impl_->slot.Execution());
   const auto location = impl_->slot.Location();
+  const bool decode_ready =
+      impl_->cache->runner->HasDecodeFrontier(*impl_->state);
   impl_->slot.Commit();
   {
     const std::lock_guard lock(impl_->cache->mutex);
+    impl_->entry->decode_ready = decode_ready;
     impl_->entry->live_tokens = live;
     impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
     impl_->entry->live = impl_->cache->index.Insert(cache::LiveFrontier{
