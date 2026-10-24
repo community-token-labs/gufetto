@@ -1631,7 +1631,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           const auto bytes = lease->CaptureBytes();
           if (bytes > impl_->budget ||
               !lease->TryReserveSnapshot(bytes, request.cached, true,
-                                         SnapshotPurpose::kBranchPoint))
+                                         SnapshotPurpose::kBranchPoint, {}))
             throw cache::ResourceExhausted();
           request.pin_capture = true;
           const auto snapshot = lease->Capture();
