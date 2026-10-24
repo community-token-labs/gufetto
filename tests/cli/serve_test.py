@@ -226,6 +226,40 @@ def main():
            "--cache-disk-bytes", "0"], 2,
           "sampling and scheduling limits are invalid")
 
+    assert "repeatable, at most 64" in help_text
+    assert "Total pinned-prefix registry byte budget" in help_text
+    for args in (["--pin-prefix-file", "missing.txt"],
+                 ["--pin-prefix-dir", "/unused-pins"],
+                 ["--pin-prefix-bytes", "1"], ["--pin-prefix-lazy"]):
+        check(load + args, 2, "require both --pin-prefix-file")
+    with tempfile.TemporaryDirectory() as directory:
+        prefix = os.path.join(directory, "prefix.txt")
+        second = os.path.join(directory, "second.txt")
+        for path in (prefix, second):
+            with open(path, "w") as output:
+                output.write("already rendered prefix")
+        pin_args = ["--pin-prefix-dir", os.path.join(directory, "pins")]
+        check(load + pin_args + ["--pin-prefix-file", prefix,
+                                 "--pin-prefix-file=" + second],
+              1, "Error loading model")
+        # Repetition must validate every file, not merely the last option.
+        for files in ((prefix, "/missing-prefix.txt"),
+                      ("/missing-prefix.txt", second)):
+            check(load + pin_args + ["--pin-prefix-file", files[0],
+                                     "--pin-prefix-file", files[1]],
+                  2, "must name a readable regular")
+        check(load + pin_args + ["--pin-prefix-file", prefix,
+                                 "--pin-prefix-bytes", "0"],
+              2, "--pin-prefix-bytes must be positive")
+        check(load + pin_args + ["--pin-prefix-file="],
+              2, "requires a nonempty path")
+        check(load + pin_args + ["--pin-prefix-file", prefix] * 65,
+              2, "at most 64 registrations")
+        check(load + pin_args + ["--pin-prefix-file", prefix,
+                                 "--cache-disk", pin_args[1]],
+              2, "must be separate from --cache-disk")
+        assert not os.path.exists(pin_args[1])  # no store/model actions
+
     for command in ("prompt", "chat", "bench"):
         check([command, "--help"], 0, "--draft-policy")
         check([command, "--draft-tokens", "0"], 2, "draft-tokens")

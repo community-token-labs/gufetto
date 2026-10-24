@@ -128,7 +128,7 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
-  void InitializePin(const TextRunnerPinnedPrefixOptions&);
+  void InitializePins(const TextRunnerPinnedPrefixOptions&);
   std::unique_ptr<Impl> impl_;
 };
 

@@ -270,11 +270,17 @@ struct ComponentTextCache::Impl {
   std::unique_ptr<cache::StreamedStore> streaming;
   std::unique_ptr<cache::PersistenceQueue> queue;
   std::unique_ptr<cache::StreamedStore> pin_streaming;
-  // Not admitted to RetentionPolicy: neither RAM pressure nor record pressure
-  // may remove this root. All its allocations still use the common ledger.
-  std::shared_ptr<const cache::Checkpoint> pinned;
-  std::optional<cache::IndexEntryId> pin_entry;
-  bool lazy_pin{}, pin_warming{};
+  // Not admitted to RetentionPolicy: neither RAM nor record pressure may
+  // remove these roots. The vector and payloads use the common ledger.
+  struct Pin {
+    cache::CheckpointId durable;
+    std::shared_ptr<const cache::Checkpoint> ram;
+    std::optional<cache::IndexEntryId> entry;
+    bool warming{};
+  };
+  cache::ResourceCharge pin_metadata;
+  std::vector<Pin> pins;
+  bool lazy_pins{};
   static constexpr std::size_t kPersistenceDepth = 8;
   // Backing that disk captures copy through when the RAM cache is off. It
   // equals the small explicit budget used before off existed, and it retains
@@ -344,9 +350,12 @@ struct ComponentTextCache::Impl {
                                                 options->capacity_bytes);
     }
     if (pins.enabled()) {
-      if (pins.file.empty() || !pins.capacity_bytes)
+      if (pins.files.empty() ||
+          pins.files.size() >
+              TextRunnerPinnedPrefixOptions::kMaxRegistrations ||
+          !pins.capacity_bytes)
         throw std::invalid_argument(
-            "pinned prefix requires a file and byte budget");
+            "pinned prefixes require 1..64 files and a byte budget");
       if (!this->runner->Descriptor().persistence)
         throw std::invalid_argument(
             "pinned prefix requires a durable model identity");
@@ -795,7 +804,8 @@ struct ComponentTextCache::Lease::Impl {
   std::vector<cache::Token> prompt;
   std::size_t cached{}, restored{}, stable{}, capture_boundary{};
   double restore_time{};
-  bool disk_hit{}, active{true}, preserve_source{}, pin_capture{}, pin_hit{};
+  bool disk_hit{}, active{true}, preserve_source{}, pin_capture{};
+  ComponentTextCache::Impl::Pin* pin_hit{};
   cache::CheckpointId source{};
   std::array<cache::CheckpointId, cache::RetentionPolicy::kRecordLimit>
       edit_boundaries{};
@@ -1087,157 +1097,203 @@ ComponentTextCache::ComponentTextCache(
                                    std::max(ram, ceiling), disk, automatic_ram,
                                    pins, ram_enabled)) {
   if (pins.enabled())
-    InitializePin(pins);
+    InitializePins(pins);
 }
-void ComponentTextCache::InitializePin(
+void ComponentTextCache::InitializePins(
     const TextRunnerPinnedPrefixOptions& options) {
-  // This is an operator-supplied *rendered* text prefix, never a role-marker
-  // search or an arbitrary client-requested registration. Lookup later proves
-  // that these exact tokens and input identity are a prefix of the request.
+  // Validate the complete operator-supplied set before retiring anything.
+  // File names and option order are not identity; exact tokens, supplemental
+  // input and the strong executable/numerics digest remain the authority.
+  struct Registration {
+    cache::ResourceCharge metadata;
+    std::vector<cache::Token> tokens;
+    cache::CheckpointId existing;
+  };
+  auto registration_metadata =
+      impl_->ledger
+          .Reserve(cache::ResourceCategory::kMetadata,
+                   options.files.size() * sizeof(Registration))
+          .Convert();
+  std::vector<Registration> registrations;
+  registrations.reserve(options.files.size());
+  if (registrations.capacity() != options.files.size())
+    throw std::logic_error("unexpected pin registration capacity");
   constexpr std::size_t kMaxPrefixFileBytes = 16ULL << 20;
-  std::ifstream file(options.file, std::ios::binary | std::ios::ate);
-  if (!file || file.tellg() <= 0 ||
-      file.tellg() > std::streamoff(kMaxPrefixFileBytes))
-    throw std::invalid_argument(
-        "pin prefix file must contain 1..16 MiB of rendered text");
-  std::string rendered(static_cast<std::size_t>(file.tellg()), '\0');
-  file.seekg(0);
-  if (!file.read(rendered.data(),
-                 static_cast<std::streamsize>(rendered.size())))
-    throw std::runtime_error("cannot read pin prefix file");
-  const auto tokens = impl_->runner->TokenizeControl(rendered);
-  if (tokens.empty() ||
-      tokens.size() >= impl_->runner->Descriptor().max_context)
-    throw std::invalid_argument(
-        "pin prefix must be nonempty and leave context for a tail");
+  for (const auto& path : options.files) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() <= 0 ||
+        file.tellg() > std::streamoff(kMaxPrefixFileBytes))
+      throw std::invalid_argument(
+          "pin prefix file must contain 1..16 MiB of rendered text");
+    std::string rendered(static_cast<std::size_t>(file.tellg()), '\0');
+    file.seekg(0);
+    if (!file.read(rendered.data(),
+                   static_cast<std::streamsize>(rendered.size())))
+      throw std::runtime_error("cannot read pin prefix file");
+    auto tokens = impl_->runner->TokenizeControl(rendered);
+    if (tokens.empty() ||
+        tokens.size() >= impl_->runner->Descriptor().max_context)
+      throw std::invalid_argument(
+          "pin prefix must be nonempty and leave context for a tail");
+    if (std::ranges::any_of(registrations, [&](const auto& registration) {
+          return registration.tokens == tokens;
+        }))
+      throw std::invalid_argument("duplicate exact pinned prefix registration");
+    auto metadata = impl_->ledger
+                        .Reserve(cache::ResourceCategory::kMetadata,
+                                 tokens.capacity() * sizeof(cache::Token))
+                        .Convert();
+    registrations.push_back({std::move(metadata), std::move(tokens), {}});
+  }
   auto& disk = *impl_->pin_disk;
   if (disk.Stats().rejected_manifests)
     throw std::runtime_error(
         "pinned prefix is corrupt or truncated; repair its directory "
         "explicitly");
-  // One registration per directory is a hard count bound. Changing its exact
-  // tokens/build/input identity is explicit replacement, never pressure LRU.
-  if (disk.Entries().size() > 1)
-    throw std::runtime_error(
-        "pin prefix directory contains more than one registration");
-  cache::CheckpointId existing{};
-  cache::CheckpointId replace{};
-  for (const auto& entry : disk.Entries()) {
-    const auto& manifest = entry.Manifest();
-    cache::ExecutionHistory::ObserveDurableId(manifest.checkpoint);
-    if (manifest.compatibility == impl_->digest && manifest.tokens == tokens &&
-        manifest.input.empty())
-      existing = manifest.checkpoint;
-    else
-      replace = manifest.checkpoint;
-  }
-  if (replace.value) {
+  // The existing v2 manifests ARE the registry: no migration or per-pin
+  // subdirectories/budgets. One owned DiskStore bounds the sum, including
+  // temporaries and orphans, and uses one shared staging buffer. The explicit
+  // configured set replaces removed/incompatible identities, never via LRU.
+  // Retire outside Entries() iteration: retirement invalidates that view.
+  for (;;) {
+    cache::CheckpointId replace{};
+    for (const auto& entry : disk.Entries()) {
+      const auto& manifest = entry.Manifest();
+      cache::ExecutionHistory::ObserveDurableId(manifest.checkpoint);
+      auto registration = std::ranges::find(registrations, manifest.tokens,
+                                            &Registration::tokens);
+      if (manifest.compatibility == impl_->digest && manifest.input.empty() &&
+          registration != registrations.end()) {
+        if (registration->existing.value &&
+            registration->existing != manifest.checkpoint)
+          throw std::runtime_error("duplicate durable pinned prefix identity");
+        registration->existing = manifest.checkpoint;
+      } else {
+        replace = manifest.checkpoint;
+      }
+    }
+    if (!replace.value)
+      break;
     if (!disk.Retire(replace))
       throw std::runtime_error("cannot replace incompatible pinned prefix");
     Logger::Info("cache", "schema=pinned-prefix-v1 event=identity_changed");
   }
-  if (!existing.value) {
+  const bool creating = std::ranges::any_of(
+      registrations, [](const auto& r) { return !r.existing.value; });
+  if (creating) {
     disk.ReclaimOrphans();
     disk.WaitForReclamation();
-  } else {
-    if (disk.Stats().managed_bytes > options.capacity_bytes)
-      throw std::runtime_error(
-          "pin prefix exceeds its reduced byte budget; not evicted");
-    if (options.lazy) {
-      impl_->pin_entry =
-          impl_->index.Insert(impl_->identity, disk.Describe(existing));
-      impl_->lazy_pin = true;
+  }
+  if (disk.Stats().managed_bytes > options.capacity_bytes)
+    throw std::runtime_error(
+        "pin registry exceeds its reduced byte budget; not evicted");
+  impl_->pin_metadata = impl_->ledger
+                            .Reserve(cache::ResourceCategory::kMetadata,
+                                     registrations.size() * sizeof(Impl::Pin))
+                            .Convert();
+  impl_->pins.reserve(registrations.size());
+  if (impl_->pins.capacity() != registrations.size())
+    throw std::logic_error("unexpected pin registry capacity");
+  impl_->lazy_pins = options.lazy;
+  for (const auto& registration : registrations) {
+    const auto& tokens = registration.tokens;
+    const auto existing = registration.existing;
+    auto& pin = impl_->pins.emplace_back();
+    pin.durable = existing;
+    if (existing.value && options.lazy) {
+      pin.entry = impl_->index.Insert(impl_->identity, disk.Describe(existing));
       Logger::Info("cache",
                    "schema=pinned-prefix-v1 event=ready mode=lazy tokens=" +
                        std::to_string(tokens.size()) +
                        " ram_payload_bytes=0 managed_bytes=" +
                        std::to_string(disk.Stats().managed_bytes));
-      return;
+      continue;
     }
-  }
-  const auto started = Clock::now();
-  // Lease a cold destination, then restore this particular pin publication.
-  // A general lookup could fall back to an equal/deeper ordinary checkpoint
-  // and accidentally claim warm readiness while the actual pin is corrupt.
-  auto lease = Acquire(tokens, {}, {}, false, 0, true);
-  if (!lease)
-    throw std::runtime_error("cannot lease pinned-prefix startup slot");
-  auto& state = dynamic_cast<TextRunnerState&>(lease->state());
-  if (existing.value) {
-    cache::TransferTiming timing;
-    if (!impl_->pin_streaming->Restore(
-            existing, impl_->digest, *impl_->resources->adapter,
-            lease->impl_->slot.Execution(), timing, {}, {},
-            [&](bool private_file, cache::DiskFileId file) {
-              disk.InvalidateDependency(private_file, file);
-            }))
+    const auto started = Clock::now();
+    // Lease a cold destination, then restore this particular pin publication.
+    // A general lookup could fall back to an equal/deeper ordinary checkpoint
+    // and accidentally claim warm readiness while the actual pin is corrupt.
+    auto lease = Acquire(tokens, {}, {}, false, 0, true);
+    if (!lease)
+      throw std::runtime_error("cannot lease pinned-prefix startup slot");
+    auto& state = dynamic_cast<TextRunnerState&>(lease->state());
+    if (existing.value) {
+      cache::TransferTiming timing;
+      if (!impl_->pin_streaming->Restore(
+              existing, impl_->digest, *impl_->resources->adapter,
+              lease->impl_->slot.Execution(), timing, {}, {},
+              [&](bool private_file, cache::DiskFileId file) {
+                disk.InvalidateDependency(private_file, file);
+              }))
+        throw std::runtime_error(
+            "pinned prefix restore failed; refusing warm readiness");
+      lease->impl_->entry->history = std::make_unique<cache::ExecutionHistory>(
+          cache::ExecutionHistory::RestoredUnshared(
+              impl_->ledger, impl_->resources->adapter->Components(),
+              impl_->identity));
+      impl_->runner->SetPromptContext(state, {});
+      impl_->runner->ReconcileComponentState(state, tokens.size());
+      if (!impl_->runner->HasDecodeFrontier(state))
+        throw std::runtime_error(
+            "pinned prefix has no complete decode frontier");
+      lease->impl_->cached = tokens.size();
+    }
+    auto offset = lease->cached_tokens();
+    while (offset < tokens.size()) {
+      const auto count = std::min<std::size_t>(4096, tokens.size() - offset);
+      lease->PreparePrefill(count);
+      const auto step = impl_->runner->Prefill(state, tokens, offset, count);
+      if (!step.consumed_tokens || step.consumed_tokens > count)
+        throw std::runtime_error("pinned prefix prefill made invalid progress");
+      offset += step.consumed_tokens;
+    }
+    if (impl_->runner->CheckpointPosition(state) != tokens.size())
       throw std::runtime_error(
-          "pinned prefix restore failed; refusing warm readiness");
-    lease->impl_->entry->history = std::make_unique<cache::ExecutionHistory>(
-        cache::ExecutionHistory::RestoredUnshared(
-            impl_->ledger, impl_->resources->adapter->Components(),
-            impl_->identity));
-    impl_->runner->SetPromptContext(state, {});
-    impl_->runner->ReconcileComponentState(state, tokens.size());
-    if (!impl_->runner->HasDecodeFrontier(state))
-      throw std::runtime_error("pinned prefix has no complete decode frontier");
-    lease->impl_->cached = tokens.size();
+          "pinned prefix checkpoint is not at the exact boundary");
+    const auto bytes = lease->CaptureBytes();
+    if (bytes > impl_->budget ||
+        !lease->TryReserveSnapshot(bytes, tokens.size(), true,
+                                   SnapshotPurpose::kBranchPoint, tokens))
+      throw std::runtime_error(
+          "pin prefix cannot fit RAM; use lazy mode for an existing pin");
+    // Required RAM warmth means materialized host backing, not native rows that
+    // will need spilling when the temporary startup slot is reassigned.
+    lease->impl_->pin_capture = true;
+    auto snapshot = lease->Capture();
+    const auto* component =
+        dynamic_cast<const ComponentSnapshot*>(snapshot.get());
+    if (!component || !component->checkpoint)
+      throw std::runtime_error("pin prefix did not materialize in RAM");
+    const auto checkpoint = component->checkpoint;
+    if (!existing.value) {
+      (void)impl_->Persist(checkpoint, true);
+      pin.durable = checkpoint->Id();
+    }
+    const auto payload_bytes = ResidentBytes(*checkpoint);
+    if (options.lazy) {
+      pin.entry =
+          impl_->index.Insert(impl_->identity, disk.Describe(pin.durable));
+    } else {
+      std::vector<cache::ComponentAvailability> available;
+      for (const auto& c : checkpoint->Components())
+        available.push_back({c.descriptor.id, true, false});
+      pin.entry = impl_->index.Insert(checkpoint, std::move(available));
+      pin.ram = checkpoint;
+    }
+    lease->Invalidate();
+    Logger::Info(
+        "cache",
+        "schema=pinned-prefix-v1 event=ready mode=" +
+            std::string(options.lazy ? "lazy" : "ram") +
+            " restored=" + std::to_string(bool(existing.value)) +
+            " tokens=" + std::to_string(tokens.size()) + " ram_payload_bytes=" +
+            std::to_string(options.lazy ? 0 : payload_bytes) +
+            " managed_bytes=" + std::to_string(disk.Stats().managed_bytes) +
+            " startup_ms=" +
+            std::to_string(std::chrono::duration<double, std::milli>(
+                               Clock::now() - started)
+                               .count()));
   }
-  auto offset = lease->cached_tokens();
-  while (offset < tokens.size()) {
-    const auto count = std::min<std::size_t>(4096, tokens.size() - offset);
-    lease->PreparePrefill(count);
-    const auto step = impl_->runner->Prefill(state, tokens, offset, count);
-    if (!step.consumed_tokens || step.consumed_tokens > count)
-      throw std::runtime_error("pinned prefix prefill made invalid progress");
-    offset += step.consumed_tokens;
-  }
-  if (impl_->runner->CheckpointPosition(state) != tokens.size())
-    throw std::runtime_error(
-        "pinned prefix checkpoint is not at the exact boundary");
-  const auto bytes = lease->CaptureBytes();
-  if (bytes > impl_->budget ||
-      !lease->TryReserveSnapshot(bytes, tokens.size(), true,
-                                 SnapshotPurpose::kBranchPoint, tokens))
-    throw std::runtime_error(
-        "pin prefix cannot fit RAM; use lazy mode for an existing pin");
-  // Required RAM warmth means materialized host backing, not native rows that
-  // will need spilling when the temporary startup slot is reassigned.
-  lease->impl_->pin_capture = true;
-  auto snapshot = lease->Capture();
-  const auto* component =
-      dynamic_cast<const ComponentSnapshot*>(snapshot.get());
-  if (!component || !component->checkpoint)
-    throw std::runtime_error("pin prefix did not materialize in RAM");
-  const auto checkpoint = component->checkpoint;
-  if (!existing.value)
-    (void)impl_->Persist(checkpoint, true);
-  if (impl_->pin_entry)
-    impl_->index.Erase(*impl_->pin_entry);
-  const auto payload_bytes = ResidentBytes(*checkpoint);
-  if (options.lazy) {
-    impl_->pin_entry =
-        impl_->index.Insert(impl_->identity, disk.Describe(checkpoint->Id()));
-  } else {
-    std::vector<cache::ComponentAvailability> available;
-    for (const auto& c : checkpoint->Components())
-      available.push_back({c.descriptor.id, true, false});
-    impl_->pin_entry = impl_->index.Insert(checkpoint, std::move(available));
-    impl_->pinned = checkpoint;
-  }
-  lease->Invalidate();
-  impl_->lazy_pin = options.lazy;
-  Logger::Info(
-      "cache",
-      "schema=pinned-prefix-v1 event=ready mode=" +
-          std::string(options.lazy ? "lazy" : "ram") +
-          " restored=" + std::to_string(bool(existing.value)) +
-          " tokens=" + std::to_string(tokens.size()) + " ram_payload_bytes=" +
-          std::to_string(options.lazy ? 0 : payload_bytes) + " managed_bytes=" +
-          std::to_string(disk.Stats().managed_bytes) + " startup_ms=" +
-          std::to_string(
-              std::chrono::duration<double, std::milli>(Clock::now() - started)
-                  .count()));
 }
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
@@ -1521,7 +1577,9 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           request.source = checkpoint.Id();
           {
             const std::lock_guard lock(impl_->mutex);
-            if (!impl_->pinned || impl_->pinned->Id() != checkpoint.Id())
+            if (std::ranges::none_of(impl_->pins, [&](const auto& pin) {
+                  return pin.ram && pin.ram->Id() == checkpoint.Id();
+                }))
               impl_->retention.Touch(checkpoint.Id());
           }
           restored = true;
@@ -1541,9 +1599,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                 const std::lock_guard lock(impl_->mutex);
                 if (pin) {
                   impl_->pin_disk->InvalidateDependency(private_file, file);
-                  if (impl_->pin_entry)
-                    impl_->index.Erase(*impl_->pin_entry);
-                  impl_->pin_entry.reset();
+                  for (auto& registration : impl_->pins) {
+                    if (registration.entry &&
+                        !impl_->pin_disk->Pin(registration.durable)) {
+                      impl_->index.Erase(*registration.entry);
+                      registration.entry.reset();
+                    }
+                  }
                   Logger::Warn("cache",
                                "schema=pinned-prefix-v1 event=corrupt");
                 } else {
@@ -1552,7 +1614,12 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
               });
           if (restored) {
             request.disk_hit = true;
-            request.pin_hit = pin;
+            if (pin) {
+              auto registration =
+                  std::ranges::find(impl_->pins, id, &Impl::Pin::durable);
+              if (registration != impl_->pins.end())
+                request.pin_hit = &*registration;
+            }
             request.restored = timing.bytes;
             Logger::Info(
                 "cache",
@@ -1584,7 +1651,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           request.source = {};
           request.restored = 0;
           request.disk_hit = false;
-          request.pin_hit = false;
+          request.pin_hit = nullptr;
           restored = false;
           continue;
         }
@@ -1600,7 +1667,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         restored = false;
         request.restored = 0;
         request.disk_hit = false;
-        request.pin_hit = false;
+        request.pin_hit = nullptr;
         request.source = {};
         entry->history.reset();
       }
@@ -1617,12 +1684,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     // Restore/reset may clear the attachment; install this request again.
     impl_->runner->SetPromptContext(*request.state, context);
     impl_->runner->ReconcileComponentState(*request.state, request.cached);
-    if (request.pin_hit && impl_->lazy_pin) {
+    if (request.pin_hit && impl_->lazy_pins) {
+      auto& pin = *request.pin_hit;
       bool warm = false;
       {
         const std::lock_guard lock(impl_->mutex);
-        if (!impl_->pinned && !impl_->pin_warming) {
-          impl_->pin_warming = true;
+        if (!pin.ram && pin.entry && !pin.warming) {
+          pin.warming = true;
           warm = true;
         }
       }
@@ -1647,10 +1715,10 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
             const std::lock_guard lock(impl_->mutex);
             const auto entry_id =
                 impl_->index.Insert(checkpoint, std::move(available));
-            if (impl_->pin_entry)
-              impl_->index.Erase(*impl_->pin_entry);
-            impl_->pin_entry = entry_id;
-            impl_->pinned = checkpoint;
+            if (pin.entry)
+              impl_->index.Erase(*pin.entry);
+            pin.entry = entry_id;
+            pin.ram = checkpoint;
           }
           request.source = checkpoint->Id();
           Logger::Info("cache",
@@ -1667,7 +1735,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         }
         request.pin_capture = false;
         const std::lock_guard lock(impl_->mutex);
-        impl_->pin_warming = false;
+        pin.warming = false;
       }
     }
     request.restore_time =

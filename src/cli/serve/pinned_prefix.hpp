@@ -3,11 +3,14 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <vector>
 
 namespace gufo::server {
-// One operator-owned text prefix per directory. Never populated by requests.
+// An explicit operator-owned registry. Never populated by requests.
 struct TextRunnerPinnedPrefixOptions {
-  std::filesystem::path file, directory;
+  static constexpr std::size_t kMaxRegistrations = 64;
+  std::vector<std::filesystem::path> files;
+  std::filesystem::path directory;
   std::size_t capacity_bytes{std::size_t{1} << 30};
   // Existing pins remain disk-backed instead of requiring startup RAM warmth.
   bool lazy{false};

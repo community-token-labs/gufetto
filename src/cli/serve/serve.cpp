@@ -436,21 +436,35 @@ struct SpeechOptions {
 
 void AddPinnedPrefixOptions(ArgParser& parser,
                             server::TextRunnerPinnedPrefixOptions* options) {
-  parser.AddOption(
+  parser.AddCustomOption(
       "", "--pin-prefix-file", "FILE",
       "Flash-Next: already-rendered UTF-8 system/tools prefix text "
-      "(requires --pin-prefix-dir)",
-      "Cache", &options->file);
+      "(repeatable, at most 64; requires --pin-prefix-dir)",
+      "Cache",
+      [options](std::string_view, std::string_view value, std::string* error) {
+        if (value.empty() ||
+            options->files.size() >=
+                server::TextRunnerPinnedPrefixOptions::kMaxRegistrations) {
+          if (error)
+            *error =
+                "--pin-prefix-file requires a nonempty path and at most "
+                "64 registrations";
+          return false;
+        }
+        options->files.emplace_back(value);
+        return true;
+      });
   parser.AddOption(
       "", "--pin-prefix-dir", "DIR",
       "Flash-Next: dedicated non-LRU prefix store, separate from --cache-disk "
       "(requires --pin-prefix-file; default: off)",
       "Cache", &options->directory);
-  parser.AddOption("", "--pin-prefix-bytes", "N",
-                   "Pinned-prefix byte budget (default: 1073741824)", "Cache",
-                   &options->capacity_bytes);
+  parser.AddOption(
+      "", "--pin-prefix-bytes", "N",
+      "Total pinned-prefix registry byte budget (default: 1073741824)", "Cache",
+      &options->capacity_bytes);
   parser.AddFlag("", "--pin-prefix-lazy",
-                 "Keep the pinned prefix disk-only until demand restore "
+                 "Keep pinned prefixes disk-only until demand restore "
                  "(default: eagerly hydrate RAM at startup)",
                  "Cache", &options->lazy);
 }
@@ -1412,7 +1426,7 @@ int RunServe(std::span<const char* const> args) {
         llm_parser.WasSupplied("--pin-prefix-bytes") ||
         llm_parser.WasSupplied("--pin-prefix-lazy");
     if (pin_prefix_supplied) {
-      if (pinned_prefix.file.empty() || !pinned_prefix.enabled()) {
+      if (pinned_prefix.files.empty() || !pinned_prefix.enabled()) {
         std::cerr << "Error: pinned prefixes require both --pin-prefix-file "
                      "FILE and --pin-prefix-dir DIR\n";
         return 2;
@@ -1422,11 +1436,13 @@ int RunServe(std::span<const char* const> args) {
         return 2;
       }
       std::error_code path_error;
-      if (!std::filesystem::is_regular_file(pinned_prefix.file, path_error) ||
-          !std::ifstream(pinned_prefix.file, std::ios::binary)) {
-        std::cerr << "Error: --pin-prefix-file must name a readable regular "
-                     "UTF-8 text file\n";
-        return 2;
+      for (const auto& file : pinned_prefix.files) {
+        if (!std::filesystem::is_regular_file(file, path_error) ||
+            !std::ifstream(file, std::ios::binary)) {
+          std::cerr << "Error: --pin-prefix-file must name a readable regular "
+                       "UTF-8 text file\n";
+          return 2;
+        }
       }
       auto pin_directory =
           std::filesystem::absolute(pinned_prefix.directory, path_error);
