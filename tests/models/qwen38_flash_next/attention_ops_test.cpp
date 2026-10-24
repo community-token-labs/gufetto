@@ -556,7 +556,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
       throw std::runtime_error("last-tile attention rejected the geometry");
     }
     const auto tail = Download(&d_wmma, q_count);
-    const std::uint32_t tile_rows = mask_ptr ? 4 : 16;
+    const std::uint32_t tile_rows = mask_ptr ? 1 : 16;
     const std::size_t begin =
         static_cast<std::size_t>((n_tokens - 1) / tile_rows * tile_rows) *
         kQWidth;
@@ -925,6 +925,99 @@ void CheckChunks(std::uint32_t n, std::uint32_t split) {
     throw std::runtime_error("attention depends on prefill chunk boundary");
 }
 
+// Freeze Q/K/V and every per-query selection: only launch companions and
+// whether future values are populated may change. This is not a model replay.
+void CheckSparseChunks() {
+  constexpr std::uint32_t start = 2412, n = 17, context = start + n;
+  constexpr std::uint32_t words = (context / kRatio + 31) / 32;
+  const std::size_t count = std::size_t(n) * kQWidth;
+  HipBuffer<float> queries(count), gates(count), full(count), chunked(count);
+  HipBuffer<__half> keys(std::size_t(context) * kKvWidth),
+      values(std::size_t(context) * kKvWidth);
+  HipBuffer<std::uint32_t> masks(std::size_t(n) * words);
+  Upload(&queries, MakeValues(count, 412, 4.0F));
+  Upload(&gates, MakeValues(count, 721, 3.0F));
+  std::vector<__half> kv(keys.bytes() / sizeof(__half));
+  for (auto* destination : {&keys, &values}) {
+    const auto f =
+        MakeValues(kv.size(), destination == &keys ? 891 : 347, 1.0F);
+    std::transform(f.begin(), f.end(), kv.begin(),
+                   [](float x) { return __float2half(x); });
+    Upload(destination, kv);
+  }
+  const auto populated_values = kv;
+  std::vector<std::uint32_t> mask(std::size_t(n) * words, 0);
+  for (std::uint32_t t = 0; t < n; ++t)
+    for (std::uint32_t b = 0; b < (start + t + 1) / kRatio; ++b)
+      if ((b + t) % 5 != 0)
+        mask[std::size_t(t) * words + b / 32] |= 1U << (b % 32);
+  Upload(&masks, mask);
+  const auto run = [&](std::uint32_t first, std::uint32_t rows, float* out) {
+    const auto offset = std::size_t(first) * kQWidth;
+    if (!q::WmmaCausalAttention(queries.get() + offset, gates.get() + offset,
+                                keys.get(), values.get(),
+                                masks.get() + std::size_t(first) * words, words,
+                                out + offset, rows, start + first, kHeads,
+                                kKvHeads, kDim, kRatio, nullptr))
+      throw std::runtime_error("sparse chunk geometry rejected");
+  };
+  run(0, n, full.get());
+  const auto expected = Download(&full, count);
+  bool exact = true;
+  const auto check_target = [&](const char* label) {
+    const auto actual = Download(&chunked, count);
+    std::size_t changed = 0;
+    float maximum = 0;
+    for (std::size_t i = 0; i < kQWidth; ++i) {
+      if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]))
+        throw std::runtime_error("non-finite sparse attention output");
+      changed += std::memcmp(&expected[i], &actual[i], sizeof(float)) != 0;
+      maximum = std::max(maximum, std::abs(expected[i] - actual[i]));
+    }
+    std::cout << label << " differing=" << changed << " max=" << maximum
+              << '\n';
+    exact = exact && changed == 0;
+  };
+  auto companions = mask;
+  for (std::uint32_t t = 1; t < n; ++t)
+    std::copy_n(mask.data(), words, companions.data() + std::size_t(t) * words);
+  Upload(&masks, companions);
+  run(0, n, chunked.get());
+  check_target("changed companion masks, frozen target");
+  Upload(&masks, mask);
+  kv = populated_values;
+  std::fill(kv.begin() + std::size_t(start + 1) * kKvWidth, kv.end(),
+            __float2half(0.0F));
+  Upload(&values, kv);
+  run(0, n, chunked.get());
+  check_target("zero future values, frozen grouping");
+  Upload(&values, populated_values);
+  for (const auto split : {1U, 2U, 3U, 4U, 7U, 8U, 9U, 16U}) {
+    // A real prefix has no future V rows yet. Then append the unchanged V.
+    kv = populated_values;
+    std::fill(kv.begin() + std::size_t(start + split) * kKvWidth, kv.end(),
+              __float2half(0.0F));
+    Upload(&values, kv);
+    run(0, split, chunked.get());
+    Upload(&values, populated_values);
+    run(split, n - split, chunked.get());
+    const auto actual = Download(&chunked, count);
+    std::size_t changed = 0;
+    float maximum = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (!std::isfinite(expected[i]) || !std::isfinite(actual[i]))
+        throw std::runtime_error("non-finite sparse chunk output");
+      changed += std::memcmp(&expected[i], &actual[i], sizeof(float)) != 0;
+      maximum = std::max(maximum, std::abs(expected[i] - actual[i]));
+    }
+    std::cout << "sparse chunks split=" << split << " differing=" << changed
+              << " max=" << maximum << '\n';
+    exact = exact && changed == 0;
+  }
+  if (!exact)
+    throw std::runtime_error("sparse attention depends on query companions");
+}
+
 void CheckWmmaLiveExtent() {
   HipBuffer<float> qv(kQWidth), gate(kQWidth), out(kQWidth);
   HipBuffer<__half> k(kKvWidth), v(kKvWidth);
@@ -946,8 +1039,11 @@ void CheckWmmaLiveExtent() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    CheckSparseChunks();
+    if (argc == 2 && std::strcmp(argv[1], "--sparse-chunks-only") == 0)
+      return 0;
     CheckChunks(136, 94);
     CheckChunks(2048, 1025);
     CheckWmmaLiveExtent();

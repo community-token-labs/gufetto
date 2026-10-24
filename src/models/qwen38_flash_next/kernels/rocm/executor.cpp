@@ -6,8 +6,11 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -40,6 +43,59 @@ bool Check(hipError_t err, const char* what, std::string* error_msg) {
   }
   AssignError(error_msg, std::string(what) + ": " + hipGetErrorString(err));
   return false;
+}
+
+// Opt-in numerical localization only. No transfers or graph-policy changes
+// occur when GUFO_FLASH_NEXT_DUMP_DIR is unset. Dumps contain model
+// activations; use a private directory and an explicit bounded absolute row
+// interval.
+const char* DumpDirectory() {
+  static const char* directory = std::getenv("GUFO_FLASH_NEXT_DUMP_DIR");
+  return directory;
+}
+struct DumpFrame {
+  std::uint32_t start, rows, layer;
+};
+thread_local DumpFrame* dump_frame = nullptr;
+template<typename T>
+void DumpRows(const char* name, const T* data, std::uint32_t rows,
+              std::size_t width, hipStream_t stream, std::uint32_t offset = 0) {
+  if (DumpDirectory() == nullptr || dump_frame == nullptr)
+    return;
+  static const auto interval = [] {
+    const char* bounds = std::getenv("GUFO_FLASH_NEXT_DUMP_ROWS");
+    unsigned first = 0, end = 0;
+    if (bounds == nullptr || std::sscanf(bounds, "%u:%u", &first, &end) != 2 ||
+        end <= first || end - first > 32)
+      throw std::runtime_error(
+          "dump requires GUFO_FLASH_NEXT_DUMP_ROWS=first:end (<=32 rows)");
+    return std::pair{first, end};
+  }();
+  const auto start = dump_frame->start + offset;
+  const auto first = std::max(start, interval.first);
+  const auto end = std::min(start + rows, interval.second);
+  if (first >= end)
+    return;
+  const auto directory =
+      std::filesystem::path(DumpDirectory()) /
+      (std::to_string(dump_frame->start) + "-" +
+       std::to_string(dump_frame->rows)) /
+      (std::to_string(dump_frame->layer) + "-" + name + "-" +
+       std::to_string(width) + "x" + std::to_string(sizeof(T)));
+  std::filesystem::create_directories(directory);
+  std::vector<T> host(width);
+  for (auto row = first; row < end; ++row) {
+    if (hipMemcpyAsync(host.data(), data + std::size_t(row - start) * width,
+                       width * sizeof(T), hipMemcpyDeviceToHost,
+                       stream) != hipSuccess ||
+        hipStreamSynchronize(stream) != hipSuccess)
+      throw std::runtime_error("numerical dump transfer failed");
+    std::ofstream file(directory / (std::to_string(row) + ".bin"),
+                       std::ios::binary);
+    file.write(reinterpret_cast<const char*>(host.data()), width * sizeof(T));
+    if (!file)
+      throw std::runtime_error("numerical dump write failed");
+  }
 }
 
 /// Allocates `count` elements of T and records the allocation.
@@ -2551,6 +2607,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
               : Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg))) {
       return false;
     }
+    DumpRows("indexer-k", s_.ik, n_tokens, c.indexer_head_dim, stream_);
     StoreRows(s_.ik, s.index_k, n_tokens, c.indexer_head_dim, pos,
               index_capacity, stream_);
   }
@@ -2564,6 +2621,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
          pos, c.rope_theta, stream_, s.rope, yarn_);
+    DumpRows("indexer-q", s_.iq, n_tokens, c.indexer_heads * c.indexer_head_dim,
+             stream_);
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
@@ -2581,9 +2640,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     // up to half the bounded scratch and doubled launches above 160K.
     const auto select_chunk = static_cast<std::uint32_t>(
         std::min(std::size_t{512}, select_score_floats_ / max_blocks));
-    // Catch-up consumes only the final attention tile. Cover its masks even
-    // when the dense/sparse boundary shifts the four-query sparse groups.
-    const auto first_query = last_only && n_tokens > 16 ? n_tokens - 16 : 0U;
+    // Sparse catch-up consumes one query; dense queries need no mask.
+    const auto first_query = last_only ? n_tokens - 1 : 0U;
     for (std::uint32_t t0 = first_query; t0 < n_tokens; t0 += select_chunk) {
       const std::uint32_t n = std::min(select_chunk, n_tokens - t0);
       // Batches wider than kVecBatch are never captured, so the host
@@ -2598,7 +2656,20 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                    s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,
                    c.compress_ratio, c.indexer_top_k / c.compress_ratio,
                    mask_words_, max_blocks, stream_, live);
+      if (DumpDirectory() != nullptr) {
+        for (std::uint32_t row = 0; row < n; ++row) {
+          const auto complete = (start_pos + t0 + row + 1) / c.compress_ratio;
+          // Under-budget rows skip scoring; padded score columns are scratch.
+          if (complete > c.indexer_top_k / c.compress_ratio)
+            DumpRows("indexer-scores",
+                     s_.scores + std::size_t(row) * max_blocks, 1, complete,
+                     stream_, t0 + row);
+        }
+      }
     }
+    DumpRows("selected-blocks",
+             s_.mask + std::size_t(first_query) * mask_words_,
+             n_tokens - first_query, mask_words_, stream_, first_query);
     mask = s_.mask;
   }
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
@@ -2640,8 +2711,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                                 c.head_dim, c.compress_ratio, stream_, last));
   };
   if (checkpoint_tokens != 0 && checkpoint_tokens < n_tokens) {
-    // Sparse tiles compact the union of their queries' selected keys.
-    // Keep the checkpoint's query grouping identical to a pass ending there.
+    // Keep the checkpoint and suffix execution ranges explicit. Query-local
+    // sparse tiles now give both ranges the same arithmetic as an unsplit pass.
     if (!attend(0, checkpoint_tokens, false) ||
         !attend(checkpoint_tokens, n_tokens - checkpoint_tokens, false)) {
       AssignError(error_msg, "checkpoint attention geometry is unsupported");
@@ -2651,6 +2722,13 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
   if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
+    const auto first = !last_only ? 0U
+                       : sparse && start_pos + n_tokens > c.indexer_top_k
+                           ? n_tokens - 1
+                           : (n_tokens - 1) / 16 * 16;
+    DumpRows("attention-context",
+             s_.ctx + std::size_t(first) * c.AttentionQDim(), n_tokens - first,
+             c.AttentionQDim(), stream_, first);
     return !project_output ||
            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
@@ -2979,6 +3057,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+  // Debug transfers cannot be captured or silently skipped by graph replay.
+  graph = graph && DumpDirectory() == nullptr;
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3245,12 +3325,20 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
                                  c.hc_count, stream_);
   }
+  DumpFrame frame{start_pos, n, 0};
+  struct RestoreDumpFrame {
+    DumpFrame* previous;
+    ~RestoreDumpFrame() { dump_frame = previous; }
+  } restore_dump{dump_frame};
+  dump_frame = &frame;
   const auto& layers = model_->layers();
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;
+    frame.layer = il;
     const DeviceLayer& l = layers[il];
+    DumpRows("input-residual", s_.res, n, c.HcDim(), stream_);
     if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
                                  embeddings_ready, checkpoint)) {
       return false;
@@ -3289,6 +3377,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       return false;
     }
 
+    const auto output_first = !last_attention ? 0U
+                              : sparse && start_pos + n > c.indexer_top_k
+                                  ? n - 1
+                                  : (n - 1) / 16 * 16;
+    DumpRows(l.linear ? "gdn-output" : "attention-output",
+             s_.block_out + std::size_t(output_first) * c.hidden_size,
+             n - output_first, c.hidden_size, stream_, output_first);
     const float* next_norm =
         il + 1 < c.num_layers
             ? (c.IsPleLayer(il + 1) ? nullptr
@@ -3319,7 +3414,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                  false, no_f32) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
+      DumpRows("moe-ids", s_.ids, rows, c.num_experts_used, stream_, n - rows);
       Combine(s_.res, next_norm, rows, next_inject);
+      DumpRows("residual", s_.res, rows, c.HcDim(), stream_, n - rows);
       return true;
     };
     if (skipped != 0) {

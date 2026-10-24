@@ -3960,11 +3960,13 @@ constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 
 /// Two row layouts share the kernel. The dense window packs 16 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
-/// The sparse window packs four queries x twelve heads into three row
-/// blocks without padding, with adjacent blocks covering both KV heads: the key
-/// tiles are gathered from the union of the block's query selections and
-/// four selections overlap far less than 32 (measured at 16k depth: 846
-/// versus 2,478 selected blocks against 512 per query).
+/// The sparse window packs one query's twelve heads into one padded row
+/// block, with adjacent blocks covering both KV heads. Its compact key sweep
+/// depends ONLY on that query's selection. Sharing a union across queries
+/// changes the online-softmax tile boundaries before probabilities round to
+/// F16, so the same query used to change with prefill chunk boundaries.
+/// A single query also gives causal padding a fixed extent: future V rows
+/// cannot change PV rounding when a pass ends in an incomplete key tile.
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads>
 __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
@@ -3979,8 +3981,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   constexpr std::uint32_t kRowBlocks = kPackHeads
                                            ? (kQueryRows * kWmmaGqa + 15) / 16
                                            : (kQueryRows / 16) * kWmmaHeads;
-  static_assert(!kPackHeads || kQueryRows * kWmmaGqa == 48,
-                "four queries pack twelve heads into three tiles");
+  static_assert(!kPackHeads || kQueryRows == 1,
+                "sparse key tiling must be independent of query companions");
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
   constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / 2;
@@ -3988,7 +3990,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   constexpr std::uint32_t kOTilesPerWave = (kRowBlocks * kWmmaKSteps) / 8;
   constexpr std::uint32_t kSoftmaxLanes = 4;
   constexpr std::uint32_t kVtStride = kKeys + 8;
-  static_assert(kSTiles == (kPackHeads ? 3 : 2), "two waves per S tile");
+  static_assert(kSTiles == (kPackHeads ? 1 : 2), "two waves per S tile");
   static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
   static_assert(kKeys % 16 == 0 && (kPackHeads || kQueryRows % 16 == 0),
                 "16-row WMMA tiles");
@@ -4087,24 +4089,25 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   float running_max = -INFINITY;
   float running_sum = 0.0F;
 
-  const std::uint32_t context_end = start_pos + n_tokens;
   const std::uint32_t max_visible =
-      min(context_end, start_pos + query_start + kQueryRows);
+      min(start_pos + n_tokens, start_pos + query_start + kQueryRows);
+  // Sparse groups own exactly one query. Zero the rest of its incomplete
+  // key block even if future rows are already populated in the cache: WMMA
+  // can round differently for 0 * populated V than for 0 * padding.
+  const std::uint32_t context_end =
+      kPackHeads ? max_visible : start_pos + n_tokens;
 
-  // Key tiles are gathered from `kBlocksPerTile` selection blocks (ratio
-  // keys each). In the sparse window the blocks come from the union of this
-  // block's query masks (every row still applies its own mask below), then
-  // every block from the earliest row's tail on; the dense window walks the
-  // blocks in order. The sweep therefore costs the union of the selected
-  // windows, not the context.
+  // Key tiles gather four selection blocks in increasing order. All heads
+  // in a sparse block share one query's mask and incomplete causal tail;
+  // the dense window walks consecutive blocks.
   constexpr std::uint32_t kBlocksPerTile = kKeys / 4;
   static_assert(kBlocksPerTile == 4, "a tile is four selection blocks");
   const std::uint32_t n_blocks = (max_visible + ratio - 1) / ratio;
   const std::uint32_t tail_block =
       ((start_pos + query_start + 1) / ratio);  // first always-visible block
   constexpr bool sparse = kPackHeads;
-  // Four 512-block selections plus their incomplete tail. The same LDS
-  // stores a mask for arbitrary wider selections used by operator callers.
+  // Production needs at most 512 selected blocks plus an incomplete tail.
+  // Retain room for the bitset fallback used by wider operator-test masks.
   constexpr unsigned kListCapacity = 4 * 512 + 4;
   // A compact entry also carries which of the packed queries selected the
   // block, so the softmax reads its mask bits from the tile, not global.
@@ -7794,7 +7797,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       return false;
   }
   if (mask != nullptr) {
-    constexpr std::uint32_t kPackedQueries = 4;
+    constexpr std::uint32_t kPackedQueries = 1;
     const std::uint32_t first_group =
         last_only ? (n_tokens - 1) / kPackedQueries : 0;
     const dim3 grid(
