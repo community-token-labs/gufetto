@@ -681,6 +681,13 @@ struct TextRunnerPool::Impl {
         shared_prefix_max_boundaries =
             disk_cache_options->shared_prefix_max_boundaries;
       }
+      if (ram_cache_options.transfer_api) {
+        if (!validated.descriptor.persistence)
+          throw std::invalid_argument(
+              "checkpoint transfer requires model file hashes");
+        transfer_configuration = CheckpointTransferConfiguration(
+            validated.descriptor, validated.runner->LookupContextIdentity());
+      }
       lookup_epoch = CacheLookupEpoch(
           validated.descriptor, component_cache->CompatibilityIdentity(),
           state_count, disk_cache_options, ram_cache_options,
@@ -753,6 +760,7 @@ struct TextRunnerPool::Impl {
   // older prompt snapshot. Decode/prefill work never holds this mutex.
   std::timed_mutex admission_mutex;
   std::string lookup_epoch;
+  std::string transfer_configuration;
   std::shared_ptr<CacheLookupTimings> lookup_timings =
       std::make_shared<CacheLookupTimings>();
   std::shared_ptr<ContinuationDiskStore> disk_store;
@@ -2377,6 +2385,29 @@ TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
                          std::chrono::steady_clock::now() - started)
                          .count();
   return result;
+}
+
+std::shared_ptr<CheckpointTransferBlob> TextRunnerPool::Export(
+    std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+    bool reuse, std::size_t stable, std::string_view configuration) const {
+  if (!impl_->component_cache || impl_->transfer_configuration.empty())
+    return {};
+  if (prompt.empty() ||
+      prompt.size() > impl_->validated.descriptor.max_context ||
+      stable > prompt.size())
+    throw CheckpointTransferError(400, "cache_transfer_invalid_prompt");
+  return impl_->component_cache->Export(
+      prompt, context, reuse, stable,
+      impl_->transfer_configuration + std::string(configuration));
+}
+std::shared_ptr<CheckpointTransferBlob> TextRunnerPool::Import(
+    const CheckpointTransferReader& reader, std::uint64_t length,
+    std::string_view configuration) const {
+  if (!impl_->component_cache || impl_->transfer_configuration.empty())
+    return {};
+  return impl_->component_cache->Import(
+      reader, length,
+      impl_->transfer_configuration + std::string(configuration));
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(

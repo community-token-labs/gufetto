@@ -31,6 +31,9 @@ struct HttpRequest {
   std::string path;    // "/v1/chat/completions" (no query)
   std::string query;   // raw query string (no leading '?')
   std::string body;
+  // Import-only bounded reader, valid for this handler invocation.
+  CheckpointTransferReader body_reader;
+  std::uint64_t content_length{};
   std::vector<std::pair<std::string, std::string>> headers;
   TextGenerationBackend::CancellationCheck is_cancelled;
   std::string request_id{};
@@ -102,6 +105,7 @@ struct HttpServerOptions {
   std::function<void()> on_device_lost{};
   /// Opt-in, read-only engine cache query. Uses the existing API-key policy.
   bool cache_lookup_api{false};
+  bool cache_transfer_api{false};
 };
 
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names

@@ -1042,6 +1042,31 @@ void RestartAndCorruption() {
     assert(Generate(retry) == token);
     (void)retry.Commit();
   }
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache exporter(runner, 1, 1 << 22, disk);
+    assert(exporter.Lookup(prompt, nullptr, true, 0)->tier == "disk");
+    auto blob = exporter.Export(prompt, nullptr, true, 0, "disk-transfer-v20");
+    std::vector<std::uint8_t> wire;
+    blob->Write([&](auto bytes) {
+      wire.insert(wire.end(), bytes.begin(), bytes.end());
+      return true;
+    });
+    auto destination_runner = std::make_shared<Runner>();
+    ComponentTextCache destination(destination_runner, 1, 1 << 22, {});
+    std::size_t offset = 0;
+    (void)destination.Import(
+        [&](std::span<std::uint8_t> out) {
+          const auto n = std::min(out.size(), wire.size() - offset);
+          std::memcpy(out.data(), wire.data() + offset, n);
+          offset += n;
+          return n;
+        },
+        wire.size(), "disk-transfer-v20");
+    assert(destination.Lookup(prompt, nullptr, true, 0)->tier == "ram");
+    auto restored = destination.Acquire(prompt, {}, {}, true, 0, true);
+    assert(restored->cached_tokens() == prompt.size());
+  }
   for (const auto& kind : {"chunks", "private"}) {
     for (const auto& file :
          std::filesystem::directory_iterator(directory / "v2" / kind)) {
@@ -2644,6 +2669,168 @@ void PinnedPrefixCorruptionFailsClosed() {
     assert(refused);  // no partial state execution or silent repeated writes
   }
 }
+void CheckpointTransferRoundTripAndConcurrentServing() {
+  class ImportRunner final : public Runner {
+  public:
+    bool refuse{};
+    std::function<void()> preparing;
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->can_capture = [this](auto) {
+        if (preparing)
+          preparing();
+        return !refuse;
+      };
+      return resources;
+    }
+  };
+  auto source_runner = std::make_shared<Runner>();
+  source_runner->defer_idle = true;
+  ComponentTextCache source(source_runner, 1, 1 << 20, {});
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto context = std::make_shared<TextPromptContext>();
+  context->cache_identity = {3, 7, 20};
+  auto seed = source.Acquire(prompt, {}, context, true, 0, true);
+  auto& seed_state = dynamic_cast<State&>(seed->state());
+  source_runner->adapter->Append(seed_state.slot, prompt, prompt);
+  const auto expected_hash =
+      source_runner->adapter->RecurrentHash(seed_state.slot);
+  assert(seed->TryReserveSnapshot(seed->CaptureBytes(), prompt.size(), false,
+                                  SnapshotPurpose::kContinuation, prompt));
+  assert(seed->PublishSnapshot(prompt, seed->Capture(), false));
+  // Exercise borrowed rows still in a busy slot, without capturing live state.
+  auto blob =
+      source.Export(prompt, context.get(), true, 0, "payload=20;build=A");
+  std::vector<std::uint8_t> wire;
+  blob->Write([&](auto bytes) {
+    wire.insert(wire.end(), bytes.begin(), bytes.end());
+    return true;
+  });
+  bool busy = false;
+  try {
+    (void)source.Export(prompt, context.get(), true, 0, "payload=20;build=A");
+  } catch (const CheckpointTransferError& error) {
+    busy = error.status == 503;
+  }
+  assert(busy);
+  blob.reset();
+  auto target_runner = std::make_shared<ImportRunner>();
+  ComponentTextCache target(target_runner, 2, 1 << 20, {});
+  const std::vector<TextRunnerToken> other{100, 101, 102, 103};
+  auto serving = target.Acquire(other, {}, {}, false, 0, true);
+  auto& live = dynamic_cast<State&>(serving->state());
+  target_runner->adapter->Append(live.slot, other, other);
+  const auto live_hash = target_runner->adapter->RecurrentHash(live.slot);
+  auto reader = [&](const auto& bytes) -> CheckpointTransferReader {
+    return
+        [&bytes, offset = std::size_t{0}](std::span<std::uint8_t> out) mutable {
+          const auto n = std::min(out.size(), bytes.size() - offset);
+          std::memcpy(out.data(), bytes.data() + offset, n);
+          offset += n;
+          return n;
+        };
+  };
+  const auto allocations = target_runner->captures;
+  for (const auto bad : {0, 1, 2}) {
+    auto invalid = wire;
+    if (bad == 0)
+      invalid.pop_back();
+    if (bad == 1)
+      invalid.back() ^= 1;
+    bool rejected = false;
+    try {
+      (void)target.Import(
+          reader(invalid), wire.size(),
+          bad == 2 ? "payload=19;build=B" : "payload=20;build=A");
+    } catch (const CheckpointTransferError& error) {
+      rejected = error.status == (bad == 2 ? 409 : 400);
+    }
+    assert(rejected && target_runner->captures == allocations);
+    assert(!target.Lookup(prompt, context.get(), true, 0)->matched_tokens);
+  }
+  target_runner->refuse = true;
+  bool refused = false;
+  try {
+    (void)target.Import(reader(wire), wire.size(), "payload=20;build=A");
+  } catch (const CheckpointTransferError& error) {
+    refused = error.status == 507;
+  }
+  assert(refused);
+  assert(target_runner->adapter->RecurrentHash(live.slot) == live_hash);
+  target_runner->refuse = false;
+  std::binary_semaphore reading(0), proceed(0), allocating(0), publish(0);
+  target_runner->preparing = [&] {
+    allocating.release();
+    publish.acquire();
+  };
+  std::exception_ptr failure;
+  std::jthread importing([&] {
+    try {
+      auto input = reader(wire);
+      bool first = true;
+      auto imported = target.Import(
+          [&](auto out) {
+            if (std::exchange(first, false)) {
+              reading.release();
+              proceed.acquire();
+            }
+            return input(out);
+          },
+          wire.size(), "payload=20;build=A");
+      assert(imported->Header().manifest.tokens == prompt);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+  reading.acquire();
+  for (int i = 0; i < 100; ++i)
+    assert(!target.Lookup(prompt, context.get(), true, 0)->matched_tokens);
+  // Generation advances while import is blocked on network input.
+  const std::array<TextRunnerToken, 1> next{104};
+  target_runner->adapter->Append(live.slot, next, next);
+  proceed.release();
+  allocating.acquire();  // Import holds the publication owner, not a GPU slot.
+  for (int i = 0; i < 100; ++i)
+    assert(!target.Lookup(prompt, context.get(), true, 0)->matched_tokens);
+  const std::array<TextRunnerToken, 1> next_decode{105};
+  target_runner->adapter->Append(live.slot, next_decode, next_decode);
+  const auto advanced_hash = target_runner->adapter->RecurrentHash(live.slot);
+  publish.release();
+  importing.join();
+  target_runner->preparing = {};
+  if (failure)
+    std::rethrow_exception(failure);
+  assert(target_runner->adapter->RecurrentHash(live.slot) == advanced_hash);
+  assert(target.Lookup(prompt, context.get(), true, 0)->matched_tokens ==
+         prompt.size());
+  auto changed = std::make_shared<TextPromptContext>();
+  changed->cache_identity = {3, 7, 21};
+  assert(!target.Lookup(prompt, changed.get(), true, 0)->matched_tokens);
+  auto restored = target.Acquire(prompt, {}, context, true, 0, true);
+  assert(restored->cached_tokens() == prompt.size());
+  auto& restored_state = dynamic_cast<State&>(restored->state());
+  assert(target_runner->adapter->RecurrentHash(restored_state.slot) ==
+         expected_hash);
+  auto again =
+      target.Export(prompt, context.get(), true, 0, "payload=20;build=A");
+  auto original = CheckpointTransferBlob::Import(reader(wire), wire.size(),
+                                                 again->Header().identity,
+                                                 "payload=20;build=A");
+  const auto old_payloads =
+      CheckpointTransferPayloads(original->Header().manifest);
+  const auto new_payloads =
+      CheckpointTransferPayloads(again->Header().manifest);
+  assert(old_payloads.size() == new_payloads.size());
+  for (std::size_t i = 0; i < old_payloads.size(); ++i) {
+    std::vector<std::uint8_t> a(old_payloads[i]->bytes),
+        b(new_payloads[i]->bytes);
+    original->Read(i, 0, a);
+    again->Read(i, 0, b);
+    assert(a == b);
+  }
+}
 #include "tests/cli/cache_lookup_checks.hpp"
 #include "tests/cli/cache_lookup_r3_checks.hpp"
 }  // namespace
@@ -2792,6 +2979,7 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
   }
 }
 int main() {
+  CheckpointTransferRoundTripAndConcurrentServing();
   LookupIsReadOnlyAndMatchesAcquire();
   LookupRespectsRamOffWithoutDisablingLiveReuse();
   LookupDoesNotWaitForAdmission();

@@ -480,6 +480,8 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `POST` | `/v1/responses` | Text/images, structured output, optional SSE streaming |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
 | `POST` | `/v1/cache/lookup` | Read-only prefix query; requires `--cache-lookup-api` |
+| `POST` | `/v1/cache/export` | Immutable checkpoint blob; requires `--cache-transfer-api` |
+| `POST` | `/v1/cache/import` | Verified blob to RAM; requires `--cache-transfer-api` |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
@@ -551,9 +553,22 @@ chat validation errors; an unavailable/lost backend returns 503.
 Treat `epoch` as opaque: it binds the build and loaded model/cache execution
 profile, including snapshot compatibility. A changed value invalidates placement
 observations; an equal value does **not** authorize checkpoint transfer between
-hosts. Export/import is not implemented. Lookup bodies are excluded from
-`--trace` request-body capture, and lookup emits no prompt text in logs.
-There is currently no `/v1/cache/stats` endpoint.
+hosts. Lookup bodies are excluded from `--trace` request-body capture, and lookup
+emits no prompt text in logs. There is currently no `/v1/cache/stats` endpoint.
+
+### Checkpoint transfer (experimental, opt-in)
+
+`--cache-transfer-api` enables Flash-Next `POST /v1/cache/export` (complete chat
+JSON to a streamed blob) and `POST /v1/cache/import` (Content-Length-framed binary
+blob to an evictable RAM checkpoint). Default OFF, independent of lookup.
+Requires matching model, build/runtime, payload ABI and execution/render policy.
+The blob includes sensitive token IDs and state: use only on a trusted,
+authenticated LAN and provision an encrypted disk-backed `TMPDIR`. Imports have
+a separate 8 GiB total limit, 16 MiB header limit, complete pre-admission
+verification and one-transfer quota; ordinary JSON body limits are unchanged.
+No live-session replacement, prefill, durable import or router reservation.
+See [checkpoint transfer](checkpoint-transfer.md) for the protocol, errors,
+source ownership, memory/SSD costs, CPU evidence and pending two-host GPU gate.
 
 #### Advisory lookup diagnostics (R3, logs/metrics only)
 

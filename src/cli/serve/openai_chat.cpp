@@ -3911,6 +3911,100 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
       request, backend, chat, max_tokens, sampling, stream, model);
 }
 
+namespace {
+HttpResponse TransferError(const CheckpointTransferError& error) {
+  const char* reason = "Bad Request";
+  switch (error.status) {
+    case 404:
+      reason = "Not Found";
+      break;
+    case 409:
+      reason = "Conflict";
+      break;
+    case 413:
+      reason = "Payload Too Large";
+      break;
+    case 503:
+      reason = "Service Unavailable";
+      break;
+    case 507:
+      reason = "Insufficient Storage";
+      break;
+  }
+  return Error(error.status, reason, error.code, error.code);
+}
+}  // namespace
+HttpResponse HandleCacheExport(const HttpRequest& request,
+                               TextGenerationBackend& backend) {
+  ParsedChatRequest parsed;
+  const auto defaults = backend.sampling_defaults();
+  parsed.max_tokens = defaults.max_tokens;
+  parsed.sampling = defaults.sampling;
+  if (auto error = ParseRequest(request, backend, &parsed))
+    return std::move(*error);
+  if (!backend.ready())
+    return Error(503, "Service Unavailable", "model service is not ready",
+                 "not_ready");
+  try {
+    auto blob = backend.cache_export(parsed.chat);
+    if (!blob)
+      return Error(501, "Not Implemented",
+                   "checkpoint transfer is not supported",
+                   "cache_transfer_unsupported");
+    return HttpResponse{
+        .headers = {{"Content-Type", "application/vnd.gufo.checkpoint"},
+                    {"Content-Length", std::to_string(blob->Bytes())},
+                    {"Cache-Control", "no-store"}},
+        .streaming_body = [blob](const HttpResponse::BodyWriter& writer) {
+          blob->Write([&](auto bytes) {
+            return writer(
+                {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+          });
+        }};
+  } catch (const CheckpointTransferError& error) {
+    return TransferError(error);
+  } catch (const TextGenerationError& error) {
+    return GenerationError(error);
+  } catch (const std::invalid_argument&) {
+    return Error(400, "Bad Request", "invalid export prompt",
+                 "cache_transfer_invalid_prompt");
+  } catch (const std::length_error&) {
+    return Error(400, "Bad Request", "export prompt exceeds context",
+                 "context_length_exceeded");
+  }
+}
+HttpResponse HandleCacheImport(const HttpRequest& request,
+                               TextGenerationBackend& backend) {
+  if (!backend.ready())
+    return Error(503, "Service Unavailable", "model service is not ready",
+                 "not_ready");
+  if (request.header("content-type") != "application/vnd.gufo.checkpoint")
+    return Error(415, "Unsupported Media Type",
+                 "checkpoint content type required",
+                 "cache_transfer_content_type");
+  if (!request.body_reader)
+    return Error(400, "Bad Request", "checkpoint Content-Length required",
+                 "cache_transfer_invalid");
+  try {
+    auto blob =
+        backend.cache_import(request.body_reader, request.content_length);
+    if (!blob)
+      return Error(501, "Not Implemented",
+                   "checkpoint transfer is not supported",
+                   "cache_transfer_unsupported");
+    json::Value body = json::Value::object();
+    body["admitted_tokens"] = blob->Header().manifest.tokens.size();
+    body["payload_bytes"] = blob->PayloadBytes();
+    body["epoch"] = blob->Header().epoch;
+    body["tier"] = "ram";
+    return HttpResponse{.body = body.dump(),
+                        .headers = {{"Content-Type", "application/json"},
+                                    {"Cache-Control", "no-store"}}};
+  } catch (const CheckpointTransferError& error) {
+    return TransferError(error);
+  }
+}
+
 HttpResponse HandleCacheLookup(const HttpRequest& request,
                                TextGenerationBackend& backend) {
   const auto started = std::chrono::steady_clock::now();
