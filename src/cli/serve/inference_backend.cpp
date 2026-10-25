@@ -48,6 +48,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/target_probe.hpp"
 #endif
 
 namespace gufo::server {
@@ -2747,7 +2748,12 @@ public:
           "Qwen3.8-Flash-Next token selection has no logits");
     }
     const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
-    if (EndsTurn(qfn, *model_, token)) {
+    const bool stop = EndsTurn(qfn, *model_, token);
+    models::qwen38_flash_next::detail::ProbeTargetLogits(
+        static_cast<std::uint32_t>(qfn.position()), logits);
+    models::qwen38_flash_next::detail::ProbeTargetToken(
+        static_cast<std::uint32_t>(qfn.position()), token, stop);
+    if (stop) {
       return {.stop = true, .token = 0, .piece = {}};
     }
     return {
