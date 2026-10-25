@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
@@ -423,6 +424,15 @@ public:
   [[nodiscard]] virtual std::optional<CacheLookupResult> cache_lookup(
       const ChatRequest&) const {
     return std::nullopt;
+  }
+
+  [[nodiscard]] virtual std::shared_ptr<CheckpointTransferBlob> cache_export(
+      const ChatRequest&) const {
+    return {};
+  }
+  [[nodiscard]] virtual std::shared_ptr<CheckpointTransferBlob> cache_import(
+      const CheckpointTransferReader&, std::uint64_t) const {
+    return {};
   }
 
   /// Prompt tokens a chat request would use after template rendering, without

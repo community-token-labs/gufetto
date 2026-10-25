@@ -62,6 +62,7 @@ struct TextRunnerRamCacheOptions {
   // Embedding pools expose Lookup by default. The server wires this to its
   // opt-in route flag so disabled HTTP lookup adds no publication work.
   bool publish_lookup{true};
+  bool transfer_api{false};
 };
 
 /// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects
@@ -686,6 +687,13 @@ public:
   [[nodiscard]] TextGenerationBackend::CacheLookupResult Lookup(
       std::span<const TextRunnerToken>, const TextPromptContext* = nullptr,
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0) const;
+
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Export(
+      std::span<const TextRunnerToken>, const TextPromptContext*, bool,
+      std::size_t stable, std::string_view configuration) const;
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Import(
+      const CheckpointTransferReader&, std::uint64_t,
+      std::string_view configuration) const;
 
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
   /// leasing a state. An upper bound: Acquire may still prefer a shorter one.

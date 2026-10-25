@@ -7,6 +7,7 @@
 
 #include "src/cache/checkpoint.hpp"
 #include "src/cache/streaming.hpp"
+#include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/pinned_prefix.hpp"
@@ -123,6 +124,14 @@ public:
       std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
       std::size_t stable) const;
   [[nodiscard]] std::span<const std::uint8_t> CompatibilityIdentity() const;
+  // Transfer never acquires/replaces an execution slot. Export pins only
+  // immutable checkpoints; Import publishes once after complete verification.
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Export(
+      std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
+      std::size_t stable, std::string configuration) const;
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Import(
+      const CheckpointTransferReader&, std::uint64_t content_length,
+      std::string_view configuration);
 
   // A disk job is writing a prefix of the prompt much deeper than any
   // restorable boundary; admission may wait for it instead of prefilling.

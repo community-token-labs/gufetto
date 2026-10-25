@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_CACHE_LOOKUP_SUPPORT_HPP_
 #define GUFO_SERVER_CACHE_LOOKUP_SUPPORT_HPP_
 
+#include <link.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -113,6 +114,69 @@ inline std::string CacheLookupConfiguredEpoch(
   const auto text = options.str();
   return crypto::Sha256Hex(
       {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
+}
+
+inline std::string CheckpointTransferPolicy(const ReasoningOptions& reasoning,
+                                            std::size_t decode_active) {
+  std::ostringstream out;
+  const auto boolean = [](const std::optional<bool>& value) {
+    return value ? (*value ? 1 : 0) : -1;
+  };
+  out << "prefill_chunk=4096\n"
+      << "decode_active_prefill=" << decode_active << '\n'
+      << "thinking_default=" << boolean(reasoning.enabled) << '\n'
+      << "preserve_thinking_default=" << boolean(reasoning.preserve_thinking)
+      << '\n'
+      << "reasoning_effort="
+      << (reasoning.effort ? static_cast<int>(*reasoning.effort) : -1) << '\n'
+      << "reasoning_budget=" << reasoning.budget_tokens.value_or(0) << ':'
+      << reasoning.budget_tokens.has_value() << '\n';
+  return out.str();
+}
+
+// Cross-host material excludes cache paths/budgets/registration names and
+// host kernel versions. It deliberately binds executable AND loaded runtime
+// content, model payload ABI, context, sidecar and numerics environment. Build
+// once at startup; never hash binaries/model weights on a lookup path.
+inline std::string CheckpointTransferConfiguration(
+    const TextRunnerDescriptor& descriptor, std::string_view image_identity) {
+  std::ostringstream out;
+  out << "gufo-checkpoint-transfer-v1\n"
+      << "execution_lane=linux-x86_64-le-gfx1151\n"
+      << "payload_version=" << descriptor.persistence->payload_version << '\n'
+      << "context=" << descriptor.max_context << '\n'
+      << "state_abi=" << descriptor.state_abi << '\n'
+      << "executable_sha256=" << crypto::Sha256FileHex("/proc/self/exe") << '\n'
+      << "image_sidecar=" << image_identity << '\n';
+  std::set<std::string> objects;
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, std::size_t, void* data) {
+        if (info->dlpi_name && info->dlpi_name[0] == '/')
+          static_cast<std::set<std::string>*>(data)->insert(info->dlpi_name);
+        return 0;
+      },
+      &objects);
+  std::set<std::string> hashes;
+  for (const auto& path : objects)
+    hashes.insert(crypto::Sha256FileHex(path));
+  for (const auto& hash : hashes)
+    out << "runtime_sha256=" << hash << '\n';
+  std::set<std::string> environment;
+  for (auto** p = environ; p && *p; ++p) {
+    const std::string_view entry(*p);
+    if (entry.starts_with("GUFO_") || entry.starts_with("HIP_") ||
+        entry.starts_with("HSA_") || entry.starts_with("ROCR_") ||
+        entry.starts_with("ROCBLAS_") || entry.starts_with("AMD_"))
+      environment.emplace(entry);
+  }
+  // Hash environment values: operational paths/secrets must not enter blobs.
+  for (const auto& value : environment)
+    out << "environment_sha256="
+        << crypto::Sha256Hex(
+               {reinterpret_cast<const std::uint8_t*>(value.data()),
+                value.size()})
+        << '\n';
+  return out.str();
 }
 
 // Bounded recent host-wall observations, excluding scheduler queueing. Prefill

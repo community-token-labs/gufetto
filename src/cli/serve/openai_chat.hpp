@@ -20,6 +20,8 @@ HttpResponse HandleApplyTemplate(const HttpRequest& request,
 
 /// Same parsing/defaults as Chat Completions, but never admits generation.
 /// Lookup requests are intentionally excluded from prompt tracing.
+HttpResponse HandleCacheExport(const HttpRequest&, TextGenerationBackend&);
+HttpResponse HandleCacheImport(const HttpRequest&, TextGenerationBackend&);
 HttpResponse HandleCacheLookup(const HttpRequest& request,
                                TextGenerationBackend& backend);
 

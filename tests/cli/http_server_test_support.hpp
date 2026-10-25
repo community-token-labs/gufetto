@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -132,6 +133,21 @@ public:
   }
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
+  }
+  std::atomic<std::shared_ptr<gufo::server::CheckpointTransferBlob>> transfer_blob;
+  std::shared_ptr<gufo::server::CheckpointTransferBlob> cache_export(
+      const gufo::server::ChatRequest&) const override {
+    return transfer_blob.load();
+  }
+  std::shared_ptr<gufo::server::CheckpointTransferBlob> cache_import(
+      const gufo::server::CheckpointTransferReader& reader,
+      std::uint64_t length) const override {
+    auto expected = transfer_blob.load();
+    if (!expected)
+      return {};
+    return gufo::server::CheckpointTransferBlob::Import(
+        reader, length, expected->Header().identity,
+        expected->Header().configuration);
   }
   std::optional<std::size_t> count_chat_tokens(
       const gufo::server::ChatRequest& request) const override {

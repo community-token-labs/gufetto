@@ -766,6 +766,10 @@ void PrintServeHelp(std::string_view program_name,
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
     bool cache_lookup_api = false;
+    bool cache_transfer_api = false;
+    parser.AddFlag("", "--cache-transfer-api",
+                   "Enable trusted-LAN checkpoint export/import (default: off)",
+                   "Cache", &cache_transfer_api);
     parser.AddFlag("", "--cache-lookup-api",
                    "Enable read-only POST /v1/cache/lookup (default: off)",
                    "Cache", &cache_lookup_api);
@@ -884,6 +888,7 @@ int RunServe(std::span<const char* const> args) {
   ServerLogOptions log_options;
 
   bool cache_lookup_api = false;
+  bool cache_transfer_api = false;
 
   // Identify the modality only after leading server options. The selected
   // parser consumes every option together, so --served-model-name -v and
@@ -1392,6 +1397,10 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddFlag(
+        "", "--cache-transfer-api",
+        "Enable trusted-LAN checkpoint export/import (default: off)", "Cache",
+        &cache_transfer_api);
     llm_parser.AddFlag("", "--cache-lookup-api",
                        "Enable read-only POST /v1/cache/lookup (default: off)",
                        "Cache", &cache_lookup_api);
@@ -1653,6 +1662,7 @@ int RunServe(std::span<const char* const> args) {
             .enabled = cache_ram.enabled,
             .pinned_prefix = std::move(pinned_prefix),
             .publish_lookup = cache_lookup_api,
+            .transfer_api = cache_transfer_api,
         },
         enable_yarn);
     loading.stop();
@@ -1731,6 +1741,7 @@ int RunServe(std::span<const char* const> args) {
                 ShutdownAfterDeviceLoss();
               },
           .cache_lookup_api = cache_lookup_api,
+          .cache_transfer_api = cache_transfer_api,
       },
       images, embeddings);
   std::string err;

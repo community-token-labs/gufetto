@@ -3251,11 +3251,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
               " original_context=" + std::to_string(qwen4exp_native_context) +
               " context=" + std::to_string(max_context));
     }
-    // Ordinary RAM checkpoints cannot outlive this loaded model and need only
-    // process-local identity. Both durable tiers require full artifact hashes,
-    // even when prefix pins are enabled without the ordinary disk cache.
+    // Transfer, like durable tiers, requires full artifact hashes even with
+    // ordinary disk caching disabled.
     if ((DiskCacheEnabled(resolved_disk_cache_config) ||
-         ram_cache_config.pinned_prefix.enabled()) &&
+         ram_cache_config.pinned_prefix.enabled() ||
+         ram_cache_config.transfer_api) &&
         resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
         !FingerprintArtifact(
             "Qwen3.8-Flash-Next", *reader,
@@ -3263,7 +3263,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     if ((DiskCacheEnabled(resolved_disk_cache_config) ||
-         ram_cache_config.pinned_prefix.enabled()) &&
+         ram_cache_config.pinned_prefix.enabled() ||
+         ram_cache_config.transfer_api) &&
         speculative_config.backend == TextSpeculativeBackend::kMtp &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
@@ -3610,7 +3611,8 @@ bool InferenceBackend::load(
              "floors are unsupported");
     return false;
   }
-  if (ram_cache_config.pinned_prefix.enabled() &&
+  if ((ram_cache_config.pinned_prefix.enabled() ||
+       ram_cache_config.transfer_api) &&
       (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
        (speculative_config.backend == TextSpeculativeBackend::kMtp &&
         !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)))) {
@@ -4081,6 +4083,49 @@ InferenceBackend::cache_lookup(const ChatRequest& request) const {
 #else
   (void)request;
   return std::nullopt;
+#endif
+}
+
+std::shared_ptr<CheckpointTransferBlob> InferenceBackend::cache_export(
+    const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (!state || !state->runner_pool)
+    return {};
+  const auto& runner = state->scheduler->runner();
+  if (runner.Descriptor().state_abi != kQwenFlashNextStateAbi)
+    return {};
+  auto constrained = ConstrainChatRequest(request, runner, nullptr);
+  const auto& effective = constrained ? *constrained : request;
+  auto prompt = runner.PrepareLookupPrompt(effective);
+  if (!prompt || prompt->tokens.empty())
+    return {};
+  return state->runner_pool->Export(
+      prompt->tokens, prompt->context.get(), request.cache_prompt,
+      prompt->cache_prefix_tokens,
+      CheckpointTransferPolicy(state->reasoning_defaults,
+                               state->prefill_policy.decode_active_tokens));
+#else
+  (void)request;
+  return {};
+#endif
+}
+std::shared_ptr<CheckpointTransferBlob> InferenceBackend::cache_import(
+    const CheckpointTransferReader& reader, std::uint64_t length) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (!state || !state->runner_pool ||
+      state->scheduler->runner().Descriptor().state_abi !=
+          kQwenFlashNextStateAbi)
+    return {};
+  return state->runner_pool->Import(
+      reader, length,
+      CheckpointTransferPolicy(state->reasoning_defaults,
+                               state->prefill_policy.decode_active_tokens));
+#else
+  (void)reader;
+  (void)length;
+  return {};
 #endif
 }
 
