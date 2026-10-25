@@ -48,6 +48,7 @@ public:
   std::size_t private_blocks{128};
   cache::Rows rows_per_chunk{4};
   mutable std::size_t through_calls{};
+  std::function<void(std::string_view)> barrier;
   bool UsesComponentCache() const override { return true; }
   bool LookupFullCheckpointReady() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
@@ -118,6 +119,10 @@ public:
       if (defer_idle && std::this_thread::get_id() != foreground)
         return {};
       return std::make_unique<FakeStream>(true);
+    };
+    resources->test_barrier = [this](std::string_view point) {
+      if (barrier)
+        barrier(point);
     };
     resources->transfer_batch_size = 4;
     resources->allocate = [this, blocks,
@@ -435,6 +440,11 @@ void FailedRestoreResetsOnce() {
   auto failed = cache.Acquire(prompt, {}, {}, true, 0, true);
   assert(!failed->cache_hit());
   assert(runner->adapter->Invalidations() == before + 2);
+  const auto metrics = failed->Metrics();
+  assert(metrics.restore_attempts == 1 && metrics.restore_failures == 1);
+  assert(metrics.restore_failure_reason == "ram_transfer");
+  // A rejected source must not remain advertised as executable after fallback.
+  assert(cache.Lookup(prompt, nullptr, true, 0)->matched_tokens == 0);
   auto& cold = dynamic_cast<State&>(failed->state());
   runner->adapter->Append(cold.slot, prompt, prompt);
   assert(runner->adapter->RecurrentHash(cold.slot) ==
@@ -898,7 +908,10 @@ void ReuseAndBranches() {
   assert(!failed_restore.cache_hit());
   Prefill(failed_restore);
   assert(Generate(failed_restore) == token);
-  failed_restore.Invalidate();
+  // The rejected checkpoint is quarantined. Re-publish only after the cold
+  // execution has rebuilt and verified this boundary, not by retrying poison.
+  assert(failed_restore.component_cache_metrics()->restore_failures == 1);
+  assert(failed_restore.Commit().snapshot_bytes > 0);
   auto history = prompt;
   history.push_back(token);
   auto continued = pool.Acquire(history);
@@ -2632,6 +2645,7 @@ void PinnedPrefixCorruptionFailsClosed() {
   }
 }
 #include "tests/cli/cache_lookup_checks.hpp"
+#include "tests/cli/cache_lookup_r3_checks.hpp"
 }  // namespace
 // An off RAM cache commits no backing, grows none before prefill and takes no
 // capture, yet a session keeps its own live frontier and its metrics stay
@@ -2785,6 +2799,7 @@ int main() {
   LookupPublicationDisabled();
   LookupPublicationStress();
   LookupMeasuredRatesAndEpoch();
+  LookupR3BarrierFixtures();
   MultiplePinsChooseLongestAndRestart();
   MultiplePinsAggregateDiskBudget();
   MultiplePinsAggregateRamAndIndependentLazyWarming();

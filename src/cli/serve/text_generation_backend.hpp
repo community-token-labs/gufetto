@@ -154,6 +154,8 @@ public:
     // freshly conservative empty view reports age zero during publication.
     std::uint64_t index_version{0};
     double snapshot_age_ms{0.0};
+    // HTTP log correlation only, deliberately not serialized in lookup JSON.
+    std::uint64_t observation_id{0};
   };
 
   using CancellationCheck = std::function<bool()>;

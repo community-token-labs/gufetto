@@ -2346,6 +2346,7 @@ TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
   result.epoch = impl_->lookup_epoch;
   result.index_version = reuse->index_version;
   result.snapshot_age_ms = reuse->snapshot_age_ms;
+  result.observation_id = reuse->observation_id;
   // Legacy Acquire attempts disk only after a RAM/live miss, even when disk
   // has a deeper record. Preserve that ordering, not a global longest match.
   if (!result.matched_tokens && reuse_prompt && impl_->disk_store) {

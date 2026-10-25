@@ -555,6 +555,39 @@ hosts. Export/import is not implemented. Lookup bodies are excluded from
 `--trace` request-body capture, and lookup emits no prompt text in logs.
 There is currently no `/v1/cache/stats` endpoint.
 
+#### Advisory lookup diagnostics (R3, logs/metrics only)
+
+Component-cache logs use `schema=cache-lookup-v1`: `http_lookup` joins the
+existing HTTP `X-Request-ID` to `lookup_id`; `lookup` records entry ID, observed
+index version, start/finish versions and `published`, `mutation_in_flight`,
+`mutation_overlap` or `unpublished`. Odd versions attest an in-flight owner
+mutation; age zero alone does not. Entry IDs and versions are process/pool-local.
+
+The existing `usage.gufo.component_cache` metrics add `acquisition_id`,
+`admission_index_version`, `selected_entry_id`, `restore_attempts`,
+`restore_failures` and static `restore_failure_reason`. The acquire log carries
+the same fields, including zero counters on a cold miss/live reuse. Admission
+version is the last completed publication **before admission's own mutation**;
+counting its own invalidation would incorrectly excuse every overreport.
+Failures log each attempted entry and a stage code, never exception text.
+`restore_ms=0` is not evidence of zero attempts.
+
+`retire` logs entry ID, retirement version and reason; retain these logs through
+the whole trial rather than try to recover an expired entry later. `erased` and
+`live_unavailable` denote complete invalidation; `resident_dropped`,
+`durable_removed` and `availability_changed` are source changes, not proof that
+the whole entry is gone. A retirement explaining a pair must be later than its
+lookup and no later than admission. A failed restore quarantines that entry
+from future index publication (retained payload lifetime and already selected
+readers remain unchanged); it is still a correctness failure, not advisory
+staleness. New validated captures may replace it.
+
+Neither lookup response fields nor snapshot payload ABI changed. No reservation
+or pin is taken between lookup and admission. The CPU-only barrier fixtures run
+in `component_text_cache_test`; offline `tests/functional/cache_lookup_classify.py`
+classifies their logs and sanitized GPU reports without prompt text. Raw harness
+exactness failures remain intact; causal classification is a separate report.
+
 ### Other model services
 
 | Method | Path | Condition |

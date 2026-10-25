@@ -76,6 +76,7 @@ from http.client import HTTPException
 import json
 import math
 import os
+import re
 from pathlib import Path
 import struct
 import threading
@@ -117,6 +118,11 @@ def token_count(value):
     return integer(value) or (type(value) is float and number(value) and value.is_integer())
 
 
+def receipt_request_id(value):
+    candidate = value.get("_receipt_request_id")
+    return candidate if isinstance(candidate, str) and re.fullmatch(r"r[0-9]{1,20}", candidate) else None
+
+
 def lookup_metrics(value):
     if not isinstance(value, dict):
         raise ProbeError("lookup_not_object")
@@ -146,6 +152,8 @@ def lookup_metrics(value):
             if value[key] is not None and not number(value[key]):
                 raise ProbeError("lookup_invalid_" + key)
             result[key] = value[key]
+    if request_id := receipt_request_id(value):
+        result["request_id"] = request_id
     return result
 
 
@@ -179,6 +187,26 @@ def generation_metrics(value):
             if not number(timing[key]):
                 raise ProbeError("generation_invalid_" + key)
             result[key] = timing[key]
+    # Keep only numeric/static diagnostic metrics, never the rest of the reply.
+    component = usage.get("gufo", {}).get("component_cache", {}) if isinstance(usage.get("gufo", {}), dict) else {}
+    if isinstance(component, dict) and "restore_attempts" in component:
+        metrics = {}
+        for key in ("acquisition_id", "admission_index_version", "selected_entry_id",
+                    "restore_attempts", "restore_failures"):
+            if not integer(component.get(key)) or component[key] > 2**64 - 1:
+                raise ProbeError("generation_invalid_component_" + key)
+            metrics[key] = component[key]
+        reason = component.get("restore_failure_reason")
+        if reason not in ("none", "ram_begin_restore", "ram_pin", "ram_transfer", "ram_validate",
+                          "ram_admission", "disk_streaming_unavailable", "disk_restore_exception",
+                          "disk_restore_rejected"):
+            raise ProbeError("generation_invalid_restore_failure_reason")
+        metrics["restore_failure_reason"] = reason
+        if metrics["restore_failures"] > metrics["restore_attempts"]:
+            raise ProbeError("generation_invalid_restore_counters")
+        result["component_cache"] = metrics
+    if request_id := receipt_request_id(value):
+        result["request_id"] = request_id
     return result
 
 
@@ -219,6 +247,7 @@ class Client:
         try:
             with self.local.opener.open(request, timeout=self.timeout) as response:
                 status = response.status
+                request_id = response.headers.get("X-Request-ID")
                 raw = response.read(8 * 1024 * 1024 + 1)
             wall = (time.perf_counter() - start) * 1000
             if len(raw) > 8 * 1024 * 1024:
@@ -229,6 +258,11 @@ class Client:
                 value = json.loads(raw)
             except (ValueError, UnicodeError):
                 raise ProbeError("invalid_response_json", http_status=status, wall_ms=wall) from None
+            if isinstance(value, dict):
+                # Replace, never trust a body field masquerading as a header.
+                value.pop("_receipt_request_id", None)
+                if isinstance(request_id, str) and re.fullmatch(r"r[0-9]{1,20}", request_id):
+                    value["_receipt_request_id"] = request_id
             return value, wall
         except HTTPError as error:
             code = "http_status"

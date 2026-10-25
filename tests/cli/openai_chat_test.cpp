@@ -6505,6 +6505,7 @@ void TestCacheLookup() {
           .lookup_ms = 0.1,
           .index_version = 42,
           .snapshot_age_ms = 3.5,
+          .observation_id = 64,
       };
   const auto response = gufo::server::HandleCacheLookup(request, backend);
   Expect(response.status == 200 && !response.streaming_body,
@@ -6527,9 +6528,11 @@ void TestCacheLookup() {
              backend.lookup_request.reasoning.preserve_thinking == true &&
              backend.lookup_request.messages.size() == 2,
          "lookup uses chat parser and template options");
-  Expect(response.body.find("sentinel") == std::string::npos &&
-             response.log_details.empty() && backend.chat_calls == 0,
-         "lookup has no prompt content or generation side effects");
+  Expect(
+      response.body.find("sentinel") == std::string::npos &&
+          response.log_details == "cache_lookup_id=64" &&
+          !body.find("observation_id") && backend.chat_calls == 0,
+      "lookup correlation is logs-only, without prompt content or generation");
 
   backend.lookup_result->restore_estimate_ms.reset();
   backend.lookup_result->prefill_estimate_ms.reset();

@@ -192,6 +192,15 @@ struct PrefixIndex::Impl {
   std::map<Identity, Tree> trees;
   std::map<std::uint64_t, Node*> directory;
   std::uint64_t next{1};
+  std::function<void(IndexEntryId, Rows, std::string_view)> invalidation;
+  void Invalidating(const Record& record, std::string_view reason) noexcept {
+    try {
+      if (invalidation)
+        invalidation(record.id, record.Boundary(), reason);
+    } catch (...) {
+      // Observability must not change index/retention behavior.
+    }
+  }
   Impl(ResourceLedger& l, ResourceReservation reservation)
       : ledger(&l), metadata(reservation.Convert()) {}
   ~Impl() {
@@ -720,6 +729,7 @@ void PrefixIndex::DropResident(IndexEntryId id) {
     Erase(id);
     return;
   }
+  impl_->Invalidating(record, "resident_dropped");
   record.checkpoint.reset();
 }
 void PrefixIndex::RemoveDurable(const DiskDescription& description,
@@ -736,8 +746,10 @@ void PrefixIndex::RemoveDurable(const DiskDescription& description,
       continue;
     if (corrupt || !record.checkpoint)
       Erase(id);
-    else
+    else {
+      impl_->Invalidating(record, "durable_removed");
       record.durable.reset();
+    }
   }
 }
 void PrefixIndex::SetAvailability(
@@ -746,12 +758,16 @@ void PrefixIndex::SetAvailability(
   if (r.live)
     throw std::invalid_argument("live frontier has no checkpoint availability");
   ValidateAvailability(availability, r.tree->descriptors);
-  r.availability = impl_->Availability(std::move(availability));
+  auto replacement = impl_->Availability(std::move(availability));
+  impl_->Invalidating(r, "availability_changed");
+  r.availability = std::move(replacement);
 }
 void PrefixIndex::SetLiveAvailable(IndexEntryId id, bool available) {
   auto& r = impl_->Get(id);
   if (!r.live)
     throw std::invalid_argument("entry is not a live frontier");
+  if (r.live->available && !available)
+    impl_->Invalidating(r, "live_unavailable");
   r.live->available = available;
 }
 void PrefixIndex::Erase(IndexEntryId id) {
@@ -759,9 +775,14 @@ void PrefixIndex::Erase(IndexEntryId id) {
   if (it == impl_->directory.end())
     return;
   auto* node = it->second;
+  impl_->Invalidating(node->records.at(id.value), "erased");
   node->records.erase(id.value);
   impl_->directory.erase(it);
   impl_->Prune(node);
+}
+void PrefixIndex::SetInvalidationObserver(
+    std::function<void(IndexEntryId, Rows, std::string_view)> observer) {
+  impl_->invalidation = std::move(observer);
 }
 PrefixIndexSnapshot PrefixIndex::Snapshot(
     const std::function<bool(const PrefixCandidate&)>& full_ready) const {

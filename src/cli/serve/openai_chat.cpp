@@ -3929,6 +3929,9 @@ HttpResponse HandleCacheLookup(const HttpRequest& request,
       return Error(501, "Not Implemented",
                    "cache lookup is not supported by the loaded backend",
                    "cache_lookup_unsupported");
+    Logger::Info("cache", "schema=cache-lookup-v1 event=http_lookup request=" +
+                              request.request_id + " lookup_id=" +
+                              std::to_string(result->observation_id));
     json::Value body = json::Value::object();
     body["total_tokens"] = result->total_tokens;
     body["matched_tokens"] = result->matched_tokens;
@@ -3952,6 +3955,8 @@ HttpResponse HandleCacheLookup(const HttpRequest& request,
         .body = body.dump(),
         .headers = {{"Content-Type", "application/json"},
                     {"Cache-Control", "no-store"}},
+        .log_details =
+            "cache_lookup_id=" + std::to_string(result->observation_id),
     };
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);

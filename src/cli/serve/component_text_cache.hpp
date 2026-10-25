@@ -57,6 +57,10 @@ struct ComponentCacheResources {
   // usable without a pool-capacity contract.
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
+  // Deterministic CPU fixtures only; empty in production providers. Hooks may
+  // pause at lookup_observed, admission, selected, or mutation (owner locked).
+  // They must not re-enter this cache from the same thread.
+  std::function<void(std::string_view)> test_barrier;
 };
 
 class ComponentTextCache {

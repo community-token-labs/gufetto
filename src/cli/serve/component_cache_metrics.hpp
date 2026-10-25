@@ -16,6 +16,11 @@ namespace gufo::server {
 struct ComponentCacheMetrics {
   std::string reuse{"none"};
   std::uint32_t selection_reason{};
+  std::uint64_t acquisition_id{}, admission_index_version{},
+      selected_entry_id{};
+  std::size_t restore_attempts{}, restore_failures{};
+  // Static reason codes only, never exception messages or prompt content.
+  std::string restore_failure_reason{"none"};
   std::size_t deepest_live{}, deepest_ram{}, deepest_disk{}, selected{};
   std::size_t restored_bytes{}, prefilled{}, captures{}, captured_bytes{};
   std::size_t borrowed_capacity_bytes{}, copied_payload_bytes{};
@@ -35,6 +40,12 @@ inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
   result["deepest_ram_tokens"] = value.deepest_ram;
   result["deepest_disk_tokens"] = value.deepest_disk;
   result["selected_tokens"] = value.selected;
+  result["acquisition_id"] = value.acquisition_id;
+  result["admission_index_version"] = value.admission_index_version;
+  result["selected_entry_id"] = value.selected_entry_id;
+  result["restore_attempts"] = value.restore_attempts;
+  result["restore_failures"] = value.restore_failures;
+  result["restore_failure_reason"] = value.restore_failure_reason;
   result["restored_bytes"] = value.restored_bytes;
   result["prefilled_tokens"] = value.prefilled;
   result["captures"] = value.captures;

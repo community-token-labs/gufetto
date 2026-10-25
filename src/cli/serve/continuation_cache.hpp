@@ -122,6 +122,8 @@ struct ContinuationReuse {
   /// Both are zero when no view is available.
   std::uint64_t index_version{0};
   double snapshot_age_ms{0.0};
+  // Internal telemetry only; not part of the lookup response/payload ABI.
+  std::uint64_t observation_id{0};
 };
 
 /// Bounded exact-prefix cache over opaque model continuation states.

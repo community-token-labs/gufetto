@@ -276,6 +276,8 @@ struct ComponentTextCache::Impl {
   };
   std::atomic<std::shared_ptr<const LookupView>> lookup_view;
   std::atomic<std::uint64_t> lookup_version{0};
+  mutable std::atomic<std::uint64_t> next_observation{1};
+  std::uint64_t next_acquisition{1};
   struct PublicationMutex {
     Impl& owner;
     std::mutex native;
@@ -285,6 +287,8 @@ struct ComponentTextCache::Impl {
         owner.lookup_version.fetch_add(1, std::memory_order_acq_rel);
         owner.lookup_view.store({}, std::memory_order_release);
       }
+      if (owner.resources->test_barrier)
+        owner.resources->test_barrier("mutation");
     }
     void unlock() noexcept {
       if (owner.lookup_enabled) {
@@ -408,6 +412,17 @@ struct ComponentTextCache::Impl {
     if (!platform::FillRandomBytes(nonce))
       throw std::runtime_error("cannot obtain cache publication nonce");
     index.Register(identity, resources->adapter->Components(), digest);
+    index.SetInvalidationObserver([this](auto id, auto boundary, auto reason) {
+      if (!lookup_enabled)
+        return;
+      const auto version = lookup_version.load(std::memory_order_relaxed);
+      Logger::Info(
+          "cache",
+          "schema=cache-lookup-v1 event=retire entry_id=" +
+              std::to_string(id.value) + " tokens=" + std::to_string(boundary) +
+              " retirement_version=" + std::to_string(version + (version & 1)) +
+              " reason=" + std::string(reason));
+    });
     if (options) {
       const auto row_bytes =
           cache::MinimumStagingBytes(resources->adapter->Components());
@@ -661,6 +676,9 @@ struct ComponentTextCache::Impl {
       queue->Drain();
     for (auto& entry : entries)
       entry->slot->StopIdleSpill();
+    // Only after callbacks drain: retention teardown later runs after the
+    // publication fields have been destroyed.
+    index.SetInvalidationObserver({});
   }
   std::unique_ptr<cache::Stream> Stream() {
     auto stream = resources->stream();
@@ -1403,13 +1421,21 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     std::size_t stable, bool stop_at_eos) {
   if (cancelled && cancelled())
     return {};
+  if (impl_->resources->test_barrier)
+    impl_->resources->test_barrier("admission");
   auto input = Inputs(prompt.size(), context.get());
   cache::PrefixLookup found;
   Impl::Entry* entry = nullptr;
   std::optional<cache::BorrowedLocation> live;
   std::size_t common = 0;
+  std::uint64_t admission_version{}, acquisition_id{};
   {
     const std::lock_guard lock(impl_->mutex);
+    // Last completed publication BEFORE this admission's own invalidation.
+    // Counting that invalidation as a later version would excuse every race.
+    const auto version = impl_->lookup_version.load(std::memory_order_relaxed);
+    admission_version = version - (version & 1);
+    acquisition_id = impl_->next_acquisition++;
     if (impl_->catalog)
       impl_->catalog->Reconcile();
     found = impl_->Plan(prompt, input, stable, reuse);
@@ -1535,6 +1561,12 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     lease = std::make_unique<Lease>(std::make_unique<Lease::Impl>(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
     auto& request = *lease->impl_;
+    request.metrics.acquisition_id = acquisition_id;
+    request.metrics.admission_index_version = admission_version;
+    request.metrics.selected_entry_id =
+        found.selected ? found.selected->entry.value : 0;
+    if (impl_->resources->test_barrier)
+      impl_->resources->test_barrier("selected");
     request.state->SetCancellationCheck(cancelled);
     request.state->SetStopAtEos(stop_at_eos);
     impl_->runner->SetPromptContext(*request.state, context);
@@ -1562,6 +1594,23 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         break;
       if (candidate.live)
         continue;
+      ++request.metrics.restore_attempts;
+      std::string_view failure_reason = "ram_begin_restore";
+      const auto failed = [&](std::string_view reason) {
+        ++request.metrics.restore_failures;
+        request.metrics.restore_failure_reason = reason;
+        Logger::Warn(
+            "cache",
+            "schema=cache-lookup-v1 event=restore_failure acquisition_id=" +
+                std::to_string(acquisition_id) +
+                " entry_id=" + std::to_string(candidate.entry.value) +
+                " reason=" + std::string(reason));
+        const std::lock_guard lock(impl_->mutex);
+        // Cold fallback does not validate this source. Quarantine its index
+        // entry rather than re-publish an executable claim after rejection.
+        // Retention/payload ownership and already selected readers are intact.
+        impl_->index.Erase(candidate.entry);
+      };
       try {
         if (candidate.checkpoint) {
           const auto& checkpoint = *candidate.checkpoint;
@@ -1574,6 +1623,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           // Every pin outlives all submitted loads, including failure drain.
           // Borrowed views name immutable native rows; materialized views name
           // assigned host backing. No source slot execution lease is needed.
+          failure_reason = "ram_pin";
           std::size_t pin_count = 0;
           for (const auto& c : checkpoint.Components())
             pin_count += c.chunks.size() + bool(c.tail) + bool(c.private_state);
@@ -1590,6 +1640,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
             if (c.tail)
               pins.push_back(c.tail->PinRows());
           }
+          failure_reason = "ram_transfer";
           TransferBatch transfers(impl_->resources->transfer_batch_size);
           std::size_t base = 0;
           for (const auto& c : checkpoint.Components()) {
@@ -1664,9 +1715,11 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
             }
           }
           transfers.Finish();
+          failure_reason = "ram_validate";
           if (!impl_->resources->adapter->Validate(request.slot.Execution(),
                                                    positions))
             throw std::runtime_error("component RAM restore validation failed");
+          failure_reason = "ram_admission";
           entry->history = std::make_unique<cache::ExecutionHistory>(
               cache::ExecutionHistory::Restored(impl_->ledger, checkpoint));
           request.source = checkpoint.Id();
@@ -1685,8 +1738,11 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           const bool pin = &candidate.durable->Store() == impl_->pin_disk.get();
           auto* streaming =
               pin ? impl_->pin_streaming.get() : impl_->streaming.get();
-          if (!streaming)
+          failure_reason = "disk_restore_exception";
+          if (!streaming) {
+            failed("disk_streaming_unavailable");
             continue;
+          }
           restored = streaming->Restore(
               id, impl_->digest, *impl_->resources->adapter,
               request.slot.Execution(), timing, {}, {},
@@ -1707,6 +1763,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                   impl_->catalog->Invalidate(private_file, file);
                 }
               });
+          if (!restored)
+            failed("disk_restore_rejected");
           if (restored) {
             request.disk_hit = true;
             if (pin) {
@@ -1740,6 +1798,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           }
         }
         if (restored && !decodable(candidate.boundary)) {
+          // Intentional conservative full-boundary fallback, not a failed
+          // transfer/restore. Lookup omits the same unready boundary.
           if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
             throw std::runtime_error("component restore reset failed");
           entry->history.reset();
@@ -1756,6 +1816,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           entry->durable = candidate.durable;
         }
       } catch (...) {
+        failed(failure_reason);
         if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
           throw;
         clean = true;
@@ -1867,7 +1928,17 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                  : request.cached   ? "ram"
                                                     : "none") +
                      " selected_tokens=" + std::to_string(request.cached) +
-                     " restored_bytes=" + std::to_string(request.restored));
+                     " restored_bytes=" + std::to_string(request.restored) +
+                     " acquisition_id=" + std::to_string(acquisition_id) +
+                     " admission_index_version=" +
+                     std::to_string(admission_version) + " selected_entry_id=" +
+                     std::to_string(request.metrics.selected_entry_id) +
+                     " restore_attempts=" +
+                     std::to_string(request.metrics.restore_attempts) +
+                     " restore_failures=" +
+                     std::to_string(request.metrics.restore_failures) +
+                     " restore_failure_reason=" +
+                     request.metrics.restore_failure_reason);
     return lease;
   } catch (...) {
     if (lease)
@@ -1925,22 +1996,45 @@ std::optional<ContinuationReuse> ComponentTextCache::Lookup(
   const auto input = Inputs(prompt.size(), context);
   const auto version = impl_->lookup_version.load(std::memory_order_acquire);
   const auto view = impl_->lookup_view.load(std::memory_order_acquire);
-  const auto unknown = [](std::uint64_t generation) {
-    ContinuationReuse result;
-    result.index_version = generation;
+  const auto observation =
+      impl_->next_observation.fetch_add(1, std::memory_order_relaxed);
+  const auto observed = [&](ContinuationReuse result, std::uint64_t entry,
+                            std::string_view state, std::uint64_t finished) {
+    result.observation_id = observation;
+    if (impl_->lookup_enabled)
+      Logger::Info(
+          "cache",
+          "schema=cache-lookup-v1 event=lookup lookup_id=" +
+              std::to_string(observation) +
+              " entry_id=" + std::to_string(entry) +
+              " index_version=" + std::to_string(result.index_version) +
+              " version_start=" + std::to_string(version) + " version_finish=" +
+              std::to_string(finished) + " state=" + std::string(state) +
+              " matched_tokens=" + std::to_string(result.matched_tokens));
     return result;
   };
-  if ((version & 1) || !view)
-    return unknown(version);
+  const auto unknown = [&](std::uint64_t generation, std::string_view state) {
+    ContinuationReuse result;
+    result.index_version = generation;
+    return observed(result, 0, state, generation);
+  };
+  if (impl_->resources->test_barrier)
+    impl_->resources->test_barrier("lookup_observed");
+  if (version & 1)
+    return unknown(version, "mutation_in_flight");
+  if (!view)
+    return unknown(version, "unpublished");
   const auto candidates =
       view->index.Lookup({impl_->identity, prompt, input, stable, reuse});
   ContinuationReuse result;
+  std::uint64_t selected_entry = 0;
   // Match Acquire's full-boundary readiness and ordered fallback rules. Busy
   // leases have no live index entry; their immutable checkpoints still count.
   if (!candidates.empty() && candidates.front().live &&
       (candidates.front().boundary < prompt.size() ||
        candidates.front().full_ready)) {
     result = {candidates.front().boundary, "live"};
+    selected_entry = candidates.front().entry.value;
   } else {
     for (const auto& candidate : candidates) {
       if (candidate.live ||
@@ -1948,6 +2042,7 @@ std::optional<ContinuationReuse> ComponentTextCache::Lookup(
         continue;
       result = {candidate.boundary, candidate.ram ? "ram" : "disk",
                 candidate.transfer_bytes};
+      selected_entry = candidate.entry.value;
       break;
     }
   }
@@ -1956,12 +2051,12 @@ std::optional<ContinuationReuse> ComponentTextCache::Lookup(
   // an entry that may already have been retired.
   const auto finished = impl_->lookup_version.load(std::memory_order_acquire);
   if (version != finished)
-    return unknown(finished);
+    return unknown(finished, "mutation_overlap");
   result.index_version = view->version;
   result.snapshot_age_ms =
       std::chrono::duration<double, std::milli>(Clock::now() - view->published)
           .count();
-  return result;
+  return observed(result, selected_entry, "published", finished);
 }
 
 std::size_t ComponentTextCache::CachedPrefixTokens(

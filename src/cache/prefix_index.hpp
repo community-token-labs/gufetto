@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "src/cache/checkpoint.hpp"
@@ -148,6 +149,10 @@ public:
   void SetAvailability(IndexEntryId, std::vector<ComponentAvailability>);
   void SetLiveAvailable(IndexEntryId, bool);
   void Erase(IndexEntryId);
+  // Owner-serialized, metadata-only telemetry. Exceptions are ignored; the
+  // observer must not re-enter the index. No tombstones/payloads are retained.
+  void SetInvalidationObserver(
+      std::function<void(IndexEntryId, Rows, std::string_view)>);
   [[nodiscard]] PrefixLookup Lookup(const PrefixQuery&) const;
   // Construct under the same owner lock as Lookup. Scans retained records and
   // validates with temporary candidates/pins, retaining only copied metadata

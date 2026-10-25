@@ -65,6 +65,25 @@ void SnapshotParity(const PrefixIndex& index, const PrefixQuery& query) {
     assert(a.transfer_bytes == e.transfer_bytes && a.full_ready);
   }
 }
+void InvalidationTelemetryDoesNotOwnOrBlockEntries() {
+  ResourceLedger ledger{kIndexLimits};
+  PrefixIndex index{ledger};
+  index.Register({1}, kIndexComponents);
+  const Tokens tokens{1, 2, 3};
+  const auto entry =
+      index.Insert(IndexCheckpoint(ledger, tokens), ResidentComponents());
+  std::size_t calls = 0;
+  index.SetInvalidationObserver(
+      [&](IndexEntryId id, Rows boundary, std::string_view reason) {
+        assert(id == entry && boundary == 3 && reason == "erased");
+        ++calls;
+        throw std::runtime_error("telemetry is best effort");
+      });
+  index.Erase(entry);
+  index.Erase(entry);  // Absent IDs do not produce fictitious retirements.
+  assert(calls == 1 && !index.Lookup(Query(tokens)).selected);
+  index.SetInvalidationObserver({});
+}
 void SelectionTable() {
   struct Case {
     Tokens prompt;
@@ -1007,6 +1026,7 @@ void RepeatedReadOnlyPlan() {
 }
 }  // namespace
 int main() {
+  InvalidationTelemetryDoesNotOwnOrBlockEntries();
   SnapshotDiskCandidates();
   SnapshotMixedValidity();
   SnapshotBorrowedInvalidation();
