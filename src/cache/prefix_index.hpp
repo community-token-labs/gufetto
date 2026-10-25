@@ -1,6 +1,7 @@
 #ifndef GUFO_CACHE_PREFIX_INDEX_HPP_
 #define GUFO_CACHE_PREFIX_INDEX_HPP_
 
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -84,6 +85,33 @@ struct PrefixLookup {
   PrefixLookup(const PrefixLookup&) = delete;
 };
 
+struct PrefixSnapshotCandidate {
+  IndexEntryId entry;
+  Rows boundary{};
+  bool live{false}, ram{false}, disk{false};
+  std::size_t transfer_bytes{};
+  bool full_ready{true};
+};
+// Immutable, independently owned metadata. No checkpoint/payload ownership,
+// slot or disk pins, mutable descriptions, or ledger references. Weak validity
+// guards omit expired/invalid sources at lookup; candidates are observations,
+// not restore leases. Other availability is frozen at construction.
+class PrefixIndexSnapshot {
+public:
+  PrefixIndexSnapshot() = default;
+  // Same query validation, stable/input/compatibility rules and candidate
+  // ordering as PrefixIndex::Lookup. Safe for concurrent readers without the
+  // original index, its owner lock, or its ledger. Source validity checks may
+  // briefly lock weak handles, but acquire no slot/disk pins or device locks.
+  [[nodiscard]] std::vector<PrefixSnapshotCandidate> Lookup(
+      const PrefixQuery&) const;
+
+private:
+  friend class PrefixIndex;
+  struct Impl;
+  std::shared_ptr<const Impl> impl_;
+};
+
 // Caller serializes all operations, including lookups. A compressed token tree
 // per compatibility identity shares token edges; it never scans every retained
 // token list during lookup. No device operations, model/serving dependencies or
@@ -121,6 +149,12 @@ public:
   void SetLiveAvailable(IndexEntryId, bool);
   void Erase(IndexEntryId);
   [[nodiscard]] PrefixLookup Lookup(const PrefixQuery&) const;
+  // Construct under the same owner lock as Lookup. Scans retained records and
+  // validates with temporary candidates/pins, retaining only copied metadata
+  // and weak validity guards. full_ready is evaluated here, never retained;
+  // an absent callback marks every coherent candidate fully ready.
+  [[nodiscard]] PrefixIndexSnapshot Snapshot(
+      const std::function<bool(const PrefixCandidate&)>& full_ready = {}) const;
   // Presence only: no live frontiers, candidate list or sorting. Ignores the
   // query's stable-prefix rules and reuse flag, as CachedPrefixTokens does.
   // The complete checkpoint must be usable at or beyond minimum_boundary.

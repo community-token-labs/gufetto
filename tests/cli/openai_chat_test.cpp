@@ -6503,6 +6503,8 @@ void TestCacheLookup() {
           .restore_estimate_ms = 0.25,
           .prefill_estimate_ms = 1.5,
           .lookup_ms = 0.1,
+          .index_version = 42,
+          .snapshot_age_ms = 3.5,
       };
   const auto response = gufo::server::HandleCacheLookup(request, backend);
   Expect(response.status == 200 && !response.streaming_body,
@@ -6517,6 +6519,10 @@ void TestCacheLookup() {
              body.member_double("prefill_estimate_ms") == 1.5 &&
              body.member_double("lookup_ms") >= 0,
          "lookup reports estimates and total processing latency");
+  Expect(body.member_str("semantics") == "advisory" &&
+             body.member_size("index_version") == 42 &&
+             body.member_double("snapshot_age_ms") == 3.5,
+         "lookup exposes advisory semantics and published inventory age");
   Expect(!backend.lookup_request.cache_prompt &&
              backend.lookup_request.reasoning.preserve_thinking == true &&
              backend.lookup_request.messages.size() == 2,

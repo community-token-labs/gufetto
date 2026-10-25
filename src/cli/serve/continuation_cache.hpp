@@ -113,11 +113,15 @@ struct ContinuationLookup {
   std::size_t checkpoint_tokens{0};
 };
 
-/// Metadata-only plan. An absent value means the metadata/slots are busy.
+/// Metadata-only reuse estimate; no execution slot or payload is reserved.
 struct ContinuationReuse {
   std::size_t matched_tokens{0};
   std::string_view tier{"none"};
   std::size_t restore_bytes{0};
+  /// Metadata publication version and elapsed steady-clock age.
+  /// Both are zero when no view is available.
+  std::uint64_t index_version{0};
+  double snapshot_age_ms{0.0};
 };
 
 /// Bounded exact-prefix cache over opaque model continuation states.
@@ -241,7 +245,8 @@ public:
   /// defaults to capacity; the byte budget bounds retained/in-flight payloads.
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
                     SnapshotSupport snapshot_support = {},
-                    std::size_t snapshot_capacity = 0);
+                    std::size_t snapshot_capacity = 0,
+                    bool publish_lookup = true);
   ~ContinuationCache();
 
   ContinuationCache(const ContinuationCache&) = delete;
@@ -259,7 +264,12 @@ public:
       bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
       std::span<const ContinuationInputPrefix> input_prefixes = {});
 
-  /// Uses Acquire's selection plan without leasing, restoring or touching LRU.
+  /// Promptly returns published metadata without leasing, payload access,
+  /// GPU work, or touching LRU. Always engaged, even with all slots busy.
+  /// Idle results match Acquire's prefix/identity/fallback rules. Concurrent
+  /// mutations may conservatively omit revoked records or unpublished work;
+  /// busy live frontiers are excluded, but retained checkpoints still count.
+  /// This is a point-in-time estimate, not a guarantee for a later Acquire.
   [[nodiscard]] std::optional<ContinuationReuse> Lookup(
       std::span<const ContinuationToken> prompt,
       std::span<const std::uint8_t> input_identity = {},

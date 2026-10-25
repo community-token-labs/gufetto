@@ -503,7 +503,10 @@ hybrid-state boundaries from message hashes.
   "restore_estimate_ms": 35.5,
   "prefill_estimate_ms": 4123.0,
   "epoch": "opaque-compatibility-digest",
-  "lookup_ms": 2.4
+  "lookup_ms": 2.4,
+  "semantics": "advisory",
+  "index_version": 42,
+  "snapshot_age_ms": 0.8
 }
 ```
 
@@ -515,14 +518,33 @@ server processing through the query, including parsing/rendering/tokenization,
 but not network I/O or response serialization. HTTP clients should measure their
 own elapsed time too. Replies have `Cache-Control: no-store`.
 
-Lookup is read-only: it never submits generation, prefills, mutates a session,
-promotes LRU entries or reserves a slot. Index inspection briefly holds shared
-metadata/read pins against retirement, released before returning; it does not
-protect a later request against eviction. It is a point-in-time
-placement observation, **not a reservation or a restore guarantee**. Busy or
-uncertain state may be conservatively under-reported. Concurrent requests,
+Lookup is an **advisory, side-effect-free hint, not a reservation or a restore
+guarantee** (`semantics: "advisory"`). It never submits generation, prefills,
+mutates a session, promotes LRU entries or reserves a slot. Rendering/tokenization
+run on the HTTP thread. The query reads immutable published metadata, without
+entering scheduler admission, waiting for a free slot or holding a GPU-work
+mutex. Weak source-validity checks briefly retain source metadata, but acquire
+no slot leases or disk publication pins and never read payloads.
+
+The component owner invalidates its published view before mutation and publishes
+a complete replacement before releasing its mutation lock. A single version
+check converts any overlapping update into a conservative miss; it never retries
+behind GPU work. Thus a completed owner mutation is not silently absent from a
+subsequent lookup: publication lag is zero completed mutation critical sections.
+New GPU work is not claimed before checkpoint publication. An executing lease
+hides its live frontier, but its published immutable checkpoints remain eligible.
+This mostly affects a conversation queried while its previous turn is still
+running, rather than sequential agent loops.
+
+`index_version` is a process-local inventory version, not the compatibility
+`epoch` or a lease. `snapshot_age_ms` is the age of the selected publication; idle
+unchanged state can be arbitrarily old without becoming incorrect. During an
+update, a freshly conservative empty observation has age zero. Legacy disk-only
+queries do not have a published clock and report zero version/age. There is no
+fixed wall-clock promise for GPU work still in flight. Concurrent requests,
 eviction and a failed integrity-checked restore can change actual reuse before
-admission. `cache_prompt: false` reports zero reuse. Unsupported backends or
+admission. A future optional reserve/TTL-pin protocol could address that race;
+no such protocol is implemented here. `cache_prompt: false` reports zero reuse. Unsupported backends or
 request shapes return 501 rather than fabricate a hit. Invalid requests retain
 chat validation errors; an unavailable/lost backend returns 503.
 

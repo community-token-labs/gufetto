@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -2778,7 +2779,11 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
 }
 int main() {
   LookupIsReadOnlyAndMatchesAcquire();
-  LookupReturnsBusyWithoutWaitingForAdmission();
+  LookupDoesNotWaitForAdmission();
+  LookupWhileAllSlotsPrefillAndDecode();
+  LookupInvalidatesBeforeLiveRetirement();
+  LookupPublicationDisabled();
+  LookupPublicationStress();
   LookupMeasuredRatesAndEpoch();
   MultiplePinsChooseLongestAndRestart();
   MultiplePinsAggregateDiskBudget();

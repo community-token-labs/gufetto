@@ -674,7 +674,8 @@ struct TextRunnerPool::Impl {
       component_cache = std::make_unique<ComponentTextCache>(
           validated.runner, state_count, std::min(requested, ceiling),
           disk_cache_options, !ram_cache_options.capacity_bytes, ceiling,
-          ram_cache_options.pinned_prefix, ram_cache_options.enabled);
+          ram_cache_options.pinned_prefix, ram_cache_options.enabled,
+          ram_cache_options.publish_lookup);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
@@ -698,7 +699,8 @@ struct TextRunnerPool::Impl {
           return state;
         },
         MakeSnapshotSupport(&validated, ram_cache_options),
-        TextRunnerRamCacheOptions::kMaxEntries);
+        TextRunnerRamCacheOptions::kMaxEntries,
+        ram_cache_options.publish_lookup);
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
       // Report the same post-allocation limits that selected the capacity.
@@ -2321,13 +2323,8 @@ TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
     throw std::length_error("text runner prompt exceeds model context");
   if (cache_prefix_tokens > prompt.size())
     throw std::invalid_argument("cache prefix exceeds prompt length");
-  const std::unique_lock admission(impl_->admission_mutex, std::try_to_lock);
-  const auto busy = [] {
-    throw TextGenerationError(TextGenerationErrorCode::kCacheLookupBusy,
-                              "cache lookup snapshot is busy; retry");
-  };
-  if (!admission.owns_lock())
-    busy();
+  // Admission may hold its mutex across restore/capture GPU work. Lookup is
+  // an inventory observation, not a slot reservation: never enter that path.
   auto reuse =
       impl_->component_cache
           ? impl_->component_cache->Lookup(prompt, context, reuse_prompt,
@@ -2341,12 +2338,14 @@ TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
                               context->cache_prefixes)
                         : std::span<const ContinuationInputPrefix>{});
   if (!reuse)
-    busy();
+    reuse = ContinuationReuse{};
   TextGenerationBackend::CacheLookupResult result;
   result.total_tokens = prompt.size();
   result.matched_tokens = reuse->matched_tokens;
   result.tier = reuse->tier;
   result.epoch = impl_->lookup_epoch;
+  result.index_version = reuse->index_version;
+  result.snapshot_age_ms = reuse->snapshot_age_ms;
   // Legacy Acquire attempts disk only after a RAM/live miss, even when disk
   // has a deeper record. Preserve that ordering, not a global longest match.
   if (!result.matched_tokens && reuse_prompt && impl_->disk_store) {
@@ -2358,11 +2357,19 @@ TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
         context
             ? std::span<const ContinuationInputPrefix>(context->cache_prefixes)
             : std::span<const ContinuationInputPrefix>{});
-    if (!disk)
-      busy();
-    result.matched_tokens = disk->matched_tokens;
-    result.tier = disk->tier;
-    reuse->restore_bytes = disk->restore_bytes;
+    // The legacy disk catalog has a nonblocking operation gate. An in-flight
+    // catalog mutation is unknown reuse, not an unavailable lookup service.
+    if (disk) {
+      result.matched_tokens = disk->matched_tokens;
+      result.tier = disk->tier;
+      reuse->restore_bytes = disk->restore_bytes;
+      // Legacy disk's try-only catalog has no published snapshot clock.
+      // Zero denotes that unsupported version/age, not a freshness lease.
+      if (disk->matched_tokens) {
+        result.index_version = disk->index_version;
+        result.snapshot_age_ms = disk->snapshot_age_ms;
+      }
+    }
   }
   impl_->lookup_timings->Estimate(result, reuse->restore_bytes);
   result.lookup_ms = std::chrono::duration<double, std::milli>(

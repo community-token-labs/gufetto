@@ -109,7 +109,7 @@ public:
                      const std::optional<TextRunnerDiskCacheOptions>&,
                      bool automatic_ram = false, std::size_t ceiling_bytes = 0,
                      const TextRunnerPinnedPrefixOptions& pins = {},
-                     bool ram_enabled = true);
+                     bool ram_enabled = true, bool publish_lookup = true);
   ~ComponentTextCache();
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,

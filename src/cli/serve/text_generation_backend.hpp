@@ -150,6 +150,10 @@ public:
     std::optional<double> restore_estimate_ms;
     std::optional<double> prefill_estimate_ms;
     double lookup_ms{0.0};
+    // Advisory inventory observation, not a future restore reservation. A
+    // freshly conservative empty view reports age zero during publication.
+    std::uint64_t index_version{0};
+    double snapshot_age_ms{0.0};
   };
 
   using CancellationCheck = std::function<bool()>;
@@ -411,8 +415,9 @@ public:
       std::string_view text) const = 0;
 
   /// No admission, prefill, state restore, LRU touch, or disk payload reads.
-  /// Busy implementations throw kCacheLookupBusy rather than wait for
-  /// generation.
+  /// Reads published metadata on the caller's thread, independently of GPU
+  /// execution. In-flight mutation may under-report reuse, never waits for a
+  /// generation slot.
   [[nodiscard]] virtual std::optional<CacheLookupResult> cache_lookup(
       const ChatRequest&) const {
     return std::nullopt;

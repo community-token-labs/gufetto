@@ -1652,6 +1652,7 @@ int RunServe(std::span<const char* const> args) {
             .capacity_bytes = cache_ram.capacity_bytes,
             .enabled = cache_ram.enabled,
             .pinned_prefix = std::move(pinned_prefix),
+            .publish_lookup = cache_lookup_api,
         },
         enable_yarn);
     loading.stop();

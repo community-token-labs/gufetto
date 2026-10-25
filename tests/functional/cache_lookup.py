@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""URL-only cache lookup exactness and four-agent HTTP latency probe (stdlib).
+r"""URL-only cache lookup exactness and concurrent HTTP load probe (stdlib).
 
 The operator must enable Gufo's --cache-lookup-api, allocate the server, complete
 its profiling/operation-lock gates, and exclude other clients for exactness.
@@ -11,15 +11,34 @@ Example (run only after the operator's GPU gate/lock):
     --output /tmp/cache-lookup.json
 
 Default: 469 sequential pairs (320 history, 140 pressure, 9 anchor probes);
-then 400 lookup samples beside four closed-loop generation clients. Every
-sequential lookup is immediately followed by the SAME buffered Chat request.
+then 400 fixed-cadence lookup samples beside --clients 4 (or 8) generation clients.
+Every sequential lookup is immediately followed by the SAME buffered Chat request.
 Each history contrasts preserve_thinking true/false on the same appended
 messages with synthetic historical reasoning; generation reasoning stays off.
-Concurrent diagnostic pairs record cache mismatches as non-reservation races,
-not exactness failures. Prompt counts remain exact even under mutation.
-HTTP 503 cache_lookup_busy is expected only during load: every busy attempt is
-retained with its wall latency and availability outcome, never retried. Busy
-responses have no engine lookup_ms; absent engine latency stays unqualified.
+Concurrent pairs FAIL if matched_tokens exceeds the following identical real
+request's cached_tokens; under-reports are counted separately. These are observed
+outcomes, not a reservation guarantee: intervening/queued work may change reuse.
+HTTP 503 cache_lookup_busy is counted as unavailable, never retried or hidden.
+Successful-only HTTP (http_200_wall) and engine p50/p95/p99 are reported separately
+from errors; http_wall additionally retains timings for all outcomes.
+
+--load-only skips idle exactness; --clients 0 sends no generation traffic, for
+use alongside an independently launched docs bench/bench.py workload. External
+load: add --external-clients 4 (or 8) to poll /slots at 20Hz. Only lookups
+bracketed by adjacent polls with the same required number of processing task IDs
+qualify; this is sampled server-state evidence, not continuous GPU execution or
+proof that a processing request belongs to bench rather than another client.
+Run bench/bench.py separately with its own 4/8-session options, then run:
+  python3 tests/functional/cache_lookup.py --base-url URL --model MODEL \
+    --load-only --clients 0 --external-clients 4 --output /tmp/external-4.json
+Use --external-clients 8 for the 8-session run. Without this option external
+overlap remains unverified. No benchmark process is launched or changed here.
+Default lookup cadence is 20Hz
+(--lookup-interval-ms 50), independent of response latency, with bounded parallel
+--lookup-workers. Saturated client capacity produces explicit missed slots,
+not queued requests or silent rate reduction. In-flight HTTP is not GPU overlap.
+The report checks observed availability=100% and successful HTTP p99<5ms;
+missing overlap/samples or unmet targets remain visibly unqualified.
 
 --pin-prompt-file takes a private Chat JSON object with the original matching
 messages/tools/template settings, NOT an already-rendered --pin-prefix-file.
@@ -33,6 +52,14 @@ JSON retains only allowlisted counts/timings, synthetic labels and error codes;
 no prompts, outputs, credentials, URLs, model names or server error messages.
 No retries: all failures survive. HTTP wall includes response-body receipt but
 not client JSON parsing; lookup_ms is engine-reported, not inferred GPU time.
+index_version (uint64) and snapshot_age_ms (finite nonnegative double) are
+required (report schema v3); old responses without these fields fail schema validation. Historical
+restore/prefill estimates remain optional/nullable for compatibility. Snapshot
+age and version stats are reported; concurrent versions need not arrive in order.
+Own unfinished-conversation probes correlate the identical in-flight body with
+that generation's eventual accounting. Under-report frequency is observational,
+not proof of busy-live-frontier suppression; tier=none alone proves no cause.
+No busy_live_frontiers field is assumed until its server definition is stable.
 Percentiles use nearest rank. Exit 0: full probe passed, 1: failure,
 2: incomplete/unqualified (including too few samples or unobserved eviction).
 This is not a matched-revision speed regression gate or a restart/disk test.
@@ -45,6 +72,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+from http.client import HTTPException
 import json
 import math
 import os
@@ -62,7 +90,6 @@ TOOLS = [{"type": "function", "function": {
     "name": "read_fixture", "description": "Read a synthetic record; never executed.",
     "parameters": {"type": "object", "properties": {"index": {"type": "integer"}},
                    "required": ["index"], "additionalProperties": False}}}]
-AGENTS = 4
 MIN_SAMPLES = 200
 PRESSURE_LINEAGES = 140
 
@@ -106,8 +133,14 @@ def lookup_metrics(value):
         raise ProbeError("lookup_tier_count_disagree")
     if not number(value.get("lookup_ms")):
         raise ProbeError("lookup_invalid_lookup_ms")
+    if not integer(value.get("index_version")) or value["index_version"] > 2**64 - 1:
+        raise ProbeError("lookup_invalid_index_version")
+    if (not number(value.get("snapshot_age_ms")) or
+            value["snapshot_age_ms"] > float.fromhex("0x1.fffffffffffffp+1023")):
+        raise ProbeError("lookup_invalid_snapshot_age_ms")
     result = {key: value[key] for key in (
-        "total_tokens", "matched_tokens", "tier", "epoch", "lookup_ms")}
+        "total_tokens", "matched_tokens", "tier", "epoch", "lookup_ms",
+        "index_version", "snapshot_age_ms")}
     for key in ("restore_estimate_ms", "prefill_estimate_ms"):
         if key in value:
             if value[key] is not None and not number(value[key]):
@@ -166,6 +199,12 @@ class Client:
         self.local = threading.local()
 
     def post(self, endpoint, body):
+        return self.request(endpoint, body)
+
+    def get(self, endpoint):
+        return self.request(endpoint)
+
+    def request(self, endpoint, body=None):
         # No ambient proxy or redirect can forward a private pin request elsewhere.
         if not hasattr(self.local, "opener"):
             self.local.opener = build_opener(ProxyHandler({}), NoRedirect())
@@ -173,21 +212,23 @@ class Client:
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
         request = Request(self.root + endpoint,
-                          data=json.dumps(body, allow_nan=False).encode(), headers=headers)
+                          data=None if body is None else json.dumps(body, allow_nan=False).encode(),
+                          headers=headers)
         start = time.perf_counter()
+        status = None
         try:
             with self.local.opener.open(request, timeout=self.timeout) as response:
-                raw = response.read(8 * 1024 * 1024 + 1)
                 status = response.status
+                raw = response.read(8 * 1024 * 1024 + 1)
             wall = (time.perf_counter() - start) * 1000
             if len(raw) > 8 * 1024 * 1024:
-                raise ProbeError("response_too_large", wall_ms=wall)
+                raise ProbeError("response_too_large", http_status=status, wall_ms=wall)
             if status != 200:
                 raise ProbeError("http_status", http_status=status, wall_ms=wall)
             try:
                 value = json.loads(raw)
             except (ValueError, UnicodeError):
-                raise ProbeError("invalid_response_json", wall_ms=wall) from None
+                raise ProbeError("invalid_response_json", http_status=status, wall_ms=wall) from None
             return value, wall
         except HTTPError as error:
             code = "http_status"
@@ -210,9 +251,38 @@ class Client:
             raise ProbeError(code, http_status=error.code,
                              wall_ms=wall if wall is not None else
                              (time.perf_counter() - start) * 1000) from None
-        except (OSError, URLError):
-            raise ProbeError("transport_error",
+        except (OSError, URLError, HTTPException):
+            raise ProbeError("transport_error", http_status=status,
                              wall_ms=(time.perf_counter() - start) * 1000) from None
+
+
+def processing_tasks(value):
+    """Allowlist metadata only; task identities stay in memory for correlation."""
+    if not isinstance(value, list):
+        raise ProbeError("slots_invalid_metadata")
+    tasks, ids = set(), set()
+    for slot in value:
+        if (not isinstance(slot, dict) or not integer(slot.get("id")) or
+                slot["id"] in ids or type(slot.get("is_processing")) is not bool):
+            raise ProbeError("slots_invalid_metadata")
+        ids.add(slot["id"])
+        if slot["is_processing"]:
+            if not integer(slot.get("id_task")):
+                raise ProbeError("slots_invalid_metadata")
+            tasks.add((slot["id"], slot["id_task"]))
+    return frozenset(tasks)
+
+
+def bracketed_tasks(start, end, polls, period):
+    # Adjacent successful polls only: errors, task churn, slow/missed polling,
+    # or a lookup spanning a poll cannot be silently bridged as continuous load.
+    for left, right in zip(polls, polls[1:]):
+        a, b, before, _ = left
+        c, d, after, _ = right
+        if (before is not None and after is not None and b <= start <= end <= c
+                and d - a <= 3 * period):
+            return len(before & after)
+    return 0
 
 
 def distribution(values):
@@ -235,7 +305,11 @@ class Config:
     max_tokens: int = 8
     latency_lookups: int = 400
     load_max_tokens: int = 64
-    lookup_interval_ms: float = 25
+    lookup_interval_ms: float = 50
+    clients: int = 4
+    lookup_workers: int = 16
+    external_clients: int = 0
+    slots_interval_ms: float = 50
     load_timeout: float = 180
     images: bool = False
     pin_min_matched_tokens: int = 0
@@ -260,7 +334,7 @@ class Harness:
         self.rows, self.failures, self.uncertainties = [], [], []
         self.targets = []  # Memory only: never serialized.
         self.lock = threading.Lock()
-        self.report = {"schema": "gufo-cache-lookup-probe-v1", "status": "running",
+        self.report = {"schema": "gufo-cache-lookup-probe-v3", "status": "running",
                        "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                        "config": {key: value for key, value in vars(config).items() if key != "model"},
                        "cases": self.rows, "failures": self.failures,
@@ -347,8 +421,13 @@ class Harness:
             if strict and not matched:
                 self.fail(row, "cached_tokens_mismatch", predicted=lookup["matched_tokens"],
                           actual=actual["cached_tokens"])
-            elif not strict and not matched:
-                row["uncertainty"] = "concurrent_mutation_not_a_reservation"
+            if not strict:
+                delta = lookup["matched_tokens"] - actual["cached_tokens"]
+                row["cache_delta_tokens"] = delta
+                row["cache_comparison"] = "over_report" if delta > 0 else "under_report" if delta < 0 else "equal"
+                if delta > 0:
+                    self.fail(row, "concurrent_cached_tokens_over_report",
+                              predicted=lookup["matched_tokens"], actual=actual["cached_tokens"])
             if body.get("cache_prompt") is False and lookup["matched_tokens"] != 0:
                 self.fail(row, "lookup_cache_prompt_false_reused")
         row["status"] = self.row_status(row)
@@ -471,12 +550,45 @@ class Harness:
             self.pair("image_appended_regenerate", appended)
 
     def latency(self):
+        clients = self.config.clients
         stop = threading.Event()
-        ready = threading.Barrier(AGENTS + 1)
+        ready = threading.Barrier(clients + 1)
         active, agent_bodies = set(), {}
         condition = threading.Condition()
-        intervals, samples = [], []
+        intervals, samples, slots = [], [], []
+        polls, poll_misses = [], []
         deadline = time.perf_counter() + self.config.load_timeout
+        monitor_stop = threading.Event()
+        external = self.config.external_clients
+        poll_period = self.config.slots_interval_ms / 1000
+
+        def poll_slots():
+            start = time.perf_counter()
+            try:
+                value, _ = self.client.get("/slots")
+                tasks = processing_tasks(value)
+                polls.append((start, time.perf_counter(), tasks, None))
+            except ProbeError as error:
+                # Error text, slot prompts, model names and task IDs never escape.
+                polls.append((start, time.perf_counter(), None, error.code))
+            except Exception:
+                polls.append((start, time.perf_counter(), None, "slots_worker_exception"))
+
+        def monitor():
+            origin, index = time.perf_counter(), 0
+            while not monitor_stop.is_set() and time.perf_counter() < deadline:
+                scheduled = origin + index * poll_period
+                if monitor_stop.wait(max(0, scheduled - time.perf_counter())):
+                    break
+                now = time.perf_counter()
+                if now - scheduled >= poll_period:
+                    skipped = int((now - scheduled) / poll_period)
+                    poll_misses.append(skipped)
+                    index += skipped
+                poll_slots()
+                index += 1
+
+        capacity = threading.BoundedSemaphore(self.config.lookup_workers)
 
         def worker(agent):
             turn, body = 0, None
@@ -488,7 +600,7 @@ class Harness:
                     body["max_completion_tokens"] = self.config.load_max_tokens
                 with condition:
                     active.add(agent)
-                    agent_bodies[agent] = body
+                    agent_bodies[agent] = (body, f"load_agent_{agent}_turn_{turn:04d}")
                     condition.notify_all()
                 try:
                     message, row = self.pair(f"load_agent_{agent}_turn_{turn:04d}", body, strict=False)
@@ -500,41 +612,113 @@ class Harness:
                     body = self.append(body, message, "Continue the numbered list for another 100 lines.")
                 turn += 1
                 if row.get("failures"):
-                    stop.wait(.05)  # Bound error storms; failures are never retried/erased.
+                    stop.wait(.05)  # Bound error storms; never erase failures.
 
-        with ThreadPoolExecutor(max_workers=AGENTS) as pool:
-            futures = [pool.submit(worker, agent) for agent in range(AGENTS)]
+        def sample(row, body, scheduled):
+            start = time.perf_counter()
+            row["dispatch_lag_ms"] = max(0, (start - scheduled) * 1000)
+            row["lookup_attempted"] = True
+            try:
+                self.lookup(row, body, allow_busy=True)
+            except Exception:
+                row["lookup_error_code"] = "worker_exception"
+                self.fail(row, "worker_exception")
+            finally:
+                samples.append((start, time.perf_counter(), row))
+                row["status"] = self.row_status(row)
+                capacity.release()
+
+        monitor_thread = threading.Thread(target=monitor, daemon=True) if external else None
+        if monitor_thread:
+            monitor_thread.start()
+            # Startup is bounded; insufficient external load remains unqualified.
+            until = min(deadline, time.perf_counter() + 5)
+            while time.perf_counter() < until and not any(
+                    tasks is not None and len(tasks) >= external for _, _, tasks, _ in polls):
+                time.sleep(min(.01, poll_period))
+
+        # Separate pools: slow lookups must not consume generation workers or
+        # serialize the launch clock. No unbounded queue of stale lookup work.
+        with ThreadPoolExecutor(max_workers=max(1, clients)) as pool, \
+                ThreadPoolExecutor(max_workers=self.config.lookup_workers) as lookup_pool:
+            futures = [pool.submit(worker, agent) for agent in range(clients)]
+            sample_futures = []
             ready.wait()
             with condition:
-                condition.wait_for(lambda: len(active) == AGENTS,
+                condition.wait_for(lambda: len(active) == clients,
                                    timeout=min(5, self.config.load_timeout))
+            origin = time.perf_counter()
+            period = self.config.lookup_interval_ms / 1000
             try:
                 for index in range(self.config.latency_lookups):
-                    if time.perf_counter() >= deadline:
+                    scheduled = origin + index * period
+                    if scheduled >= deadline:
                         self.uncertain("load_deadline_before_all_samples")
                         break
-                    with condition:
-                        current = agent_bodies.get((index // 2) % AGENTS) if index % 2 == 0 else None
-                    body = current or (self.targets[index % len(self.targets)]
-                                       if self.targets else self.body("latency"))
+                    stop.wait(max(0, scheduled - time.perf_counter()))
+                    now = time.perf_counter()
+                    if now >= deadline:
+                        self.uncertain("load_deadline_before_all_samples")
+                        break
                     row = {"case": f"latency_{index:04d}", "phase": "load_lookup",
-                           "target_kind": "current_agent_history" if current else "prior_history"}
+                           "scheduled_offset_ms": index * self.config.lookup_interval_ms,
+                           "lookup_attempted": False}
                     self.rows.append(row)
-                    start = time.perf_counter()
-                    self.lookup(row, body, allow_busy=True)
-                    end = time.perf_counter()
-                    samples.append((start, end, row))
-                    row["status"] = self.row_status(row)
-                    stop.wait(self.config.lookup_interval_ms / 1000)
+                    slots.append(row)
+                    # Do not burst-replay slots missed by the launch thread.
+                    if period and now - scheduled >= period:
+                        row["lookup_error_code"] = "client_cadence_missed"
+                        row["status"] = "missed"
+                        continue
+                    if not capacity.acquire(blocking=False):
+                        row["lookup_error_code"] = "client_capacity_missed"
+                        row["status"] = "missed"
+                        continue
+                    with condition:
+                        current = agent_bodies.get((index // 2) % clients) if clients and index % 2 == 0 else None
+                    body = current[0] if current else (self.targets[index % len(self.targets)]
+                                                      if self.targets else self.body("latency"))
+                    row["target_kind"] = "current_agent_history" if current else "prior_history"
+                    if current:
+                        row["own_generation_case"] = current[1]
+                    sample_futures.append(lookup_pool.submit(sample, row, body, scheduled))
+                # Keep load active until the final sample finishes, not merely
+                # until its launch. Each HTTP request has its own timeout.
+                for future in sample_futures:
+                    try:
+                        future.result()
+                    except Exception:
+                        self.fail({"case": "lookup_worker", "phase": "load_lookup"}, "worker_exception")
             finally:
                 stop.set()
+                monitor_stop.set()
             for future in futures:
                 try:
                     future.result()
                 except Exception:
                     self.fail({"case": "load_worker", "phase": "load_diagnostic"}, "worker_exception")
+        if monitor_thread:
+            # A final poll brackets even the last completed lookup. Do not race
+            # poll_slots with the monitor's HTTP request.
+            monitor_stop.set()
+            monitor_thread.join()
+            poll_slots()
         completed = Counter()
-        windows = {agent: [] for agent in range(AGENTS)}
+        own_generations = {row["case"]: row for _, row in intervals}
+        for start, end, row in samples:
+            generation = own_generations.get(row.get("own_generation_case"))
+            if generation is not None:
+                a, b = generation["_generation_interval"]
+                row["own_generation_covers_lookup"] = a <= start and b >= end
+                if row["own_generation_covers_lookup"] and "lookup" in row and "actual" in generation:
+                    actual = generation["actual"]
+                    row["own_generation_total_agrees"] = row["lookup"]["total_tokens"] == actual["total_tokens"]
+                    if row["own_generation_total_agrees"]:
+                        # This is an in-flight observation, not the pre-request
+                        # pair contract: no causal inference from this delta.
+                        row["own_generation_cache_delta_tokens"] = (
+                            row["lookup"]["matched_tokens"] - actual["cached_tokens"])
+        windows = {agent: [] for agent in range(clients)}
         for agent, row in intervals:
             start, end = row.pop("_generation_interval")
             windows[agent].append((start, end))
@@ -545,27 +729,120 @@ class Harness:
                 any(a < end and b > start for a, b in windows[agent]) for agent in windows)
             row["generation_agents_covering_entire_lookup"] = sum(
                 any(a <= start and b >= end for a, b in windows[agent]) for agent in windows)
-        covered = [row for _, _, row in samples
-                   if row["generation_agents_covering_entire_lookup"] == AGENTS]
-        self.report["load"] = {"agents": AGENTS,
-                               "completed_generations_with_tokens": [completed[i] for i in range(AGENTS)],
-                               "samples_fully_covered_by_four_generations": len(covered),
-                               "latency_all_samples_ms": self.latencies([row for _, _, row in samples]),
-                               "latency_four_generation_overlap_ms": self.latencies(covered),
-                               "availability_all_samples": self.availability([row for _, _, row in samples]),
-                               "availability_four_generation_overlap": self.availability(covered),
-                               "diagnostic_pair_lookup_availability": self.availability([row for _, row in intervals]),
-                               "overlap_is_http_in_flight_not_gpu_execution": True}
-        if not all(completed[i] for i in range(AGENTS)):
-            self.uncertain("not_all_four_agents_completed_generation")
-        if len(covered) < MIN_SAMPLES:
-            self.uncertain("fewer_than_200_lookups_fully_overlapping_four_generation_requests")
-        if not any("lookup" in row for row in covered):
-            self.uncertain("no_engine_lookup_ms_under_full_four_agent_load")
+        covered = [row for _, _, row in samples if clients and
+                   row["generation_agents_covering_entire_lookup"] == clients]
+        attempted = [row for row in slots if row["lookup_attempted"]]
+        missed = len(slots) - len(attempted)
+        external_covered = []
+        if external:
+            for start, end, row in samples:
+                row["external_processing_tasks_bracketed"] = bracketed_tasks(
+                    start, end, polls, poll_period)
+                if row["external_processing_tasks_bracketed"] >= external:
+                    external_covered.append(row)
+        measured = covered if clients else external_covered if external else attempted
+        available = self.availability(measured)["available_rate"]
+        p99 = self.latencies(measured)["http_200_wall"]["p99"]
+        all_available = self.availability(attempted)["available_rate"]
+        all_p99 = self.latencies(attempted)["http_200_wall"]["p99"]
+        target_met = (available == 1 and p99 is not None and p99 < 5 and
+                      all_available == 1 and all_p99 is not None and all_p99 < 5)
+        starts = sorted(start for start, _, _ in samples)
+        self.report["load"] = {
+            "agents": clients,
+            "external_load_overlap_unverified": clients == 0 and not external_covered,
+            "external_slots": {
+                "required_processing_tasks": external,
+                "poll_interval_ms": self.config.slots_interval_ms,
+                "polls": len(polls), "missed_poll_slots": sum(poll_misses),
+                "includes_final_tail_bracket_poll": bool(external),
+                "poll_http_wall_ms": distribution([(end - start) * 1000
+                                                   for start, end, _, _ in polls]),
+                "observed_poll_intervals_ms": distribution([
+                    (right[0] - left[0]) * 1000 for left, right in zip(polls, polls[1:])]),
+                "successful_polls": sum(tasks is not None for _, _, tasks, _ in polls),
+                "processing_counts": distribution([len(tasks) for _, _, tasks, _ in polls
+                                                   if tasks is not None]),
+                "error_codes": dict(Counter(error for _, _, _, error in polls if error)),
+                "bracketed_lookup_samples": len(external_covered),
+                "latency_bracketed_samples_ms": self.latencies(external_covered),
+                "availability_bracketed_samples": self.availability(external_covered),
+                "snapshot_metadata_bracketed_samples": self.snapshot_stats(external_covered),
+                "workload_attribution_verified": False,
+                "evidence": "adjacent_polls_same_processing_task_ids_not_continuous_gpu_proof"},
+            "own_unfinished_conversation_observations": self.own_busy_observations(attempted),
+            "completed_generations_with_tokens": [completed[i] for i in range(clients)],
+            "samples_fully_covered_by_all_generations": len(covered),
+            "latency_all_samples_ms": self.latencies(attempted),
+            "latency_full_generation_overlap_ms": self.latencies(covered),
+            "snapshot_metadata_full_generation_overlap": self.snapshot_stats(covered),
+            "availability_all_samples": self.availability(attempted),
+            "availability_full_generation_overlap": self.availability(covered),
+            "diagnostic_pair_lookup_availability": self.availability([row for _, row in intervals]),
+            "concurrent_pair_comparisons": self.comparisons([row for _, row in intervals]),
+            "cadence": {"interval_ms": self.config.lookup_interval_ms,
+                        "target_hz": 1000 / self.config.lookup_interval_ms if period else None,
+                        "requested_slots": self.config.latency_lookups, "scheduled_slots": len(slots),
+                        "attempted_slots": len(attempted), "missed_slots": missed,
+                        "unlaunched_slots": self.config.latency_lookups - len(slots),
+                        "missed_codes": dict(Counter(row["lookup_error_code"] for row in slots
+                                                     if not row["lookup_attempted"])),
+                        "dispatch_lag_ms": distribution([row["dispatch_lag_ms"] for row in attempted]),
+                        "observed_launch_intervals_ms": distribution([
+                            (b - a) * 1000 for a, b in zip(starts, starts[1:])])},
+            "acceptance_target": {"available_rate": 1, "successful_http_p99_ms_lt": 5,
+                                  "observed_target_met": target_met,
+                                  "observed_available_rate": available,
+                                  "observed_successful_http_p99_ms": p99,
+                                  "scope": ("all_samples_and_full_http_overlap" if clients else
+                                            "all_samples_and_slots_brackets" if external else
+                                            "external_load_unverified")},
+            "overlap_is_http_in_flight_not_gpu_execution": True}
+        if clients and not all(completed[i] for i in range(clients)):
+            self.uncertain("not_all_agents_completed_generation")
+        if len(measured) < MIN_SAMPLES:
+            self.uncertain("fewer_than_200_load_samples_at_required_overlap")
+        if not any("lookup" in row for row in measured):
+            self.uncertain("no_engine_lookup_ms_under_measured_load")
+        if missed:
+            self.uncertain("lookup_launch_cadence_missed")
+        if not target_met:
+            self.uncertain("load_availability_or_http_p99_target_not_met")
+        if not clients and not external_covered:
+            self.uncertain("external_generation_load_not_verified")
+        if external and (poll_misses or any(error for _, _, _, error in polls)):
+            self.uncertain("external_slots_polling_incomplete")
+
+    @staticmethod
+    def own_busy_observations(rows):
+        targeted = [row for row in rows if "own_generation_case" in row]
+        covered = [row for row in targeted if row.get("own_generation_covers_lookup")]
+        compared = [row for row in covered if "own_generation_cache_delta_tokens" in row]
+        under = sum(row["own_generation_cache_delta_tokens"] < 0 for row in compared)
+        return {"targeted_samples": len(targeted), "fully_in_flight_samples": len(covered),
+                "compared_samples": len(compared), "uncompared_in_flight_samples": len(covered) - len(compared),
+                "under_report_count": under,
+                "under_report_rate": under / len(compared) if compared else None,
+                "equal_count": sum(row["own_generation_cache_delta_tokens"] == 0 for row in compared),
+                "over_report_count": sum(row["own_generation_cache_delta_tokens"] > 0 for row in compared),
+                "suppression_cause_verified": False,
+                "basis": "same_body_own_in_flight_generation_eventual_accounting_not_tier",
+                "busy_live_frontier_suppression_count": None}
+
+    @staticmethod
+    def snapshot_stats(rows):
+        values = [row["lookup"] for row in rows if "lookup" in row]
+        versions = [value["index_version"] for value in values]
+        return {"snapshot_age_ms": distribution([value["snapshot_age_ms"] for value in values]),
+                "index_version": {"n": len(versions), "min": min(versions) if versions else None,
+                                  "max": max(versions) if versions else None,
+                                  "distinct": len(set(versions))},
+                "version_order_checked": False}
 
     @staticmethod
     def row_status(row):
-        return "failed" if row.get("failures") else "busy" if row.get("lookup_busy") else "passed"
+        return ("failed" if row.get("failures") else "missed" if row.get("lookup_attempted") is False
+                else "busy" if row.get("lookup_busy") else "passed")
 
     @staticmethod
     def availability(rows):
@@ -574,13 +851,29 @@ class Harness:
         return {"attempts": len(rows), "available_200": available, "busy_503": busy,
                 "other_failures": len(rows) - available - busy,
                 "available_rate": available / len(rows) if rows else None,
-                "busy_rate": busy / len(rows) if rows else None}
+                "busy_rate": busy / len(rows) if rows else None,
+                "http_status_counts": dict(Counter(str(row.get("lookup_http_status")) for row in rows)),
+                "error_code_counts": dict(Counter(row["lookup_error_code"] for row in rows
+                                                  if "lookup_error_code" in row))}
+
+    @staticmethod
+    def comparisons(rows):
+        compared = [row for row in rows if "cache_comparison" in row]
+        over = sum(row["cache_comparison"] == "over_report" for row in compared)
+        under = sum(row["cache_comparison"] == "under_report" for row in compared)
+        return {"pairs": len(rows), "compared_pairs": len(compared),
+                "uncompared_pairs": len(rows) - len(compared),
+                "over_report_count": over, "under_report_count": under,
+                "over_report_rate": over / len(compared) if compared else None,
+                "under_report_rate": under / len(compared) if compared else None,
+                "equal_count": len(compared) - over - under,
+                "observations_not_reservation_guarantees": True}
 
     @staticmethod
     def latencies(rows):
         return {"http_wall": distribution([row["lookup_wall_ms"] for row in rows if "lookup_wall_ms" in row]),
                 "http_200_wall": distribution([row["lookup_wall_ms"] for row in rows
-                                                if row.get("lookup_http_status") == 200]),
+                                                if "lookup" in row]),
                 "http_503_busy_wall": distribution([row["lookup_wall_ms"] for row in rows
                                                      if row.get("lookup_busy")]),
                 "engine_lookup": distribution([row["lookup"]["lookup_ms"] for row in rows if "lookup" in row])}
@@ -595,14 +888,18 @@ class Harness:
         for tier in self.config.required_tiers:
             if not tiers[tier]:
                 self.uncertain("required_tier_not_observed_" + tier)
-        if len([r for r in sequential if "cache_equal" in r]) < MIN_SAMPLES:
+        if self.report.get("scope", {}).get("sequential_requires_exclusive_server") and len(
+                [r for r in sequential if "cache_equal" in r]) < MIN_SAMPLES:
             self.uncertain("fewer_than_200_sequential_comparisons")
         self.report["summary"] = {
             "sequential_pairs": len(sequential),
             "sequential_cache_mismatches": sum(r.get("cache_equal") is False for r in sequential),
-            "concurrent_cache_mismatches_not_failures": sum(r.get("cache_equal") is False for r in diagnostic),
+            "concurrent_pair_comparisons": self.comparisons(diagnostic),
             "tier_counts": dict(tiers), "failure_count": len(self.failures),
-            "sequential_latency_ms": self.latencies(sequential)}
+            "sequential_latency_ms": self.latencies(sequential),
+            "snapshot_metadata_all": self.snapshot_stats(self.rows),
+            "snapshot_metadata_load_samples": self.snapshot_stats([
+                row for row in self.rows if row["phase"] == "load_lookup"])}
         self.report["status"] = "failed" if self.failures else "unqualified" if self.uncertainties else "passed"
         return self.report
 
@@ -610,12 +907,15 @@ class Harness:
         try:
             if phase in ("all", "exactness"):
                 self.sequential()
+            elif phase == "load":
+                self.report["scope"]["sequential_requires_exclusive_server"] = False
+                self.report["scope"]["sequential_exactness_tested"] = False
             else:
                 self.uncertain("sequential_exactness_not_run")
-            if phase in ("all", "latency"):
+            if phase in ("all", "latency", "load"):
                 self.latency()
             else:
-                self.uncertain("four_agent_latency_not_run")
+                self.uncertain("concurrent_latency_not_run")
         except KeyboardInterrupt:
             self.uncertain("interrupted")
         except Exception:
@@ -629,7 +929,10 @@ def main(argv=None):
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True, type=Path, help="new JSON file, never overwritten")
-    parser.add_argument("--phase", choices=("all", "exactness", "latency"), default="all")
+    phase = parser.add_mutually_exclusive_group()
+    phase.add_argument("--phase", choices=("all", "exactness", "latency"), default="all")
+    phase.add_argument("--load-only", action="store_const", dest="phase", const="load",
+                       help="measure load only; no idle suite or exclusive-server acknowledgement")
     parser.add_argument("--exclusive", action="store_true", help="acknowledge no other server clients during exactness")
     parser.add_argument("--rounds", type=int, default=32)
     parser.add_argument("--pressure-lineages", type=int, default=PRESSURE_LINEAGES)
@@ -638,22 +941,35 @@ def main(argv=None):
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--latency-lookups", type=int, default=400)
     parser.add_argument("--load-max-tokens", type=int, default=64)
-    parser.add_argument("--lookup-interval-ms", type=float, default=25)
+    parser.add_argument("--lookup-interval-ms", type=float, default=50,
+                        help="fixed launch period, not a post-response sleep (default: 20Hz)")
+    parser.add_argument("--clients", type=int, choices=(0, 4, 8), default=4,
+                        help="generation sessions; 0 for separately launched external bench load")
+    parser.add_argument("--lookup-workers", type=int, default=16,
+                        help="maximum simultaneous lookup HTTP requests; missed slots are reported")
+    parser.add_argument("--external-clients", type=int, choices=(0, 4, 8), default=0,
+                        help="with --clients 0, verify external load via metadata-only /slots polling")
+    parser.add_argument("--slots-interval-ms", type=float, default=50,
+                        help="fixed /slots poll period; missed polls never burst-replay")
     parser.add_argument("--load-timeout", type=float, default=180,
-                        help="load launch budget in seconds; in-flight HTTP may finish up to request-timeout later")
+                        help="launch budget in seconds; in-flight pairs may take 2*request-timeout to drain")
     parser.add_argument("--request-timeout", type=float, default=120)
     parser.add_argument("--images", action="store_true")
     parser.add_argument("--pin-prompt-file", type=Path, help="private matching Chat JSON, not rendered prefix text")
     parser.add_argument("--pin-min-matched-tokens", type=int, default=0)
     parser.add_argument("--require-tier", action="append", choices=("live", "ram", "disk", "none"), default=[])
     args = parser.parse_args(argv)
-    if args.phase != "latency" and not args.exclusive:
+    if args.phase in ("all", "exactness") and not args.exclusive:
         parser.error("exactness requires --exclusive and an allocated server with no other clients")
-    if (any(getattr(args, key) < 1 for key in ("rounds", "max_tokens", "latency_lookups", "load_max_tokens")) or
+    if args.external_clients and (args.clients != 0 or args.phase not in ("load", "latency")):
+        parser.error("--external-clients requires --clients 0 and --load-only or --phase latency")
+    if (any(getattr(args, key) < 1 for key in ("rounds", "max_tokens", "latency_lookups",
+                                             "load_max_tokens", "lookup_workers")) or
             any(getattr(args, key) < 0 for key in ("pressure_lineages", "system_lines", "pressure_lines",
                                                  "pin_min_matched_tokens")) or
             not number(args.lookup_interval_ms) or
-            any(not number(v) or v == 0 for v in (args.request_timeout, args.load_timeout))):
+            any(not number(v) or v == 0 for v in (
+                args.request_timeout, args.load_timeout, args.slots_interval_ms))):
         parser.error("counts/deadlines must be finite and positive; line counts/interval/depth may be zero")
     if args.pin_min_matched_tokens and args.pin_prompt_file is None:
         parser.error("--pin-min-matched-tokens requires --pin-prompt-file")

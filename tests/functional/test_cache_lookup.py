@@ -17,7 +17,8 @@ import unittest
 import zlib
 
 from cache_lookup import (Client, Config, Harness, ProbeError, distribution,
-                          generation_metrics, lookup_metrics, main, png_url)
+                          bracketed_tasks, generation_metrics, lookup_metrics, main,
+                          png_url, processing_tasks)
 
 
 class Engine:
@@ -30,17 +31,33 @@ class Engine:
         self.calls = []
         self.lock = threading.Lock()
         self.generation_delay = 0
+        self.lookup_delay = 0
+        self.lookup_delta = 0
         self.cache_delta = 0
         self.total_delta = 0
         self.fail_lookup = False
         self.busy_lookup = False
         self.fail_generation = False
         self.invalid_lookup = None
+        self.slots_value = [{"id": i, "id_task": 987654321 + i, "is_processing": True,
+                             "prompt": "PRIVATE_SLOT_PROMPT", "model": "PRIVATE_MODEL"}
+                            for i in range(8)]
+        self.slots_error = False
+        self.slots_delay = 0
+
+    def get(self, endpoint):
+        assert endpoint == "/slots"
+        time.sleep(self.slots_delay)
+        if self.slots_error:
+            raise ProbeError("http_status", http_status=503, wall_ms=.1)
+        return deepcopy(self.slots_value), .5
 
     def post(self, endpoint, body):
         body = deepcopy(body)
         if endpoint == "/v1/chat/completions":
             time.sleep(self.generation_delay)
+        else:
+            time.sleep(self.lookup_delay)
         with self.lock:
             self.calls.append((endpoint, body))
             rendered = json.dumps({k: body[k] for k in (
@@ -54,9 +71,11 @@ class Engine:
                     raise ProbeError("http_status", http_status=503, wall_ms=.1)
                 if self.busy_lookup:
                     raise ProbeError("cache_lookup_busy", http_status=503, wall_ms=.2)
+                matched = max(0, cached - self.lookup_delta)
                 result = {"total_tokens": total + self.total_delta,
-                          "matched_tokens": cached, "tier": "ram" if cached else "none",
+                          "matched_tokens": matched, "tier": "ram" if matched else "none",
                           "epoch": "fixture-opaque-epoch-" + str(self.epoch), "lookup_ms": .125,
+                          "index_version": self.epoch, "snapshot_age_ms": .25,
                           "restore_estimate_ms": None, "prefill_estimate_ms": 0,
                           "untrusted_extra": "PRIVATE_RESPONSE_AND_PROMPT"}
                 if self.invalid_lookup:
@@ -109,10 +128,27 @@ def fake_http(engine, raw_response=None, redirect=False):
             self.end_headers()
             self.wfile.write(raw)
 
+        def do_GET(self):
+            try:
+                value, _ = engine.get(self.path)
+                status, raw = 200, json.dumps(value).encode()
+            except ProbeError as error:
+                status = error.metrics.get("http_status", 500)
+                raw = b'{"error":{"message":"PRIVATE_SLOT_ERROR"}}'
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(raw)
+
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(ThreadingHTTPServer):
+        request_queue_size = 64
+
+    server = Server(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -142,6 +178,48 @@ class AccountingTests(unittest.TestCase):
                        {"matched_tokens": 1000000}, {"tier": "live"}):
             with self.subTest(change=change), self.assertRaises(ProbeError):
                 lookup_metrics({**baseline, **change})
+
+    def test_snapshot_metadata_required_uint64_and_finite_age(self):
+        baseline, _ = Engine().post("/v1/cache/lookup", {"messages": []})
+        for version in (0, 2**64 - 1):
+            for age in (0, 0.0, 12.5):
+                parsed = lookup_metrics({**baseline, "index_version": version, "snapshot_age_ms": age})
+                self.assertEqual((parsed["index_version"], parsed["snapshot_age_ms"]), (version, age))
+        for key, bad in (("index_version", (-1, True, 1.0, 2**64, None, "PRIVATE")),
+                         ("snapshot_age_ms", (-1, True, float("inf"), float("nan"), 10**400, None, "PRIVATE"))):
+            for value in bad:
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ProbeError, "lookup_invalid_" + key):
+                    lookup_metrics({**baseline, key: value})
+            missing = dict(baseline)
+            del missing[key]
+            with self.assertRaisesRegex(ProbeError, "lookup_invalid_" + key):
+                lookup_metrics(missing)
+
+    def test_slots_metadata_and_adjacent_brackets_reject_churn_errors_and_gaps(self):
+        tasks = processing_tasks(Engine().slots_value)
+        self.assertEqual(len(tasks), 8)
+        polls = [(0, .001, tasks, None), (.05, .051, tasks, None)]
+        self.assertEqual(bracketed_tasks(.01, .02, polls, .05), 8)
+        churned = frozenset((slot, task + 1) for slot, task in tasks)
+        self.assertEqual(bracketed_tasks(.01, .02, [polls[0], (.05, .051, churned, None)], .05), 0)
+        self.assertEqual(bracketed_tasks(.01, .02, [polls[0], (.05, .051, None, "error")], .05), 0)
+        self.assertEqual(bracketed_tasks(.01, .02, [polls[0], (.2, .201, tasks, None)], .05), 0)
+        self.assertEqual(bracketed_tasks(.0005, .02, polls, .05), 0)
+        self.assertEqual(bracketed_tasks(.01, .06, polls, .05), 0)
+        for value in ({}, [{"id": 0, "is_processing": 1}],
+                      [{"id": 0, "is_processing": True, "id_task": -1}],
+                      [{"id": 0, "is_processing": False}] * 2):
+            with self.assertRaisesRegex(ProbeError, "slots_invalid_metadata"):
+                processing_tasks(value)
+
+    def test_snapshot_stats_keep_age_distribution_and_do_not_assume_version_order(self):
+        rows = [{"lookup": {"snapshot_age_ms": age, "index_version": version}}
+                for version, age in ((9, 1), (7, 4), (9, 3))]
+        stats = Harness.snapshot_stats(rows + [{"lookup_error_code": "cache_lookup_busy"}])
+        self.assertEqual(stats["index_version"], {"n": 3, "min": 7, "max": 9, "distinct": 2})
+        self.assertEqual(stats["snapshot_age_ms"], distribution([1, 4, 3]))
+        self.assertFalse(stats["version_order_checked"])
+        self.assertIsNone(Harness.snapshot_stats([])["index_version"]["min"])
 
     def test_generation_requires_both_cache_sources_and_total_prompt_accounting(self):
         value, _ = Engine().post("/v1/chat/completions", {"messages": []})
@@ -183,10 +261,10 @@ class WorkloadTests(unittest.TestCase):
 
     def test_hundreds_case_default_histories_match_and_keep_identical_pair_payloads(self):
         engine = Engine()
-        runner = Harness(engine, Config("fixture"))
+        runner = Harness(engine, Config("fixture", images=True))
         runner.sequential()
         report = runner.finish()
-        self.assertEqual(report["summary"]["sequential_pairs"], 320 + 140 + 9)
+        self.assertEqual(report["summary"]["sequential_pairs"], 477)
         self.assertEqual(report["failures"], [])
         self.assertGreater(report["pressure"]["anchors_with_retention_drop"], 0)
         self.assertEqual(len(engine.calls), 2 * len(runner.rows))
@@ -256,7 +334,7 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(dropped["messages"][-2]["reasoning_content"], reasoning)
         self.assertNotIn("reasoning_content", appended["messages"][-2])
 
-    def test_strict_mismatches_fail_but_concurrent_cache_mismatch_is_uncertainty(self):
+    def test_strict_equality_and_concurrent_over_report_both_fail(self):
         engine = Engine()
         runner = self.runner(engine)
         body = runner.body("fixture")
@@ -265,11 +343,12 @@ class WorkloadTests(unittest.TestCase):
         _, strict = runner.pair("strict", body)
         _, concurrent = runner.pair("concurrent", body, strict=False)
         self.assertIn("cached_tokens_mismatch", strict["failures"])
-        self.assertEqual(concurrent["status"], "passed")
-        self.assertEqual(concurrent["uncertainty"], "concurrent_mutation_not_a_reservation")
+        self.assertEqual(concurrent["status"], "failed")
+        self.assertIn("concurrent_cached_tokens_over_report", concurrent["failures"])
+        self.assertEqual(concurrent["cache_comparison"], "over_report")
         concurrent.pop("_generation_interval")
         report = runner.finish()
-        self.assertEqual(report["summary"]["concurrent_cache_mismatches_not_failures"], 1)
+        self.assertEqual(report["summary"]["concurrent_pair_comparisons"]["over_report_count"], 1)
         self.assertEqual(report["summary"]["sequential_cache_mismatches"], 1)
 
     def test_busy_is_recorded_without_retry_only_under_load(self):
@@ -410,11 +489,161 @@ class HttpTests(unittest.TestCase):
             self.assertNotIn("PRIVATE", str(caught.exception))
             self.assertLessEqual(len(engine.calls), 1)
 
+    def test_http_concurrent_over_report_is_hard_failure_not_a_race_exception(self):
+        engine = Engine()
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), Config("fixture"))
+            body = runner.body("PRIVATE_PROMPT")
+            runner.pair("seed", body)
+            engine.cache_delta = 3
+            _, row = runner.pair("over_report", body, strict=False)
+        report = runner.finish()
+        self.assertEqual(row["cache_delta_tokens"], 3)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("concurrent_cached_tokens_over_report", row["failures"])
+        stats = report["summary"]["concurrent_pair_comparisons"]
+        self.assertEqual((stats["over_report_count"], stats["over_report_rate"]), (1, 1))
+        self.assertEqual(stats["under_report_count"], 0)
+        self.assertEqual(engine.calls[-2][1], engine.calls[-1][1])
+        self.assertNotIn("PRIVATE", json.dumps(report))
+
+    def test_http_under_report_is_measured_with_compared_pair_denominator(self):
+        engine = Engine()
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), Config("fixture"))
+            body = runner.body("PRIVATE_PROMPT")
+            runner.pair("seed", body)
+            engine.lookup_delta = 2
+            _, under = runner.pair("under_report", body, strict=False)
+            # Idle equality remains strict in the under-report direction too.
+            _, strict = runner.pair("idle_under_report", body)
+            engine.lookup_delta = 0
+            runner.pair("equal", body, strict=False)
+            engine.busy_lookup = True
+            runner.pair("uncompared", body, strict=False)
+        report = runner.finish()
+        stats = report["summary"]["concurrent_pair_comparisons"]
+        self.assertEqual(under["cache_delta_tokens"], -2)
+        self.assertEqual(under["status"], "passed")
+        self.assertIn("cached_tokens_mismatch", strict["failures"])
+        self.assertEqual(stats["pairs"], 3)
+        self.assertEqual(stats["compared_pairs"], 2)
+        self.assertEqual(stats["uncompared_pairs"], 1)
+        self.assertEqual(stats["under_report_count"], 1)
+        self.assertEqual(stats["under_report_rate"], .5)
+        self.assertEqual(stats["over_report_count"], 0)
+        self.assertNotIn("PRIVATE", json.dumps(report))
+
+    def test_successful_only_latency_excludes_http_200_schema_and_json_errors(self):
+        engine = Engine()
+        engine.invalid_lookup = {"lookup_ms": "PRIVATE"}
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), Config("fixture"))
+            _, schema_row = runner.pair("schema_error", runner.body("fixture"), strict=False)
+        with fake_http(engine, raw_response=b"PRIVATE not json") as url:
+            runner.client = Client(url, timeout=2)
+            json_row = {"case": "json_error", "phase": "load_lookup"}
+            runner.lookup(json_row, runner.body("fixture"), allow_busy=True)
+        stats = runner.availability([schema_row, json_row])
+        self.assertEqual(stats["available_200"], 0)
+        self.assertEqual(stats["other_failures"], 2)
+        self.assertEqual(stats["http_status_counts"], {"200": 2})
+        self.assertEqual(stats["error_code_counts"], {"lookup_invalid_lookup_ms": 1,
+                                                     "invalid_response_json": 1})
+        latency = runner.latencies([schema_row, json_row])
+        self.assertEqual(latency["http_wall"]["n"], 2)
+        self.assertEqual(latency["http_200_wall"]["n"], 0)
+        self.assertEqual(latency["engine_lookup"]["n"], 0)
+
+    def test_fixed_cadence_dispatches_slow_http_concurrently(self):
+        engine = Engine()
+        engine.lookup_delay = .12
+        config = Config("fixture", clients=0, latency_lookups=12, lookup_workers=8,
+                        lookup_interval_ms=25, load_timeout=3)
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), config)
+            report = runner.run("load")
+        cadence = report["load"]["cadence"]
+        self.assertEqual(cadence["scheduled_slots"], 12)
+        self.assertEqual(cadence["attempted_slots"], 12)
+        self.assertEqual(cadence["missed_slots"], 0)
+        self.assertEqual(cadence["unlaunched_slots"], 0)
+        self.assertEqual(cadence["target_hz"], 40)
+        self.assertLess(cadence["observed_launch_intervals_ms"]["p50"], 70)
+        self.assertGreater(report["load"]["latency_all_samples_ms"]["http_200_wall"]["p50"], 100)
+        self.assertEqual([row["scheduled_offset_ms"] for row in runner.rows], list(range(0, 300, 25)))
+        self.assertTrue(all(endpoint == "/v1/cache/lookup" for endpoint, _ in engine.calls))
+        self.assertTrue(report["load"]["external_load_overlap_unverified"])
+        self.assertEqual(report["load"]["samples_fully_covered_by_all_generations"], 0)
+
+    def test_client_capacity_missed_slots_are_counted_not_queued(self):
+        engine = Engine()
+        engine.lookup_delay = .12
+        config = Config("fixture", clients=0, latency_lookups=12, lookup_workers=1,
+                        lookup_interval_ms=25, load_timeout=3)
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), config)
+            report = runner.run("load")
+        cadence = report["load"]["cadence"]
+        self.assertGreater(cadence["missed_slots"], 0)
+        self.assertEqual(cadence["attempted_slots"] + cadence["missed_slots"], 12)
+        self.assertEqual(cadence["attempted_slots"], len(engine.calls))
+        self.assertEqual(sum(cadence["missed_codes"].values()), cadence["missed_slots"])
+        self.assertIn("client_capacity_missed", cadence["missed_codes"])
+        self.assertIn("lookup_launch_cadence_missed", report["uncertainties"])
+        self.assertEqual(sum(row["status"] == "missed" for row in runner.rows), cadence["missed_slots"])
+
+    def test_launch_thread_delay_records_missed_cadence_without_burst_replay(self):
+        class SlowBodyHarness(Harness):
+            def body(self, *args, **kwargs):
+                time.sleep(.06)
+                return super().body(*args, **kwargs)
+
+        config = Config("fixture", clients=0, latency_lookups=20,
+                        lookup_interval_ms=10, load_timeout=2)
+        with fake_http(Engine()) as url:
+            report = SlowBodyHarness(Client(url, timeout=2), config).run("load")
+        cadence = report["load"]["cadence"]
+        self.assertGreater(cadence["missed_codes"]["client_cadence_missed"], 0)
+        self.assertEqual(cadence["attempted_slots"] + cadence["missed_slots"], 20)
+        self.assertIn("lookup_launch_cadence_missed", report["uncertainties"])
+
+    def test_deadline_records_slots_never_launched(self):
+        config = Config("fixture", clients=0, latency_lookups=20,
+                        lookup_interval_ms=50, load_timeout=.12)
+        with fake_http(Engine()) as url:
+            report = Harness(Client(url, timeout=2), config).run("load")
+        cadence = report["load"]["cadence"]
+        self.assertGreater(cadence["unlaunched_slots"], 0)
+        self.assertEqual(cadence["scheduled_slots"] + cadence["unlaunched_slots"], 20)
+        self.assertIn("load_deadline_before_all_samples", report["uncertainties"])
+
+    def test_eight_agent_load_records_actual_overlap_and_pair_outcomes(self):
+        engine = Engine()
+        engine.generation_delay = .12
+        config = Config("fixture", clients=8, latency_lookups=20,
+                        lookup_interval_ms=10, load_timeout=4, system_lines=1)
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), config)
+            report = runner.run("load")
+        load = report["load"]
+        self.assertEqual(load["agents"], 8)
+        self.assertEqual(len(load["completed_generations_with_tokens"]), 8)
+        self.assertTrue(all(load["completed_generations_with_tokens"]))
+        self.assertGreater(load["samples_fully_covered_by_all_generations"], 0)
+        self.assertEqual(report["failures"], [])
+        stats = load["concurrent_pair_comparisons"]
+        self.assertGreaterEqual(stats["compared_pairs"], 8)
+        self.assertEqual(stats["over_report_count"], 0)
+        self.assertTrue(all(row["generation_agents_overlapping"] <= 8 for row in runner.rows
+                            if row.get("lookup_attempted")))
+        self.assertNotIn("PRIVATE", json.dumps(report))
+
     def test_four_agent_http_load_separates_latency_overlap_from_exactness(self):
         engine = Engine()
         engine.generation_delay = .08
         config = Config("fixture", rounds=1, pressure_lineages=1, latency_lookups=40,
-                        lookup_interval_ms=2, load_timeout=4, system_lines=1)
+                        lookup_interval_ms=10, load_timeout=4, system_lines=1)
         with fake_http(engine) as url:
             runner = Harness(Client(url, timeout=2), config)
             runner.latency()
@@ -422,8 +651,9 @@ class HttpTests(unittest.TestCase):
         load = report["load"]
         self.assertEqual(load["agents"], 4)
         self.assertTrue(all(load["completed_generations_with_tokens"]))
-        self.assertEqual(load["latency_all_samples_ms"]["http_wall"]["n"], 40)
-        self.assertGreater(load["samples_fully_covered_by_four_generations"], 0)
+        self.assertEqual(load["latency_all_samples_ms"]["http_wall"]["n"] +
+                         load["cadence"]["missed_slots"], 40)
+        self.assertGreater(load["samples_fully_covered_by_all_generations"], 0)
         self.assertEqual(report["failures"], [])
         self.assertTrue(all("_generation_interval" not in row for row in report["cases"]))
         self.assertTrue(all(not row.get("failures") for row in report["cases"]
@@ -433,7 +663,7 @@ class HttpTests(unittest.TestCase):
         engine = Engine()
         engine.busy_lookup = True
         engine.generation_delay = .08
-        config = Config("fixture", latency_lookups=30, lookup_interval_ms=2, load_timeout=4)
+        config = Config("fixture", latency_lookups=30, lookup_interval_ms=10, load_timeout=4)
         with fake_http(engine) as url:
             runner = Harness(Client(url, timeout=2), config)
             runner.latency()
@@ -441,12 +671,110 @@ class HttpTests(unittest.TestCase):
         load = report["load"]
         self.assertEqual(report["failures"], [])
         self.assertTrue(all(load["completed_generations_with_tokens"]))
-        self.assertEqual(load["availability_all_samples"]["busy_503"], 30)
+        attempts = load["cadence"]["attempted_slots"]
+        self.assertEqual(attempts + load["cadence"]["missed_slots"], 30)
+        self.assertEqual(load["availability_all_samples"]["busy_503"], attempts)
         self.assertEqual(load["availability_all_samples"]["busy_rate"], 1)
-        self.assertEqual(load["latency_all_samples_ms"]["http_503_busy_wall"]["n"], 30)
+        self.assertEqual(load["availability_all_samples"]["http_status_counts"], {"503": attempts})
+        self.assertEqual(load["availability_all_samples"]["error_code_counts"], {"cache_lookup_busy": attempts})
+        self.assertEqual(load["latency_all_samples_ms"]["http_503_busy_wall"]["n"], attempts)
         self.assertEqual(load["latency_all_samples_ms"]["engine_lookup"]["n"], 0)
-        self.assertIn("no_engine_lookup_ms_under_full_four_agent_load", report["uncertainties"])
-        self.assertTrue(all(row["status"] == "busy" for row in report["cases"]))
+        self.assertIn("no_engine_lookup_ms_under_measured_load", report["uncertainties"])
+        self.assertFalse(load["acceptance_target"]["observed_target_met"])
+        self.assertTrue(all(row["status"] in ("busy", "missed") for row in report["cases"]))
+
+    def test_external_slots_http_verifies_four_and_eight_busy_sessions_privately(self):
+        for clients in (4, 8):
+            engine = Engine()
+            engine.slots_value = engine.slots_value[:clients]
+            config = Config("fixture", clients=0, external_clients=clients, latency_lookups=30,
+                            lookup_interval_ms=10, slots_interval_ms=20, load_timeout=3)
+            with fake_http(engine) as url:
+                report = Harness(Client(url, timeout=2), config).run("load")
+            load = report["load"]
+            self.assertGreater(load["external_slots"]["bracketed_lookup_samples"], 0)
+            self.assertFalse(load["external_load_overlap_unverified"])
+            self.assertNotIn("external_generation_load_not_verified", report["uncertainties"])
+            self.assertEqual(load["acceptance_target"]["scope"], "all_samples_and_slots_brackets")
+            self.assertEqual(load["external_slots"]["processing_counts"]["max"], clients)
+            self.assertEqual(load["external_slots"]["error_codes"], {})
+            self.assertEqual(report["failures"], [])
+            self.assertEqual(report["summary"]["snapshot_metadata_load_samples"]["index_version"]["max"], 0)
+            encoded = json.dumps(report)
+            self.assertNotIn("PRIVATE", encoded)
+            self.assertNotIn("987654321", encoded)
+            self.assertNotIn(url, encoded)
+
+    def test_external_slots_errors_remain_unqualified_and_slow_polls_are_counted(self):
+        for error in (False, True):
+            engine = Engine()
+            engine.slots_error = error
+            engine.slots_delay = .04
+            config = Config("fixture", clients=0, external_clients=4, latency_lookups=20,
+                            lookup_interval_ms=10, slots_interval_ms=10, load_timeout=.3)
+            with fake_http(engine) as url:
+                report = Harness(Client(url, timeout=2), config).run("load")
+            load = report["load"]
+            self.assertEqual(load["external_slots"]["bracketed_lookup_samples"], 0)
+            self.assertGreater(load["external_slots"]["missed_poll_slots"], 0)
+            self.assertTrue(load["external_load_overlap_unverified"])
+            self.assertIn("external_slots_polling_incomplete", report["uncertainties"])
+            self.assertIn("external_generation_load_not_verified", report["uncertainties"])
+            if error:
+                self.assertGreater(load["external_slots"]["error_codes"]["http_status"], 0)
+            self.assertNotIn("PRIVATE", json.dumps(report))
+
+    def test_own_unfinished_body_correlation_measures_underreport_not_tier_cause(self):
+        class WarmBusyEngine(Engine):
+            def post(self, endpoint, body):
+                if endpoint == "/v1/chat/completions":
+                    # Controlled fake: reuse exists before a slow generation;
+                    # lookups under-report it while the same request is active.
+                    delay = self.generation_delay
+                    self.generation_delay = 0
+                    try:
+                        super().post(endpoint, body)
+                    finally:
+                        self.generation_delay = delay
+                return super().post(endpoint, body)
+
+        # One generation thread avoids mutable fake timing races; the harness's
+        # 4/8 production configuration remains covered by the existing tests.
+        engine = WarmBusyEngine()
+        engine.generation_delay = .12
+        engine.lookup_delta = 2
+        config = Config("fixture", clients=1, latency_lookups=40,
+                        lookup_interval_ms=10, system_lines=1, load_timeout=3)
+        with fake_http(engine) as url:
+            runner = Harness(Client(url, timeout=2), config)
+            report = runner.run("load")
+        stats = report["load"]["own_unfinished_conversation_observations"]
+        self.assertGreater(stats["fully_in_flight_samples"], 0)
+        self.assertGreater(stats["under_report_count"], 0)
+        self.assertEqual(stats["under_report_rate"], 1)
+        self.assertFalse(stats["suppression_cause_verified"])
+        self.assertIsNone(stats["busy_live_frontier_suppression_count"])
+        self.assertEqual(report["failures"], [])
+        for row in runner.rows:
+            if "own_generation_cache_delta_tokens" in row:
+                self.assertTrue(row["own_generation_covers_lookup"])
+                self.assertEqual(row["own_generation_cache_delta_tokens"], -2)
+        self.assertNotIn("PRIVATE", json.dumps(report))
+
+    def test_own_busy_denominator_excludes_uncovered_uncompared_and_general_underreports(self):
+        rows = [{"own_generation_case": "fixture", "own_generation_covers_lookup": covered,
+                 **({"own_generation_cache_delta_tokens": delta} if delta is not None else {})}
+                for covered, delta in ((True, -2), (True, 0), (True, 3), (True, None), (False, None))]
+        rows.append({"cache_comparison": "under_report"})
+        stats = Harness.own_busy_observations(rows)
+        self.assertEqual(stats["targeted_samples"], 5)
+        self.assertEqual(stats["fully_in_flight_samples"], 4)
+        self.assertEqual(stats["compared_samples"], 3)
+        self.assertEqual(stats["uncompared_in_flight_samples"], 1)
+        self.assertEqual(stats["under_report_count"], 1)
+        self.assertEqual(stats["under_report_rate"], 1 / 3)
+        self.assertEqual(stats["over_report_count"], 1)
+        self.assertIsNone(Harness.own_busy_observations([])["under_report_rate"])
 
     def test_cli_reserves_new_private_output_and_refuses_overwrite(self):
         engine = Engine()
@@ -465,6 +793,54 @@ class HttpTests(unittest.TestCase):
             report = json.loads(before)
             self.assertEqual(report["status"], "unqualified")
             self.assertNotIn(url, before.decode())
+
+    def test_cli_load_only_external_and_eight_client_flags(self):
+        self.assertEqual(Config("fixture").lookup_interval_ms, 50)
+        engine = Engine()
+        engine.generation_delay = .06
+        with tempfile.TemporaryDirectory() as directory, fake_http(engine) as url:
+            for clients in (0, 8):
+                output = Path(directory) / f"load_{clients}.json"
+                args = ["--base-url", url, "--model", "PRIVATE_MODEL", "--output", str(output),
+                        "--load-only", "--clients", str(clients), "--lookup-workers", "3",
+                        "--latency-lookups", "5", "--lookup-interval-ms", "20", "--load-timeout", "3"]
+                with redirect_stdout(io.StringIO()):
+                    code = main(args)
+                self.assertEqual(code, 2)
+                report = json.loads(output.read_text())
+                self.assertEqual(report["config"]["clients"], clients)
+                self.assertEqual(report["config"]["lookup_workers"], 3)
+                self.assertEqual(report["config"]["phase"], "load")
+                self.assertFalse(report["config"]["exclusive_acknowledged"])
+                self.assertEqual(report["summary"]["sequential_pairs"], 0)
+                self.assertNotIn("fewer_than_200_sequential_comparisons", report["uncertainties"])
+                self.assertNotIn("sequential_exactness_not_run", report["uncertainties"])
+                self.assertNotIn("PRIVATE", output.read_text())
+            base = ["--base-url", url, "--model", "fixture", "--output", str(Path(directory) / "invalid.json")]
+            for extra in (["--load-only", "--clients", "2"], ["--load-only", "--lookup-workers", "0"],
+                          ["--load-only", "--phase", "latency"], ["--load-only", "--lookup-interval-ms", "nan"],
+                          ["--load-only", "--external-clients", "4"],
+                          ["--load-only", "--clients", "0", "--slots-interval-ms", "0"],
+                          ["--exclusive", "--clients", "0", "--external-clients", "4"]):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    main(base + extra)
+            self.assertFalse((Path(directory) / "invalid.json").exists())
+
+    def test_cli_external_slots_flags_enable_private_monitoring(self):
+        with tempfile.TemporaryDirectory() as directory, fake_http(Engine()) as url:
+            output = Path(directory) / "external.json"
+            args = ["--base-url", url, "--model", "PRIVATE_MODEL", "--output", str(output),
+                    "--load-only", "--clients", "0", "--external-clients", "8",
+                    "--slots-interval-ms", "20", "--latency-lookups", "20",
+                    "--lookup-interval-ms", "10", "--request-timeout", "2"]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(args), 2)
+            report = json.loads(output.read_text())
+            self.assertEqual(report["schema"], "gufo-cache-lookup-probe-v3")
+            self.assertEqual(report["config"]["external_clients"], 8)
+            self.assertEqual(report["config"]["slots_interval_ms"], 20)
+            self.assertGreater(report["load"]["external_slots"]["bracketed_lookup_samples"], 0)
+            self.assertNotIn("PRIVATE", output.read_text())
 
     def test_cli_exactness_requires_exclusive_and_rejects_rendered_pin_text(self):
         with tempfile.TemporaryDirectory() as directory:

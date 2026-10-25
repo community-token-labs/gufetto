@@ -109,10 +109,14 @@ void LookupIsReadOnlyAndMatchesAcquire() {
   const auto captured = runner->captures;
   const auto invalidations = runner->adapter->Invalidations();
   double sum_ms = 0;
+  const auto published = pool.Lookup(longer);
+  assert(published.index_version > cold.index_version);
   for (int i = 0; i < 100; ++i) {
     const auto live = pool.Lookup(longer);
     assert(live.matched_tokens == prompt.size() && live.tier == "live");
     assert(live.epoch == cold.epoch);
+    assert(live.index_version == published.index_version);
+    assert(live.snapshot_age_ms >= published.snapshot_age_ms);
     sum_ms += live.lookup_ms;
   }
   std::cout << "CPU metadata lookup mean_ms=" << sum_ms / 100 << '\n';
@@ -136,7 +140,7 @@ void LookupIsReadOnlyAndMatchesAcquire() {
   image.cache_prefixes = {{prompt.size(), {}}};
   assert(pool.Lookup(longer, &image).matched_tokens == prompt.size());
 }
-void LookupReturnsBusyWithoutWaitingForAdmission() {
+void LookupDoesNotWaitForAdmission() {
   class BlockingRunner final : public Runner {
   public:
     mutable std::binary_semaphore entered{0}, released{0};
@@ -152,18 +156,200 @@ void LookupReturnsBusyWithoutWaitingForAdmission() {
   const std::vector<TextRunnerToken> prompt{10, 11};
   std::thread generation([&] { auto request = pool.Acquire(prompt); });
   runner->entered.acquire();
-  bool busy = false;
-  try {
-    (void)pool.Lookup(prompt);
-  } catch (const TextGenerationError& error) {
-    busy = error.code() == TextGenerationErrorCode::kCacheLookupBusy &&
-           error.http_status() == 503 && error.retryable();
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 100; ++i) {
+    const auto observed = pool.Lookup(prompt);
+    assert(observed.total_tokens == prompt.size());
+    assert(observed.matched_tokens == 0 && observed.tier == "none");
   }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
   runner->released.release();
   // Acquire reinstalls prompt context after restoration too.
   runner->entered.acquire();
   runner->released.release();
   generation.join();
-  assert(busy);
+  assert(elapsed < std::chrono::milliseconds(100));
+}
+
+void LookupWhileAllSlotsPrefillAndDecode() {
+  class BlockingWorkRunner final : public Runner {
+  public:
+    mutable std::binary_semaphore entered{0}, released{0};
+    std::atomic<bool> block{false};
+    void Wait() const {
+      if (block.load()) {
+        entered.release();
+        released.acquire();
+      }
+    }
+    TextPrefillStep Prefill(TextRunnerState& state,
+                            std::span<const TextRunnerToken> prompt,
+                            std::size_t offset,
+                            std::size_t budget) const override {
+      Wait();
+      return Runner::Prefill(state, prompt, offset, budget);
+    }
+    void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+      Wait();
+      Runner::Advance(state, token);
+    }
+  };
+  auto runner = std::make_shared<BlockingWorkRunner>();
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> root{10, 11, 12, 13, 14, 15, 16, 17};
+  auto warm = pool.Acquire(root);
+  Prefill(warm);
+  (void)warm.Commit();
+  auto prompt = root;
+  prompt.push_back(99);
+  auto request = pool.Acquire(prompt);
+  assert(request.cached_prompt_tokens() == root.size());
+  runner->block = true;
+  std::thread prefill([&] { Prefill(request); });
+  runner->entered.acquire();
+  for (int i = 0; i < 100; ++i) {
+    const auto observed = pool.Lookup(prompt);
+    assert(observed.matched_tokens == root.size() && observed.tier == "ram");
+  }
+  runner->released.release();
+  prefill.join();
+  auto longer = prompt;
+  longer.push_back(100);
+  std::thread decode([&] {
+    (void)request.SelectNext();
+    request.Advance();
+  });
+  runner->entered.acquire();
+  for (int i = 0; i < 100; ++i) {
+    const auto observed = pool.Lookup(longer);
+    assert(observed.matched_tokens <= prompt.size());
+    assert(observed.matched_tokens >= root.size());
+  }
+  runner->released.release();
+  decode.join();
+  runner->block = false;
+  (void)request.Commit();
+  const auto idle = pool.Lookup(longer);
+  auto actual = pool.Acquire(longer);
+  assert(idle.matched_tokens == actual.cached_prompt_tokens());
+}
+
+void LookupInvalidatesBeforeLiveRetirement() {
+  class BlockingPublicationRunner final : public Runner {
+  public:
+    mutable std::binary_semaphore entered{0}, released{0};
+    mutable std::atomic<bool> block_next{false};
+    bool LookupFullCheckpointReady() const override {
+      if (block_next.exchange(false)) {
+        entered.release();
+        released.acquire();
+      }
+      return true;
+    }
+  };
+  auto runner = std::make_shared<BlockingPublicationRunner>();
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> root{10, 11, 12, 13, 14, 15, 16, 17};
+  auto warm = pool.Acquire(root);
+  Prefill(warm);
+  const auto next = warm.SelectNext();
+  warm.Advance();
+  (void)warm.Commit();
+  auto target = root;
+  target.push_back(next.token);
+  target.push_back(99);
+  const auto before = pool.Lookup(target);
+  assert(before.matched_tokens == root.size() + 1 && before.tier == "live");
+  runner->block_next = true;
+  std::thread mutation([&] {
+    auto other = pool.Acquire({1000, 1001, 1002});
+    other.Invalidate();
+  });
+  // Publication is paused with the owner mutex held, after retiring the live
+  // frontier. A reader must not wait or reuse the previous published frontier.
+  runner->entered.acquire();
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 100; ++i) {
+    const auto observed = pool.Lookup(target);
+    assert(observed.matched_tokens == 0 && observed.tier == "none");
+    assert(observed.index_version > before.index_version);
+  }
+  assert(std::chrono::steady_clock::now() - start <
+         std::chrono::milliseconds(100));
+  runner->released.release();
+  mutation.join();
+  const auto after = pool.Lookup(target);
+  assert(after.matched_tokens == root.size() && after.tier == "ram");
+  auto actual = pool.Acquire(target);
+  assert(after.matched_tokens == actual.cached_prompt_tokens());
+}
+
+void LookupPublicationDisabled() {
+  auto runner = std::make_shared<Runner>();
+  TextRunnerPool pool(runner, 1, {}, {.publish_lookup = false});
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17};
+  auto request = pool.Acquire(prompt);
+  Prefill(request);
+  (void)request.Commit();
+  const auto disabled = pool.Lookup(prompt);
+  assert(disabled.matched_tokens == 0 && disabled.index_version == 0);
+  auto actual = pool.Acquire(prompt);
+  assert(actual.cached_prompt_tokens() == prompt.size());
+}
+
+void LookupPublicationStress() {
+  auto runner = std::make_shared<Runner>();
+  TextRunnerPool pool(runner, 2);
+  const std::vector<TextRunnerToken> root{10, 11, 12, 13, 14, 15, 16, 17};
+  auto warm = pool.Acquire(root);
+  Prefill(warm);
+  (void)warm.Commit();
+  auto prompt = root;
+  prompt.push_back(99);
+  std::atomic<bool> done{false};
+  std::atomic<std::size_t> reads{0}, under_reports{0}, ready_reads{0};
+  std::barrier ready(9);
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 8; ++i)
+    readers.emplace_back([&] {
+      ready.arrive_and_wait();
+      bool first = true;
+      while (!done.load()) {
+        const auto observed = pool.Lookup(prompt);
+        assert(observed.total_tokens == prompt.size());
+        assert(observed.matched_tokens <= prompt.size());
+        if (observed.matched_tokens < root.size())
+          ++under_reports;
+        ++reads;
+        if (first) {
+          ++ready_reads;
+          first = false;
+        }
+      }
+    });
+  ready.arrive_and_wait();
+  while (ready_reads.load() != 8)
+    std::this_thread::yield();
+  const auto before_updates = reads.load();
+  for (int i = 0; i < 200; ++i) {
+    auto request = pool.Acquire(prompt);
+    Prefill(request);
+    if (i % 3)
+      (void)request.Commit();
+    else
+      request.Invalidate();
+    if (i == 0)
+      while (reads.load() == before_updates)
+        std::this_thread::yield();
+  }
+  done = true;
+  for (auto& reader : readers)
+    reader.join();
+  assert(reads > 0);
+  std::cout << "CPU concurrent lookup reads=" << reads
+            << " conservative_misses=" << under_reports << '\n';
+  const auto idle = pool.Lookup(prompt);
+  auto actual = pool.Acquire(prompt);
+  assert(idle.matched_tokens == actual.cached_prompt_tokens());
 }
 #endif

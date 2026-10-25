@@ -3940,6 +3940,9 @@ HttpResponse HandleCacheLookup(const HttpRequest& request,
         result->prefill_estimate_ms ? json::Value(*result->prefill_estimate_ms)
                                     : json::Value();
     body["epoch"] = result->epoch;
+    body["semantics"] = "advisory";
+    body["index_version"] = result->index_version;
+    body["snapshot_age_ms"] = result->snapshot_age_ms;
     // Includes HTTP body parsing, image decoding, rendering, tokenization and
     // the index query, but excludes network I/O and JSON response encoding.
     body["lookup_ms"] = std::chrono::duration<double, std::milli>(

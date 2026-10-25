@@ -59,6 +59,9 @@ struct TextRunnerRamCacheOptions {
   /// capacity_bytes is ignored. Sessions still reuse their own live state.
   bool enabled{true};
   TextRunnerPinnedPrefixOptions pinned_prefix;
+  // Embedding pools expose Lookup by default. The server wires this to its
+  // opt-in route flag so disabled HTTP lookup adds no publication work.
+  bool publish_lookup{true};
 };
 
 /// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects
@@ -677,8 +680,9 @@ public:
       bool stop_at_eos = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
-  /// Metadata-only immediate Acquire plan; throws kCacheLookupBusy instead of
-  /// waiting for admission/metadata locks or a free execution slot.
+  /// Read-only published Acquire inventory. Never waits for admission,
+  /// metadata mutation, a free execution slot or device work. Unknown reuse
+  /// during publication is conservatively omitted, not a busy error.
   [[nodiscard]] TextGenerationBackend::CacheLookupResult Lookup(
       std::span<const TextRunnerToken>, const TextPromptContext* = nullptr,
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0) const;

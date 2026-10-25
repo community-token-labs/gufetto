@@ -1,9 +1,13 @@
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <stdexcept>
+#include <thread>
 
 #include "tests/cache/prefix_index_fixture.hpp"
 
@@ -47,6 +51,19 @@ void Invalid(F action) {
     threw = true;
   }
   assert(threw);
+}
+void SnapshotParity(const PrefixIndex& index, const PrefixQuery& query) {
+  const auto expected = index.Lookup(query);
+  const auto actual = index.Snapshot().Lookup(query);
+  assert(actual.size() == expected.candidates.size());
+  for (std::size_t i = 0; i < actual.size(); ++i) {
+    const auto& a = actual[i];
+    const auto& e = expected.candidates[i];
+    assert(a.entry == e.entry && a.boundary == e.boundary);
+    assert(a.live == bool(e.live) && a.ram == bool(e.checkpoint) &&
+           a.disk == bool(e.durable));
+    assert(a.transfer_bytes == e.transfer_bytes && a.full_ready);
+  }
 }
 void SelectionTable() {
   struct Case {
@@ -155,6 +172,7 @@ void SelectionTable() {
       }
       const auto result = index.Lookup(Query(c.prompt, c.stable));
       assert(result.reason == c.reason);
+      SnapshotParity(index, Query(c.prompt, c.stable));
       assert((result.selected ? result.selected->boundary : 0) == c.expected);
       if (result.selected && result.selected->checkpoint)
         assert(result.selected->transfer_bytes == 3 * 4 + 1 * 2 + 32);
@@ -568,6 +586,398 @@ void AdmissionAndValidation() {
   assert(ledger.Snapshot().total_bytes == old_bytes);
   assert(index.Lookup(Query(original)).selected->entry == id);
 }
+struct SnapshotDirectory {
+  std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("gufo-prefix-snapshot-" +
+       std::to_string(
+           std::chrono::steady_clock::now().time_since_epoch().count()));
+  SnapshotDirectory() { assert(std::filesystem::create_directory(path)); }
+  ~SnapshotDirectory() { std::filesystem::remove_all(path); }
+};
+DiskFileId SnapshotFile() {
+  static std::uint64_t next = 1;
+  const auto value = next++;
+  DiskFileId file{};
+  for (unsigned i = 0; i < 8; ++i)
+    file[i] = value >> (i * 8);
+  return file;
+}
+std::shared_ptr<const DiskDescription> SnapshotPublish(
+    DiskStore& store, const Checkpoint& checkpoint,
+    CompatibilityDigest digest) {
+  DiskManifest manifest;
+  manifest.checkpoint = checkpoint.Id();
+  manifest.lineage = checkpoint.Lineage();
+  manifest.compatibility = digest;
+  manifest.input = checkpoint.Input();
+  manifest.tokens.assign(checkpoint.Tokens().begin(),
+                         checkpoint.Tokens().end());
+  std::vector<std::vector<std::uint8_t>> payloads;
+  std::vector<DiskWriteBuffer> buffers;
+  auto add = [&](const Payload& payload, bool private_file) {
+    auto& bytes = payloads.emplace_back(payload.Bytes(), 0);
+    const auto file = SnapshotFile();
+    buffers.push_back({private_file, file, bytes});
+    return DiskPayload{file, bytes.size(), DiskChecksum(bytes)};
+  };
+  for (const auto& component : checkpoint.Components()) {
+    DiskComponent copy{component.descriptor, component.position, {}, {}, {}};
+    for (const auto& chunk : component.chunks)
+      copy.chunks.push_back(add(chunk.Storage(), false));
+    if (component.tail)
+      copy.tail = add(*component.tail, true);
+    if (component.private_state)
+      copy.private_state = add(*component.private_state, true);
+    manifest.components.push_back(std::move(copy));
+  }
+  store.Publish(SnapshotFile(), manifest, buffers);
+  return store.Describe(checkpoint.Id());
+}
+void SnapshotDiskCandidates() {
+  PrefixIndexSnapshot snapshot;
+  const Tokens tokens{1, 2, 3, 4};
+  {
+    ResourceLedger ledger{kIndexLimits};
+    {
+      SnapshotDirectory directory;
+      DiskStore store{ledger, directory.path, 1 << 20};
+      PrefixIndex index{ledger};
+      CompatibilityDigest digest{};
+      digest[0] = 42;
+      index.Register({1}, kIndexComponents, digest);
+      auto ram = IndexCheckpoint(ledger, tokens);
+      auto mixed = IndexCheckpoint(ledger, tokens);
+      auto disk = IndexCheckpoint(ledger, tokens);
+      const auto ram_id = index.Insert(ram, ResidentComponents(), 2);
+      const auto mixed_id = index.Insert(mixed, ResidentComponents(), 2);
+      auto ram_description = SnapshotPublish(store, *ram, digest);
+      auto mixed_description = SnapshotPublish(store, *mixed, digest);
+      auto disk_description = SnapshotPublish(store, *disk, digest);
+      index.AttachDurable(ram_id, ram_description);
+      index.AttachDurable(mixed_id, mixed_description);
+      index.SetAvailability(
+          mixed_id, {{{1}, true, true}, {{2}, false, true}, {{3}, true, true}});
+      const auto disk_id = index.Insert({1}, disk_description, 2);
+      const auto live_id = index.Insert(IndexLive(tokens));
+      SnapshotParity(index, Query(tokens));
+      SnapshotParity(index, Query(tokens, 2));
+      const auto ram_owners = ram.use_count();
+      const auto description_owners = disk_description.use_count();
+      snapshot = index.Snapshot();
+      assert(ram.use_count() == ram_owners);
+      assert(disk_description.use_count() == description_owners);
+      const auto result = snapshot.Lookup(Query(tokens, 2));
+      assert(result.size() == 4);
+      assert(result[0].entry == live_id && result[0].live);
+      assert(result[1].entry == ram_id && result[1].ram && !result[1].disk);
+      assert(result[2].entry == mixed_id && result[2].ram && result[2].disk);
+      assert(result[3].entry == disk_id && !result[3].ram && result[3].disk);
+      for (std::size_t i = 1; i < result.size(); ++i)
+        assert(result[i].transfer_bytes == 4 * 4 + 2 * 2 + 32);
+      // Quarantine is an atomic validity change outside index publication.
+      // It also invalidates a wholly RAM candidate bound to that publication.
+      store.Invalidate(ram->Id(), ram_description->Epoch());
+      store.Invalidate(mixed->Id(), mixed_description->Epoch());
+      store.Invalidate(disk->Id(), disk_description->Epoch());
+      assert(index.Lookup(Query(tokens)).candidates.size() == 1);
+      assert(snapshot.Lookup(Query(tokens)).size() == 1);
+      // The only live frontier cannot attest the now-invalid stable fallback.
+      assert(snapshot.Lookup(Query(tokens, 2)).empty());
+      // Neither construction nor lookup retains disk pins.
+      assert(store.Retire(ram->Id()));
+      assert(store.Retire(mixed->Id()));
+      assert(store.Retire(disk->Id()));
+    }
+    assert(ledger.Snapshot().total_bytes == 0);
+  }
+  assert(snapshot.Lookup(Query(tokens)).size() == 1);
+}
+// A size-only adapter for real managed borrowing. Release deliberately fails
+// preservation so validity changes without any PrefixIndex mutation.
+struct SnapshotStream final : Stream {
+  TransferResult Synchronize() noexcept override {
+    return TransferResult::kSucceeded;
+  }
+};
+struct SnapshotAdapter final : Adapter {
+  struct TestSlot final : Slot {
+    MutationGuard& guard;
+    Rows rows{};
+    explicit TestSlot(MutationGuard& g) : guard(g) {}
+    bool IsValid() const noexcept override { return true; }
+  };
+  std::size_t component_count{1};
+  Capabilities GetCapabilities() const override { return {}; }
+  std::span<const ComponentDescriptor> Components() const override {
+    return std::span(kIndexComponents).first(component_count);
+  }
+  Identity CompatibilityIdentity() const override { return {1}; }
+  std::unique_ptr<Slot> CreateSlot(MutationGuard& guard) override {
+    return std::make_unique<TestSlot>(guard);
+  }
+  std::vector<ComponentPosition> Positions(const Slot& slot) const override {
+    std::vector<ComponentPosition> positions;
+    for (const auto& descriptor : Components())
+      positions.push_back(
+          {descriptor.id,
+           static_cast<const TestSlot&>(slot).rows / descriptor.id.value});
+    return positions;
+  }
+  std::vector<Rows> PlanPrefill(const Slot&, Rows, Rows) const override {
+    return {};
+  }
+  void BeginRestore(Slot&, std::span<const ComponentPosition>) override {
+    throw std::logic_error("unused restore");
+  }
+  Completion CapturePrivate(const Slot&, ComponentId, std::span<std::byte>,
+                            Stream&) override {
+    throw std::logic_error("unused private capture");
+  }
+  Completion CopyRowsOut(const Slot&, ComponentId, Rows, Rows,
+                         std::span<std::byte>, Stream&) override {
+    throw std::runtime_error("preservation failure");
+  }
+  Completion CopyRowsIn(Slot&, ComponentId, Rows, Rows,
+                        std::span<const std::byte>, Stream&) override {
+    throw std::logic_error("unused row restore");
+  }
+  Completion LoadPrivate(Slot&, ComponentId, std::span<const std::byte>,
+                         Stream&) override {
+    throw std::logic_error("unused private restore");
+  }
+  bool Validate(Slot&, std::span<const ComponentPosition>) override {
+    return false;
+  }
+  bool Invalidate(Slot& slot) noexcept override {
+    auto& guard = static_cast<TestSlot&>(slot).guard;
+    for (const auto& descriptor : Components())
+      guard.BeforeRelease(descriptor.id, 0, std::numeric_limits<Rows>::max());
+    static_cast<TestSlot&>(slot).rows = 0;
+    guard.AfterReset();
+    return true;
+  }
+};
+std::shared_ptr<const Checkpoint> SnapshotBorrow(ResourceLedger& ledger,
+                                                 SlotLease& lease,
+                                                 const SnapshotAdapter& adapter,
+                                                 const Tokens& tokens) {
+  auto history = ExecutionHistory::Cold(ledger, adapter.Components(), {1});
+  std::vector<ComponentPosition> positions;
+  for (const auto& descriptor : adapter.Components())
+    positions.push_back({descriptor.id, tokens.size() / descriptor.id.value});
+  return history.Capture(
+      {tokens, InputIdentity(tokens.size()), positions,
+       CheckpointPurpose::kPrompt, 1},
+      [&](const PayloadRequest& request) {
+        auto pool =
+            ledger.Reserve(ResourceCategory::kBackingFree, request.bytes)
+                .Convert();
+        auto backing = std::make_shared<std::vector<std::byte>>(request.bytes);
+        return Payload::Borrowed(lease.Borrow(
+            request.component, request.first, request.end,
+            pool.ReserveBacking(request.category), backing, *backing));
+      });
+}
+void SnapshotMixedValidity() {
+  ResourceLedger ledger{kIndexLimits};
+  SnapshotDirectory directory;
+  DiskStore store{ledger, directory.path, 1 << 20};
+  SnapshotAdapter adapter;
+  adapter.component_count = 2;
+  SnapshotStream stream;
+  LeasedSlot slot{ledger, adapter, stream, {1}};
+  auto lease = slot.Acquire();
+  auto& execution = static_cast<SnapshotAdapter::TestSlot&>(lease.Execution());
+  execution.rows = 4;
+  PrefixIndex index{ledger};
+  const Tokens tokens{1, 2, 3, 4};
+  CompatibilityDigest digest{};
+  index.Register({1}, adapter.Components(), digest);
+  auto checkpoint = SnapshotBorrow(ledger, lease, adapter, tokens);
+  const auto id =
+      index.Insert(checkpoint, {{{1}, true, false}, {{2}, true, false}});
+  auto description = SnapshotPublish(store, *checkpoint, digest);
+  index.AttachDurable(id, description);
+  // The second RAM component dies before construction. Candidate resolves
+  // just that component to disk; whole-checkpoint IsValid would over-reject.
+  execution.guard.BeforeRelease({2}, 0, 2);
+  assert(!checkpoint->IsValid());
+  SnapshotParity(index, Query(tokens));
+  const auto bytes = ledger.Snapshot().total_bytes;
+  const auto snapshot = index.Snapshot();
+  assert(ledger.Snapshot().total_bytes == bytes);
+  const auto mixed = snapshot.Lookup(Query(tokens));
+  assert(mixed.size() == 1 && mixed[0].ram && mixed[0].disk);
+  execution.guard.BeforeRelease({1}, 0, 4);
+  // A selected RAM source dying after publication fails closed. A newly
+  // constructed snapshot can resolve the entirely durable replacement plan.
+  assert(snapshot.Lookup(Query(tokens)).empty());
+  const auto refreshed = index.Snapshot().Lookup(Query(tokens));
+  assert(refreshed.size() == 1 && !refreshed[0].ram && refreshed[0].disk);
+}
+void SnapshotBorrowedInvalidation() {
+  ResourceLedger ledger{kIndexLimits};
+  SnapshotAdapter adapter;
+  SnapshotStream stream;
+  LeasedSlot slot{ledger, adapter, stream, {1}};
+  auto lease = slot.Acquire();
+  static_cast<SnapshotAdapter::TestSlot&>(lease.Execution()).rows = 4;
+  PrefixIndex index{ledger};
+  index.Register({1}, adapter.Components());
+  const Tokens shallow{1, 2}, deep{1, 2, 3, 4};
+  auto borrowed = SnapshotBorrow(ledger, lease, adapter, shallow);
+  (void)index.Insert(borrowed, {{{1}, true, false}});
+  const auto deep_id =
+      index.Insert(IndexCheckpoint(ledger, deep, {1}, {}, adapter.Components()),
+                   {{{1}, true, false}});
+  const auto snapshot = index.Snapshot();
+  assert(borrowed->IsValid());
+  assert(snapshot.Lookup(Query(deep, 2)).front().entry == deep_id);
+  lease.Reset();
+  assert(!borrowed->IsValid());
+  assert(index.Lookup(Query(deep, 2)).candidates.empty());
+  assert(snapshot.Lookup(Query(deep, 2)).empty());
+  assert(snapshot.Lookup(Query(deep)).size() == 1);
+  assert(snapshot.Lookup(Query(deep)).front().entry == deep_id);
+  SnapshotParity(index, Query(deep));
+  // Expiration is also checked before deciding whether a stable fallback
+  // exists; a deep checkpoint cannot keep using a dead shorter attestation.
+  const auto fallback = index.Insert(
+      IndexCheckpoint(ledger, shallow, {1}, {}, adapter.Components()),
+      {{{1}, true, false}});
+  const auto expiring = index.Snapshot();
+  assert(expiring.Lookup(Query(deep, 2)).front().entry == deep_id);
+  index.Erase(fallback);
+  assert(index.Lookup(Query(deep, 2)).candidates.empty());
+  assert(expiring.Lookup(Query(deep, 2)).empty());
+}
+void SnapshotIdentityAndReadiness() {
+  ResourceLedger ledger{kIndexLimits};
+  PrefixIndex index{ledger};
+  index.Register({1}, kIndexComponents);
+  index.Register({2}, kIndexComponents);
+  const Tokens tokens{1, 2, 3, 4, 5};
+  const auto short_id =
+      index.Insert(IndexCheckpoint(ledger, Tokens{1, 2}), ResidentComponents());
+  const auto image_id =
+      index.Insert(IndexCheckpoint(ledger, Tokens{1, 2, 3, 4}, {1}, {10}),
+                   ResidentComponents(), 2);
+  const auto live_id = index.Insert(IndexLive({1, 2, 3, 4}, {7}, {10}));
+  const auto bad_id =
+      index.Insert(IndexCheckpoint(ledger, tokens), {{{1}, true, false}});
+  (void)bad_id;
+  for (Rows stable = 0; stable <= tokens.size(); ++stable) {
+    SnapshotParity(index, Query(tokens, stable));
+    SnapshotParity(index, Query(tokens, stable, {20}, {{2, {}}, {4, {10}}}));
+    SnapshotParity(index, Query(tokens, stable, {20}, {{2, {}}}));
+  }
+  auto query = Query(tokens, 2, {20}, {{2, {}}, {4, {10}}});
+  const auto metadata = index.MetadataBytes();
+  const auto bytes = ledger.Snapshot().total_bytes;
+  std::size_t calls{};
+  const auto snapshot = index.Snapshot([&](const PrefixCandidate& candidate) {
+    ++calls;
+    assert(candidate.entry != bad_id);
+    return candidate.entry == image_id;
+  });
+  assert(calls == 3);
+  assert(index.MetadataBytes() == metadata);
+  assert(ledger.Snapshot().total_bytes == bytes);
+  const auto result = snapshot.Lookup(query);
+  assert(result.size() == 3);
+  assert(result[0].entry == live_id && result[0].live && !result[0].full_ready);
+  assert(result[1].entry == image_id && result[1].ram && result[1].full_ready);
+  assert(result[2].entry == short_id && !result[2].full_ready);
+  // Readiness annotates observations; it does not change ordering/fallback.
+  query.reuse = false;
+  SnapshotParity(index, query);
+  assert(snapshot.Lookup(query).empty());
+  query.reuse = true;
+  for (const auto& identity : {Identity{2}, Identity{3}}) {
+    query.compatibility = identity;
+    SnapshotParity(index, query);
+    assert(snapshot.Lookup(query).empty());
+  }
+  Invalid([&] { (void)snapshot.Lookup(Query(tokens, tokens.size() + 1)); });
+  query = Query(tokens);
+  query.input = InputIdentity(1);
+  Invalid([&] { (void)snapshot.Lookup(query); });
+  Invalid([&] { (void)PrefixIndexSnapshot{}.Lookup(query); });
+  // Snapshot creation and HTTP lookup need no ledger admission for coherent
+  // RAM/live metadata, even when the ledger refuses every new reservation.
+  ledger.FailAfter(LedgerStep::kReserve, 0);
+  const auto independent = index.Snapshot();
+  assert(independent.Lookup(Query(tokens)).size() == 1);
+  assert(snapshot.Lookup(Query(tokens)).size() == 1);
+  assert(calls == 3);
+  assert(ledger.Snapshot().total_bytes == bytes);
+  ledger.ClearFaults();
+}
+void SnapshotOrderingAndLifetime() {
+  PrefixIndexSnapshot snapshot;
+  const Tokens tokens{1, 2, 3};
+  assert(snapshot.Lookup(Query(tokens)).empty());
+  {
+    ResourceLedger ledger{kIndexLimits};
+    std::shared_ptr<const Checkpoint> retained;
+    {
+      PrefixIndex index{ledger};
+      index.Register({1}, kIndexComponents);
+      auto earlier = IndexCheckpoint(ledger, tokens);
+      auto later = IndexCheckpoint(ledger, tokens);
+      const auto late = index.Insert(later, ResidentComponents());
+      const auto early = index.Insert(earlier, ResidentComponents());
+      const auto duplicate = index.Insert(earlier, ResidentComponents());
+      auto frontier = IndexLive(tokens, {2});
+      frontier.location.generation = 2;
+      const auto generation2 = index.Insert(frontier);
+      frontier.location.generation = 1;
+      const auto generation1 = index.Insert(frontier);
+      const auto first_slot = index.Insert(IndexLive(tokens, {1}));
+      SnapshotParity(index, Query(tokens));
+      assert(earlier.use_count() == 3 && later.use_count() == 2);
+      snapshot = index.Snapshot();
+      assert(earlier.use_count() == 3 && later.use_count() == 2);
+      const auto ordered = snapshot.Lookup(Query(tokens));
+      const std::vector<IndexEntryId> ids{first_slot, generation1, generation2,
+                                          early,      duplicate,   late};
+      assert(ordered.size() == ids.size());
+      for (std::size_t i = 0; i < ids.size(); ++i)
+        assert(ordered[i].entry == ids[i]);
+      // Later index availability mutations do not alter copied observations.
+      index.SetLiveAvailable(first_slot, false);
+      index.SetAvailability(early, {});
+      assert(snapshot.Lookup(Query(tokens)).size() == ids.size());
+      // The snapshot is not a payload owner. Expiration removes only the
+      // affected checkpoint entries, even while the snapshot remains alive.
+      const std::weak_ptr<const Checkpoint> weak = later;
+      index.Erase(late);
+      later.reset();
+      assert(weak.expired());
+      assert(snapshot.Lookup(Query(tokens)).size() == ids.size() - 1);
+      retained = earlier;
+    }
+    // No pointer back to the destroyed index is needed for surviving sources.
+    assert(snapshot.Lookup(Query(tokens)).size() == 5);
+    retained.reset();
+    assert(snapshot.Lookup(Query(tokens)).size() == 3);
+    assert(ledger.Snapshot().total_bytes == 0);
+  }
+  // Destruction of the index AND ledger leaves standalone live metadata safe.
+  const auto lives = snapshot.Lookup(Query(tokens));
+  assert(lives.size() == 3);
+  assert(std::ranges::all_of(lives, [](const auto& c) { return c.live; }));
+  const auto copy = snapshot;
+  snapshot = {};
+  assert(copy.Lookup(Query(tokens)).size() == 3);
+  std::vector<std::jthread> readers;
+  for (unsigned i = 0; i < 4; ++i)
+    readers.emplace_back([&] {
+      for (unsigned iteration = 0; iteration < 100; ++iteration)
+        assert(copy.Lookup(Query(tokens)).size() == 3);
+    });
+}
 void RepeatedReadOnlyPlan() {
   ResourceLedger ledger{kIndexLimits};
   PrefixIndex index{ledger};
@@ -597,6 +1007,11 @@ void RepeatedReadOnlyPlan() {
 }
 }  // namespace
 int main() {
+  SnapshotDiskCandidates();
+  SnapshotMixedValidity();
+  SnapshotBorrowedInvalidation();
+  SnapshotIdentityAndReadiness();
+  SnapshotOrderingAndLifetime();
   RepeatedReadOnlyPlan();
   SelectionTable();
   CheckpointPresence();
