@@ -649,11 +649,37 @@ void SharedPeerReusesTheCurrentStableCapture() {
     peer.Invalidate();
     leader.Invalidate();
   }
+  // A peer with the same prompt shares at most the leader's last prefill
+  // position. When that is the stable boundary, the leader stops right there:
+  // the pending or just published copy is the shared checkpoint.
+  for (const bool settled : {false, true}) {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 2);
+    std::vector<TextRunnerToken> prompt(40);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto leader = pool.Acquire(prompt, {}, {}, {}, true, 39);
+    const auto first = leader.Prefill(64);
+    assert(first.consumed_tokens == 39 && !first.decode_ready);
+    if (settled)
+      leader.CapturePromptSnapshot();
+    assert(leader.ShareCheckpoint(prompt.size()) == 39 &&
+           "a peer arriving at the leader's stable boundary was not parked");
+    assert(leader.Prefill(64).consumed_tokens == 1);
+    auto peer = pool.Acquire(prompt, {}, {}, {}, true, 39);
+    assert(peer.cached_prompt_tokens() == 39);
+    assert(peer.Prefill(64).consumed_tokens == 1);
+    assert(Generate(peer) == Generate(leader));
+    peer.Invalidate();
+    leader.Invalidate();
+  }
   auto runner = std::make_shared<Runner>();
   TextRunnerPool pool(runner, 1);
   const std::vector<TextRunnerToken> prompt(40, 9);
   auto leader = pool.Acquire(prompt);
   assert(leader.Prefill(16).consumed_tokens == 16);
+  assert(leader.ShareCheckpoint(16) == 0 &&
+         "an uncaptured equal frontier cannot be offered to a peer");
+  assert(leader.ShareCheckpoint(15) == 0);
   assert(leader.ShareCheckpoint(prompt.size()) > 16 &&
          "an uncaptured partial pass cannot be offered to a peer");
   leader.Invalidate();
