@@ -939,7 +939,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                     {"X-Accel-Buffering", "no"}},
         .streaming_body =
             [generation = std::move(generation), id, created, model,
-             include_usage, return_progress,
+             include_usage, return_progress, cache_persist,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
               const auto write_chunk =
@@ -969,6 +969,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       chunk["usage"] = *usage;
                     if (timings != nullptr)
                       chunk["timings"] = *timings;
+                    // The finishing and usage chunks echo the applied value.
+                    if (usage != nullptr || timings != nullptr)
+                      chunk["cache_persist"] = cache_persist;
                     if (progress != nullptr)
                       chunk["prompt_progress"] = *progress;
                     started = true;
@@ -1077,6 +1080,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   resp["choices"] = std::move(choices);
   resp["usage"] = UsageJson(res);
   resp["timings"] = GenerationTimings(res);
+  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1419,6 +1423,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   resp["tokens_cached"] = res.cached_prompt_tokens;
   resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
+  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
