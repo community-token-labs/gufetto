@@ -598,10 +598,17 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   } catch (...) {
     // Preserve preflight failures, but never expose old logits/history over
     // partially restored native state if a transfer/allocation throws.
-    if (info.mutation_started)
+    if (info.mutation_started) {
       valid_ = false;
+      if (image_identity.empty())
+        image_prompt_.reset();
+    }
     throw;
   }
+  // Once native mutation starts, text-only restoration has discarded vision
+  // even if a later copy or host/native consistency check fails.
+  if (info.mutation_started && image_identity.empty())
+    image_prompt_.reset();
   if (!restored) {
     // Geometry/packed-byte preflight rejection must leave the live session
     // untouched. A transfer failure after writes begin still invalidates it.
@@ -616,8 +623,6 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot positions are inconsistent");
     return false;
   }
-  if (image_identity.empty())
-    image_prompt_.reset();
   tokens_ = std::move(tokens);
   ForgetDraftVocab();
   lookup_.Restore(header.lookup);
