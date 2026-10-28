@@ -1,13 +1,14 @@
 # Experimental shared Q4_K_M MTP control
 
-**EXPERIMENTAL landing candidate; defaults unchanged.** Coordinator V5 on
-`fe100d11` passed native build/synthetic operators and all four Q8 model gates
-(audit, cache, sampling, batch). Q4 failed recursive carry; the route-specific
-CPU-oracle defect described below is fixed in source, but its corrected model
-result and M0 useful throughput remain pending. This is not release qualification
-or production-container ELF equivalence. The owner controls landing on main.
-No production default, target weight, shared vocabulary head, sampler or draft
-length policy changes; existing numerical and final-AR gates remain unchanged.
+**EXPERIMENTAL; compiled defaults unchanged.** The
+[measured internal setup](MTP-MEASURED-SETUP.md) recommends shared-Q8_0 MTP ON
+through tested C4; Q4_K_M remains the lower-weight-memory option, not the measured
+throughput winner. Q4 cache/sampling/batch gates passed. The scalar-oracle fix
+below corrected step0, while step1 retains an original recursive-carry FAIL and
+is explicitly record-only for internal measurement. No Q4 public numerical PASS,
+production200K/pin or two-host qualification is implied.
+No target weight, shared vocabulary head, sampler or draft-length policy changes;
+existing numerical thresholds and final-AR identity requirements remain.
 
 ## First control identity
 
