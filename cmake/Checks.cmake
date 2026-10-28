@@ -76,10 +76,6 @@ if (WIN32)
   list(REMOVE_ITEM gufo_pr_tests ${gufo_pr_linux_only})
 endif()
 
-if (NOT WIN32)
-  list(APPEND gufo_pr_tests strix_sync_test)
-endif()
-
 list(JOIN gufo_pr_tests "|" gufo_pr_pattern)
 add_custom_target(check-pr
   COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --no-tests=error

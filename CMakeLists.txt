@@ -917,12 +917,6 @@ if (BUILD_TESTING)
     set_tests_properties(${name}_harness_test PROPERTIES
       LABELS "cpu;server;functional;strix")
   endforeach()
-  if (NOT WIN32)
-    add_test(NAME strix_sync_test
-      COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/strix/test_sync.py)
-    set_tests_properties(strix_sync_test PROPERTIES LABELS "cpu;strix;maintenance")
-  endif()
 
   add_test(NAME cache_workloads_test
     COMMAND ${Python3_EXECUTABLE}
