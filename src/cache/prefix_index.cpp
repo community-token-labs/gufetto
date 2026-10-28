@@ -24,6 +24,36 @@ bool Same(const ComponentDescriptor& a, const ComponentDescriptor& b) {
          a.layout_version == b.layout_version && a.row_bytes == b.row_bytes &&
          a.rows_per_chunk == b.rows_per_chunk && a.state_bytes == b.state_bytes;
 }
+void ValidateQuery(const PrefixQuery& query) {
+  if (query.stable_prefix_tokens > query.tokens.size() ||
+      query.input.TokenCount() != query.tokens.size())
+    throw std::invalid_argument("invalid prefix query boundaries");
+}
+PrefixSnapshotCandidate Metadata(const PrefixCandidate& candidate) {
+  return {candidate.entry,         candidate.boundary,
+          bool(candidate.live),    bool(candidate.checkpoint),
+          bool(candidate.durable), candidate.transfer_bytes};
+}
+auto SelectionOrder(const PrefixSnapshotCandidate& candidate,
+                    std::uint64_t identity, std::uint64_t generation) {
+  return std::tuple{std::numeric_limits<Rows>::max() - candidate.boundary,
+                    candidate.live   ? 0
+                    : candidate.disk ? (candidate.ram ? 2 : 3)
+                                     : 1,
+                    identity, generation, candidate.entry.value};
+}
+auto SelectionOrder(const PrefixCandidate& candidate) {
+  return SelectionOrder(Metadata(candidate),
+                        candidate.live ? candidate.live->slot.value
+                        : candidate.checkpoint
+                            ? candidate.checkpoint->Id().value
+                            : candidate.durable->Manifest().checkpoint.value,
+                        candidate.live ? candidate.live->generation : 0);
+}
+bool AttestsFallback(bool live, Rows boundary, Rows stable, Rows query_stable) {
+  return !live &&
+         (boundary <= query_stable || (stable != 0 && stable <= query_stable));
+}
 void ValidateAvailability(std::span<const ComponentAvailability> list,
                           std::span<const ComponentDescriptor> descriptors) {
   for (std::size_t i = 0; i < list.size(); ++i) {
@@ -45,6 +75,71 @@ PrefixLookup& PrefixLookup::operator=(PrefixLookup&& other) noexcept {
     metadata = std::move(other.metadata);
   }
   return *this;
+}
+struct PrefixIndexSnapshot::Impl {
+  struct Record {
+    std::vector<Token> tokens;
+    Identity input;
+    Rows stable{};
+    PrefixSnapshotCandidate candidate;
+    std::uint64_t identity{}, generation{};
+    std::weak_ptr<const Checkpoint> checkpoint;
+    std::optional<std::weak_ptr<const DiskDescription>> durable;
+    // Mixed candidates may already use disk for an invalid RAM component.
+    // Only RAM components selected during construction gate their validity.
+    std::vector<ComponentId> resident_components;
+    [[nodiscard]] bool Usable() const {
+      if (durable) {
+        const auto source = durable->lock();
+        if (!source || source->Quarantined())
+          return false;
+      }
+      if (!candidate.ram)
+        return true;
+      const auto source = checkpoint.lock();
+      if (!source)
+        return false;
+      if (!candidate.disk)
+        return source->IsValid();
+      for (const auto id : resident_components) {
+        const auto component =
+            std::ranges::find(source->Components(), id,
+                              [](const auto& c) { return c.descriptor.id; });
+        if (component == source->Components().end() || !component->IsValid())
+          return false;
+      }
+      return true;
+    }
+  };
+  std::map<Identity, std::vector<Record>> records;
+};
+std::vector<PrefixSnapshotCandidate> PrefixIndexSnapshot::Lookup(
+    const PrefixQuery& query) const {
+  ValidateQuery(query);
+  std::vector<PrefixSnapshotCandidate> result;
+  if (!query.reuse || !impl_)
+    return result;
+  const auto tree = impl_->records.find(query.compatibility);
+  if (tree == impl_->records.end())
+    return result;
+  bool fallback = query.stable_prefix_tokens == 0;
+  for (const auto& record : tree->second) {
+    const auto& candidate = record.candidate;
+    if (candidate.boundary > query.tokens.size() ||
+        !std::ranges::equal(record.tokens,
+                            query.tokens.first(record.tokens.size())) ||
+        !std::ranges::equal(record.input, query.input.At(candidate.boundary)) ||
+        !record.Usable())
+      continue;
+    fallback |= AttestsFallback(candidate.live, candidate.boundary,
+                                record.stable, query.stable_prefix_tokens);
+    result.push_back(candidate);
+  }
+  if (!fallback)
+    std::erase_if(result, [&](const auto& candidate) {
+      return candidate.boundary > query.stable_prefix_tokens;
+    });
+  return result;
 }
 struct PrefixIndex::Impl {
   struct Tree;
@@ -97,6 +192,15 @@ struct PrefixIndex::Impl {
   std::map<Identity, Tree> trees;
   std::map<std::uint64_t, Node*> directory;
   std::uint64_t next{1};
+  std::function<void(IndexEntryId, Rows, std::string_view)> invalidation;
+  void Invalidating(const Record& record, std::string_view reason) noexcept {
+    try {
+      if (invalidation)
+        invalidation(record.id, record.Boundary(), reason);
+    } catch (...) {
+      // Observability must not change index/retention behavior.
+    }
+  }
   Impl(ResourceLedger& l, ResourceReservation reservation)
       : ledger(&l), metadata(reservation.Convert()) {}
   ~Impl() {
@@ -625,6 +729,7 @@ void PrefixIndex::DropResident(IndexEntryId id) {
     Erase(id);
     return;
   }
+  impl_->Invalidating(record, "resident_dropped");
   record.checkpoint.reset();
 }
 void PrefixIndex::RemoveDurable(const DiskDescription& description,
@@ -641,8 +746,10 @@ void PrefixIndex::RemoveDurable(const DiskDescription& description,
       continue;
     if (corrupt || !record.checkpoint)
       Erase(id);
-    else
+    else {
+      impl_->Invalidating(record, "durable_removed");
       record.durable.reset();
+    }
   }
 }
 void PrefixIndex::SetAvailability(
@@ -651,12 +758,16 @@ void PrefixIndex::SetAvailability(
   if (r.live)
     throw std::invalid_argument("live frontier has no checkpoint availability");
   ValidateAvailability(availability, r.tree->descriptors);
-  r.availability = impl_->Availability(std::move(availability));
+  auto replacement = impl_->Availability(std::move(availability));
+  impl_->Invalidating(r, "availability_changed");
+  r.availability = std::move(replacement);
 }
 void PrefixIndex::SetLiveAvailable(IndexEntryId id, bool available) {
   auto& r = impl_->Get(id);
   if (!r.live)
     throw std::invalid_argument("entry is not a live frontier");
+  if (r.live->available && !available)
+    impl_->Invalidating(r, "live_unavailable");
   r.live->available = available;
 }
 void PrefixIndex::Erase(IndexEntryId id) {
@@ -664,14 +775,75 @@ void PrefixIndex::Erase(IndexEntryId id) {
   if (it == impl_->directory.end())
     return;
   auto* node = it->second;
+  impl_->Invalidating(node->records.at(id.value), "erased");
   node->records.erase(id.value);
   impl_->directory.erase(it);
   impl_->Prune(node);
 }
+void PrefixIndex::SetInvalidationObserver(
+    std::function<void(IndexEntryId, Rows, std::string_view)> observer) {
+  impl_->invalidation = std::move(observer);
+}
+PrefixIndexSnapshot PrefixIndex::Snapshot(
+    const std::function<bool(const PrefixCandidate&)>& full_ready) const {
+  auto copy = std::make_shared<PrefixIndexSnapshot::Impl>();
+  for (const auto& [identity, tree] : impl_->trees) {
+    auto& records = copy->records[identity];
+    std::vector<const Impl::Node*> pending{tree.root.get()};
+    while (!pending.empty()) {
+      const auto* node = pending.back();
+      pending.pop_back();
+      for (const auto& [id, record] : node->records) {
+        (void)id;
+        // Candidate may temporarily pin payloads/disk dependencies or resolve
+        // an availability plan. Only weak validity guards enter the snapshot.
+        const auto candidate = impl_->Candidate(tree, record);
+        if (!candidate)
+          continue;
+        const auto tokens =
+            record.checkpoint ? record.checkpoint->Tokens()
+            : record.live
+                ? std::span<const Token>(record.live->tokens)
+                : std::span<const Token>(record.durable->Manifest().tokens);
+        records.push_back(
+            {std::vector<Token>(tokens.begin(), tokens.end()),
+             record.Input(),
+             record.stable,
+             Metadata(*candidate),
+             candidate->live ? candidate->live->slot.value
+             : candidate->checkpoint
+                 ? candidate->checkpoint->Id().value
+                 : candidate->durable->Manifest().checkpoint.value,
+             candidate->live ? candidate->live->generation : 0,
+             candidate->checkpoint,
+             {},
+             {}});
+        auto& copied = records.back();
+        if (record.durable)
+          copied.durable = record.durable;
+        if (candidate->checkpoint && candidate->durable)
+          for (const auto& component : tree.descriptors)
+            if (!candidate->UsesDisk(component.id))
+              copied.resident_components.push_back(component.id);
+        copied.candidate.full_ready = !full_ready || full_ready(*candidate);
+      }
+      for (const auto& [token, child] : node->children) {
+        (void)token;
+        pending.push_back(child.get());
+      }
+    }
+    // All future queries only filter this immutable order.
+    std::ranges::sort(records, [](const auto& a, const auto& b) {
+      return SelectionOrder(a.candidate, a.identity, a.generation) <
+             SelectionOrder(b.candidate, b.identity, b.generation);
+    });
+  }
+  PrefixIndexSnapshot snapshot;
+  snapshot.impl_ = std::move(copy);
+  return snapshot;
+}
 PrefixLookup PrefixIndex::Lookup(const PrefixQuery& query) const {
-  if (query.stable_prefix_tokens > query.tokens.size() ||
-      query.input.TokenCount() != query.tokens.size())
-    throw std::invalid_argument("invalid prefix query boundaries");
+  ValidateQuery(query);
   PrefixLookup result;
   if (!query.reuse) {
     result.reason = SelectionReason::kDisabled;
@@ -712,10 +884,8 @@ PrefixLookup PrefixIndex::Lookup(const PrefixQuery& query) const {
         missing = true;
         continue;
       }
-      if (!r.live &&
-          (r.Boundary() <= query.stable_prefix_tokens ||
-           (r.stable != 0 && r.stable <= query.stable_prefix_tokens)))
-        fallback = true;
+      fallback |= AttestsFallback(bool(r.live), r.Boundary(), r.stable,
+                                  query.stable_prefix_tokens);
       result.candidates.push_back(std::move(*candidate));
     }
   });
@@ -725,17 +895,7 @@ PrefixLookup PrefixIndex::Lookup(const PrefixQuery& query) const {
     return rejected;
   });
   std::ranges::sort(result.candidates, [](const auto& a, const auto& b) {
-    const auto key = [](const auto& c) {
-      return std::tuple{std::numeric_limits<Rows>::max() - c.boundary,
-                        c.live      ? 0
-                        : c.durable ? (c.checkpoint ? 2 : 3)
-                                    : 1,
-                        c.live         ? c.live->slot.value
-                        : c.checkpoint ? c.checkpoint->Id().value
-                                       : c.durable->Manifest().checkpoint.value,
-                        c.live ? c.live->generation : 0, c.entry.value};
-    };
-    return key(a) < key(b);
+    return SelectionOrder(a) < SelectionOrder(b);
   });
   if (result.candidates.empty()) {
     result.reason = stable_rejected  ? SelectionReason::kStablePrefixBoundary

@@ -11,11 +11,13 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "src/core/perf_trace.hpp"
 
 namespace gufo::server {
 
@@ -85,7 +87,8 @@ std::optional<ChatRequest> ConstrainChatRequest(
   if (runner.InitialOutputState(request) ==
       TextGenerationBackend::InitialOutputState::kReasoning)
     grammar = sampling::JsonConstraint::WithReasoning(grammar);
-  sampling->constraint = runner.BindConstraint(grammar);
+  if (sampling)
+    sampling->constraint = runner.BindConstraint(grammar);
   return constrained;
 }
 
@@ -672,14 +675,29 @@ struct TextRunnerPool::Impl {
       component_cache = std::make_unique<ComponentTextCache>(
           validated.runner, state_count, std::min(requested, ceiling),
           disk_cache_options, !ram_cache_options.capacity_bytes, ceiling,
-          ram_cache_options.enabled);
+          ram_cache_options.pinned_prefix, ram_cache_options.enabled,
+          ram_cache_options.publish_lookup);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
             disk_cache_options->shared_prefix_max_boundaries;
       }
+      if (ram_cache_options.transfer_api) {
+        if (!validated.descriptor.persistence)
+          throw std::invalid_argument(
+              "checkpoint transfer requires model file hashes");
+        transfer_configuration = CheckpointTransferConfiguration(
+            validated.descriptor, validated.runner->LookupContextIdentity());
+      }
+      if (ram_cache_options.publish_lookup)
+        lookup_epoch = CacheLookupEpoch(
+            validated.descriptor, component_cache->CompatibilityIdentity(),
+            state_count, disk_cache_options, ram_cache_options,
+            validated.runner->LookupContextIdentity());
       return;
     }
+    if (ram_cache_options.pinned_prefix.enabled())
+      throw std::invalid_argument("pinned prefixes require a component runner");
     cache = std::make_unique<ContinuationCache>(
         state_count,
         [this] {
@@ -690,7 +708,8 @@ struct TextRunnerPool::Impl {
           return state;
         },
         MakeSnapshotSupport(&validated, ram_cache_options),
-        TextRunnerRamCacheOptions::kMaxEntries);
+        TextRunnerRamCacheOptions::kMaxEntries,
+        ram_cache_options.publish_lookup);
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
       // Report the same post-allocation limits that selected the capacity.
@@ -714,7 +733,7 @@ struct TextRunnerPool::Impl {
       }
       disk_store = std::make_shared<ContinuationDiskStore>(
           ContinuationDiskStoreOptions{
-              .directory = std::move(disk_cache_options->directory),
+              .directory = disk_cache_options->directory,
               .capacity_bytes = disk_cache_options->capacity_bytes,
               .staging_capacity_bytes =
                   disk_cache_options->staging_capacity_bytes,
@@ -731,6 +750,10 @@ struct TextRunnerPool::Impl {
       shared_prefix_max_boundaries =
           disk_cache_options->shared_prefix_max_boundaries;
     }
+    if (ram_cache_options.publish_lookup)
+      lookup_epoch = CacheLookupEpoch(
+          validated.descriptor, {}, state_count, disk_cache_options,
+          ram_cache_options, validated.runner->LookupContextIdentity());
   }
 
   ValidatedRunner validated;
@@ -739,6 +762,10 @@ struct TextRunnerPool::Impl {
   // Publish a live checkpoint before another admission can fall back to the
   // older prompt snapshot. Decode/prefill work never holds this mutex.
   std::timed_mutex admission_mutex;
+  std::string lookup_epoch;
+  std::string transfer_configuration;
+  std::shared_ptr<CacheLookupTimings> lookup_timings =
+      std::make_shared<CacheLookupTimings>();
   std::shared_ptr<ContinuationDiskStore> disk_store;
   std::size_t shared_prefix_min_tokens{0};
   std::size_t shared_prefix_max_boundaries{0};
@@ -1241,6 +1268,9 @@ struct TextRunnerPool::Request::Impl {
   }
 
   std::shared_ptr<TextModelRunner> runner;
+  std::shared_ptr<CacheLookupTimings> lookup_timings;
+  std::size_t observed_prefill_tokens{};
+  double observed_prefill_ms{};
   std::shared_ptr<ContinuationDiskStore> disk_store;
   ServingCacheLease lease;
   std::vector<TextRunnerToken> prompt;
@@ -1584,12 +1614,22 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   } clear_lookahead{state};
   state.SetPrefillLookahead(std::span<const TextRunnerToken>(impl_->prompt)
                                 .subspan(frontier, lookahead_end - frontier));
+  const auto prefill_started = std::chrono::steady_clock::now();
+  if (perf::current != nullptr) {
+    perf::current->through = in_pass;
+    perf::current->tokens_requested = std::min(remaining, max_input_tokens);
+  }
   auto step =
       in_pass ? impl_->runner->PrefillThrough(
                     state, model_prompt, impl_->prefill_offset,
                     max_input_tokens, snapshot_position, &captured, capture)
               : impl_->runner->Prefill(state, model_prompt,
                                        impl_->prefill_offset, max_input_tokens);
+  const auto prefill_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - prefill_started)
+          .count() -
+      step.checkpoint_ms;
   if (step.interrupted) {
     if (!capabilities.prefill_rollback || step.consumed_tokens ||
         step.decode_ready || !impl_->cancelled || !impl_->cancelled() ||
@@ -1604,6 +1644,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         "text runner returned an invalid prefill token count");
   }
 
+  if (impl_->lookup_timings) {
+    impl_->observed_prefill_tokens += step.consumed_tokens;
+    impl_->observed_prefill_ms += std::max(0.0, prefill_ms);
+    impl_->lookup_timings->Prefill(impl_->observed_prefill_tokens,
+                                   impl_->observed_prefill_ms);
+  }
   impl_->prefill_offset += step.consumed_tokens;
   const bool reached_frontier = impl_->prefill_offset == impl_->prompt.size();
   if (step.decode_ready != (impl_->prefill_offset == model_prompt.size())) {
@@ -2089,6 +2135,14 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         std::move(prompt), std::vector<std::size_t>{}, sampling_config,
         std::move(context), cache_prefix_tokens, capacity() > 1));
     request.impl_->cancelled = is_cancelled;
+    request.impl_->lookup_timings = impl_->lookup_timings;
+    if (request.cache_hit())
+      impl_->lookup_timings->Restore(request.cache_disk_hit()        ? "disk"
+                                     : request.cache_restore_bytes() ? "ram"
+                                                                     : "live",
+                                     request.cached_prompt_tokens(),
+                                     request.cache_restore_bytes(),
+                                     request.cache_restore_ms());
     if (reuse_prompt) {
       const auto common = impl_->component_cache->CachedPrefixTokens(
           request.prompt(), request.impl_->context.get(), true);
@@ -2227,6 +2281,14 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       std::move(prompt), std::move(boundaries), sampling_config,
       std::move(context), cache_prefix_tokens, impl_->cache->capacity() > 1));
   request.impl_->cancelled = is_cancelled;
+  request.impl_->lookup_timings = impl_->lookup_timings;
+  if (request.cache_hit())
+    impl_->lookup_timings->Restore(request.cache_disk_hit()        ? "disk"
+                                   : request.cache_restore_bytes() ? "ram"
+                                                                   : "live",
+                                   request.cached_prompt_tokens(),
+                                   request.cache_restore_bytes(),
+                                   request.cache_restore_ms());
   // Prompts that diverge from a retained one after a long common prefix,
   // such as new conversations under one system prompt, publish a checkpoint
   // at the divergence point. Later prompts sharing it restore it exactly
@@ -2264,6 +2326,95 @@ std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
   return impl_->component_cache ? impl_->component_cache->PendingPublication(
                                       prompt, context, checkpoint_id)
                                 : std::nullopt;
+}
+
+TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
+    std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+    bool reuse_prompt, std::size_t cache_prefix_tokens) const {
+  const auto started = std::chrono::steady_clock::now();
+  if (prompt.empty())
+    throw std::invalid_argument("text runner prompt must not be empty");
+  if (prompt.size() > impl_->validated.descriptor.max_context)
+    throw std::length_error("text runner prompt exceeds model context");
+  if (cache_prefix_tokens > prompt.size())
+    throw std::invalid_argument("cache prefix exceeds prompt length");
+  // Admission may hold its mutex across restore/capture GPU work. Lookup is
+  // an inventory observation, not a slot reservation: never enter that path.
+  auto reuse =
+      impl_->component_cache
+          ? impl_->component_cache->Lookup(prompt, context, reuse_prompt,
+                                           cache_prefix_tokens)
+          : impl_->cache->Lookup(
+                prompt,
+                context ? std::span<const std::uint8_t>(context->cache_identity)
+                        : std::span<const std::uint8_t>{},
+                reuse_prompt, cache_prefix_tokens,
+                context ? std::span<const ContinuationInputPrefix>(
+                              context->cache_prefixes)
+                        : std::span<const ContinuationInputPrefix>{});
+  if (!reuse)
+    reuse = ContinuationReuse{};
+  TextGenerationBackend::CacheLookupResult result;
+  result.total_tokens = prompt.size();
+  result.matched_tokens = reuse->matched_tokens;
+  result.tier = reuse->tier;
+  result.epoch = impl_->lookup_epoch;
+  result.index_version = reuse->index_version;
+  result.snapshot_age_ms = reuse->snapshot_age_ms;
+  result.observation_id = reuse->observation_id;
+  // Legacy Acquire attempts disk only after a RAM/live miss, even when disk
+  // has a deeper record. Preserve that ordering, not a global longest match.
+  if (!result.matched_tokens && reuse_prompt && impl_->disk_store) {
+    const auto disk = impl_->disk_store->Lookup(
+        *impl_->validated.runner, prompt,
+        context ? std::span<const std::uint8_t>(context->cache_identity)
+                : std::span<const std::uint8_t>{},
+        cache_prefix_tokens,
+        context
+            ? std::span<const ContinuationInputPrefix>(context->cache_prefixes)
+            : std::span<const ContinuationInputPrefix>{});
+    // The legacy disk catalog has a nonblocking operation gate. An in-flight
+    // catalog mutation is unknown reuse, not an unavailable lookup service.
+    if (disk) {
+      result.matched_tokens = disk->matched_tokens;
+      result.tier = disk->tier;
+      reuse->restore_bytes = disk->restore_bytes;
+      // Legacy disk's try-only catalog has no published snapshot clock.
+      // Zero denotes that unsupported version/age, not a freshness lease.
+      if (disk->matched_tokens) {
+        result.index_version = disk->index_version;
+        result.snapshot_age_ms = disk->snapshot_age_ms;
+      }
+    }
+  }
+  impl_->lookup_timings->Estimate(result, reuse->restore_bytes);
+  result.lookup_ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - started)
+                         .count();
+  return result;
+}
+
+std::shared_ptr<CheckpointTransferBlob> TextRunnerPool::Export(
+    std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+    bool reuse, std::size_t stable, std::string_view configuration) const {
+  if (!impl_->component_cache || impl_->transfer_configuration.empty())
+    return {};
+  if (prompt.empty() ||
+      prompt.size() > impl_->validated.descriptor.max_context ||
+      stable > prompt.size())
+    throw CheckpointTransferError(400, "cache_transfer_invalid_prompt");
+  return impl_->component_cache->Export(
+      prompt, context, reuse, stable,
+      impl_->transfer_configuration + std::string(configuration));
+}
+std::shared_ptr<CheckpointTransferBlob> TextRunnerPool::Import(
+    const CheckpointTransferReader& reader, std::uint64_t length,
+    std::string_view configuration) const {
+  if (!impl_->component_cache || impl_->transfer_configuration.empty())
+    return {};
+  return impl_->component_cache->Import(
+      reader, length,
+      impl_->transfer_configuration + std::string(configuration));
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(

@@ -183,6 +183,14 @@ public:
   /// Token count of raw text (no generation).
   [[nodiscard]] std::size_t count_tokens(std::string_view text) const override;
 
+  [[nodiscard]] std::optional<CacheLookupResult> cache_lookup(
+      const ChatRequest& request) const override;
+
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> cache_export(
+      const ChatRequest&) const override;
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> cache_import(
+      const CheckpointTransferReader&, std::uint64_t) const override;
+
   /// Prompt tokens of a chat request as generation would prepare them.
   [[nodiscard]] std::optional<std::size_t> count_chat_tokens(
       const ChatRequest& request) const override;

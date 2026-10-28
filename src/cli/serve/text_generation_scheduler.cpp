@@ -27,6 +27,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/perf_trace.hpp"
 
 namespace gufo::server {
 namespace {
@@ -161,6 +162,19 @@ struct ScheduledRequest {
       output_budget->Release(buffered_output_bytes);
   }
 };
+
+void TraceRequest(const std::shared_ptr<ScheduledRequest>& request,
+                  bool prefill = false) {
+  if (perf::current == nullptr || request->session == kNoSession)
+    return;
+  const auto depth = prefill
+                         ? request->runner_request.prefill_position()
+                         : request->runner_request.prompt_tokens() +
+                               request->result.tokens.size() -
+                               (request->preview_token.has_value() ? 1 : 0) -
+                               (request->advance_pending ? 1 : 0);
+  perf::current->sessions.push_back({request->session, request->id, depth});
+}
 
 struct PendingClient {
   std::string client_id;
@@ -1190,6 +1204,18 @@ struct TextGenerationScheduler::Impl {
       if (request == nullptr) {
         return;
       }
+      perf::Work perf_admit("admit");
+      if (auto* trace = perf_admit.get()) {
+        trace->prefilling_waiting = prefilling.size();
+        trace->decoders_due = static_cast<std::size_t>(
+            std::count_if(decoding.begin(), decoding.end(),
+                          [](const auto& r) { return r->decode_due; }));
+        trace->capturing = capturing.size();
+        trace->waiting = waiting.size();
+        // The runner lease is not acquired yet; admission may restore it.
+        if (request->session != kNoSession)
+          trace->sessions.push_back({request->session, request->id, 0});
+      }
       try {
         if (CompleteIfStopped(request)) {
           continue;
@@ -1307,8 +1333,14 @@ struct TextGenerationScheduler::Impl {
         request->result.prefill_fallback_reason =
             "incremental_prefill_unavailable";
       }
+      if (perf::current != nullptr) {
+        perf::current->tokens_budget = budget;
+        perf::current->tokens_requested = budget;
+      }
       const auto start = Clock::now();
       const auto step = request->runner_request.Prefill(budget);
+      if (perf::current != nullptr)
+        perf::current->tokens_processed = step.consumed_tokens;
       const double step_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - start)
               .count();
@@ -1450,6 +1482,7 @@ struct TextGenerationScheduler::Impl {
 
   void FinishAdvanced(const std::shared_ptr<ScheduledRequest>& request,
                       Clock::time_point decode_start) {
+    perf::Decode(request->session, 1, 1);
     request->result.decode_ms +=
         std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
             .count();
@@ -1499,6 +1532,9 @@ struct TextGenerationScheduler::Impl {
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
       const auto step = request->runner_request.DecodeStep(remaining);
+      perf::Decode(request->session,
+                   step.selections.empty() ? 0 : step.draft_tokens + 1,
+                   step.selections.size());
       request->result.draft_rounds += step.draft_rounds;
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
@@ -1789,6 +1825,10 @@ struct TextGenerationScheduler::Impl {
       if (CompleteIfStopped(item.request))
         continue;
       const auto& step = steps[index];
+      if (!step.failure)
+        perf::Decode(item.request->session,
+                     step.selections.empty() ? 0 : step.draft_tokens + 1,
+                     step.selections.size());
       if (step.failure) {
         if (!CompleteIfStopped(item.request))
           CompleteFailure(item.request, step.failure, true);
@@ -1921,6 +1961,16 @@ struct TextGenerationScheduler::Impl {
     std::deque<std::shared_ptr<ScheduledRequest>> capturing;
     // Cold requests waiting for a resident prefill of their shared prefix.
     std::deque<std::shared_ptr<ScheduledRequest>> waiting;
+    const auto trace_queue = [&](perf::Work& work) {
+      if (auto* trace = work.get()) {
+        trace->prefilling_waiting = prefilling.size();
+        trace->decoders_due = static_cast<std::size_t>(
+            std::count_if(decoding.begin(), decoding.end(),
+                          [](const auto& r) { return r->decode_due; }));
+        trace->capturing = capturing.size();
+        trace->waiting = waiting.size();
+      }
+    };
     while (!stop_token.stop_requested()) {
       if (device_lost.load(std::memory_order_acquire))
         break;
@@ -1928,6 +1978,9 @@ struct TextGenerationScheduler::Impl {
       ProcessQueuedCancellations();
 
       for (std::size_t count = capturing.size(); count != 0; --count) {
+        perf::Work perf_capture("capture");
+        trace_queue(perf_capture);
+        TraceRequest(capturing.front(), true);
         auto request = std::move(capturing.front());
         capturing.pop_front();
         if (request->runner_request.SnapshotPending()) {
@@ -1950,6 +2003,8 @@ struct TextGenerationScheduler::Impl {
       if (device_lost.load(std::memory_order_acquire))
         break;
       if (prefilling.empty() && decoding.empty()) {
+        perf::Work perf_wait("idle-wait");
+        trace_queue(perf_wait);
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
           return stop_token.stop_requested() || stopping ||
@@ -2014,6 +2069,9 @@ struct TextGenerationScheduler::Impl {
                       });
       if (!prefilling.empty() && !decoding.empty() &&
           (!due_decoder || assemble_initial_batch)) {
+        perf::Work perf_prefill("prefill");
+        trace_queue(perf_prefill);
+        TraceRequest(prefilling.front(), true);
         auto request = std::move(prefilling.front());
         prefilling.pop_front();
         StepPrefill(request, true);
@@ -2042,11 +2100,15 @@ struct TextGenerationScheduler::Impl {
             plan.kind == TextExecutionPlanKind::kBatched
                 ? std::min(candidate_count, plan.physical_width)
                 : 1;
+        perf::Work perf_decode(batch_size == 1 ? "decode_single"
+                                               : "decode_batch");
+        trace_queue(perf_decode);
         std::vector<std::shared_ptr<ScheduledRequest>> batch;
         batch.reserve(batch_size);
         for (std::size_t index = 0; index < batch_size; ++index) {
           auto request = PopDecoder(decoding, due_decoder);
           request->decode_due = false;
+          TraceRequest(request);
           batch.push_back(std::move(request));
         }
         StepDecodeBatch(batch);
@@ -2061,6 +2123,9 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
 
+      perf::Work perf_prefill("prefill");
+      trace_queue(perf_prefill);
+      TraceRequest(prefilling.front(), true);
       auto request = std::move(prefilling.front());
       prefilling.pop_front();
       const bool short_peer_waiting = std::any_of(

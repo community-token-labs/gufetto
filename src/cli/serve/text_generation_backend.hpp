@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
@@ -33,6 +34,7 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kSchedulerStopping,
   kToolChoiceUnsatisfied,
   kDeviceLost,
+  kCacheLookupBusy,
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.
@@ -56,6 +58,7 @@ public:
       case TextGenerationErrorCode::kOutputBackpressure:
       case TextGenerationErrorCode::kSchedulerStopping:
       case TextGenerationErrorCode::kDeviceLost:
+      case TextGenerationErrorCode::kCacheLookupBusy:
         return 503;
       case TextGenerationErrorCode::kToolChoiceUnsatisfied:
         return 502;
@@ -80,6 +83,8 @@ public:
         return "tool_choice_unsatisfied";
       case TextGenerationErrorCode::kDeviceLost:
         return "device_lost";
+      case TextGenerationErrorCode::kCacheLookupBusy:
+        return "cache_lookup_busy";
     }
     return "generation_error";
   }
@@ -132,6 +137,28 @@ struct ChatRequest {
 /// generated text pieces and aggregate request metrics.
 class TextGenerationBackend {
 public:
+  /// Point-in-time local reuse hint, not a reservation or transferable state
+  /// identity. Predicts selection from trusted single-owner cache metadata;
+  /// disk bytes are NOT read/verified. Concurrent state changes, external file
+  /// modification, corruption, I/O or restore failures can change actual reuse
+  /// (RAM/device restores can fail too). Opaque full checkpoints whose decode
+  /// readiness is unknown are conservatively omitted.
+  struct CacheLookupResult {
+    std::size_t total_tokens{0};
+    std::size_t matched_tokens{0};
+    std::string tier{"none"};
+    std::string epoch;
+    std::optional<double> restore_estimate_ms;
+    std::optional<double> prefill_estimate_ms;
+    double lookup_ms{0.0};
+    // Advisory inventory observation, not a future restore reservation. A
+    // freshly conservative empty view reports age zero during publication.
+    std::uint64_t index_version{0};
+    double snapshot_age_ms{0.0};
+    // HTTP log correlation only, deliberately not serialized in lookup JSON.
+    std::uint64_t observation_id{0};
+  };
+
   using CancellationCheck = std::function<bool()>;
   using TokenCallback = std::function<bool(std::string_view)>;
 
@@ -389,6 +416,24 @@ public:
 
   [[nodiscard]] virtual std::size_t count_tokens(
       std::string_view text) const = 0;
+
+  /// No admission, prefill, state restore, LRU touch, or disk payload reads.
+  /// Reads published metadata on the caller's thread, independently of GPU
+  /// execution. In-flight mutation may under-report reuse, never waits for a
+  /// generation slot.
+  [[nodiscard]] virtual std::optional<CacheLookupResult> cache_lookup(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
+
+  [[nodiscard]] virtual std::shared_ptr<CheckpointTransferBlob> cache_export(
+      const ChatRequest&) const {
+    return {};
+  }
+  [[nodiscard]] virtual std::shared_ptr<CheckpointTransferBlob> cache_import(
+      const CheckpointTransferReader&, std::uint64_t) const {
+    return {};
+  }
 
   /// Prompt tokens a chat request would use after template rendering, without
   /// generating. Empty when the backend cannot tell.

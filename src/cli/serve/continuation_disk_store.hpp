@@ -163,6 +163,16 @@ public:
       std::size_t stable_prefix_tokens = 0,
       std::span<const ContinuationInputPrefix> input_prefixes = {});
 
+  /// Same metadata plan as RestoreLongestPrefix, without payload reads,
+  /// verification, events, file opens or LRU touches. Null means busy.
+  /// Trusted single-owner metadata predicts a restore attempt, not successful
+  /// I/O/integrity: external writers/corruption can invalidate the prediction.
+  [[nodiscard]] std::optional<ContinuationReuse> Lookup(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      std::size_t stable_prefix_tokens = 0,
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
+
   /// Prefix lengths that prompt shares with stored entries but that no entry
   /// holds exactly.
   ///

@@ -2579,9 +2579,35 @@ void TestServerInstructionsAreFraming() {
   }
 }
 
+void TestLookupRuntimeDefaultsAndDisabled() {
+  class IdentityRunner final : public FakeRunner {
+  public:
+    IdentityRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    mutable std::size_t identity_calls{};
+    std::string LookupContextIdentity() const override {
+      ++identity_calls;
+      return "fake-sidecar";
+    }
+  };
+  const std::vector<TextRunnerToken> prompt{10};
+  auto disabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool no_lookup(disabled, 1, {}, {.publish_lookup = false});
+  Expect(disabled->identity_calls == 0,
+         "disabled lookup does not discover or hash an epoch");
+  Expect(no_lookup.Lookup(prompt).epoch.empty(),
+         "disabled lookup has no advisory epoch");
+  auto enabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool default_pool(enabled, 1);
+  Expect(
+      enabled->identity_calls == 1 &&
+          default_pool.Lookup(prompt).epoch.size() == 64,
+      "default CPU pools have a portable advisory epoch without strict pins");
+}
+
 }  // namespace
 
 int main() {
+  TestLookupRuntimeDefaultsAndDisabled();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();

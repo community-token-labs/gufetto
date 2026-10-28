@@ -813,6 +813,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
+  perf::Forward perf_forward(false);
+  perf::HostPhase perf_batch("target_forward_batch");
   selected_logits_ = nullptr;
   DropReadyQ8();
   const Config& c = config();
@@ -844,6 +846,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         return Fail(error, "token out of range");
       }
     }
+    perf_forward.Rows(item.session->position_, item.tokens.size());
     offsets[i] = rows;
     rows += static_cast<std::uint32_t>(item.tokens.size());
     max_tokens =
@@ -975,6 +978,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       if (!AnyActive(items))
         return true;
       const auto& l = layers[il];
+      if (perf::current != nullptr)
+        perf::layer_id = il;
       if (c.IsPleLayer(il) && !WaitPle(error))
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
@@ -1089,6 +1094,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         return false;
       if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
         return false;
+      if (perf::sample_moe)
+        PerfRoutes(il, rows);
       const float* next_norm =
           il + 1 < c.num_layers
               ? (c.IsPleLayer(il + 1) ? nullptr
@@ -1115,6 +1122,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                       rows, error) &&
            DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
   };
+  PerfTarget perf_target(perf_events_, stream_);
   bool ok = false;
   try {
     ok = body();
@@ -1123,7 +1131,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     UseScratch(base);
     throw;
   }
+  if (perf::current != nullptr)
+    perf_events_.Stop(stream_);
   const auto status = hipStreamSynchronize(stream_);
+  if (status == hipSuccess && ok)
+    perf_target.Finish();
   UseScratch(base);
   if (!ok || !Check(status, error)) {
     return false;

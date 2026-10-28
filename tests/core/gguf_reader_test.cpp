@@ -636,10 +636,11 @@ void TestIntegerRoutingTensor() {
 }
 
 void TestMappedPrefetch() {
-  char path[] = "/tmp/gufo-prefetch-XXXXXX";
-  const int fd = mkstemp(path);
+  auto path = (std::filesystem::temp_directory_path() / "gufo-prefetch-XXXXXX")
+                  .string();
+  const int fd = mkstemp(path.data());
   Expect(fd >= 0, "create prefetch fixture");
-  unlink(path);
+  unlink(path.c_str());
   constexpr std::size_t bytes = (17U << 20) + 7;
   Expect(ftruncate(fd, bytes) == 0, "size two-chunk prefetch fixture");
   const char marker = 'Q';

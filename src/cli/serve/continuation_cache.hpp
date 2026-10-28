@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -110,6 +111,19 @@ struct ContinuationLookup {
   std::string_view miss_reason;
   std::size_t common_prefix_tokens{0};
   std::size_t checkpoint_tokens{0};
+};
+
+/// Metadata-only reuse estimate; no execution slot or payload is reserved.
+struct ContinuationReuse {
+  std::size_t matched_tokens{0};
+  std::string_view tier{"none"};
+  std::size_t restore_bytes{0};
+  /// Metadata publication version and elapsed steady-clock age.
+  /// Both are zero when no view is available.
+  std::uint64_t index_version{0};
+  double snapshot_age_ms{0.0};
+  // Internal telemetry only; not part of the lookup response/payload ABI.
+  std::uint64_t observation_id{0};
 };
 
 /// Bounded exact-prefix cache over opaque model continuation states.
@@ -233,7 +247,8 @@ public:
   /// defaults to capacity; the byte budget bounds retained/in-flight payloads.
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
                     SnapshotSupport snapshot_support = {},
-                    std::size_t snapshot_capacity = 0);
+                    std::size_t snapshot_capacity = 0,
+                    bool publish_lookup = true);
   ~ContinuationCache();
 
   ContinuationCache(const ContinuationCache&) = delete;
@@ -250,6 +265,18 @@ public:
       const std::function<void(ContinuationState&)>& prepare_state = {},
       bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
       std::span<const ContinuationInputPrefix> input_prefixes = {});
+
+  /// Promptly returns published metadata without leasing, payload access,
+  /// GPU work, or touching LRU. Always engaged, even with all slots busy.
+  /// Idle results match Acquire's prefix/identity/fallback rules. Concurrent
+  /// mutations may conservatively omit revoked records or unpublished work;
+  /// busy live frontiers are excluded, but retained checkpoints still count.
+  /// This is a point-in-time estimate, not a guarantee for a later Acquire.
+  [[nodiscard]] std::optional<ContinuationReuse> Lookup(
+      std::span<const ContinuationToken> prompt,
+      std::span<const std::uint8_t> input_identity = {},
+      bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
+      std::span<const ContinuationInputPrefix> input_prefixes = {}) const;
 
   /// Longest retained prefix of prompt with a matching input identity,
   /// ignoring stable-prefix fallback rules. Leases nothing.

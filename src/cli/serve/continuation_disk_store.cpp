@@ -1288,6 +1288,22 @@ struct ContinuationDiskStore::Impl {
     return best;
   }
 
+  [[nodiscard]] EntryIterator PlanRestore(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity,
+      std::size_t stable_prefix_tokens,
+      std::span<const ContinuationInputPrefix> input_prefixes) {
+    const auto candidate = FindLongestInputCandidate(
+        runner, prompt, input_identity, input_prefixes);
+    if (candidate != entries.end() && stable_prefix_tokens != 0 &&
+        candidate->tokens.size() > stable_prefix_tokens &&
+        FindLongestInputCandidate(runner, prompt.first(stable_prefix_tokens),
+                                  input_identity,
+                                  input_prefixes) == entries.end())
+      return entries.end();
+    return candidate;
+  }
+
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt,
@@ -1302,23 +1318,13 @@ struct ContinuationDiskStore::Impl {
     }
 
     while (true) {
-      const EntryIterator candidate = FindLongestInputCandidate(
-          runner, prompt, input_identity, input_prefixes);
+      const EntryIterator candidate = PlanRestore(
+          runner, prompt, input_identity, stable_prefix_tokens, input_prefixes);
       if (candidate == entries.end()) {
         Emit(ContinuationDiskEventAction::kMiss,
              ContinuationDiskEventReason::kNotFound, 0, 0, 0);
         return {};
       }
-      if (stable_prefix_tokens != 0 &&
-          candidate->tokens.size() > stable_prefix_tokens &&
-          FindLongestInputCandidate(runner, prompt.first(stable_prefix_tokens),
-                                    input_identity,
-                                    input_prefixes) == entries.end()) {
-        Emit(ContinuationDiskEventAction::kMiss,
-             ContinuationDiskEventReason::kNotFound, 0, 0, 0);
-        return {};
-      }
-
       std::vector<std::uint8_t> image;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
@@ -1595,6 +1601,26 @@ ContinuationDiskStore::RestoreLongestPrefix(
   }
   return impl_->RestoreLongestPrefix(runner, state, prompt, input_identity,
                                      stable_prefix_tokens, input_prefixes);
+}
+
+std::optional<ContinuationReuse> ContinuationDiskStore::Lookup(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+    std::span<const std::uint8_t> input_identity,
+    std::size_t stable_prefix_tokens,
+    std::span<const ContinuationInputPrefix> input_prefixes) const {
+  if (stable_prefix_tokens > prompt.size())
+    throw std::invalid_argument("stable cache prefix exceeds prompt length");
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit)
+    return std::nullopt;
+  if (!DescriptorForInput(runner, input_identity).persistence)
+    return ContinuationReuse{};
+  const auto candidate = impl_->PlanRestore(
+      runner, prompt, input_identity, stable_prefix_tokens, input_prefixes);
+  if (candidate == impl_->entries.end())
+    return ContinuationReuse{};
+  return ContinuationReuse{candidate->tokens.size(), "disk",
+                           candidate->file_bytes};
 }
 
 std::vector<std::size_t> ContinuationDiskStore::SharedPrefixBoundaries(

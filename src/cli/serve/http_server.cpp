@@ -1856,6 +1856,12 @@ void HttpServer::register_routes() {
   // ---- OpenAI ----
   add("POST", "/v1/completions", OpenAiCompletions);
   add("POST", "/v1/chat/completions", HandleOpenAiChat);
+  if (options_.cache_lookup_api)
+    add("POST", "/v1/cache/lookup", HandleCacheLookup);
+  if (options_.cache_transfer_api) {
+    add("POST", "/v1/cache/export", HandleCacheExport);
+    add("POST", "/v1/cache/import", HandleCacheImport);
+  }
   add("POST", "/v1/responses", OpenAiResponses);
   add("POST", "/v1/embeddings", NotImplemented);
 
@@ -2336,6 +2342,51 @@ void HttpServer::handle_connection(int client_fd,
             content_length > body.size() ? content_length - body.size() : 0;
         if (!valid_headers || !parsed_length.has_value()) {
           ok = false;
+        } else if (options_.cache_transfer_api && req.method == "POST" &&
+                   req.path == "/v1/cache/import") {
+          req.content_length = content_length;
+          if (content_length > kMaxCheckpointTransferBytes) {
+            payload_too_large = true;
+          } else {
+            // Authorization/routing happens before the first read or 100
+            // Continue. Never buffer a multi-GiB request in HttpRequest::body.
+            req.body_reader =
+                [client_fd, initial = std::move(body),
+                 position = std::size_t{0}, left = content_length, first = true,
+                 expect = http11 && ExpectsContinue(req),
+                 deadline = start_time + std::chrono::minutes(2)](
+                    std::span<std::uint8_t> out) mutable -> std::size_t {
+              if (std::chrono::steady_clock::now() >= deadline)
+                return 0;
+              if (first) {
+                first = false;
+                if (expect &&
+                    !SendAll(client_fd, "HTTP/1.1 100 Continue\r\n\r\n"))
+                  return 0;
+              }
+              out = out.first(std::min(out.size(), left));
+              if (out.empty())
+                return 0;
+              std::size_t n = 0;
+              if (position < initial.size()) {
+                n = std::min(out.size(), initial.size() - position);
+                std::memcpy(out.data(), initial.data() + position, n);
+                position += n;
+              } else {
+                std::intptr_t got;
+                do {
+                  got = net::Receive(client_fd, out.data(), out.size());
+                } while (got < 0 && net::IsSocketInterrupted() &&
+                         std::chrono::steady_clock::now() < deadline);
+                if (got <= 0)
+                  return 0;
+                n = static_cast<std::size_t>(got);
+              }
+              left -= n;
+              return n;
+            };
+            ok = true;
+          }
         } else if (content_length > options_.max_request_body_bytes) {
           payload_too_large = true;
         } else if (content_length > 0) {
@@ -2428,6 +2479,10 @@ void HttpServer::handle_connection(int client_fd,
         auto last_write = std::chrono::steady_clock::now();
         const auto send_body = [&](std::string_view chunk) {
           const std::lock_guard lock(write_mutex);
+          if (req.path == "/v1/cache/export" &&
+              std::chrono::steady_clock::now() - start_time >=
+                  std::chrono::minutes(2))
+            connected = false;
           if (!connected)
             return false;
           if (!response_started) {

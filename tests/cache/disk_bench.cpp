@@ -52,8 +52,8 @@ int main() {
   std::cout << "100k_token_manifest_bytes="
             << EncodeManifest(Manifest(100000, 1)).size() << '\n';
   for (unsigned count : {100, 1000}) {
-    char name[] = "/tmp/gufo-disk-bench-XXXXXX";
-    fs::path root = mkdtemp(name);
+    auto name = (fs::temp_directory_path() / "gufo-disk-bench-XXXXXX").string();
+    fs::path root = mkdtemp(name.data());
     try {
       {
         DiskStore init(ledger, root, UINT64_MAX);

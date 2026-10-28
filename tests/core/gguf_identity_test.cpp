@@ -143,8 +143,9 @@ void TestEveryPayloadByte() {
 }
 
 void TestFileDigestCache() {
-  char temp[] = "/tmp/gufo-identity-XXXXXX";
-  Expect(mkdtemp(temp) != nullptr, "create cache test directory");
+  auto temp = (std::filesystem::temp_directory_path() / "gufo-identity-XXXXXX")
+                  .string();
+  Expect(mkdtemp(temp.data()) != nullptr, "create cache test directory");
   const std::filesystem::path root(temp);
   const char* old_cache = std::getenv("XDG_CACHE_HOME");
   const std::string saved_cache = old_cache ? old_cache : "";

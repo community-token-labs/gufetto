@@ -278,6 +278,16 @@ The startup line `event=vision_prepared` reports `resident_bytes`,
 `identity_ms` and `upload_ms`. Startup fails if the upload does not fit. Image
 encoding scratch is still allocated per image.
 
+Flash-Next can explicitly register one persistent system/tools checkpoint with
+`--pin-prefix-file FILE --pin-prefix-dir DIR` (default off). The file contains
+already-rendered text. `--pin-prefix-bytes N` bounds its dedicated non-LRU
+store (default 1 GiB); the checkpoint counts against the RAM budget and is
+materialized before readiness on compatible restarts, without prefix prefill
+or another pin write. `--pin-prefix-lazy` instead restores on demand and warms
+RAM when it fits. This tier works without `--cache-disk`; the directories must
+be separate. See [registered pinned prefixes](fork/PINNED-PREFIX.md) for the
+identity contract, exact-token caveats, corruption handling and limitations.
+
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
 
@@ -469,10 +479,129 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `GET` | `/v1/models` | List loaded model aliases and capabilities |
 | `POST` | `/v1/responses` | Text/images, structured output, optional SSE streaming |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
+| `POST` | `/v1/cache/lookup` | Read-only prefix query; requires `--cache-lookup-api` |
+| `POST` | `/v1/cache/export` | Immutable checkpoint blob; requires `--cache-transfer-api` |
+| `POST` | `/v1/cache/import` | Verified blob to RAM; requires `--cache-transfer-api` |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
+
+### Prefix-cache lookup (opt-in)
+
+Start text serving with `--cache-lookup-api` to expose
+`POST /v1/cache/lookup`. Without the flag the route returns 404. It uses the
+same authentication, body limits, chat parsing and model validation as
+`/v1/chat/completions`; send the **same complete request body**, including tools,
+images and template/reasoning options. `stream` does not enable streaming here.
+The worker renders and tokenizes; the caller must not approximate token or
+hybrid-state boundaries from message hashes.
+
+```json
+{
+  "total_tokens": 104211,
+  "matched_tokens": 98304,
+  "tier": "ram",
+  "restore_estimate_ms": 35.5,
+  "prefill_estimate_ms": 4123.0,
+  "epoch": "opaque-compatibility-digest",
+  "lookup_ms": 2.4,
+  "semantics": "advisory",
+  "index_version": 42,
+  "snapshot_age_ms": 0.8
+}
+```
+
+The numbers above illustrate the schema, not measured performance. `tier` is
+`live`, `ram`, `disk` or `none`; registered pins are classified by their current
+storage tier. An unmeasured cost is JSON `null`, not zero. Costs exclude queueing
+and decoding; `prefill_estimate_ms` prices the unmatched tail. `lookup_ms` measures
+server processing through the query, including parsing/rendering/tokenization,
+but not network I/O or response serialization. HTTP clients should measure their
+own elapsed time too. Replies have `Cache-Control: no-store`.
+
+Lookup is an **advisory, side-effect-free hint, not a reservation or a restore
+guarantee** (`semantics: "advisory"`). It never submits generation, prefills,
+mutates a session, promotes LRU entries or reserves a slot. Rendering/tokenization
+run on the HTTP thread. The query reads immutable published metadata, without
+entering scheduler admission, waiting for a free slot or holding a GPU-work
+mutex. Weak source-validity checks briefly retain source metadata, but acquire
+no slot leases or disk publication pins and never read payloads.
+
+The component owner invalidates its published view before mutation and publishes
+a complete replacement before releasing its mutation lock. A single version
+check converts any overlapping update into a conservative miss; it never retries
+behind GPU work. Thus a completed owner mutation is not silently absent from a
+subsequent lookup: publication lag is zero completed mutation critical sections.
+New GPU work is not claimed before checkpoint publication. An executing lease
+hides its live frontier, but its published immutable checkpoints remain eligible.
+This mostly affects a conversation queried while its previous turn is still
+running, rather than sequential agent loops.
+
+`index_version` is a process-local inventory version, not the compatibility
+`epoch` or a lease. `snapshot_age_ms` is the age of the selected publication; idle
+unchanged state can be arbitrarily old without becoming incorrect. During an
+update, a freshly conservative empty observation has age zero. Legacy disk-only
+queries do not have a published clock and report zero version/age. There is no
+fixed wall-clock promise for GPU work still in flight. Concurrent requests,
+eviction and a failed integrity-checked restore can change actual reuse before
+admission. A future optional reserve/TTL-pin protocol could address that race;
+no such protocol is implemented here. `cache_prompt: false` reports zero reuse. Unsupported backends or
+request shapes return 501 rather than fabricate a hit. Invalid requests retain
+chat validation errors; an unavailable/lost backend returns 503.
+
+Treat `epoch` as opaque: it binds the build and loaded model/cache execution
+profile, including snapshot compatibility. A changed value invalidates placement
+observations; an equal value does **not** authorize checkpoint transfer between
+hosts. Lookup bodies are excluded from `--trace` request-body capture, and lookup
+emits no prompt text in logs. There is currently no `/v1/cache/stats` endpoint.
+
+### Checkpoint transfer (experimental, opt-in)
+
+`--cache-transfer-api` enables Flash-Next `POST /v1/cache/export` (complete chat
+JSON to a streamed blob) and `POST /v1/cache/import` (Content-Length-framed binary
+blob to an evictable RAM checkpoint). Default OFF, independent of lookup.
+Requires matching model, build/runtime, payload ABI and execution/render policy.
+The blob includes sensitive token IDs and state: use only on a trusted,
+authenticated LAN and provision an encrypted disk-backed `TMPDIR`. Imports have
+a separate 8 GiB total limit, 16 MiB header limit, complete pre-admission
+verification and one-transfer quota; ordinary JSON body limits are unchanged.
+No live-session replacement, prefill, durable import or router reservation.
+See [checkpoint transfer](checkpoint-transfer.md) for the protocol, errors,
+source ownership, memory/SSD costs, CPU evidence and pending two-host GPU gate.
+
+#### Advisory lookup diagnostics (R3, logs/metrics only)
+
+Component-cache logs use `schema=cache-lookup-v1`: `http_lookup` joins the
+existing HTTP `X-Request-ID` to `lookup_id`; `lookup` records entry ID, observed
+index version, start/finish versions and `published`, `mutation_in_flight`,
+`mutation_overlap` or `unpublished`. Odd versions attest an in-flight owner
+mutation; age zero alone does not. Entry IDs and versions are process/pool-local.
+
+The existing `usage.gufo.component_cache` metrics add `acquisition_id`,
+`admission_index_version`, `selected_entry_id`, `restore_attempts`,
+`restore_failures` and static `restore_failure_reason`. The acquire log carries
+the same fields, including zero counters on a cold miss/live reuse. Admission
+version is the last completed publication **before admission's own mutation**;
+counting its own invalidation would incorrectly excuse every overreport.
+Failures log each attempted entry and a stage code, never exception text.
+`restore_ms=0` is not evidence of zero attempts.
+
+`retire` logs entry ID, retirement version and reason; retain these logs through
+the whole trial rather than try to recover an expired entry later. `erased` and
+`live_unavailable` denote complete invalidation; `resident_dropped`,
+`durable_removed` and `availability_changed` are source changes, not proof that
+the whole entry is gone. A retirement explaining a pair must be later than its
+lookup and no later than admission. A failed restore quarantines that entry
+from future index publication (retained payload lifetime and already selected
+readers remain unchanged); it is still a correctness failure, not advisory
+staleness. New validated captures may replace it.
+
+Neither lookup response fields nor snapshot payload ABI changed. No reservation
+or pin is taken between lookup and admission. The CPU-only barrier fixtures run
+in `component_text_cache_test`; offline `tests/functional/cache_lookup_classify.py`
+classifies their logs and sanitized GPU reports without prompt text. Raw harness
+exactness failures remain intact; causal classification is a separate report.
 
 ### Other model services
 

@@ -13,8 +13,10 @@ namespace gufo::cache::testing {
 struct TieredDirectory {
   std::filesystem::path path;
   TieredDirectory() {
-    char pattern[] = "/tmp/gufo-tiered-test-XXXXXX";
-    path = mkdtemp(pattern);
+    auto pattern =
+        (std::filesystem::temp_directory_path() / "gufo-tiered-test-XXXXXX")
+            .string();
+    path = mkdtemp(pattern.data());
   }
   ~TieredDirectory() { std::filesystem::remove_all(path); }
 };

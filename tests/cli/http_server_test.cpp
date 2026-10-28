@@ -24,6 +24,7 @@
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/net.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -193,7 +194,8 @@ void TestContentTrace() {
   {
     RunningServer server(
         {.api_key = "test-secret",
-         .sse_heartbeat_interval = std::chrono::milliseconds(5)});
+         .sse_heartbeat_interval = std::chrono::milliseconds(5),
+         .cache_transfer_api = true});
     server.backend->SetOutput("<tool_call>leak");
     const auto post = [&](std::string_view route, std::string_view body,
                           bool authorized = true) {
@@ -229,6 +231,12 @@ void TestContentTrace() {
         post("/v1/completions", R"({"prompt":"unauthorized-prompt"})", false),
         401);
     ExpectStatus(post("/echo", "echo-body"), 200);
+    ExpectStatus(
+        post(
+            "/v1/cache/export",
+            R"({"model":"test","messages":[{"role":"user","content":"private-transfer-prompt"}]})"),
+        501);
+    ExpectStatus(post("/v1/cache/import", "private-transfer-blob"), 415);
     ExpectStatus(server.Send("GET /health HTTP/1.1\r\nAuthorization: Bearer "
                              "test-secret\r\n\r\n"),
                  200);
@@ -243,6 +251,8 @@ void TestContentTrace() {
     for (std::string line; std::getline(input, line);) {
       assert(line.find("unauthorized-prompt") == std::string::npos);
       assert(line.find("echo-body") == std::string::npos);
+      assert(line.find("private-transfer-prompt") == std::string::npos);
+      assert(line.find("private-transfer-blob") == std::string::npos);
       records.push_back(gufo::json::parse(line));
     }
   }
@@ -3131,7 +3141,109 @@ void TestEmbeddingService() {
   }
 }
 
+void TestCacheLookupOptIn() {
+  const std::string input =
+      R"({"model":"test","messages":[{"role":"user","content":"private-lookup-sentinel"}]})";
+  {
+    RunningServer server;
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 404);
+  }
+  {
+    RunningServer server({.cache_lookup_api = true});
+    // The fake backend has no lookup implementation: dispatch works without
+    // falling back to token counting or generating a request.
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 501);
+    assert(server.backend->LastCall().chat.messages.empty());
+    server.backend->lost = true;
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 503);
+  }
+  {
+    RunningServer server(
+        {.api_key = "lookup-test-key", .cache_lookup_api = true});
+    ExpectStatus(server.Post("/v1/cache/lookup", input), 401);
+    const auto reply = server.Send(
+        "POST /v1/cache/lookup HTTP/1.1\r\nAuthorization: Bearer "
+        "lookup-test-key\r\n"
+        "Content-Length: " +
+        std::to_string(input.size()) + "\r\n\r\n" + input);
+    ExpectStatus(reply, 501);
+  }
+}
+
+void TestCheckpointTransferHttp() {
+  using namespace gufo;
+  using namespace gufo::server;
+  const std::string request =
+      R"({"model":"test","messages":[{"role":"user","content":"private-transfer-sentinel"}]})";
+  {
+    RunningServer off;
+    ExpectStatus(off.Post("/v1/cache/export", request), 404);
+    ExpectStatus(off.Post("/v1/cache/import", ""), 404);
+  }
+  RunningServer server({.cache_transfer_api = true});
+  ExpectStatus(server.Post("/v1/cache/export", request), 501);
+  constexpr std::uint64_t size = 9ULL << 20;  // Above normal HTTP's 8 MiB cap.
+  CheckpointTransferHeader header;
+  header.configuration = "payload=20;build=identical";
+  header.identity = {1, 2, 20};
+  crypto::Sha256Hasher hash;
+  hash.Update(header.identity);
+  header.manifest = {
+      .checkpoint = {1},
+      .lineage = {1},
+      .compatibility = hash.Finish(),
+      .tokens = {100, 101},
+      .components = {
+          {.descriptor =
+               {{1}, 1, cache::ComponentKind::kPrivateState, 0, 0, size},
+           .position = {{1}, 2},
+           .private_state = cache::DiskPayload{{1}, size, 0}}}};
+  header.decode_ready = true;
+  auto blob =
+      CheckpointTransferBlob::Export(header, [&](auto, const auto& consume) {
+        std::vector<std::uint8_t> piece(1 << 20, 87);
+        for (std::uint64_t i = 0; i < size; i += piece.size())
+          consume(piece);
+      });
+  server.backend->transfer_blob.store(blob);
+  const auto exported = server.Post("/v1/cache/export", request);
+  ExpectStatus(exported, 200);
+  assert(exported.find("Cache-Control: no-store") != std::string::npos);
+  assert(exported.find("Transfer-Encoding: chunked") == std::string::npos);
+  const auto wire = exported.substr(exported.find("\r\n\r\n") + 4);
+  assert(wire.size() == blob->Bytes() && wire.starts_with("GUFOCK01"));
+  const auto head =
+      "POST /v1/cache/import HTTP/1.1\r\nContent-Type: "
+      "application/vnd.gufo.checkpoint\r\nContent-Length: " +
+      std::to_string(wire.size()) + "\r\n";
+  ExpectStatus(server.Send(head + "\r\n" + wire), 200);
+  const auto continued =
+      server.Send(head + "Expect: 100-continue\r\n\r\n" + wire);
+  ExpectStatus(continued, 100);
+  assert(continued.find("HTTP/1.1 200 ") != std::string::npos);
+  assert(server.backend->LastCall().chat.messages.empty());
+  ExpectStatus(server.Send("POST /echo HTTP/1.1\r\nContent-Length: " +
+                           std::to_string(wire.size()) + "\r\n\r\n"),
+               413);
+  ExpectStatus(
+      server.Send("POST /v1/cache/import HTTP/1.1\r\nContent-Length: " +
+                  std::to_string(kMaxCheckpointTransferBytes + 1) + "\r\n\r\n"),
+      413);
+  ExpectStatus(server.Post("/v1/cache/import", ""), 415);
+  auto corrupt = wire;
+  corrupt.back() ^= 1;
+  ExpectStatus(server.Send(head + "\r\n" + corrupt), 400);
+  ExpectStatus(server.Send(head + "\r\n" + wire.substr(0, 200), true), 400);
+  // Auth rejection must not request/consume an upload or emit 100 Continue.
+  RunningServer secured(
+      {.api_key = "transfer-test-key", .cache_transfer_api = true});
+  const auto unauthorized = secured.Send(head + "Expect: 100-continue\r\n\r\n");
+  ExpectStatus(unauthorized, 401);
+  assert(unauthorized.find("100 Continue") == std::string::npos);
+}
 int main() {
+  TestCheckpointTransferHttp();
+  TestCacheLookupOptIn();
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
   // tint around the level tag.
