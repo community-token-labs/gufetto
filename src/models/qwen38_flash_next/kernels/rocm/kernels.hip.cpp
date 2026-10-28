@@ -183,8 +183,11 @@ __device__ __forceinline__ float RowElement(const void* row, WeightType type,
           static_cast<const void*>(blk + 2))[i % 32];
       return __half2float(d) * static_cast<float>(q);
     }
+    case WeightType::kQ5_1:
+    case WeightType::kQ5_K:
+    default:
+      return NAN;  // No generic decoder: never fabricate a zero weight.
   }
-  return 0.0f;
 }
 
 __device__ __forceinline__ std::size_t RowBytes(WeightType type,
@@ -203,8 +206,11 @@ __device__ __forceinline__ std::size_t RowBytes(WeightType type,
       return static_cast<std::size_t>(k / 256) * 144;
     case WeightType::kQ6_K:
       return static_cast<std::size_t>(k / 256) * 210;
+    case WeightType::kQ5_1:
+    case WeightType::kQ5_K:
+    default:
+      return 0;  // Unsupported row geometry; callers must not launch it.
   }
-  return 0;
 }
 
 /// Sum over one wave; every lane receives the total. The wave-per-row
@@ -6075,6 +6081,20 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
                  std::uint32_t streams, hipStream_t stream) {
+  switch (type) {
+    case WeightType::kF32:
+    case WeightType::kF16:
+    case WeightType::kBF16:
+    case WeightType::kQ8_0:
+    case WeightType::kQ5_0:
+    case WeightType::kQ4_K:
+    case WeightType::kQ6_K:
+      break;
+    case WeightType::kQ5_1:
+    case WeightType::kQ5_K:
+    default:
+      throw std::invalid_argument("unsupported embedding weight type");
+  }
   hipLaunchKernelGGL(EmbedKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
                      table, type, tokens, res, hidden, streams);
 }
