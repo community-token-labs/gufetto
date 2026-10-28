@@ -3157,7 +3157,8 @@ __global__ void AttentionKernel(const float* q, const void* k_cache,
   // overlap instead of each waiting out its own latency. Empty lanes read
   // the last key's row and are never used; a batch with no key at all is
   // skipped (returns false).
-  constexpr std::uint32_t kBatch = 8;
+  // Bound Group4 q8's live prefetched rows without changing key/FMA order.
+  constexpr std::uint32_t kBatch = kQ8 && kGroup == 4 ? 4 : 8;
   const auto load_batch = [&](const void* head, std::uint32_t base,
                               uint4* rows) {
     bool any = false;
@@ -3169,33 +3170,45 @@ __global__ void AttentionKernel(const float* q, const void* k_cache,
       return false;
     }
     if constexpr (kQ8) {
-      static_assert(kBatch == 8);
+      static_assert(kBatch == 4 || kBatch == 8);
       std::uint64_t raw_codes[kBatch];
       std::uint32_t raw_scales[kBatch];
+      // The launcher requires D256: each row/head is block-aligned. Factor
+      // its byte stride once instead of dividing/scaling every row index.
+      constexpr std::size_t kRowBlockElements = kKvQ8BlockElements;
+      const std::size_t column = head_offset + lane * 8;
+      const std::size_t row_bytes =
+          (kv_stride / kRowBlockElements) * sizeof(Q8KvDeviceBlock);
+      const auto* column_block =
+          static_cast<const unsigned char*>(head) +
+          (column / kRowBlockElements) * sizeof(Q8KvDeviceBlock);
+      const std::size_t code_offset = 2 + column % kRowBlockElements;
 #pragma unroll
       for (std::uint32_t b = 0; b < kBatch; ++b) {
         const std::uint32_t j = min(keys[base + b], n_kv - 1);
-        const std::size_t index = head_offset +
-                                  (static_cast<std::size_t>(j) * kv_stride) +
-                                  (lane * 8);
-        const auto* block =
-            static_cast<const unsigned char*>(head) +
-            (index / kKvQ8BlockElements) * sizeof(Q8KvDeviceBlock);
+        const auto* block = column_block + std::size_t{j} * row_bytes;
         std::uint16_t scale_bits;
         __builtin_memcpy(&scale_bits, block, sizeof(scale_bits));
-        __builtin_memcpy(&raw_codes[b], block + 2 + index % kKvQ8BlockElements,
+        __builtin_memcpy(&raw_codes[b], block + code_offset,
                          sizeof(raw_codes[b]));
         raw_scales[b] = scale_bits;
       }
-      // Opaque read/write operands make reconstruction depend on all eight raw
-      // tuples. Empty asm: no GPU barrier, memory clobber or volatile effects.
-      asm(""
-          : "+v"(raw_codes[0]), "+v"(raw_codes[1]), "+v"(raw_codes[2]),
-            "+v"(raw_codes[3]), "+v"(raw_codes[4]), "+v"(raw_codes[5]),
-            "+v"(raw_codes[6]), "+v"(raw_codes[7]), "+v"(raw_scales[0]),
-            "+v"(raw_scales[1]), "+v"(raw_scales[2]), "+v"(raw_scales[3]),
-            "+v"(raw_scales[4]), "+v"(raw_scales[5]), "+v"(raw_scales[6]),
-            "+v"(raw_scales[7]));
+      // Opaque read/write operands make reconstruction depend on the raw batch.
+      // Empty asm: no GPU barrier, memory clobber or volatile effects.
+      if constexpr (kBatch == 4) {
+        asm(""
+            : "+v"(raw_codes[0]), "+v"(raw_codes[1]), "+v"(raw_codes[2]),
+              "+v"(raw_codes[3]), "+v"(raw_scales[0]), "+v"(raw_scales[1]),
+              "+v"(raw_scales[2]), "+v"(raw_scales[3]));
+      } else {
+        asm(""
+            : "+v"(raw_codes[0]), "+v"(raw_codes[1]), "+v"(raw_codes[2]),
+              "+v"(raw_codes[3]), "+v"(raw_codes[4]), "+v"(raw_codes[5]),
+              "+v"(raw_codes[6]), "+v"(raw_codes[7]), "+v"(raw_scales[0]),
+              "+v"(raw_scales[1]), "+v"(raw_scales[2]), "+v"(raw_scales[3]),
+              "+v"(raw_scales[4]), "+v"(raw_scales[5]), "+v"(raw_scales[6]),
+              "+v"(raw_scales[7]));
+      }
 #pragma unroll
       for (std::uint32_t b = 0; b < kBatch; ++b) {
         rows[b] = detail::DecodeQ8Kv8Packed(
