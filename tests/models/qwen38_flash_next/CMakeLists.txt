@@ -19,6 +19,16 @@ add_qwen38_flash_next_test(kv_cache gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_rotation gufo_qwen38_flash_next "cpu")
 target_compile_options(qwen38_flash_next_kv_rotation_test PRIVATE
   -fno-fast-math -ffp-contract=off -frounding-math)
+# Host compile/control probe of verbatim HIP helper bodies, not native decoding.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+  add_test(NAME qwen38_flash_next.weight_dispatch_contract
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/weight_dispatch_contract_test.py"
+      --source-root "${PROJECT_SOURCE_DIR}" --cxx "${CMAKE_CXX_COMPILER}"
+      --rotation "ON"
+      --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(qwen38_flash_next.weight_dispatch_contract PROPERTIES
+    LABELS "qwen38_flash_next;cpu" TIMEOUT 45)
+endif()
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
