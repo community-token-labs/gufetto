@@ -81,6 +81,10 @@ public:
   /// pass over the pinned pages is cheaper than copying them first.
   void* Staged(hipStream_t stream, int id);
 
+  /// Drain callbacks and forget a stream before its owner destroys it.
+  /// No Submit/Wait calls may race this operation for the same stream.
+  bool ReleaseStream(hipStream_t stream);
+
   /// False once a run timed out or failed: results since then are invalid.
   bool Healthy() const noexcept;
 
@@ -93,10 +97,5 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-/// Hands the qwen executor the factory for the Qwen3.8-27B FFN NPU offload.
-void RegisterQwenNpuFfn();
-/// Hands the qwen executor the grouped-expert prefill for qwen35moe.
-void RegisterQwenMoePrefill();
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

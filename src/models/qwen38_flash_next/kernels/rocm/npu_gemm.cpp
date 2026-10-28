@@ -28,7 +28,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 
 namespace {
 
-constexpr unsigned kOpcode = 3;
+constexpr std::uint64_t kOpcode = 3;
 constexpr unsigned kDefaultRunTimeoutMs = 8000;  // a dispatch takes 1-15 ms
 constexpr std::size_t kBytesPer8 = 9;
 constexpr std::int64_t kHeartbeatQuietMs = 2000;
@@ -491,6 +491,17 @@ struct NpuGemm::Impl {
 };
 
 NpuGemm::NpuGemm() = default;
+
+bool NpuGemm::ReleaseStream(hipStream_t stream) {
+  const std::lock_guard lock(impl_->api_mutex);
+  if (hipStreamSynchronize(stream) != hipSuccess) {
+    impl_->failed = true;
+    return false;
+  }
+  std::erase(impl_->streams, stream);
+  return Healthy();
+}
+
 NpuGemm::~NpuGemm() {
   if (!impl_) {
     return;

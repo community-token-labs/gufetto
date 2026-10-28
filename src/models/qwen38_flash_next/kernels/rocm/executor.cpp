@@ -920,6 +920,13 @@ void Session::Reset(bool reuse_mtp) {
 }
 
 Executor::~Executor() {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  // Runtime outlives this executor through DeviceModel. Drain its callbacks
+  // before releasing scratch and remove the soon-to-be-destroyed HIP stream.
+  if (stream_ != nullptr && model_ != nullptr && model_->npu() != nullptr) {
+    (void)model_->npu()->ReleaseStream(stream_);
+  }
+#endif
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
   if (ple_pending_ || prefetch_.pending) {
