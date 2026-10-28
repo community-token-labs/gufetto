@@ -220,7 +220,9 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
                       const YarnRope& yarn = {},
-                      KvCacheType cache_type = KvCacheType::kF16);
+                      KvCacheType cache_type = KvCacheType::kF16,
+                      bool half_weights = false,
+                      std::uint32_t skip_gate_heads = 0);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -381,7 +383,15 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
-                   hipEvent_t z_ready = nullptr);
+                   hipEvent_t z_ready = nullptr,
+
+                   void (*before_epilogue)(void*) = nullptr,
+                   void* before_epilogue_arg = nullptr,
+                   const std::uint8_t* const* z_streams = nullptr,
+                   std::uint32_t z_stream_stride = 0,
+                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0,
+                   bool conv_half = false, void* chunk_scratch = nullptr,
+                   std::size_t chunk_scratch_bytes = 0);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
@@ -659,6 +669,110 @@ std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
+
+#ifdef GUFO_ENABLE_NPU
+// Donor split APIs: unsupported F16 weight copies return false for GPU fallback.
+bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
+                     const float* history, float* qkvz, float* convolved,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     std::uint32_t channels, std::uint32_t kernel,
+                     hipStream_t stream, std::uint32_t checkpoint_tokens,
+                     bool half_weights, std::uint32_t gpu_rows = 0);
+
+bool AttentionF16Gemm(const void* weights, const __half* input,
+                      const float* q_gamma, const float* k_gamma, float* query,
+                      float* gate, __half* keys, __half* values,
+                      std::uint32_t n_tokens, const std::uint32_t* position,
+                      float theta, float eps, hipStream_t stream,
+                      const qwen::vision::DeviceRope* rope, bool half_weights,
+                      std::uint32_t skip_gate_heads);
+
+void SsmConvTail(const float* qkvz, const float* conv_w, const float* history,
+                 float* convolved, std::uint32_t n_tokens,
+                 std::uint32_t channels, std::uint32_t stride,
+                 std::uint32_t c_begin, hipStream_t stream);
+
+/// Chunked recurrence scratch (the NPU F16 convolution path only).
+std::size_t GdnChunkScratchBytesFor(std::size_t n_tokens);
+
+void PrepareQueryHeads(const float* packed, std::uint32_t stride,
+                       const float* q_gamma, float* q, float* gate,
+                       std::uint32_t n_tokens, std::uint32_t heads,
+                       std::uint32_t kv_heads, std::uint32_t d,
+                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                       float theta, float eps, hipStream_t stream,
+                       const qwen::vision::DeviceRope* rope,
+                       std::uint32_t q_heads);
+/// The same, reading the packed rows straight from the NPU's C streams.
+/// Keys and values of the packed rows (heads query/gate pairs, then k, then v)
+/// into the caches: the kv heads' blocks of PrepareAttention only.
+bool PrepareKvHeads(const float* packed, std::uint32_t stride,
+                    const float* k_gamma, __half* k_cache, __half* v_cache,
+                    std::uint32_t n_tokens, std::uint32_t heads,
+                    std::uint32_t kv_heads, std::uint32_t d,
+                    std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                    float theta, float eps, hipStream_t stream,
+                    const qwen::vision::DeviceRope* rope);
+void PrepareQueryHeadsStreams(
+    const std::uint8_t* const* streams, std::uint32_t stream_stride,
+    std::uint32_t stream_tokens, const float* q_gamma, float* q, float* gate,
+    std::uint32_t n_tokens, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t d, std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+    float theta, float eps, hipStream_t stream,
+    const qwen::vision::DeviceRope* rope, std::uint32_t q_heads,
+    std::uint32_t first_token = 0, const YarnRope& yarn = {});
+
+/// NPU staging for the block-float GEMM kernel (see kernels.hip.cpp). Buffers
+/// hold 9 bytes per 8 values. Activations: tokens (a multiple of 128) rows of
+/// F16 at pitch ldx, K columns [k_offset, k_offset + k_slice), zero past
+/// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix.
+/// Output: tokens x cols decoded into out (pitch out_pitch) from column col0;
+/// with valid_cols only the first valid_cols columns of the slice are written.
+void NpuEncodeActivations(const __half* x, std::size_t ldx,
+                          std::uint32_t tokens, std::uint32_t k_slice,
+                          std::uint32_t k_offset, std::uint32_t k_valid,
+                          void* dst, hipStream_t stream, bool residual = false);
+void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
+                      std::uint32_t cols, std::uint32_t k_slice,
+                      std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
+                      hipStream_t stream);
+/// Weights from a quantized GGUF tensor of `type` (a core::GgmlType value) with
+/// rows of k_total elements; otherwise as NpuEncodeWeights.
+void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
+                           std::uint32_t k_total, std::uint32_t row0,
+                           std::uint32_t cols, std::uint32_t k_slice,
+                           std::uint32_t k_offset, std::uint32_t k_valid,
+                           void* dst, hipStream_t stream);
+/// Re-encodes `rows` rows of k weights (any K-quant or IQ `type`, a
+/// core::GgmlType value) as Q8_0 into dst (rows * k / 32 * 34 bytes).
+void RequantToQ8_0(const void* src, std::uint32_t type, std::uint32_t k,
+                   std::size_t rows, void* dst, hipStream_t stream);
+void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
+               const void* up_lo, __half* out, std::uint32_t tokens,
+               std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
+               std::size_t out_pitch = 0, std::uint32_t out_col0 = 0);
+void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
+                     std::uint32_t cols, std::size_t out_pitch,
+                     std::uint32_t col0, bool accumulate, hipStream_t stream,
+                     std::uint32_t valid_cols = 0);
+
+void NpuDecodeStreamRows(const std::uint8_t* const* streams,
+                         std::uint32_t stream_stride,
+                         std::uint32_t stream_tokens, float* out,
+                         std::uint32_t row0, std::uint32_t rows,
+                         std::uint32_t cols, std::size_t out_pitch,
+                         std::uint32_t col0, hipStream_t stream);
+
+/// Convolves NPU raw QKV streams into F32/F16 rows. Does not advance history:
+/// decode the trailing raw rows and let GatedDeltaNet shift the live history.
+/// F16 consumption requires convolved=true, row_split=true, d=128, no rollback.
+void SsmConv4Streams(const std::uint8_t* const* streams,
+                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                     const float* w, float* conv_state, void* out,
+                     std::uint32_t n_tokens, std::uint32_t channels,
+                     hipStream_t stream, bool half_out = false);
+
+#endif  // GUFO_ENABLE_NPU
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
