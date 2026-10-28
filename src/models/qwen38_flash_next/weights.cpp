@@ -25,6 +25,8 @@ struct Format {
       return {1, 2};
     case GgmlType::kQ8_0:
       return {32, 34};
+    case GgmlType::kQ5_0:
+      return {32, 22};
     case GgmlType::kQ5_1:
       return {32, 24};
     case GgmlType::kIQ4_NL:
@@ -114,19 +116,31 @@ struct Binder {
     return t;
   }
 
-  HcMixer Mixer(const std::string& prefix, const Config& c, bool with_inject) {
+  HcMixer Mixer(const std::string& prefix, const Config& c, bool with_inject,
+                bool nextn = false, bool ffn = false) {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
-    m.down =
-        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
-    m.up =
-        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
-            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+    const auto plain = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                        GgmlType::kF32};
+    const auto down = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                       GgmlType::kF32, ffn ? GgmlType::kQ6_K : GgmlType::kQ4_K};
+    const auto up = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                     GgmlType::kF32, GgmlType::kQ5_0};
+    m.down = Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+                 nextn ? down : plain);
+    // HC rank 320 is Q5_0-aligned, but not Q4_K-aligned.
+    m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
+               nextn ? up : plain);
     if (with_inject) {
-      m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
-                     {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
+      m.inject =
+          Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
+              nextn ? std::initializer_list<GgmlType>{GgmlType::kF32,
+                                                      GgmlType::kQ8_0,
+                                                      GgmlType::kBF16,
+                                                      GgmlType::kQ4_K}
+                    : std::initializer_list<GgmlType>{
+                          GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
     }
     return m;
   }
@@ -143,8 +157,14 @@ struct Binder {
     const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
                           GgmlType::kQ5_1, GgmlType::kQ8_0};
 
-    l.hc_attn = Mixer(p + "hc_attn", c, true);
-    l.hc_ffn = Mixer(p + "hc_ffn", c, true);
+    const auto mtp_q4 = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                         GgmlType::kF32, GgmlType::kQ4_K};
+    const auto mtp_q6 = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+                         GgmlType::kF32, GgmlType::kQ6_K};
+    const auto q4 = nextn ? mtp_q4 : dense;
+    const auto q6 = nextn ? mtp_q6 : dense;
+    l.hc_attn = Mixer(p + "hc_attn", c, true, nextn);
+    l.hc_ffn = Mixer(p + "hc_ffn", c, true, nextn, true);
 
     if (linear) {
       l.ssm_qkv =
@@ -164,12 +184,11 @@ struct Binder {
           Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, {GgmlType::kF32});
       l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
     } else {
-      l.attn_q =
-          Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, dense);
-      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, dense);
-      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, dense);
+      l.attn_q = Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, q4);
+      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, q4);
+      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, q6);
       l.attn_out =
-          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, dense);
+          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, q4);
       l.attn_q_norm =
           Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
       l.attn_k_norm =
@@ -209,9 +228,9 @@ struct Binder {
     l.shexp_gate_inp =
         Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, {GgmlType::kF32});
     l.shexp_gate =
-        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
+        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, q4);
     l.shexp_up =
-        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
+        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, q4);
     l.shexp_down =
         Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, dense);
 
@@ -221,8 +240,8 @@ struct Binder {
       l.nextn_hnorm =
           Get(p + "nextn.hnorm.weight", hc_dim, 1, 1, {GgmlType::kF32});
       l.nextn_eh_proj =
-          Get(p + "nextn.eh_proj.weight", 2 * hidden, hidden, 1, dense);
-      l.nextn_head = Mixer(p + "nextn.hc_head", c, false);
+          Get(p + "nextn.eh_proj.weight", 2 * hidden, hidden, 1, q4);
+      l.nextn_head = Mixer(p + "nextn.hc_head", c, false, nextn);
     }
     return l;
   }

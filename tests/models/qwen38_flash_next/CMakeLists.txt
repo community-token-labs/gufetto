@@ -13,11 +13,22 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_cache gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_rotation gufo_qwen38_flash_next "cpu")
 target_compile_options(qwen38_flash_next_kv_rotation_test PRIVATE
   -fno-fast-math -ffp-contract=off -frounding-math)
+# Host compile/control probe of verbatim HIP helper bodies, not native decoding.
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+  add_test(NAME qwen38_flash_next.weight_dispatch_contract
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/weight_dispatch_contract_test.py"
+      --source-root "${PROJECT_SOURCE_DIR}" --cxx "${CMAKE_CXX_COMPILER}"
+      --rotation "ON"
+      --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+  set_tests_properties(qwen38_flash_next.weight_dispatch_contract PROPERTIES
+    LABELS "qwen38_flash_next;cpu" TIMEOUT 45)
+endif()
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 add_qwen38_flash_next_test(rope_scaling gufo_qwen38_flash_next "cpu")
@@ -58,6 +69,9 @@ if (ENGINE_ENABLE_HIP)
     LABELS "qwen38_flash_next;hip;gpu;gfx1151" TIMEOUT 60)
   add_dependencies(qwen38_flash_next_tests qwen38_flash_next_kv_q8_load_test)
 
+  # Packed MTP projections use the independent CPU GGUF decoders.
+  target_link_libraries(qwen38_flash_next_projection_ops_test PRIVATE gufo_core)
+  target_link_libraries(qwen38_flash_next_hc_mix_ops_test PRIVATE gufo_core)
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)

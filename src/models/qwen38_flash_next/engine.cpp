@@ -1,9 +1,13 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -15,6 +19,9 @@
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+#endif
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -187,6 +194,26 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  const char* strix_npu = std::getenv("GUFO_STRIX_NPU");
+  const char* two_bank = std::getenv("GUFO_TWO_BANK");
+  if (strix_npu != nullptr && std::strcmp(strix_npu, "1") == 0 &&
+      two_bank != nullptr && std::strcmp(two_bank, "1") == 0 &&
+      m->device_->npu() != nullptr && options.max_context >= 8192) {
+    const auto* npu = m->device_->npu();
+    bool supported = npu->Healthy() && npu->tokens() == 4096 &&
+                     npu->k() <= m->device_->max_half_cols();
+    for (const auto& l : m->device_->layers()) {
+      const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
+      const auto& ids = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
+      supported = supported && w.type == core::GgmlType::kQ8_0 &&
+                  w.cols == npu->k() && !ids.empty() && ids.size() <= 16 &&
+                  w.rows == ids.size() * npu->n();
+    }
+    if (supported)
+      exec.max_batch = 8192;  // capacity only; ordinary chunks stay 4096
+  }
+#endif
   exec.max_logit_rows =
       m->mtp_weights_
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -346,8 +373,13 @@ bool Session::SyncDraftVocab(std::string* error_msg) {
   draft_vocab_.CatchUp(
       tokens_, [&](std::int32_t token) { return model_->InDraftSubset(token); },
       &draft_added_);
-  return exec.AppendDraftRows(*session_, first + tabled, draft_added_,
-                              error_msg);
+  if (!exec.AppendDraftRows(*session_, first + tabled, draft_added_, error_msg))
+    return false;
+  if (perf::current != nullptr)
+    perf::current->draft_tables.push_back({tokens_.size(),
+                                           first + draft_vocab_.rare().size(),
+                                           kMtpDraftExtraRows});
+  return true;
 }
 
 Session::~Session() = default;
@@ -600,10 +632,17 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   } catch (...) {
     // Preserve preflight failures, but never expose old logits/history over
     // partially restored native state if a transfer/allocation throws.
-    if (info.mutation_started)
+    if (info.mutation_started) {
       valid_ = false;
+      if (image_identity.empty())
+        image_prompt_.reset();
+    }
     throw;
   }
+  // Once native mutation starts, text-only restoration has discarded vision
+  // even if a later copy or host/native consistency check fails.
+  if (info.mutation_started && image_identity.empty())
+    image_prompt_.reset();
   if (!restored) {
     // Geometry/packed-byte preflight rejection must leave the live session
     // untouched. A transfer failure after writes begin still invalidates it.
@@ -618,8 +657,6 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot positions are inconsistent");
     return false;
   }
-  if (image_identity.empty())
-    image_prompt_.reset();
   tokens_ = std::move(tokens);
   ForgetDraftVocab();
   lookup_.Restore(header.lookup);
@@ -735,6 +772,21 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
   return items.empty() || exec.MtpForwardBatch(items, error_msg);
 }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+std::optional<std::size_t> Session::SinglePassPrefillLimit(
+    std::size_t remaining, std::size_t budget) const noexcept {
+  if (!valid_ || image_prompt_ || remaining == 0 || budget == 0)
+    return std::nullopt;
+  if (remaining >= 8192 && budget >= 8192 &&
+      model_->executor_->CanForwardPair(*session_))
+    return 8192;
+  return std::min<std::size_t>({budget, remaining,
+                                remaining <= model_->PrefillThroughCapacity()
+                                    ? model_->PrefillThroughCapacity()
+                                    : model_->PrefillCapacity()});
+}
+#endif
+
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
@@ -743,8 +795,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
-    const auto capacity = remaining <= exec.max_batch()
-                              ? exec.max_batch()
+    const bool pair = prefill && !image_prompt_ && !checkpoint && !consume &&
+                      remaining >= 8192 && exec.CanForwardPair(*session_);
+    const auto capacity = pair ? 8192U
+                          : remaining <= model_->PrefillThroughCapacity()
+                              ? model_->PrefillThroughCapacity()
                               : model_->PrefillCapacity();
     std::size_t n = std::min<std::size_t>(capacity, remaining);
     // Extended-context attention can fall back from WMMA to the per-token
@@ -780,10 +835,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
-    const auto next = rest.first(std::min<std::size_t>(
-        rest.size() <= exec.max_batch() ? exec.max_batch()
-                                        : model_->PrefillCapacity(),
-        rest.size()));
+    const auto next = rest.first(
+        std::min<std::size_t>(rest.size() <= model_->PrefillThroughCapacity()
+                                  ? model_->PrefillThroughCapacity()
+                                  : model_->PrefillCapacity(),
+                              rest.size()));
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
                       capture.get(), next)) {
       return false;
@@ -1188,6 +1244,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
     tokens_.push_back(anchor);
     sampler.Accept(static_cast<sampling::TokenId>(anchor));
     result->tokens.push_back(anchor);
+    perf::TraceMtpCycle(base, 0, 0, 0, 1);
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
@@ -1326,6 +1383,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t mtp_accepted = std::min(keep - 1, mtp_drafts);
   stats_.lookup += pending.lookup;
   stats_.lookup_accepted += keep - 1 - mtp_accepted;
+  perf::TraceMtpCycle(base, k - 1, keep - 1, pending.lookup, keep);
   if (pending.lookup != 0) {
     lookup_.Observe(pending.lookup_start, pending.lookup,
                     keep - 1 - mtp_accepted);
@@ -1361,6 +1419,12 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   valid_ = false;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  auto provenance = pd::current_association;
+  provenance.model_filtered = 1;
+  // Preserve backend-MTP-batch provenance when isolation leaves a singleton.
+  pd::AssociationScope association(provenance);
+#endif
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
@@ -1452,6 +1516,11 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::string shared_error;
   try {
     if (!active.empty()) {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      auto provenance = pd::current_association;
+      provenance.model_filtered = active.size();
+      pd::AssociationScope association(provenance);
+#endif
       if constexpr (std::is_same_v<Request, DecodeRequest>)
         (void)DecodeBatchImpl(active, &shared_error);
       else

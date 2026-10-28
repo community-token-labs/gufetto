@@ -165,6 +165,11 @@ public:
                                  double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  /// Serial text-only planning; not mixed component/capture eligibility.
+  [[nodiscard]] std::optional<std::size_t> SinglePassPrefillLimit(
+      std::size_t remaining, std::size_t budget) const noexcept;
+#endif
   struct DecodeResult {
     std::vector<std::int32_t> tokens;
     bool stop{false};

@@ -2128,6 +2128,14 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["draft_rounds"] = result.draft_rounds;
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  metrics["serial_shadow_mixed_eligible"] = false;
+  metrics["serial_shadow_steps"] = result.serial_shadow_steps;
+  metrics["serial_shadow_unsupported"] = result.serial_shadow_unsupported;
+  metrics["serial_shadow_plan_declined"] = result.serial_shadow_plan_declined;
+  metrics["serial_shadow_verifier_rows_upper"] =
+      result.serial_shadow_verifier_rows_upper;
+#endif
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;
   metrics["max_prefill_chunk_tokens"] = result.max_prefill_chunk_tokens;
   metrics["queue_depth_at_submit"] = result.queue_depth_at_submit;

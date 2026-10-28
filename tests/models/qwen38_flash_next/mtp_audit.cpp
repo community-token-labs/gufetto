@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -58,22 +59,32 @@ struct Trace {
         ffn_output(c.hidden_size),
         spans{norm, fused, attention, hidden, head, ffn_input, ffn_output} {}
 };
-void Compare(std::span<const float> actual, std::span<const float> expected,
-             const char* stage, double limit) {
+// Measurement does not enforce a numerical gate, so one failing stage cannot
+// hide the remaining component errors. Shape mismatch is still a harness bug.
+double Statistics(std::span<const float> actual,
+                  std::span<const float> expected, const char* stage) {
   Require(actual.size() == expected.size(), "oracle shape mismatch");
   double error = 0, norm = 0, maximum = 0;
+  bool finite = true;
   for (std::size_t i = 0; i < actual.size(); ++i) {
-    Require(std::isfinite(actual[i]) && std::isfinite(expected[i]),
-            std::string(stage) + " nonfinite value");
+    if (!std::isfinite(actual[i]) || !std::isfinite(expected[i])) {
+      finite = false;
+      continue;
+    }
     const double delta = double(actual[i]) - expected[i];
     error += delta * delta;
     norm += double(expected[i]) * expected[i];
     maximum = std::max(maximum, std::abs(delta));
   }
-  const auto relative = std::sqrt(error / std::max(norm, 1e-30));
-  std::printf("  %s relative_rms=%.7f max_abs=%.7f\n", stage, relative,
-              maximum);
-  Require(relative <= limit,
+  const auto relative = finite ? std::sqrt(error / std::max(norm, 1e-30))
+                               : std::numeric_limits<double>::infinity();
+  std::printf("  %s relative_rms=%.7f max_abs=%.7f finite=%d\n", stage,
+              relative, finite ? maximum : INFINITY, finite);
+  return relative;
+}
+void Compare(std::span<const float> actual, std::span<const float> expected,
+             const char* stage, double limit) {
+  Require(Statistics(actual, expected, stage) <= limit,
           std::string(stage) + " exceeds scalar oracle tolerance");
 }
 }  // namespace
@@ -124,6 +135,10 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
                      hipMemcpyDeviceToHost, stream));
   Hip(hipStreamSynchronize(stream));
   Compare(actual_norm, expected_norm, "adversarial-full-hidden-norm", 2e-6);
+  std::puts(
+      "MTP oracle weights=same-sidecar scope=same-boundary "
+      "dense-Q4/Q5/Q6=F32 routed-Q4=Q8_1-vector Q8=Q8_1 "
+      "FFN-output-includes-CPU-HC-mix=1");
   std::array<std::unique_ptr<q::rocm::Session>, 2> sessions, serial;
   std::array<std::unique_ptr<q::ReferenceModel>, 2> references;
   std::array<std::int32_t, 2> next{42, 43};
@@ -195,13 +210,31 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       initial = gpu.hidden;
       std::printf("MTP oracle sequence=%u step=%u image=%u\n", sequence, step,
                   sequence);
-      // Independent scalar execution includes storage rounding. Remaining
-      // differences come from reductions and nonlinear approximations.
-      Compare(gpu.norm, cpu.norm, "full-hidden-norm", 2e-6);
-      Compare(gpu.fused, cpu.fused, "split-fusion", 0.002);
-      Compare(gpu.attention, cpu.attention, "attention-state", 0.002);
-      Compare(gpu.hidden, cpu.hidden, "recursive-carry", 0.00005);
-      Compare(gpu.head, cpu.head, "head-mixer", 0.00005);
+      // Print ALL stage errors before enforcing the original gates. FFN
+      // metrics are diagnostic only, not a newly invented acceptance limit.
+      // FFN starts at the same observed attention boundary and includes the
+      // CPU HC mix; head starts at the observed hidden boundary.
+      const auto norm_error =
+          Statistics(gpu.norm, cpu.norm, "full-hidden-norm");
+      const auto fused_error = Statistics(gpu.fused, cpu.fused, "split-fusion");
+      const auto attention_error =
+          Statistics(gpu.attention, cpu.attention, "attention-state");
+      Statistics(gpu.ffn_input, cpu.ffn_input, "ffn-hc-mix-input-diagnostic");
+      Statistics(gpu.ffn_output, cpu.ffn_output, "ffn-output-diagnostic");
+      const auto carry_error =
+          Statistics(gpu.hidden, cpu.hidden, "recursive-carry");
+      const auto head_error = Statistics(gpu.head, cpu.head, "head-mixer");
+      std::fflush(stdout);
+      Require(norm_error <= 2e-6,
+              "full-hidden-norm exceeds scalar oracle tolerance");
+      Require(fused_error <= 0.002,
+              "split-fusion exceeds scalar oracle tolerance");
+      Require(attention_error <= 0.002,
+              "attention-state exceeds scalar oracle tolerance");
+      Require(carry_error <= 0.00005,
+              "recursive-carry exceeds scalar oracle tolerance");
+      Require(head_error <= 0.00005,
+              "head-mixer exceeds scalar oracle tolerance");
       // Full Q8 vocabulary baseline uses the exact production dot arithmetic;
       // independent host sorting checks candidate selection and vocabulary
       // tail.

@@ -206,4 +206,12 @@ private:
 
 }  // namespace gufo::server
 
+// Keep optional diagnostic includes after the original declarations. Inserting
+// lines at the top of inference_backend.cpp would change HIP_CHECK's __LINE__
+// even when diagnostics are OFF. The prerequisite helper is already supplied
+// by text_generation_scheduler.hpp when its build option is enabled.
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
+
 #endif  // GUFO_SERVER_INFERENCE_BACKEND_HPP_

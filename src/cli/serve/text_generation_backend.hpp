@@ -249,6 +249,12 @@ public:
     std::size_t max_prefill_chunk_tokens{0};
     std::size_t max_consecutive_active_prefill_chunks{0};
     std::size_t configured_active_prefill_tokens{0};
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    std::size_t serial_shadow_steps{0};
+    std::size_t serial_shadow_unsupported{0};
+    std::size_t serial_shadow_plan_declined{0};
+    std::size_t serial_shadow_verifier_rows_upper{0};
+#endif
     std::size_t queue_depth_at_submit{0};
     std::size_t client_queue_depth_at_submit{0};
     std::size_t resident_requests_at_admission{0};

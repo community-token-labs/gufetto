@@ -1,9 +1,11 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -273,6 +275,31 @@ void CheckAppendSnapshotOracle(
                 error);
         Require(left.tokens == right.tokens && left.stop == right.stop,
                 "restored appended image changed sampled AR/MTP decoding");
+
+        // A text-only native restore clears vision before host/native frontier
+        // consistency is checked. Its failure must also clear the host prompt;
+        // otherwise the next plain-text snapshot falsely retains image
+        // identity.
+        attached->ConfigureVision({});
+        Require(attached->Sync(tokens, &error), error);
+        auto text_snapshot = attached->SaveSnapshot(&error);
+        Require(text_snapshot != nullptr, error);
+        std::vector<std::uint8_t> inconsistent(text_snapshot->SizeBytes());
+        Require(text_snapshot->CopyTo(inconsistent), "copy text snapshot");
+        // The versioned host header has hidden_rows at byte 20, after magic,
+        // version, vocabulary size and token count. Native payload stays valid.
+        const auto wrong_rows = std::numeric_limits<std::uint32_t>::max();
+        std::memcpy(inconsistent.data() + 20, &wrong_rows, sizeof(wrong_rows));
+        Require(!restored->RestoreSnapshot(inconsistent, &error) &&
+                    error == "session snapshot positions are inconsistent" &&
+                    restored->Position() == 0,
+                "inconsistent text snapshot did not reach post-mutation reset");
+        Require(restored->Sync(tokens, &error), error);
+        auto recovered = restored->SaveSnapshot(&error);
+        Require(recovered != nullptr, error);
+        Require(attached->RestoreSnapshot(*recovered, &error),
+                "failed text restore retained a stale host image prompt");
+        equal_logits(attached->Logits(), restored->Logits());
       }
     } else {
       hip::QwenGpuExecutor delayed(qwen, 1024), attached(qwen, 1024),
