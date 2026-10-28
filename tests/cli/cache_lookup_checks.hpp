@@ -140,6 +140,30 @@ void LookupIsReadOnlyAndMatchesAcquire() {
   image.cache_prefixes = {{prompt.size(), {}}};
   assert(pool.Lookup(longer, &image).matched_tokens == prompt.size());
 }
+void LookupRespectsRamOffWithoutDisablingLiveReuse() {
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17};
+  for (const auto value : {"off", "0"}) {
+    auto options = *ParseRamCacheOption(value, nullptr);
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, {}, options);
+    {
+      auto first = pool.Acquire(prompt);
+      Prefill(first);
+      (void)first.Commit();
+    }
+    auto longer = prompt;
+    longer.push_back(99);
+    const auto live = pool.Lookup(longer);
+    assert(live.tier == "live" && live.matched_tokens == prompt.size());
+    auto actual = pool.Acquire(longer);
+    assert(actual.cached_prompt_tokens() == prompt.size());
+    actual.Invalidate();
+    const auto checkpoint = pool.Lookup(longer);
+    assert(checkpoint.tier == (options.enabled ? "ram" : "none"));
+    assert(checkpoint.matched_tokens == (options.enabled ? prompt.size() : 0));
+    assert((runner->captures != 0) == options.enabled);
+  }
+}
 void LookupDoesNotWaitForAdmission() {
   class BlockingRunner final : public Runner {
   public:

@@ -2793,6 +2793,7 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
 }
 int main() {
   LookupIsReadOnlyAndMatchesAcquire();
+  LookupRespectsRamOffWithoutDisablingLiveReuse();
   LookupDoesNotWaitForAdmission();
   LookupWhileAllSlotsPrefillAndDecode();
   LookupInvalidatesBeforeLiveRetirement();
