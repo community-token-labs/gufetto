@@ -1,0 +1,92 @@
+{
+  "schema": "gufo-qwen38-ple-artifact-profile-v1",
+  "status": "SUPPORTED_INTERNALLY_TESTED_OPTION_IQ4_RECOMMENDED",
+  "runtime_config": false,
+  "purpose": "Artifact identity and documented launch profile; not a Gufo --config input",
+  "first_shard": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "logical_bytes": 213735147168,
+  "shards": [
+    {
+      "name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "bytes": 10946624,
+      "sha256": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082"
+    },
+    {
+      "name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+      "bytes": 152260075520,
+      "sha256": "074fec4c6eb76a0d0c901168c6b40d936dc977c60a38193c05c71dcba3a4026e"
+    },
+    {
+      "name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+      "bytes": 49376141504,
+      "sha256": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"
+    },
+    {
+      "name": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+      "bytes": 12087983520,
+      "sha256": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"
+    }
+  ],
+  "ple": {
+    "tensor": "per_layer_token_embd.weight",
+    "dtype": "BF16",
+    "gguf_dimensions": [160, 320001536],
+    "bytes": 102400491520,
+    "sha256": "f90a8563ba5939e5c0b0f6a57bd3a5f94c39126932f4f10eae98c3585e81434d",
+    "shard_index_one_based": 2,
+    "offset_from_shard_start": 49859584000
+  },
+  "packaging": {
+    "strategy": "required-FICLONE",
+    "preserved_non_ple_tensors": 1223,
+    "descriptor_patch_bytes": 12,
+    "producer_manifest_sha256": "cf73e32a8112d524d6f3b1379f9123e6beefe9f97026517f01e361f83cf4be80",
+    "producer_config_sha256": "09b38cb4d8456a88753fa7c23b9efeba056096d1fb2e1ef809e3b8c00262a1eb",
+    "ordinary_copy_fallback": false
+  },
+  "mmproj": {
+    "name": "mmproj-BF16.gguf",
+    "bytes": 907542944,
+    "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
+  },
+  "serve_options": {
+    "--sessions": "4",
+    "--context": "200000",
+    "--kv-cache-type": "q8_0",
+    "--prefill-chunk": "4096",
+    "--speculative": "off",
+    "--think": "off",
+    "--cache-ram-bytes": "1073741824",
+    "--max-tokens": "512"
+  },
+  "conditional_prerequisites_build_options": {
+    "--experimental-prefill-policy": "legacy",
+    "--experimental-prefill-budget": "0"
+  },
+  "enable_yarn": false,
+  "internal_recommendation": "KEEP_IQ4_NL_DEFAULT_NO_DEMONSTRATED_OVERALL_BF16_BENEFIT",
+  "default_changed": false,
+  "internal_model_tested": true,
+  "public_release_qualification": false,
+  "comparison": {
+    "date": "2026-10-27",
+    "source_revision": "337eaed64b5c05a16029bfc3aaa3e41146163f68",
+    "native_elf_sha256": "f21c00200efa54cfc4b37bbaa51369d1c710fad41816702f1fd3e0caf53b1fbc",
+    "matched_quality_rows": 144,
+    "histories": 18,
+    "mean_kl_bf16_to_iq4": 0.0035160704211871802,
+    "p99_linear_kl": 0.06196798178707825,
+    "max_kl": 0.312067331392819,
+    "top1_agreement": 0.9791666666666666,
+    "delta_nll_bf16_minus_iq4": -0.0023410702799340406,
+    "delta_nll_history_ci95": [-0.010246972291310406, 0.005165890724682659],
+    "speed_ratios_bf16_over_iq4": {
+      "S1": {"decode": 1.012, "prefill": 0.997, "ttft": 1.003, "useful_output": 1.000},
+      "S4": {"decode": 1.007, "prefill": 1.006, "ttft": 0.994, "useful_output": 1.007}
+    },
+    "speed_values_source": "Coordinator rounded summary; raw variance not transferred",
+    "decision": "Statistical quality tie; no meaningful speed cost or gain; keep smaller IQ4 option",
+    "report": "http://git.home.arpa/JCFrags/gufo-agent-concurrency/src/commit/d9549bf61687b646fbbf92ee1719f991764d3bc4/docs/ple-final-decision-20261027.md"
+  },
+  "q8_ple_reader": "PERMANENTLY_PARKED_NOT_A_FOLLOW_ON_TASK"
+}

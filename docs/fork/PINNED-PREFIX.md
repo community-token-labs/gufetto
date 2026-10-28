@@ -128,7 +128,7 @@ Each pin is written once per accepted identity, not on a request, cache hit,
 normal RAM eviction or compatible restart. The existing ordinary disk tier is
 independent: enabling `--cache-disk` still allows its existing descendant
 checkpoint writes. Cross-directory dependencies are not spliced. For minimal
-P310 QLC wear, use pins with ordinary disk caching off; this change does not
+SSD wear, use pins with ordinary disk caching off; this change does not
 claim to solve ordinary conversation-checkpoint write amplification or qualify
 220-TBW endurance.
 
@@ -194,12 +194,12 @@ indexed; partially restored state never executes.
   one-token replacement, numerics rejection of the entire set, and lazy
   corruption fallback preserving unrelated registrations.
 
-Run on the authorized test host, with no model loaded while compiling:
+Run the deterministic CPU fixture without a model or device:
 
 ```sh
-GAC_HOST=nimo-2 tools/nimo-build.sh gpu-test component_text_cache_test
-# Under that host's operation ownership/preflight:
-build/gpu-test/component_text_cache_test
+cmake --preset cpu-test
+cmake --build --preset cpu-test --target component_text_cache_test --parallel 2
+ctest --preset cpu-test -R '^component_text_cache_test$' --output-on-failure
 ```
 
 Registered pins currently require Linux's strict executable/runtime fingerprint
@@ -233,42 +233,13 @@ prove persistence without file inventories and independently managed restarts.
 `python3 tests/functional/test_pinned_prefix.py` checks only the probe's offline
 multi-report/accounting contracts; it is not model qualification.
 
-### Prior single-registration qualification (2026-10-24, nimo-2 only)
+## Qualification status
 
-The following evidence is for the earlier single-registration implementation,
-**not qualification of the multi-registration extension**. The parent task owns
-candidate runtime/build/model validation and packaging.
-
-Tested implementation: `b39c5d86`, release binary SHA-256
-`2d8153e3d3783823455b0e70f1c9c7c1394e0fbfd897f1ff632891b632df6eed`.
-Four focused CTests pass, including the assertions-enabled pressure/corruption
-fixtures. Two real MTP functional runs pass cold greedy visible-output and
-predicted-token-count equality, seeded RAM replay and compatible restart replay.
-The restart uses a fresh ordinary store so deeper disk checkpoints cannot mask
-pin restoration. Warm requests select 10047 tokens and prefill 24; cold prefills
-10071, full RAM replay 0. Draft counters are nonzero in the real workload.
-
-The registered system/tools prefix is 41591 bytes/10047 tokens. One publication
-created 409006155 managed bytes and 412155904 RAM payload-capacity bytes. Initial
-registration took 8.409 s; five compatible hydrations took 95.95–105.31 ms, without
-publication or pin size/mtime changes. These timings exclude model loading and
-are not isolated cold-device throughput measurements (no global cache drops).
-
-Two alternating 600-second, five-session fresh-server repetitions per state,
-ordinary disk OFF, show initial-chat median TTFT 3.72–3.80 s OFF vs 0.335–0.340 s ON.
-Compacted-chat medians remain about 0.81 s. Completed throughput is **6.20/min OFF
-vs 6.00/min ON**; all traced prefill, including censored work, increases 8.86%.
-Overall request p95 does not improve. One separate restart pair reduces the
-first client-dispatched completed request's TTFT 9.237→2.202 s (not necessarily
-the GPU's cold leader). This is a cold-start benefit, not a throughput win.
-
-Sampled closed-loop histories diverge across arms. Sparse-attention grouping/
-pass shapes can affect cold comparisons: the finite functional checks do not
-prove universal raw-token/logit equality or arbitrary split invariance. Real
-AR/image-registration/lazy-mode sweeps remain unqualified. All ten qualified
-epochs pass bounded safety and graceful shutdown checks. The previous best was
-restored, trace OFF and five slots idle; this candidate was not adopted.
-
-Full raw evidence, failed pilots and measurement definitions live in the
-concurrency project's `docs/pinned-prefix.md` and
-`bench/results/2026-10-24-nimo-2-pinned-prefix/`. Baseline-v1-5a is unchanged.
+The v0.23 split-fixed multi-registration candidate has bounded historical
+qualification for four real registrations on one host. That result does not
+qualify this rebased build, every template, lazy mode or arbitrary workloads.
+A changed build/runtime requires recapture and requalification. The original
+single-pin production failure and later candidate-024 failure remain recorded.
+See [the historical qualification ledger](http://git.home.arpa/JCFrags/gufo/src/commit/7b360b41136a4134855659d001051e6f4c8fdc82/docs/STRIX-QUALIFICATION.md) for immutable evidence,
+new-build gaps and the inherited file-verification risk. Registration files and
+model/cache backing files must not be rewritten in place while serving.
