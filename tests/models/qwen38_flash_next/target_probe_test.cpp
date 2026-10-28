@@ -1,9 +1,15 @@
 #include "src/models/qwen38_flash_next/target_probe.hpp"
 
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+
+#include "src/core/platform/env.hpp"
 
 namespace probe = gufo::models::qwen38_flash_next::detail;
 namespace fs = std::filesystem;
@@ -29,7 +35,7 @@ std::vector<std::uint8_t> Read(const fs::path& path) {
 struct Temporary {
   fs::path path;
   ~Temporary() {
-    ::unsetenv("GUFO_FLASH_NEXT_TARGET_PROBE");
+    gufo::platform::UnsetEnv("GUFO_FLASH_NEXT_TARGET_PROBE");
     fs::remove_all(path);
   }
 };
@@ -37,15 +43,40 @@ struct Temporary {
 
 int main() {
   try {
-    ::unsetenv("GUFO_FLASH_NEXT_TARGET_PROBE");
+    Require(gufo::platform::UnsetEnv("GUFO_FLASH_NEXT_TARGET_PROBE"),
+            "cannot clear probe environment");
     const std::array<float, 3> logits{1.25F, -0.0F, -4.5F};
     probe::ProbeTargetLogits(2415, logits);  // Fully disabled: no directory.
-    std::array<char, 64> name{};
-    std::strcpy(name.data(), "/tmp/qfn-target-probe-XXXXXX");
-    const auto directory = ::mkdtemp(name.data());
-    Require(directory != nullptr, "temporary probe directory failed");
+    if (std::string_view(gufo::platform::HostOsName()) != "Linux") {
+      Require(gufo::platform::SetEnv("GUFO_FLASH_NEXT_TARGET_PROBE",
+                                     "unsupported-private-probe"),
+              "cannot set probe environment");
+      Require(probe::TargetProbeRange(2415, 0).second == 0,
+              "empty probe range became active");
+      try {
+        probe::ProbeTargetLogits(2415, logits);
+        throw std::logic_error("unsupported probe was accepted");
+      } catch (const std::runtime_error& error) {
+        Require(std::string_view(error.what()).find("unsupported") !=
+                    std::string_view::npos,
+                "unsupported probe error is unclear");
+      }
+      Require(gufo::platform::UnsetEnv("GUFO_FLASH_NEXT_TARGET_PROBE"),
+              "cannot clear probe environment");
+      std::cout << "target_probe_test passed (optional probe unsupported)\n";
+      return 0;
+    }
+    const auto directory =
+        fs::temp_directory_path() /
+        ("qfn-target-probe-" + std::to_string(gufo::platform::ProcessId()));
+    Require(fs::create_directory(directory),
+            "temporary probe directory failed");
     Temporary temporary{directory};
-    ::setenv("GUFO_FLASH_NEXT_TARGET_PROBE", directory, 1);
+    Require(gufo::platform::RestrictToOwner(directory),
+            "cannot restrict probe directory");
+    Require(gufo::platform::SetEnv("GUFO_FLASH_NEXT_TARGET_PROBE",
+                                   directory.string()),
+            "cannot set probe environment");
     const auto arm = [&](const char* text) {
       std::ofstream(temporary.path / "arm") << text;
       fs::permissions(temporary.path / "arm",
@@ -95,10 +126,18 @@ int main() {
                     fs::perm_options::add);
     Refused([&] { (void)probe::TargetProbeRange(2415, 1); });
     fs::remove(temporary.path / "arm");
-    Require(::mkfifo((temporary.path / "arm").c_str(), 0600) == 0,
+    Require(fs::create_directory(temporary.path / "arm"),
             "nonregular arm fixture failed");
     Refused([&] { (void)probe::TargetProbeRange(2415, 1); });
     fs::remove(temporary.path / "arm");
+#if defined(__linux__)
+    // Retain the Linux nonblocking-open regression: a FIFO must be refused
+    // rather than waiting for a writer before the regular-file check.
+    Require(::mkfifo((temporary.path / "arm").c_str(), 0600) == 0,
+            "FIFO arm fixture failed");
+    Refused([&] { (void)probe::TargetProbeRange(2415, 1); });
+    fs::remove(temporary.path / "arm");
+#endif
     probe::ProbeTargetLogits(2418, logits);
     Require(!fs::exists(temporary.path / "2418.logits"),
             "disarmed probe wrote data");

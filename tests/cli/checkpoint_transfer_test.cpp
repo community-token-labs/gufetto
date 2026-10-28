@@ -1,10 +1,12 @@
 #include "src/cli/serve/checkpoint_transfer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
@@ -92,6 +94,26 @@ int main() {
     restored->Load(i, bytes);
     assert(bytes == payloads[i]);
   }
+  // Random-access reads must not depend on a shared spool file position.
+  std::vector<std::thread> readers;
+  for (std::size_t t = 0; t < 4; ++t) {
+    readers.emplace_back([&, t] {
+      for (std::size_t n = 0; n < 64; ++n) {
+        const auto i = (n + t) % payloads.size();
+        const auto offset = n % payloads[i].size();
+        std::vector<std::uint8_t> bytes(payloads[i].size() - offset);
+        restored->Read(i, offset, bytes);
+        assert(
+            std::ranges::equal(bytes, std::span(payloads[i]).subspan(offset)));
+      }
+    });
+  }
+  for (auto& reader : readers)
+    reader.join();
+  Check(true, [&] {
+    std::array<std::uint8_t, 1> byte{};
+    restored->Read(0, payloads[0].size(), byte);
+  });
   // Incompatible model/quant/MTP/ABI and executable/numerics/render policies.
   auto changed = identity;
   changed[2] = 19;
@@ -153,5 +175,32 @@ int main() {
     return false;
   });
   assert(calls == 1);
+  // Cross the bounded staging-buffer boundary and feed the export in short
+  // binary pieces, including CR/LF/zero bytes (no Windows text translation).
+  auto large_header = header;
+  auto large_payloads = payloads;
+  auto& large = large_payloads.back();
+  large.resize(kCheckpointTransferPieceBytes + 37);
+  for (std::size_t i = 0; i < large.size(); ++i)
+    large[i] = static_cast<std::uint8_t>(i);
+  large_header.manifest.components.back().descriptor.state_bytes = large.size();
+  large_header.manifest.components.back().private_state->bytes = large.size();
+  const auto large_source = CheckpointTransferBlob::Export(
+      large_header, [&](auto i, const auto& consume) {
+        auto bytes = std::span<const std::uint8_t>(large_payloads[i]);
+        while (!bytes.empty()) {
+          const auto piece =
+              bytes.first(std::min(bytes.size(), std::size_t{8191}));
+          consume(piece);
+          bytes = bytes.subspan(piece.size());
+        }
+      });
+  const auto large_wire = Wire(*large_source);
+  auto large_restored = CheckpointTransferBlob::Import(
+      Reader(large_wire), large_wire.size(), identity, header.configuration);
+  std::vector<std::uint8_t> loaded(large.size());
+  large_restored->Load(large_payloads.size() - 1, loaded);
+  assert(loaded == large);
+  assert(Wire(*large_restored) == large_wire);
   std::cout << "checkpoint transfer envelope checks passed\n";
 }

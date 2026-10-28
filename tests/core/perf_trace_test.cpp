@@ -1,18 +1,28 @@
 #include "src/core/perf_trace.hpp"
 
 #include <cassert>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <thread>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/env.hpp"
+
+namespace {
+std::filesystem::path trace_path;
+void RemoveTrace() {
+  std::error_code ec;
+  std::filesystem::remove(trace_path, ec);
+}
+}  // namespace
 
 int main(int argc, char**) {
   using namespace gufo;
   if (argc > 1) {
-    unsetenv("GUFO_PERF_TRACE");
-    unsetenv("GUFO_PERF_TRACE_MOE");
+    assert(platform::UnsetEnv("GUFO_PERF_TRACE"));
+    assert(platform::UnsetEnv("GUFO_PERF_TRACE_MOE"));
     perf::Work work("decode_single");
     perf::Forward forward(false);
     perf::HostPhase phase("target_forward");
@@ -23,11 +33,16 @@ int main(int argc, char**) {
     assert(!perf::sample_moe);
     return 0;
   }
-  const auto path = std::filesystem::temp_directory_path() /
-                    ("gufo-perf-trace-" + std::to_string(getpid()) + ".jsonl");
+  const auto path =
+      std::filesystem::temp_directory_path() /
+      ("gufo-perf-trace-" + std::to_string(platform::ProcessId()) + ".jsonl");
   std::filesystem::remove(path);
-  setenv("GUFO_PERF_TRACE", path.c_str(), 1);
-  setenv("GUFO_PERF_TRACE_MOE", "2", 1);
+  trace_path = path;
+  // Register before constructing Sink(): its stream must close before the
+  // cleanup runs, because Windows cannot unlink an open ofstream.
+  assert(std::atexit(RemoveTrace) == 0);
+  assert(platform::SetEnv("GUFO_PERF_TRACE", path.string()));
+  assert(platform::SetEnv("GUFO_PERF_TRACE_MOE", "2"));
   assert(perf::Enabled());
   {
     perf::Work work("prefill");
@@ -89,6 +104,8 @@ int main(int argc, char**) {
   while (std::getline(input, line)) {
     const auto value = json::parse(line);
     assert(value.member_size("schema") == 1);
+    assert(value.member_size("pid") ==
+           static_cast<std::size_t>(platform::ProcessId()));
     if (line.find("\"kind\":\"prefill\"") != std::string::npos) {
       const auto bits = value.find("moe")->items()[0].member_str("experts");
       assert(bits.size() == 128);
@@ -100,5 +117,4 @@ int main(int argc, char**) {
   assert(lines == 66);
   assert(found_mask);
   input.close();
-  std::filesystem::remove(path);
 }

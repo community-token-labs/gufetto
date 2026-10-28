@@ -1,14 +1,9 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_TARGET_PROBE_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_TARGET_PROBE_HPP_
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstdlib>
@@ -20,6 +15,9 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/platform/fs.hpp"
+#include "src/core/platform/os_info.hpp"
+
 // Private qualification instrumentation, not a model or HTTP API. No I/O when
 // the environment variable is absent. The operator arms a <=32-position window
 // only after priming/import; the environment stays identical for the epoch.
@@ -27,17 +25,14 @@ namespace gufo::models::qwen38_flash_next::detail {
 
 class TargetProbeFile {
 public:
-  explicit TargetProbeFile(int fd) : fd_(fd) {}
-  ~TargetProbeFile() {
-    if (fd_ >= 0)
-      (void)::close(fd_);
-  }
+  explicit TargetProbeFile(platform::PlatformFile fd) : fd_(fd) {}
+  ~TargetProbeFile() { platform::CloseFile(fd_); }
   TargetProbeFile(const TargetProbeFile&) = delete;
   TargetProbeFile& operator=(const TargetProbeFile&) = delete;
-  int get() const { return fd_; }
+  platform::PlatformFile get() const { return fd_; }
 
 private:
-  int fd_;
+  platform::PlatformFile fd_;
 };
 
 [[noreturn]] inline void TargetProbeError() {
@@ -45,12 +40,30 @@ private:
   throw std::runtime_error("private target probe configuration or I/O failed");
 }
 
-inline void TargetProbePrivate(int fd, bool directory) {
-  struct stat info{};
-  if (fd < 0 || ::fstat(fd, &info) != 0 || info.st_uid != ::geteuid() ||
-      (info.st_mode & 077) != 0 ||
-      (directory ? !S_ISDIR(info.st_mode) : !S_ISREG(info.st_mode)))
+inline void TargetProbePrivate(platform::PlatformFile fd) {
+  platform::FileInfo info{};
+  std::error_code ec;
+  if (!platform::Stat(fd, &info, ec) || !info.regular ||
+      !platform::OwnerOnly(info, 077))
     TargetProbeError();
+}
+
+inline platform::Directory OpenTargetProbeDirectory(const char* path) {
+  // The Windows filesystem leaf has no ACL/owner validation yet. Do not
+  // silently weaken the private evidence directory's security contract.
+  if (std::string_view(platform::HostOsName()) != "Linux")
+    throw std::runtime_error(
+        "private target probe is unsupported on this host");
+  if (*path != '/')
+    TargetProbeError();
+  platform::Directory directory;
+  platform::FileInfo info{};
+  std::error_code ec;
+  if (!directory.Open(path, ec) ||
+      !platform::StatAt(directory, ".", false, &info, ec) ||
+      !platform::OwnerOnly(info, 077))
+    TargetProbeError();
+  return directory;
 }
 
 inline const char* TargetProbeDirectory() {
@@ -63,19 +76,17 @@ inline std::pair<std::uint32_t, std::uint32_t> TargetProbeRange(
   const char* path = TargetProbeDirectory();
   if (path == nullptr || count == 0)
     return {};
-  if (*path != '/')
-    TargetProbeError();
-  TargetProbeFile directory(
-      ::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-  TargetProbePrivate(directory.get(), true);
-  TargetProbeFile arm(::openat(directory.get(), "arm",
-                               O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
-  if (arm.get() < 0 && errno == ENOENT)
+  auto directory = OpenTargetProbeDirectory(path);
+  std::error_code ec;
+  TargetProbeFile arm(
+      platform::OpenAt(directory, "arm", platform::FileMode::kRead, ec));
+  if (!platform::FileValid(arm.get()) &&
+      ec == std::errc::no_such_file_or_directory)
     return {};
-  TargetProbePrivate(arm.get(), false);
+  TargetProbePrivate(arm.get());
   std::array<char, 64> text{};
-  const auto size = ::read(arm.get(), text.data(), text.size());
-  if (size <= 0 || size == static_cast<ssize_t>(text.size()))
+  const auto size = platform::Read(arm.get(), text.data(), text.size(), ec);
+  if (ec || size == 0 || size == text.size())
     TargetProbeError();
   std::string_view bounds(text.data(), size);
   if (bounds.ends_with('\n'))
@@ -101,40 +112,36 @@ inline void WriteTargetProbe(std::uint32_t position, const char* suffix,
                              std::span<const std::uint8_t> bytes) {
   if (TargetProbeRange(position, 1).second == 0)
     return;
-  TargetProbeFile directory(::open(
-      TargetProbeDirectory(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
-  TargetProbePrivate(directory.get(), true);
+  auto directory = OpenTargetProbeDirectory(TargetProbeDirectory());
+  std::error_code ec;
   const auto name = std::to_string(position) + suffix;
   if (std::string_view(suffix) == ".token" ||
       std::string_view(suffix) == ".stop") {
     const auto opposite =
         std::to_string(position) +
         (std::string_view(suffix) == ".token" ? ".stop" : ".token");
-    struct stat info{};
-    if (::fstatat(directory.get(), opposite.c_str(), &info,
-                  AT_SYMLINK_NOFOLLOW) == 0 ||
-        errno != ENOENT)
+    platform::FileInfo info{};
+    if (platform::StatAt(directory, opposite, false, &info, ec) ||
+        ec != std::errc::no_such_file_or_directory)
       TargetProbeError();
   }
-  const int created =
-      ::openat(directory.get(), name.c_str(),
-               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (created < 0) {
-    if (errno != EEXIST)
+  const auto created =
+      platform::OpenAt(directory, name, platform::FileMode::kCreateNew, ec);
+  if (!platform::FileValid(created)) {
+    if (ec != std::errc::file_exists)
       TargetProbeError();
     // Preview/anchor observations can repeat a row. Never silently overwrite
     // or hide a different second observation (or an incomplete prior file).
     TargetProbeFile existing(
-        ::openat(directory.get(), name.c_str(),
-                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
-    TargetProbePrivate(existing.get(), false);
+        platform::OpenAt(directory, name, platform::FileMode::kRead, ec));
+    TargetProbePrivate(existing.get());
     std::vector<std::uint8_t> previous(bytes.size() + 1);
     std::size_t offset = 0;
     while (offset < previous.size()) {
-      const auto n = ::read(existing.get(), previous.data() + offset,
-                            previous.size() - offset);
-      if (n < 0) {
-        if (errno == EINTR)
+      const auto n = platform::Read(existing.get(), previous.data() + offset,
+                                    previous.size() - offset, ec);
+      if (ec) {
+        if (ec == std::errc::interrupted)
           continue;
         TargetProbeError();
       }
@@ -150,11 +157,11 @@ inline void WriteTargetProbe(std::uint32_t position, const char* suffix,
   TargetProbeFile file(created);
   std::size_t offset = 0;
   while (offset < bytes.size()) {
-    const auto n =
-        ::write(file.get(), bytes.data() + offset, bytes.size() - offset);
-    if (n < 0 && errno == EINTR)
+    const auto n = platform::Write(file.get(), bytes.data() + offset,
+                                   bytes.size() - offset, ec);
+    if (ec == std::errc::interrupted)
       continue;
-    if (n <= 0)
+    if (ec || n == 0)
       TargetProbeError();
     offset += n;
   }

@@ -1,16 +1,15 @@
 #include "src/cli/serve/checkpoint_transfer.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <filesystem>
+#include <mutex>
 #include <numeric>
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/fs.hpp"
+#include "src/core/platform/temporary_file.hpp"
 
 namespace gufo::server {
 namespace {
@@ -103,24 +102,30 @@ void Exact(const CheckpointTransferReader& reader,
     out = out.subspan(n);
   }
 }
-void FileWrite(int fd, std::uint64_t offset,
+void FileWrite(platform::PlatformFile fd, std::uint64_t offset,
                std::span<const std::uint8_t> data) {
-  while (!data.empty()) {
-    auto n = pwrite(fd, data.data(), data.size(), static_cast<off_t>(offset));
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
+  std::error_code ec;
+  while (!platform::SeekTo(fd, offset, ec)) {
+    if (ec != std::errc::interrupted)
       IoError();
-    offset += n;
+  }
+  while (!data.empty()) {
+    const auto n = platform::Write(fd, data.data(), data.size(), ec);
+    if (ec == std::errc::interrupted)
+      continue;
+    if (ec || n == 0)
+      IoError();
     data = data.subspan(n);
   }
 }
-void FileRead(int fd, std::uint64_t offset, std::span<std::uint8_t> data) {
+void FileRead(platform::PlatformFile fd, std::uint64_t offset,
+              std::span<std::uint8_t> data) {
+  std::error_code ec;
   while (!data.empty()) {
-    auto n = pread(fd, data.data(), data.size(), static_cast<off_t>(offset));
-    if (n < 0 && errno == EINTR)
+    const auto n = platform::ReadAt(fd, offset, data.data(), data.size(), ec);
+    if (ec == std::errc::interrupted)
       continue;
-    if (n <= 0)
+    if (ec || n == 0)
       IoError();
     offset += n;
     data = data.subspan(n);
@@ -153,27 +158,24 @@ std::vector<const cache::DiskPayload*> CheckpointTransferPayloads(
   return out;
 }
 struct CheckpointTransferBlob::Impl {
-  int fd{-1};
+  platform::PlatformFile fd{platform::kInvalidFile};
+  mutable std::mutex read_mutex;
   CheckpointTransferHeader header;
   std::vector<std::uint8_t> encoded;
   std::vector<std::uint64_t> offsets{0};
   std::vector<Hash> hashes;
   Impl() {
-    auto path =
-        (std::filesystem::temp_directory_path() / "gufo-transfer-XXXXXX")
-            .string();
-    fd = mkostemp(path.data(), O_CLOEXEC);
-    if (fd < 0)
+    std::error_code ec;
+    fd = platform::OpenTemporaryFile(ec);
+    if (!platform::FileValid(fd))
       IoError();
-    if (unlink(path.c_str()) != 0) {
-      close(fd);
-      fd = -1;
-      IoError();
-    }
   }
-  ~Impl() {
-    if (fd >= 0)
-      close(fd);
+  ~Impl() { platform::CloseFile(fd); }
+  void Read(std::uint64_t offset, std::span<std::uint8_t> out) const {
+    // ReadAt may move the Windows handle's file position. Keep concurrent
+    // checkpoint downloads/loads independent, as pread did on Linux.
+    const std::lock_guard lock(read_mutex);
+    FileRead(fd, offset, out);
   }
   void Layout() {
     offsets.assign(1, 0);
@@ -215,7 +217,7 @@ void CheckpointTransferBlob::Read(std::size_t payload, std::uint64_t offset,
       out.size() >
           impl_->offsets[payload + 1] - impl_->offsets[payload] - offset)
     Invalid();
-  FileRead(impl_->fd, impl_->offsets[payload] + offset, out);
+  impl_->Read(impl_->offsets[payload] + offset, out);
 }
 std::shared_ptr<CheckpointTransferBlob> CheckpointTransferBlob::Export(
     CheckpointTransferHeader header, const ReadPayload& read) {
@@ -396,7 +398,7 @@ void CheckpointTransferBlob::Write(
   for (std::uint64_t offset = 0; offset < PayloadBytes();) {
     auto piece = std::span(staging).first(
         std::min<std::uint64_t>(staging.size(), PayloadBytes() - offset));
-    FileRead(impl_->fd, offset, piece);
+    impl_->Read(offset, piece);
     if (!writer(piece))
       return;
     offset += piece.size();
