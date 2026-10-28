@@ -688,10 +688,9 @@ void CheckAttention(unsigned start, unsigned n, bool sparse, bool rotated) {
   };
   const auto full_wmma = wmma(false, false, nullptr);
   for (bool last : {false, true}) {
-    // Last-only retains the final query tile: dense16/sparse4.
-    const unsigned first = !last    ? 0
-                           : sparse ? (n - 1) / 4 * 4
-                                    : (n - 1) / 16 * 16;
+    // Query-local sparse WMMA retains only the final query; dense WMMA
+    // retains its final 16-query tile. Match WmmaCausalAttention's dispatch.
+    const unsigned first = !last ? 0 : sparse ? n - 1 : (n - 1) / 16 * 16;
     const auto reference = wmma(true, last, nullptr);
     const auto direct = wmma(false, last, nullptr);
     auto last_expected = full_wmma;
