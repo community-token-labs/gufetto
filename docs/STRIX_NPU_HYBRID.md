@@ -17,8 +17,10 @@ All stages had no selected kernel faults. Production was verified restored;
 the freshly captured prior controls were **high/auto**, not auto/auto.
 Earlier exact99/d4ed completed555Process/3511reaps then failed at layer44.
 
-This landing generation rebases only the NPU feature onto nightly C
-`aba4e33a`; it does not alter C's q8 policy, guards or qualified history.
+This landing generation rebases only the NPU feature onto frozen nightly C2
+`9df6ea7f`; it preserves C2's q8 policy, guards and HIP include fix unchanged.
+The earlier C1-based22e06e74 build packet is retired unconsumed: it lacked that
+include fix and must not be used as native qualification.
 Rebased native build/CPU qualification must be recorded separately from the
 8d hardware results. Statistics synchronization, failed stream-release
 ownership, QKV-only index-key policy and backing accounting are fixed in
