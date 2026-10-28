@@ -10,6 +10,7 @@
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/perf_trace.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -647,6 +648,7 @@ bool Session::DraftReplay(std::int32_t next_token,
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
                            MtpCandidateLogits* candidates, bool draft_subset) {
+  perf::HostPhase perf_catchup("draft_catchup");
   std::vector<std::int32_t> replay;
   std::int32_t hidden_row = 0;
   if (!DraftReplay(next_token, &replay, &hidden_row, error_msg))
@@ -669,6 +671,7 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
 bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg,
                                 std::span<const std::uint8_t> propose) {
+  perf::HostPhase perf_catchup("draft_catchup_batch");
   if (requests.empty())
     return true;
   if (!propose.empty() && propose.size() != requests.size()) {
@@ -729,6 +732,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     std::unique_ptr<rocm::PrefillCheckpoint> capture;
     if ((checkpoint || consume) && boundary > tokens_.size() &&
         boundary <= tokens_.size() + n) {
+      if (perf::current != nullptr)
+        perf::current->checkpoint = true;
       capture = exec.MakePrefillCheckpoint(
           *session_, chunk,
           static_cast<std::uint32_t>(boundary - tokens_.size()), error_msg);
@@ -1078,6 +1083,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->draft = draft_token_;
   if (!defer_head) {
     while (pending->chain.size() < pending->width) {
+      perf::HostPhase perf_proposal("mtp_proposal_round");
       AppendDraft(*pending);
       if (stop_at_eos && model_->IsStopToken(pending->chain.back())) {
         pending->width = pending->chain.size();
@@ -1103,6 +1109,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 bool Session::FinishDecode(const DecodeRequest& request,
                            const PendingDecode& pending,
                            std::string* error_msg) {
+  perf::HostPhase perf_finish("finish_rollback");
   auto& sampler = *request.sampler;
   auto* result = request.result;
   auto& exec = *model_->executor_;
@@ -1497,6 +1504,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   // Each round shares predictor projections across ready sessions.
   // Attention state, proposal distributions and RNG streams stay private.
   for (;;) {
+    perf::HostPhase perf_proposal("mtp_proposal_round");
     std::vector<rocm::Executor::MtpHeadItem> heads;
     std::vector<rocm::Executor::MtpBatchItem> bodies;
     for (std::size_t i = 0; i < requests.size(); ++i) {
@@ -1566,6 +1574,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   }
   if (!items.empty() && !exec.ForwardBatch(items, error_msg))
     return false;
+  perf::HostPhase perf_finish_batch("finish_rollback_batch");
   std::uint32_t offset = 0;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& p = pending[i];
@@ -1600,6 +1609,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       r.outcome->error = exception.what();
     }
   }
+  perf_finish_batch.Finish();
   const bool used_lookup =
       std::ranges::any_of(pending, [](const auto& p) { return p.lookup != 0; });
   if (used_lookup)

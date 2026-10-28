@@ -24,6 +24,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/perf_trace.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -483,6 +484,8 @@ private:
   /// Reads the routing of the current batch back and derives the tile
   /// hints for its expert GEMMs (tiled batches only).
   bool RouteHints(std::uint32_t n_tokens, std::string* error_msg) const;
+  void PerfRoutes(std::uint32_t layer, std::uint32_t rows,
+                  bool counts_available = false) const;
   /// Routed gate/up projections followed by SwiGLU.
   bool GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                     const float* x, const std::int32_t* ids, float* out,
@@ -605,6 +608,8 @@ private:
   hipEvent_t side_done_{nullptr};
   mutable bool side_pending_{false};  ///< side_done_ not yet waited on
   hipEvent_t counts_ready_{nullptr};
+  mutable PerfEvents perf_events_;
+  std::int32_t* perf_ids_host_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
 
