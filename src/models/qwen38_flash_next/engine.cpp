@@ -1,4 +1,7 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -735,6 +738,19 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
   return items.empty() || exec.MtpForwardBatch(items, error_msg);
 }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+std::optional<std::size_t> Session::SinglePassPrefillLimit(
+    std::size_t remaining, std::size_t budget) const noexcept {
+  if (!valid_ || image_prompt_ || remaining == 0 || budget == 0)
+    return std::nullopt;
+  return std::min<std::size_t>(
+      {budget, remaining,
+       remaining <= model_->PrefillThroughCapacity()
+           ? model_->PrefillThroughCapacity()
+           : model_->PrefillCapacity()});
+}
+#endif
+
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
@@ -1361,6 +1377,12 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   valid_ = false;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  auto provenance = pd::current_association;
+  provenance.model_filtered = 1;
+  // Preserve backend-MTP-batch provenance when isolation leaves a singleton.
+  pd::AssociationScope association(provenance);
+#endif
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
@@ -1452,6 +1474,11 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::string shared_error;
   try {
     if (!active.empty()) {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      auto provenance = pd::current_association;
+      provenance.model_filtered = active.size();
+      pd::AssociationScope association(provenance);
+#endif
       if constexpr (std::is_same_v<Request, DecodeRequest>)
         (void)DecodeBatchImpl(active, &shared_error);
       else

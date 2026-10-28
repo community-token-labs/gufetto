@@ -25,6 +25,9 @@
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#include "src/cli/serve/text_generation_scheduler.hpp"
+#endif
 #include "src/core/platform/env.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/support/temporary_directory.hpp"
@@ -188,6 +191,15 @@ public:
                      prompt.subspan(offset, count));
     return {count, offset + count == prompt.size()};
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const override {
+    if (offset != CheckpointPosition(state) || offset >= prompt.size())
+      return std::nullopt;
+    return std::min(budget, prompt.size() - offset);
+  }
+#endif
   std::optional<std::size_t> PrefillCheckpointBytes(
       const TextRunnerState&, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget,
@@ -3601,6 +3613,107 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
     }
   }
 }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+namespace {
+void PreparedSerialCutKeepsRealComponentBoundaries() {
+  auto runner = std::make_shared<Runner>();
+  runner->in_pass = true;
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> prompt(40, 7);
+  auto request = pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {},
+                              true, 16);
+  // B1/B2: a large proposed range is clipped to the actual stable boundary,
+  // not published at the proposed end or through an interior capture.
+  auto cut = request.PrepareSinglePassPrefill(31);
+  assert(cut && *cut == 16);
+  assert(request.prefill_position() == 0);  // Planning did not execute rows.
+  assert(request.Prefill(*cut).consumed_tokens == 16);
+  assert(request.prefill_position() == 16 && runner->through_calls == 0);
+  while (!request.prefill_complete()) {
+    cut = request.PrepareSinglePassPrefill(7);
+    assert(cut && *cut > 0 && *cut <= 7);
+    assert(request.Prefill(*cut).consumed_tokens == *cut);
+  }
+  const auto token = request.SelectNext().token;
+  (void)request.Commit();
+  auto warm = pool.Acquire(prompt);
+  assert(warm.cached_prompt_tokens() == prompt.size());
+  assert(warm.SelectNext().token == token);
+  warm.Invalidate();
+
+  // B3/B4: a frozen cut cannot be relabelled with a different budget and
+  // execute/publish under that identity. Rejection precedes component mutation.
+  auto changed = prompt;
+  changed.front() = 8;
+  auto other = pool.Acquire(changed);
+  cut = other.PrepareSinglePassPrefill(9);
+  assert(cut && *cut == 9);
+  bool rejected = false;
+  try {
+    (void)other.Prefill(10);
+  } catch (const std::logic_error&) {
+    rejected = true;
+  }
+  assert(rejected && other.prefill_position() == 0);
+  other.Invalidate();
+}
+
+void AdaptiveSchedulingUsesRealComponentCache() {
+  class AdaptiveRunner final : public Runner {
+  public:
+    mutable std::binary_semaphore entered{0};
+    mutable std::binary_semaphore resume{0};
+    mutable bool blocked{false};
+    mutable std::vector<std::pair<TextRunnerToken, std::size_t>> cuts;
+    TextPrefillStep Prefill(TextRunnerState& state,
+                            std::span<const TextRunnerToken> prompt,
+                            std::size_t offset,
+                            std::size_t budget) const override {
+      cuts.emplace_back(prompt.front(), budget);
+      return Runner::Prefill(state, prompt, offset, budget);
+    }
+    TextDecodeSelection SelectNext(TextRunnerState& state,
+                                   sampling::SamplerState& sampler)
+        const override {
+      if (!blocked) {
+        blocked = true;
+        entered.release();
+        if (!resume.try_acquire_for(std::chrono::seconds(5)))
+          throw std::runtime_error("adaptive component fixture barrier timeout");
+      }
+      return Runner::SelectNext(state, sampler);
+    }
+  };
+  auto runner = std::make_shared<AdaptiveRunner>();
+  assert(runner->UsesComponentCache());  // CreateState throws on wrong path.
+  auto pool = std::make_shared<TextRunnerPool>(runner, 2);
+  TextGenerationScheduler scheduler(pool,
+      {.decode_active_tokens = 512,
+       .prerequisites = {.mode = detail::PrefillPrerequisiteMode::kAdaptive,
+                         .tokens = 64}});
+  auto decoder = scheduler.Submit({11}, 4, 0.0f);
+  assert(runner->entered.try_acquire_for(std::chrono::seconds(5)));
+  std::vector<TextRunnerToken> prompt(256, 22);
+  auto prefill = scheduler.Submit(prompt, 1, 0.0f);
+  runner->resume.release();
+  const auto first = decoder.Wait();
+  const auto second = prefill.Wait();
+  assert(first.tokens.size() == 4 && second.tokens.size() == 1);
+  assert(second.prefill_tokens == prompt.size());
+  const auto first_long = std::find_if(
+      runner->cuts.begin(), runner->cuts.end(),
+      [](const auto& cut) { return cut.first == 22; });
+  assert(first_long != runner->cuts.end() && first_long->second == 64);
+  // Independent cold component pool: altered cuts preserve exact state/output.
+  auto cold_runner = std::make_shared<Runner>();
+  TextRunnerPool cold(cold_runner, 1);
+  auto reference = cold.Acquire(prompt, sampling::SamplingConfig{});
+  while (!reference.prefill_complete())
+    (void)reference.Prefill(4096);
+  assert(second.tokens.front() == reference.SelectNext().token);
+}
+}  // namespace
+#endif
 int main() {
   if (std::getenv("GUFO_TEST_ROTATED_PROCESS_LOCAL_ONLY") != nullptr) {
     packed_ingress_cpu::RotatedWithoutFingerprintDisk();
@@ -3615,6 +3728,10 @@ int main() {
     std::cout << "CPU packed disk admission PASS\n";
     return 0;
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  PreparedSerialCutKeepsRealComponentBoundaries();
+  AdaptiveSchedulingUsesRealComponentCache();
+#endif
   LookupRuntimeDefaultsAndDisabled();
   CheckpointTransferRoundTripAndConcurrentServing();
   CheckpointImportRespectsRamOff();

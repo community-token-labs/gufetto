@@ -56,6 +56,9 @@ using gufo::server::TextRunnerResourceClaim;
 using gufo::server::TextRunnerState;
 using gufo::server::TextRunnerToken;
 using gufo::server::TextSchedulerPolicy;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+using gufo::server::detail::PrefillPrerequisiteMode;
+#endif
 
 constexpr auto kTestTimeout = std::chrono::seconds{5};
 
@@ -215,6 +218,13 @@ struct FakeControl {
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
   std::function<void()> snapshot_callback;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  std::size_t maximum_plan_width{4};
+  std::function<void(TextRunnerToken, std::size_t)> advance_callback;
+  std::function<std::optional<std::size_t>(
+      std::span<const TextRunnerToken>, std::size_t, std::size_t)>
+      single_pass_limit;
+#endif
 };
 
 class FakeState final : public TextRunnerState {
@@ -304,10 +314,13 @@ public:
           .kind = TextExecutionPlanKind::kBatched,
           .physical_width = 2,
       });
-      plans.push_back({
-          .kind = TextExecutionPlanKind::kBatched,
-          .physical_width = 4,
-      });
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+      if (control_->maximum_plan_width >= 4)
+#endif
+        plans.push_back({
+            .kind = TextExecutionPlanKind::kBatched,
+            .physical_width = 4,
+        });
     }
     return plans;
   }
@@ -402,6 +415,18 @@ public:
     };
   }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  [[nodiscard]] std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const override {
+    Expect(RequireFakeState(state).position == offset,
+           "scheduler planning observes the actual native frontier");
+    if (control_->single_pass_limit)
+      return control_->single_pass_limit(prompt, offset, budget);
+    return std::nullopt;
+  }
+#endif
+
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, gufo::sampling::SamplerState&) const override {
     const auto& fake = RequireFakeState(state);
@@ -474,6 +499,10 @@ public:
     if (!fake.frontier.has_value() || token != *fake.frontier) {
       throw std::logic_error("scheduler fake frontier mismatch");
     }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    if (control_->advance_callback)
+      control_->advance_callback(fake.label, fake.decode_count);
+#endif
 
     {
       std::unique_lock<std::mutex> lock(control_->mutex);
@@ -1394,6 +1423,181 @@ void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
   Expect(result_c.max_consecutive_active_prefill_chunks == 1,
          "scheduler never runs consecutive chunks while decode is due");
 }
+
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+void TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals() {
+  // Five ready members cannot drain in one W2 call. One fails, another is
+  // cancelled after freeze, and both a newcomer and a capture resume arrive
+  // while that finite roster is being serviced. Neither may reopen it.
+  for (const TextRunnerToken failed_label : {2U, 3U, 5U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->max_context = 4096;
+    control->supports_batched_advance = true;
+    control->maximum_plan_width = 2;
+    control->snapshot_callback = [] {};
+    auto pool = std::make_shared<TextRunnerPool>(
+        std::make_shared<FakeRunner>(control), 8);
+    for (TextRunnerToken label = 1; label <= 6; ++label) {
+      auto seed = pool->Acquire({label});
+      Expect(seed.Prefill(1).decode_ready, "seed a real reusable frontier");
+      seed.Commit();
+    }
+    {
+      const std::lock_guard<std::mutex> lock(control->mutex);
+      control->events.clear();
+    }
+    std::binary_semaphore captured(0), release_capture(0);
+    std::binary_semaphore first_advance(0), release_first(0);
+    std::binary_semaphore frozen_advance(0), release_frozen(0);
+    std::atomic<unsigned> captures{0};
+    control->snapshot_callback = [&] {
+      if (captures.fetch_add(1) == 0) {
+        captured.release();
+        Expect(release_capture.try_acquire_for(kTestTimeout),
+               "release the deliberately deferred capture");
+      }
+    };
+    control->advance_callback = [&](TextRunnerToken label, std::size_t index) {
+      if (label == 1 && index == 0) {
+        first_advance.release();
+        Expect(release_first.try_acquire_for(kTestTimeout),
+               "release the initial decoder");
+      }
+      if (label == 2 && index == 0) {
+        frozen_advance.release();
+        Expect(release_frozen.try_acquire_for(kTestTimeout),
+               "release the first fragmented cohort group");
+      }
+    };
+    control->throw_advance_label = failed_label;
+    TextGenerationScheduler scheduler(
+        pool, {.prerequisites = {
+                   .mode = PrefillPrerequisiteMode::kAdaptive,
+                   .tokens = 64}});
+    auto resuming = scheduler.Submit({7}, 12, 0.0F);
+    Expect(captured.try_acquire_for(kTestTimeout), "capture really defers");
+    auto first = scheduler.Submit({1}, 12, 0.0F);
+    Expect(first_advance.try_acquire_for(kTestTimeout),
+           "initial decoder holds admission open");
+    std::vector<TextGenerationScheduler::Request> cohort;
+    for (TextRunnerToken label = 2; label <= 5; ++label)
+      cohort.push_back(scheduler.Submit({label}, 12, 0.0F));
+    auto prompt =
+        scheduler.Submit(std::vector<TextRunnerToken>(150, 9), 2, 0.0F);
+    release_first.release();
+    Expect(frozen_advance.try_acquire_for(kTestTimeout),
+           "a ready cohort is frozen before the next prompt cut");
+    cohort[2].Cancel();  // label 4, not a member of the in-flight W2 group.
+    auto newcomer = scheduler.Submit({6}, 12, 0.0F);
+    release_capture.release();
+    release_frozen.release();
+
+    Expect(first.Wait().tokens == ExpectedTokens(1, 12),
+           "the original decoder keeps its isolated trajectory");
+    for (std::size_t i = 0; i < cohort.size(); ++i) {
+      const auto label = static_cast<TextRunnerToken>(i + 2);
+      bool failed = false;
+      try {
+        const auto result = cohort[i].Wait();
+        if (label == 4)
+          Expect(result.cancelled && result.tokens.empty(),
+                 "a cancelled unserved member is not sampled or advanced");
+        else
+          Expect(result.tokens == ExpectedTokens(label, 12),
+                 "runnable peers survive another member's failure");
+      } catch (const std::runtime_error&) {
+        failed = true;
+      }
+      Expect(failed == (label == failed_label),
+             "only the injected failing member reports failure");
+    }
+    Expect(prompt.Wait().tokens == ExpectedTokens(9, 2) &&
+               newcomer.Wait().tokens == ExpectedTokens(6, 12) &&
+               resuming.Wait().tokens == ExpectedTokens(7, 12),
+           "prefiller, capture resume and newcomer all finish exactly once");
+    const auto events = control->Events();
+    const auto cut = EventIndex(events, EventKind::kPrefill, 9);
+    Expect(cut < events.size(), "the prefiller gets a finite turn");
+    for (TextRunnerToken label = 1; label <= 5; ++label) {
+      if (label == 4 || label == failed_label)
+        continue;
+      Expect(EventIndex(events, EventKind::kAdvance, label,
+                        label == 1 ? 1 : 0) < cut,
+             "every surviving frozen member runs before more prefill");
+    }
+    Expect(EventIndex(events, EventKind::kAdvance, 4) == events.size(),
+           "cancellation does not count as executed decode work");
+    Expect(cut < EventIndex(events, EventKind::kAdvance, 6) &&
+               cut < EventIndex(events, EventKind::kAdvance, 7),
+           "newcomers and capture resumes join the next finite cohort");
+    for (const auto& event : events)
+      if (event.kind == EventKind::kPrefill && event.label == 9)
+        Expect(event.count <= 64 && event.count > 0,
+               "active AD cuts remain positive and bounded");
+  }
+}
+
+void TestSerialShadowPlanFailureOrDeclineKeepsPeersRunnable() {
+  for (const bool fail : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->max_context = 4096;
+    control->block_advance_label = 1;
+    control->single_pass_limit = [fail](
+        std::span<const TextRunnerToken> prompt, std::size_t offset,
+        std::size_t budget) -> std::optional<std::size_t> {
+      if (prompt.front() == 2) {
+        if (fail)
+          throw std::runtime_error("injected read-only planner failure");
+        return std::nullopt;
+      }
+      return std::min({budget, prompt.size() - offset, std::size_t{17}});
+    };
+    auto scheduler = MakeScheduler(
+        control, 3,
+        {.decode_active_tokens = 2,
+         .prerequisites = {
+             .mode = PrefillPrerequisiteMode::kSerialShadow,
+             .tokens = 64}});
+    auto decoder = scheduler->Submit({1}, 30, 0.0F);
+    control->WaitForAdvance(1);
+    auto declining = scheduler->Submit(std::vector<TextRunnerToken>(35, 2), 2,
+                                       0.0F);
+    auto healthy = scheduler->Submit(std::vector<TextRunnerToken>(35, 3), 2,
+                                     0.0F);
+    control->ReleaseAdvance();
+    bool failed = false;
+    try {
+      const auto result = declining.Wait();
+      Expect(result.tokens == ExpectedTokens(2, 2) &&
+                 result.serial_shadow_plan_declined > 0,
+             "a model decline takes the real bounded serial fallback");
+    } catch (const std::runtime_error&) {
+      failed = true;
+    }
+    Expect(failed == fail, "planner failure belongs only to its prefiller");
+    const auto result = healthy.Wait();
+    Expect(result.tokens == ExpectedTokens(3, 2) &&
+               result.serial_shadow_steps > 0 &&
+               result.serial_shadow_unsupported > 0 &&
+               decoder.Wait().tokens == ExpectedTokens(1, 30),
+           "SC planning preserves peer progress without certifying mixing");
+    const auto events = control->Events();
+    if (fail)
+      Expect(EventIndex(events, EventKind::kPrefill, 2) == events.size(),
+             "planner failure precedes all prompt mutation");
+    const auto first = EventIndex(events, EventKind::kPrefill, 3);
+    const auto second = EventIndex(events, EventKind::kPrefill, 3, 1);
+    Expect(first < second && second < events.size(),
+           "the healthy prefiller makes repeated positive progress");
+    Expect(std::any_of(events.begin() + first + 1, events.begin() + second,
+                       [](const Event& event) {
+                         return event.kind == EventKind::kAdvance &&
+                                event.label == 1;
+                       }),
+           "a ready peer decodes between SC cuts despite decline/failure");
+  }
+}
+#endif
 
 void TestNonIncrementalRunnerFallsBackSafely() {
   auto control = std::make_shared<FakeControl>();
@@ -2979,6 +3183,10 @@ void TestEmptyTokenIsPublished() {
 
 int main() {
   TestPublicationWaitUsesRecentSubstantialPrefill();
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals();
+  TestSerialShadowPlanFailureOrDeclineKeepsPeersRunnable();
+#endif
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   gufo::platform::SetEnv("NO_COLOR", "1");

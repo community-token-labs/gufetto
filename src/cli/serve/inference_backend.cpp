@@ -1,4 +1,11 @@
 #include "src/cli/serve/inference_backend.hpp"
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#include "src/cli/serve/prefill_prerequisites.hpp"
+#endif
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+namespace qfn_pd = gufo::models::qwen38_flash_next::pd;
+#endif
 
 #include <algorithm>
 #include <array>
@@ -2707,6 +2714,22 @@ public:
     };
   }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  [[nodiscard]] std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const override {
+    const auto& qfn = RequireQwenFlashNextState(state);
+    if (offset != qfn.position() || offset >= prompt.size() ||
+        qfn.session().Tokens().size() != offset)
+      return std::nullopt;
+    // Ordinary text Sync below uses this same native capacity rule. The pool
+    // ends this serial cut at captures; no SyncThrough/interior checkpoint.
+    // This admits SERIAL component work, NOT mixed component eligibility.
+    const auto remaining = prompt.size() - offset;
+    return qfn.session().SinglePassPrefillLimit(remaining, budget);
+  }
+#endif
+
   [[nodiscard]] std::optional<std::size_t> PrefillCheckpointBytes(
       const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget,
@@ -2826,7 +2849,20 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    auto provenance = qfn_pd::current_association;
+    provenance.backend_filtered = provenance.backend_filtered.value_or(1);
+    provenance.route = !use_mtp_ || max_tokens == 1
+                           ? qfn_pd::LegacyRoute::kGeneric
+                           : qfn_pd::LegacyRoute::kScalarMtp;
+    qfn_pd::AssociationScope association(provenance);
+#endif
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    if (detail::QfnBackendRoute(use_mtp_, 1, max_tokens) ==
+        detail::DecodeRoute::kGenericScalar) {
+#else
     if (!use_mtp_ || max_tokens == 1) {
+#endif
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -2901,7 +2937,20 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    auto provenance = qfn_pd::current_association;
+    provenance.backend_filtered = decodes.size();
+    provenance.route = use_mtp_ && decodes.size() >= 2
+                           ? qfn_pd::LegacyRoute::kBackendMtpBatch
+                           : qfn_pd::LegacyRoute::kGeneric;
+    qfn_pd::AssociationScope association(provenance);
+#endif
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    if (detail::QfnBackendRoute(use_mtp_, decodes.size(), 0) !=
+        detail::DecodeRoute::kEngineBatch) {
+#else
     if (decodes.size() < 2 || !use_mtp_) {
+#endif
       return TextModelRunner::DecodeBatch(decodes);
     }
     const auto count = decodes.size();

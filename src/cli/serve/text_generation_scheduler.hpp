@@ -12,6 +12,9 @@
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#include "src/cli/serve/prefill_prerequisites.hpp"
+#endif
 
 namespace gufo::server {
 
@@ -34,6 +37,9 @@ inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
 
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  detail::PrefillPrerequisites prerequisites;
+#endif
 };
 
 struct TextSchedulerPolicy {

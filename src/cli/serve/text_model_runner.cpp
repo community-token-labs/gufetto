@@ -1285,6 +1285,13 @@ struct TextRunnerPool::Request::Impl {
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  struct PreparedSinglePass {
+    std::size_t offset;
+    std::size_t tokens;
+  };
+  std::optional<PreparedSinglePass> prepared_single_pass;
+#endif
   /// The leased state's cumulative n-gram rows before this request ran.
   TextRunnerNgramRows ngram_baseline;
   // A throwing model call may have partially mutated device state. Never
@@ -1490,6 +1497,46 @@ void TextRunnerPool::Request::PrepareBatchExecution() {
       dynamic_cast<TextRunnerState&>(impl_->lease.state()));
 }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+std::optional<std::size_t>
+TextRunnerPool::Request::PrepareSinglePassPrefill(std::size_t budget) {
+  if (!*this || impl_->stopped || impl_->pending_selection || budget == 0 ||
+      impl_->decode_ready)
+    return std::nullopt;
+  if (impl_->prepared_single_pass)
+    throw std::logic_error("single-pass prefill already prepared");
+  if (impl_->cancelled && impl_->cancelled())
+    return std::nullopt;
+  if (!PreparePromptSnapshot())
+    return std::nullopt;
+  // Stop AT every pool boundary, never silently capture through one.
+  auto frontier = impl_->prompt.size();
+  const auto offset = impl_->prefill_offset;
+  const auto clip = [&](std::size_t point) {
+    if (point > offset)
+      frontier = std::min(frontier, point);
+  };
+  clip(impl_->snapshot_tokens.size());
+  for (const auto point : impl_->boundaries)
+    clip(point);
+  for (const auto point : impl_->checkpoints)
+    clip(point);
+  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
+  const auto count = impl_->runner->SinglePassPrefillLimit(
+      state, std::span<const TextRunnerToken>(impl_->prompt).first(frontier),
+      offset, std::min(budget, frontier - offset));
+  if (!count || *count == 0 || *count > budget || *count > frontier - offset)
+    return std::nullopt;
+  if (impl_->runner->CheckpointPosition(state) != offset)
+    throw std::logic_error("single-pass prefill has stale native frontier");
+  // Reuse the real component/native ownership and preservation/admission hook.
+  // Failure is BEFORE decoder proposals; no weaker scheduler reservation.
+  impl_->lease.PreparePrefill(*count);
+  impl_->prepared_single_pass = Impl::PreparedSinglePass{offset, *count};
+  return count;
+}
+#endif
+
 TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
@@ -1512,6 +1559,14 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         "text runner prefill budget must be at least one token");
   }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  const auto prepared = impl_->prepared_single_pass;
+  impl_->prepared_single_pass.reset();
+  if (prepared &&
+      (prepared->offset != impl_->prefill_offset ||
+       prepared->tokens != max_input_tokens))
+    throw std::logic_error("prepared single-pass range changed");
+#endif
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
   // Direct callers join any capture before mutating its borrowed state.
   impl_->CapturePromptSnapshot();
@@ -1561,6 +1616,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   const std::size_t remaining = impl_->prompt.size() - impl_->prefill_offset;
   if (impl_->cancelled && impl_->cancelled())
     throw std::runtime_error("generation cancelled");
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  if (prepared && (in_pass || max_input_tokens != prepared->tokens ||
+                   impl_->runner->CheckpointPosition(state) !=
+                       prepared->offset))
+    throw std::logic_error("prepared single-pass boundary changed");
+#endif
   impl_->state_reusable = false;
   // Complete the model frontier at the cache boundary, including logits and
   // draft catch-up. Its snapshot can then be restored independently.
@@ -1638,6 +1699,10 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     impl_->state_reusable = true;
     throw std::runtime_error("generation cancelled");
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  if (prepared && step.consumed_tokens != prepared->tokens)
+    throw std::runtime_error("model violated prepared single-pass range");
+#endif
   const std::size_t maximum_consumed = std::min(remaining, max_input_tokens);
   if (step.consumed_tokens == 0 || step.consumed_tokens > maximum_consumed) {
     throw std::runtime_error(

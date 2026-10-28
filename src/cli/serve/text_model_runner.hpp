@@ -480,6 +480,15 @@ public:
       const std::function<std::unique_ptr<TextRunnerSnapshot>()>& = {}) const {
     throw std::logic_error("runner does not support in-pass checkpoints");
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  /// Read-only model-owned limit for ONE target pass; null declines before
+  /// decoder/RNG mutation. Component ownership is still prepared by the pool.
+  [[nodiscard]] virtual std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
+      std::size_t) const {
+    return std::nullopt;
+  }
+#endif
   [[nodiscard]] virtual TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const = 0;
   virtual void Advance(TextRunnerState& state, TextRunnerToken token) const = 0;
@@ -625,6 +634,12 @@ public:
 
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    /// Freeze/admit a legal serial prompt cut before any decoder mutation.
+    /// A pending capture/model decline returns null; no progress is invented.
+    [[nodiscard]] std::optional<std::size_t> PrepareSinglePassPrefill(
+        std::size_t max_input_tokens);
+#endif
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);

@@ -426,6 +426,36 @@ std::optional<ReasoningOptions> ResolveReasoningDefaults(
   return options;
 }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+void AddPrefillPrerequisiteOptions(
+    ArgParser& parser, server::detail::PrefillPrerequisites* options) {
+  parser.AddCustomOption(
+      "", "--experimental-prefill-policy", "MODE",
+      "Experimental prefill policy: legacy, adaptive, serial-shadow "
+      "(default: legacy; no mixed kernel)", "Scheduling",
+      [options](std::string_view, std::string_view value, std::string* error) {
+        using Mode = server::detail::PrefillPrerequisiteMode;
+        if (value == "legacy")
+          options->mode = Mode::kLegacy;
+        else if (value == "adaptive")
+          options->mode = Mode::kAdaptive;
+        else if (value == "serial-shadow")
+          options->mode = Mode::kSerialShadow;
+        else {
+          if (error)
+            *error = "invalid experimental prefill policy";
+          return false;
+        }
+        return true;
+      });
+  parser.AddOption(
+      "", "--experimental-prefill-budget", "N",
+      "Experimental policy budget64..4224; prompt rows for adaptive, TOTAL rows "
+      "for serial-shadow (default:0/off; at most8 sessions)", "Scheduling",
+      &options->tokens);
+}
+#endif
+
 struct SpeechOptions {
   std::filesystem::path model;
   std::size_t context;
@@ -643,6 +673,9 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    server::detail::PrefillPrerequisites prefill_prerequisites;
+#endif
     std::size_t max_pending_requests = 16;
     std::size_t max_pending_requests_per_client = 0;
     std::uint64_t request_timeout_ms = 0;
@@ -744,6 +777,9 @@ void PrintServeHelp(std::string_view program_name,
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
         "Scheduling", &prefill_chunk_tokens);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    AddPrefillPrerequisiteOptions(parser, &prefill_prerequisites);
+#endif
     parser.AddOption("", "--max-pending", "N",
                      "Maximum queued generation requests (default: 16)",
                      "Scheduling", &max_pending_requests);
@@ -1270,6 +1306,9 @@ int RunServe(std::span<const char* const> args) {
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    server::detail::PrefillPrerequisites prefill_prerequisites;
+#endif
     std::size_t max_pending_requests = 16;
     // Defaults to --max-pending after parsing unless supplied.
     std::size_t max_pending_requests_per_client = 0;
@@ -1378,6 +1417,9 @@ int RunServe(std::span<const char* const> args) {
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
         "Scheduling", &prefill_chunk_tokens);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    AddPrefillPrerequisiteOptions(llm_parser, &prefill_prerequisites);
+#endif
     llm_parser.AddOption("", "--max-pending", "N",
                          "Maximum queued generation requests (default: 16)",
                          "Scheduling", &max_pending_requests);
@@ -1630,6 +1672,14 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
     }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    try {
+      prefill_prerequisites.Validate(session_count);
+    } catch (const std::invalid_argument& error) {
+      std::cerr << "Error: " << error.what() << '\n';
+      return 2;
+    }
+#endif
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
@@ -1641,6 +1691,9 @@ int RunServe(std::span<const char* const> args) {
         model, &err, max_context, session_count,
         server::TextPrefillPolicy{
             .decode_active_tokens = prefill_chunk_tokens,
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+            .prerequisites = prefill_prerequisites,
+#endif
         },
         server::TextSchedulerPolicy{
             .max_pending_requests = max_pending_requests,
