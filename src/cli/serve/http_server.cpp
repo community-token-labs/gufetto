@@ -2373,10 +2373,11 @@ void HttpServer::handle_connection(int client_fd,
                 std::memcpy(out.data(), initial.data() + position, n);
                 position += n;
               } else {
-                ssize_t got;
+                std::intptr_t got;
                 do {
-                  got = ::read(client_fd, out.data(), out.size());
-                } while (got < 0 && errno == EINTR);
+                  got = net::Receive(client_fd, out.data(), out.size());
+                } while (got < 0 && net::IsSocketInterrupted() &&
+                         std::chrono::steady_clock::now() < deadline);
                 if (got <= 0)
                   return 0;
                 n = static_cast<std::size_t>(got);

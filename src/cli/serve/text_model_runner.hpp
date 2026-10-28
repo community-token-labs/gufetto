@@ -59,8 +59,9 @@ struct TextRunnerRamCacheOptions {
   /// capacity_bytes is ignored. Sessions still reuse their own live state.
   bool enabled{true};
   TextRunnerPinnedPrefixOptions pinned_prefix;
-  // Embedding pools expose Lookup by default. The server wires this to its
-  // opt-in route flag so disabled HTTP lookup adds no publication work.
+  // Embedding pools expose portable advisory Lookup by default. The server
+  // wires this to its opt-in route flag: disabled lookup skips publication and
+  // epoch discovery/hashing. This does not enable strict pins or transfer.
   bool publish_lookup{true};
   bool transfer_api{false};
 };

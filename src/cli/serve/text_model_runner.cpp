@@ -689,10 +689,11 @@ struct TextRunnerPool::Impl {
         transfer_configuration = CheckpointTransferConfiguration(
             validated.descriptor, validated.runner->LookupContextIdentity());
       }
-      lookup_epoch = CacheLookupEpoch(
-          validated.descriptor, component_cache->CompatibilityIdentity(),
-          state_count, disk_cache_options, ram_cache_options,
-          validated.runner->LookupContextIdentity());
+      if (ram_cache_options.publish_lookup)
+        lookup_epoch = CacheLookupEpoch(
+            validated.descriptor, component_cache->CompatibilityIdentity(),
+            state_count, disk_cache_options, ram_cache_options,
+            validated.runner->LookupContextIdentity());
       return;
     }
     if (ram_cache_options.pinned_prefix.enabled())
@@ -749,9 +750,10 @@ struct TextRunnerPool::Impl {
       shared_prefix_max_boundaries =
           disk_cache_options->shared_prefix_max_boundaries;
     }
-    lookup_epoch = CacheLookupEpoch(validated.descriptor, {}, state_count,
-                                    disk_cache_options, ram_cache_options,
-                                    validated.runner->LookupContextIdentity());
+    if (ram_cache_options.publish_lookup)
+      lookup_epoch = CacheLookupEpoch(
+          validated.descriptor, {}, state_count, disk_cache_options,
+          ram_cache_options, validated.runner->LookupContextIdentity());
   }
 
   ValidatedRunner validated;

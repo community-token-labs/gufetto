@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/core/crypto/sha256.hpp"
 
 using namespace gufo;
@@ -35,17 +36,20 @@ CheckpointTransferReader Reader(const std::vector<std::uint8_t>& data) {
         return n;
       };
 }
-void Check(bool expected, const std::function<void()>& action,
-           int status = 400) {
+void Check(bool expected, const std::function<void()>& action, int status = 400,
+           std::string_view code = {}) {
   bool rejected = false;
   try {
     action();
   } catch (const CheckpointTransferError& error) {
     assert(error.status == status);
+    if (!code.empty())
+      assert(error.code == code);
     rejected = true;
   }
   assert(rejected == expected);
 }
+#include "tests/cli/checkpoint_identity_checks.hpp"
 }  // namespace
 int main() {
   cache::Identity identity{1, 2, 20, 4};
@@ -77,6 +81,7 @@ int main() {
       {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
       {16, 17, 18, 19},
       std::vector<std::uint8_t>(64, 87)};
+  CheckpointIdentityChecks(header, payloads);
   auto source = CheckpointTransferBlob::Export(
       header, [&](auto i, const auto& consume) { consume(payloads[i]); });
   const auto wire = Wire(*source);
@@ -168,6 +173,37 @@ int main() {
       },
       413);
   assert(!read);
+  // Reject advertised header limits before reading/allocating the header.
+  // Impossible lengths remain malformed even if also above the size limit.
+  const auto advertised = [&](std::uint64_t size, std::uint64_t total,
+                              int status, std::string_view code) {
+    auto prefix = std::vector<std::uint8_t>(wire.begin(), wire.begin() + 16);
+    for (unsigned i = 0; i < 8; ++i)
+      prefix[8 + i] = static_cast<std::uint8_t>(size >> (8 * i));
+    std::size_t received = 0;
+    Check(
+        true,
+        [&] {
+          (void)CheckpointTransferBlob::Import(
+              [&](std::span<std::uint8_t> out) {
+                assert(received + out.size() <= prefix.size());
+                std::ranges::copy(
+                    std::span(prefix).subspan(received, out.size()),
+                    out.begin());
+                received += out.size();
+                return out.size();
+              },
+              total, identity, header.configuration);
+        },
+        status, code);
+    assert(received == prefix.size());
+  };
+  advertised(cache::kMaxManifestBytes + 1, cache::kMaxManifestBytes + 1, 413,
+             "cache_transfer_too_large");
+  advertised(47, 48, 400, "cache_transfer_invalid");
+  advertised(49, 48, 400, "cache_transfer_invalid");
+  advertised(cache::kMaxManifestBytes + 1, cache::kMaxManifestBytes, 400,
+             "cache_transfer_invalid");
   // Disconnect stops a streamed response immediately, without leaking a spool.
   std::size_t calls = 0;
   source->Write([&](auto) {

@@ -1,9 +1,6 @@
 #ifndef GUFO_SERVER_CACHE_LOOKUP_SUPPORT_HPP_
 #define GUFO_SERVER_CACHE_LOOKUP_SUPPORT_HPP_
 
-#include <link.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -14,14 +11,17 @@
 #include <set>
 #include <sstream>
 
+#include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/cache_identity.hpp"
 
 namespace gufo::server {
 // Router epochs are deliberately stronger than the on-disk ABI. Computed once
-// at pool creation, not during lookup. Binary hashing also distinguishes dirty
-// development builds and builds whose revision was not supplied by packaging.
-// This is a local configuration identity, never a cross-host transfer promise.
+// at enabled pool creation, not during lookup. Linux binary hashing also
+// distinguishes dirty development builds and builds without packaged revisions;
+// other hosts conservatively use a process nonce. This is a local advisory
+// configuration identity, never a cross-host transfer promise.
 inline std::string CacheLookupEpoch(
     const TextRunnerDescriptor& descriptor,
     std::span<const std::uint8_t> identity, std::size_t slots,
@@ -43,8 +43,7 @@ inline std::string CacheLookupEpoch(
 #else
   add("revision-unrecorded");
 #endif
-  static const auto executable = crypto::Sha256FileHex("/proc/self/exe");
-  add(executable);
+  add(platform::CacheLookupExecutableIdentity());
   add(descriptor.model_id);
   add(descriptor.state_abi);
   add(context);
@@ -82,8 +81,8 @@ inline std::string CacheLookupEpoch(
           << disk->min_checkpoint_step_tokens;
   add(flags.str());
   std::set<std::string> environment;
-  for (auto** p = environ; p && *p; ++p) {
-    const std::string_view entry(*p);
+  for (const auto& value : platform::CacheIdentityEnvironment()) {
+    const std::string_view entry(value);
     if (entry.starts_with("GUFO_") || entry.starts_with("HIP_") ||
         entry.starts_with("HSA_") || entry.starts_with("ROCR_") ||
         entry.starts_with("ROCBLAS_") || entry.starts_with("AMD_"))
@@ -134,49 +133,82 @@ inline std::string CheckpointTransferPolicy(const ReasoningOptions& reasoning,
   return out.str();
 }
 
-// Cross-host material excludes cache paths/budgets/registration names and
-// host kernel versions. It deliberately binds executable AND loaded runtime
-// content, model payload ABI, context, sidecar and numerics environment. Build
-// once at startup; never hash binaries/model weights on a lookup path.
+// Keep unknown Gufo/vendor controls conservatively: new arithmetic knobs must
+// not silently disappear from the identity. Only these observed non-arithmetic
+// readers are excluded: serve.cpp's bind settings and perf_trace.hpp's sinks.
+inline bool CheckpointTransferEnvironmentRelevant(std::string_view name) {
+  if (name == "GUFO_HOST" || name == "GUFO_PORT" || name == "GUFO_PERF_TRACE" ||
+      name == "GUFO_PERF_TRACE_MOE")
+    return false;
+  return name.starts_with("GUFO_") || name.starts_with("HIP_") ||
+         name.starts_with("HSA_") || name.starts_with("ROCR_") ||
+         name.starts_with("ROCBLAS_") || name.starts_with("AMD_") ||
+         name.starts_with("GPU_") || name.starts_with("HIPBLASLT_") ||
+         name.starts_with("CUDA_") || name.starts_with("CUBLAS_") ||
+         name.starts_with("NVIDIA_");
+}
+
+inline std::string CheckpointTransferEnvironmentDigest(
+    std::span<const std::string> entries) {
+  std::set<std::string> environment;
+  for (const auto& entry : entries) {
+    const auto equals = entry.find('=');
+    if (equals == std::string::npos)
+      continue;
+    const auto name = std::string_view(entry).substr(0, equals);
+    if (!CheckpointTransferEnvironmentRelevant(name))
+      continue;
+    // target_probe.hpp tests getenv != nullptr, even for an empty value.
+    // Preserve activation, not the host-private output directory.
+    environment.insert(name == "GUFO_FLASH_NEXT_TARGET_PROBE"
+                           ? "GUFO_FLASH_NEXT_TARGET_PROBE=present"
+                           : entry);
+  }
+  // One digest over the sorted, u64-length-prefixed block, not separately
+  // guessable per-variable digests. Hashing still does NOT provide secrecy.
+  crypto::Sha256Hasher hash;
+  for (const auto& entry : environment) {
+    const auto size = static_cast<std::uint64_t>(entry.size());
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+      const auto byte = static_cast<std::uint8_t>(size >> shift);
+      hash.Update({&byte, 1});
+    }
+    hash.Update(
+        {reinterpret_cast<const std::uint8_t*>(entry.data()), entry.size()});
+  }
+  return hash.FinishHex();
+}
+
+// Pure mapping permits CPU tests with fake runtime material. Cross-host keys
+// exclude local paths/budgets/kernel versions, but bind exact executable and
+// loaded-runtime contents, model ABI, context, sidecar and numerics settings.
 inline std::string CheckpointTransferConfiguration(
-    const TextRunnerDescriptor& descriptor, std::string_view image_identity) {
+    const TextRunnerDescriptor& descriptor, std::string_view image_identity,
+    const platform::CheckpointTransferRuntimeIdentity& runtime) {
   std::ostringstream out;
   out << "gufo-checkpoint-transfer-v1\n"
       << "execution_lane=linux-x86_64-le-gfx1151\n"
       << "payload_version=" << descriptor.persistence->payload_version << '\n'
       << "context=" << descriptor.max_context << '\n'
       << "state_abi=" << descriptor.state_abi << '\n'
-      << "executable_sha256=" << crypto::Sha256FileHex("/proc/self/exe") << '\n'
+      << "executable_sha256=" << runtime.executable_sha256 << '\n'
       << "image_sidecar=" << image_identity << '\n';
-  std::set<std::string> objects;
-  dl_iterate_phdr(
-      [](dl_phdr_info* info, std::size_t, void* data) {
-        if (info->dlpi_name && info->dlpi_name[0] == '/')
-          static_cast<std::set<std::string>*>(data)->insert(info->dlpi_name);
-        return 0;
-      },
-      &objects);
-  std::set<std::string> hashes;
-  for (const auto& path : objects)
-    hashes.insert(crypto::Sha256FileHex(path));
-  for (const auto& hash : hashes)
+  for (const auto& hash : runtime.object_sha256)
     out << "runtime_sha256=" << hash << '\n';
-  std::set<std::string> environment;
-  for (auto** p = environ; p && *p; ++p) {
-    const std::string_view entry(*p);
-    if (entry.starts_with("GUFO_") || entry.starts_with("HIP_") ||
-        entry.starts_with("HSA_") || entry.starts_with("ROCR_") ||
-        entry.starts_with("ROCBLAS_") || entry.starts_with("AMD_"))
-      environment.emplace(entry);
-  }
-  // Hash environment values: operational paths/secrets must not enter blobs.
-  for (const auto& value : environment)
-    out << "environment_sha256="
-        << crypto::Sha256Hex(
-               {reinterpret_cast<const std::uint8_t*>(value.data()),
-                value.size()})
-        << '\n';
+  out << "environment_sha256="
+      << CheckpointTransferEnvironmentDigest(runtime.environment) << '\n';
   return out.str();
+}
+
+// Called only when transfer is enabled. Unsupported hosts fail closed rather
+// than weakening executable-bound compatibility or breaking default pools.
+inline std::string CheckpointTransferConfiguration(
+    const TextRunnerDescriptor& descriptor, std::string_view image_identity) {
+  if (!platform::CheckpointTransferRuntimeSupported())
+    throw CheckpointTransferError(501, "cache_transfer_unsupported");
+  return CheckpointTransferConfiguration(
+      descriptor, image_identity,
+      platform::ReadCheckpointTransferRuntimeIdentity());
 }
 
 // Bounded recent host-wall observations, excluding scheduler queueing. Prefill

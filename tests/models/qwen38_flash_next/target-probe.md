@@ -56,9 +56,9 @@ private disk I/O. The unset path does no probe I/O or device transfers.
 1. Build the final source **once** after the parent's CPU checks, then install
    the **identical immutable executable and runtime objects** on both hosts.
    No helper executable imports transfers and no epoch check is bypassed.
-2. Before either server starts, provision the same absolute private path, on
-   encrypted disk, owned by the server UID and mode 0700. Export exactly the
-   same environment on both hosts, including:
+2. Before either server starts, provision a fixed absolute private path on
+   each host, on encrypted disk, owned by the server UID and mode 0700. Paths
+   may differ between hosts. Enable capture on both, for example:
 
    ```sh
    export GUFO_FLASH_NEXT_TARGET_PROBE=/absolute/private/qfn-target-probe
@@ -67,10 +67,13 @@ private disk I/O. The unset path does no probe I/O or device transfers.
    ```
 
    Start each server with the parent's existing qualified options and transfer
-   flag. Keep all GUFO/HIP/HSA/etc environment values identical. The new variable
-   is included in the existing compatibility environment hash; **do not change
-   its value or unset it between export and import**. Different archive paths
-   are allowed outside the server environment. No `arm` file means no capture.
+   flag. Keep relevant arithmetic/runtime settings identical. Transfer identity
+   binds probe activation, not the private output path; bind-address and perf
+   trace settings are likewise not numerical keys. The stricter local pin
+   fingerprint can still bind the full probe environment value. Keep each
+   server's output path fixed throughout a run and do not toggle activation
+   between export/import. Archive outside that local path. No `arm` file means
+   no capture.
 3. For cold, bypass cache using the existing ordinary request control. For
    local-warm, prime the exact intended cache history **while disarmed**. For
    imported-warm, import while disarmed into the intended fresh destination,

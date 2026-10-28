@@ -159,7 +159,9 @@ std::vector<const cache::DiskPayload*> CheckpointTransferPayloads(
 }
 struct CheckpointTransferBlob::Impl {
   platform::PlatformFile fd{platform::kInvalidFile};
+#if defined(_WIN32)
   mutable std::mutex read_mutex;
+#endif
   CheckpointTransferHeader header;
   std::vector<std::uint8_t> encoded;
   std::vector<std::uint64_t> offsets{0};
@@ -172,9 +174,11 @@ struct CheckpointTransferBlob::Impl {
   }
   ~Impl() { platform::CloseFile(fd); }
   void Read(std::uint64_t offset, std::span<std::uint8_t> out) const {
-    // ReadAt may move the Windows handle's file position. Keep concurrent
-    // checkpoint downloads/loads independent, as pread did on Linux.
+#if defined(_WIN32)
+    // Windows ReadAt may move the handle's file position. POSIX pread is
+    // position-independent and keeps its existing concurrent read path.
     const std::lock_guard lock(read_mutex);
+#endif
     FileRead(fd, offset, out);
   }
   void Layout() {
@@ -290,9 +294,10 @@ std::shared_ptr<CheckpointTransferBlob> CheckpointTransferBlob::Import(
   if (!std::ranges::equal(p.Take(8), kMagic))
     Invalid();
   const auto header_bytes = p.Number();
-  if (header_bytes < prefix.size() + 32 ||
-      header_bytes > cache::kMaxManifestBytes || header_bytes > length)
+  if (header_bytes < prefix.size() + 32 || header_bytes > length)
     Invalid();
+  if (header_bytes > cache::kMaxManifestBytes)
+    throw CheckpointTransferError(413, "cache_transfer_too_large");
   std::vector<std::uint8_t> encoded(header_bytes);
   std::ranges::copy(prefix, encoded.begin());
   Exact(reader, std::span(encoded).subspan(prefix.size()));

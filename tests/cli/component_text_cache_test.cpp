@@ -25,6 +25,7 @@
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/env.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -2470,6 +2471,8 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   assert(log.find("event=capture_failed") == std::string::npos);
   std::filesystem::remove_all(directory);
 }
+// Registered pins intentionally retain the strict Linux runtime contract.
+#if defined(__linux__)
 class PinRunner final : public Runner {
 public:
   mutable std::size_t prefilled{};
@@ -2507,20 +2510,16 @@ public:
   }
 };
 struct PinFixture {
-  std::filesystem::path root;
+  TemporaryDirectory temporary{"gufo-pinned-prefix-test"};
+  std::filesystem::path root{temporary.path()};
   TextRunnerPinnedPrefixOptions options;
   std::vector<TextRunnerToken> tokens{10, 11, 12, 13, 14, 15, 16, 17};
   PinFixture() {
-    auto pattern = (std::filesystem::temp_directory_path() /
-                    "gufo-pinned-prefix-test-XXXXXX")
-                       .string();
-    root = mkdtemp(pattern.data());
     options.files = {root / "rendered.txt"};
     options.directory = root / "pins";
     options.capacity_bytes = 1 << 20;
     WriteTokens();
   }
-  ~PinFixture() { std::filesystem::remove_all(root); }
   void WriteTokens() const {
     std::ofstream file(options.files.front());
     for (const auto token : tokens)
@@ -2739,16 +2738,16 @@ void PinnedPrefixIdentityReplacementAndBudgets() {
   const char* previous = std::getenv("GUFO_TEST_PIN_NUMERICS");
   const std::optional<std::string> saved =
       previous ? std::optional<std::string>(previous) : std::nullopt;
-  setenv("GUFO_TEST_PIN_NUMERICS", "new-build-lane", 1);
+  assert(platform::SetEnv("GUFO_TEST_PIN_NUMERICS", "new-build-lane"));
   {
     auto runner = std::make_shared<PinRunner>();
     TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
     assert(runner->prefilled == fixture.tokens.size());
   }
   if (saved)
-    setenv("GUFO_TEST_PIN_NUMERICS", saved->c_str(), 1);
+    assert(platform::SetEnv("GUFO_TEST_PIN_NUMERICS", *saved));
   else
-    unsetenv("GUFO_TEST_PIN_NUMERICS");
+    assert(platform::UnsetEnv("GUFO_TEST_PIN_NUMERICS"));
   fixture.tokens.back() = 77;
   fixture.WriteTokens();
   {
@@ -3023,7 +3022,7 @@ void MultiplePinsExplicitReplacementAndValidation() {
   const char* previous = std::getenv("GUFO_TEST_MULTI_PIN_NUMERICS");
   const std::optional<std::string> saved =
       previous ? std::optional<std::string>(previous) : std::nullopt;
-  setenv("GUFO_TEST_MULTI_PIN_NUMERICS", "changed", 1);
+  assert(platform::SetEnv("GUFO_TEST_MULTI_PIN_NUMERICS", "changed"));
   auto options = fixture.options;
   options.lazy = true;
   {
@@ -3032,9 +3031,9 @@ void MultiplePinsExplicitReplacementAndValidation() {
     assert(runner->prefilled == fixture.tokens.size() + other.size());
   }
   if (saved)
-    setenv("GUFO_TEST_MULTI_PIN_NUMERICS", saved->c_str(), 1);
+    assert(platform::SetEnv("GUFO_TEST_MULTI_PIN_NUMERICS", *saved));
   else
-    unsetenv("GUFO_TEST_MULTI_PIN_NUMERICS");
+    assert(platform::UnsetEnv("GUFO_TEST_MULTI_PIN_NUMERICS"));
   // Shrinking the explicit set returns to a single-manifest legacy layout.
   options = fixture.options;
   options.files.resize(1);
@@ -3213,6 +3212,8 @@ void PinnedPrefixCorruptionFailsClosed() {
     assert(refused);  // no partial state execution or silent repeated writes
   }
 }
+#endif  // defined(__linux__)
+
 void CheckpointImportRespectsRamOff() {
   for (const bool with_disk : {false, true}) {
     const TemporaryDirectory temp("gufo-component-import-off");
@@ -3411,6 +3412,48 @@ void CheckpointTransferRoundTripAndConcurrentServing() {
     assert(a == b);
   }
 }
+void LookupRuntimeDefaultsAndDisabled() {
+  class IdentityRunner final : public Runner {
+  public:
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = Runner::Descriptor();
+      descriptor.persistence = TextRunnerPersistenceDescriptor{{1, 2, 3}, 21};
+      return descriptor;
+    }
+    mutable std::size_t identity_calls{};
+    std::string LookupContextIdentity() const override {
+      ++identity_calls;
+      return "fake-sidecar";
+    }
+  };
+  const std::vector<TextRunnerToken> prompt{10};
+  auto disabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool no_lookup(disabled, 1, {}, {.publish_lookup = false});
+  assert(disabled->identity_calls == 0);
+  assert(no_lookup.Lookup(prompt).epoch.empty());
+  auto enabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool default_pool(enabled, 1);
+  assert(enabled->identity_calls == 1);
+  assert(default_pool.Lookup(prompt).epoch.size() == 64);
+  if (!platform::CheckpointTransferRuntimeSupported()) {
+    bool unsupported = false;
+    try {
+      TextRunnerPool transfer(std::make_shared<IdentityRunner>(), 1, {},
+                              {.transfer_api = true});
+    } catch (const CheckpointTransferError& error) {
+      unsupported = error.status == 501 && std::string_view(error.code) ==
+                                               "cache_transfer_unsupported";
+    }
+    assert(unsupported);
+    std::cout << "SKIP: executable-bound transfer requires Linux x86-64\n";
+  } else {
+    auto runner = std::make_shared<IdentityRunner>();
+    TextRunnerPool transfer(runner, 1, {},
+                            {.publish_lookup = false, .transfer_api = true});
+    assert(runner->identity_calls == 1);
+    assert(transfer.Lookup(prompt).epoch.empty());
+  }
+}
 #include "tests/cli/cache_lookup_checks.hpp"
 #include "tests/cli/cache_lookup_r3_checks.hpp"
 }  // namespace
@@ -3572,6 +3615,7 @@ int main() {
     std::cout << "CPU packed disk admission PASS\n";
     return 0;
   }
+  LookupRuntimeDefaultsAndDisabled();
   CheckpointTransferRoundTripAndConcurrentServing();
   CheckpointImportRespectsRamOff();
   LookupIsReadOnlyAndMatchesAcquire();
@@ -3583,6 +3627,7 @@ int main() {
   LookupPublicationStress();
   LookupMeasuredRatesAndEpoch();
   LookupR3BarrierFixtures();
+#if defined(__linux__)
   MultiplePinsChooseLongestAndRestart();
   MultiplePinsAggregateDiskBudget();
   MultiplePinsAggregateRamAndIndependentLazyWarming();
@@ -3596,6 +3641,9 @@ int main() {
   PinnedPrefixCorruptionFailsClosed();
   PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk();
   PinnedPrefixLazySurvivesRamRefusal();
+#else
+  std::cout << "SKIP: registered pins require strict Linux fingerprinting\n";
+#endif
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();

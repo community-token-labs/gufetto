@@ -110,9 +110,12 @@ The header carries both the raw identity and inspectable configuration:
   component ABI/layout. There is no human model-name-only compatibility.
 - Payload version 20, exact executable SHA-256 (including kernel code), loaded
   runtime-object content hashes, fixed Linux/x86-64/little-endian/gfx1151 lane,
-  image-encoder identity, relevant GUFO/HIP/HSA/ROCR/ROCBLAS/AMD environment
-  hashes, prefill chunk/decode-active policy and server reasoning defaults,
-  including preserve-thinking. Environment values and host paths are not sent.
+  image-encoder identity, one SHA-256 over the sorted, u64-length-prefixed
+  relevant environment block, prefill chunk/decode-active policy and server
+  reasoning defaults, including preserve-thinking. Environment values and host
+  paths are not sent. Transfer runtime discovery fails closed outside Linux
+  x86-64; ordinary advisory lookup/default CPU pools do not require that lane.
+  Registered pins retain their separate strict Linux fingerprint contract.
 - Exact token vector, count and SHA-256 of uint32 little-endian token IDs;
   cumulative native image/input prefix identities and selected-boundary input
   identity. These are image identities, not image pixels. The later request
@@ -121,6 +124,21 @@ The header carries both the raw identity and inspectable configuration:
   token/input matching. Defaults must match between hosts.
 - Component descriptors, exact target/private and draft row frontiers, stable
   fallback attestation, decode-readiness bit, byte lengths and per-object hashes.
+
+Environment identity conservatively retains unknown `GUFO_`, `HIP_`, `HSA_`,
+`ROCR_`, `ROCBLAS_`, `AMD_`, `GPU_`, `HIPBLASLT_`, `CUDA_`, `CUBLAS_`
+and `NVIDIA_` controls, including numerics and queue/plan settings. Only
+`GUFO_HOST`/`GUFO_PORT` (the bind readers in `serve.cpp`) and
+`GUFO_PERF_TRACE`/`GUFO_PERF_TRACE_MOE` (the sinks in `perf_trace.hpp`) are
+excluded from those namespaces. Plain `HOST`/`PORT` are also not identity
+inputs. `GUFO_FLASH_NEXT_TARGET_PROBE` records presence, including an empty
+value, rather than its host-private output directory: this matches the probe's
+`getenv != nullptr` activation check. Both hosts must agree on activation.
+
+The environment digest is **not secrecy**: low-entropy settings can still be
+guessed by dictionary attacks against the complete block. A single block digest
+avoids publishing independently guessable per-entry hashes, but does not make
+secrets safe to include in a blob.
 
 No local cache directory, RAM budget, pin-registration name or process-local
 pointer is a portable key. Incoming checkpoint/chunk/lineage IDs are **not**
