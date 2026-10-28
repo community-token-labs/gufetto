@@ -2012,6 +2012,60 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
     }
   }
 }
+void PinnedPrefixesRespectOffAndAutomaticRam() {
+  PinFixture fixture;
+  // 0 is AUTO, not off: creating the registered RAM checkpoint still works.
+  auto automatic = *ParseRamCacheOption("0", nullptr);
+  automatic.pinned_prefix = fixture.options;
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, automatic);
+    assert(runner->prefilled == fixture.tokens.size());
+    assert(runner->captures != 0);
+  }
+  const auto published = fixture.Files();
+  auto off = *ParseRamCacheOption("off", nullptr);
+  off.pinned_prefix = fixture.options;
+  // A request for mandatory RAM warmth is incompatible with off, even when
+  // a durable pin already exists. Refusal must not change the registry.
+  {
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {}, off);
+    } catch (const std::invalid_argument& e) {
+      refused = std::string(e.what()).find("RAM-warm") != std::string::npos;
+    }
+    assert(refused && fixture.Files() == published);
+  }
+  off.pinned_prefix.lazy = true;
+  automatic.pinned_prefix.lazy = true;
+  for (const auto& options : {off, automatic}) {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, options);
+    assert(runner->prefilled == 0 && runner->captures == 0);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      auto request = pool.Acquire(fixture.tokens);
+      assert(request.cached_prompt_tokens() == fixture.tokens.size());
+      // Off always reads the disk pin; AUTO warms it on first use.
+      assert(request.cache_disk_hit() == (!options.enabled || attempt == 0));
+      request.Invalidate();  // Do not let live reuse hide a RAM promotion.
+    }
+    assert((runner->captures != 0) == options.enabled);
+    assert(fixture.Files() == published);
+  }
+  // Incompatible/new registrations need capture. Check the complete set
+  // before retiring the old identity, not after a failed attempt to warm it.
+  fixture.tokens.front() = 999;
+  fixture.WriteTokens();
+  bool refused = false;
+  try {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {}, off);
+  } catch (const std::invalid_argument& e) {
+    refused = std::string(e.what()).find("creating pinned prefixes") !=
+              std::string::npos;
+  }
+  assert(refused && fixture.Files() == published);
+}
 void PinnedPrefixPressureIdentityAndAccounting(bool record_pressure = false) {
   PinFixture fixture;
   const std::vector<TextRunnerToken> second{300, 301, 302, 303, 304};
@@ -2574,7 +2628,7 @@ void RamCacheOffCommitsNoBackingAndKeepsLiveFrontiers() {
   };
   for (const bool enabled : {true, false}) {
     auto runner = std::make_shared<CountingRunner>();
-    ComponentTextCache cache(runner, 2, 1 << 22, {}, false, 0, enabled);
+    ComponentTextCache cache(runner, 2, 1 << 22, {}, false, 0, {}, enabled);
     std::vector<TextRunnerToken> conversation(12, 7);
     for (int turn = 0; turn < 2; ++turn) {
       auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
@@ -2638,7 +2692,7 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
   std::uint64_t hash;
   {
     auto runner = std::make_shared<CountingRunner>();
-    ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, false);
+    ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, {}, false);
     assert(runner->committed != 0 && runner->committed <= 512ULL << 20);
     auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
     assert(!lease->TryReserveSnapshot(0, prompt.size(), false,
@@ -2657,7 +2711,7 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
     (void)lease->Commit(prompt, {}, prompt);
   }
   auto runner = std::make_shared<CountingRunner>();
-  ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, false);
+  ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, {}, false);
   auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
   assert(lease->restored_from_disk() &&
          lease->cached_tokens() == prompt.size());
@@ -2673,7 +2727,7 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
     const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
                                           .capacity_bytes = 1 << 20};
     auto runner = std::make_shared<Runner>();
-    ComponentTextCache cache(runner, 2, 1 << 22, disk, false, 0, enabled);
+    ComponentTextCache cache(runner, 2, 1 << 22, disk, false, 0, {}, enabled);
     std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
     for (int turn = 0; turn < 2; ++turn) {
       auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
@@ -2704,6 +2758,7 @@ int main() {
   MultiplePinsExplicitReplacementAndValidation();
   MultiplePinsLazyCorruptionPreservesOtherRegistrations();
   PinnedPrefixRestartReplayAndNoRewrite();
+  PinnedPrefixesRespectOffAndAutomaticRam();
   PinnedPrefixPressureIdentityAndAccounting();
   PinnedPrefixPressureIdentityAndAccounting(true);
   PinnedPrefixIdentityReplacementAndBudgets();
