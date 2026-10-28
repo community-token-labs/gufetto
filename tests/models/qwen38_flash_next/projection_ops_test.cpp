@@ -16,6 +16,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
+#include "tests/models/qwen38_flash_next/packed_mtp_reference.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -1034,6 +1035,11 @@ int main() {
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
     CheckDenseAcrossStreams();
+    packed_mtp_test::Projection(q::WeightType::kQ4_K, 17, 2560);
+    packed_mtp_test::Projection(q::WeightType::kQ4_K, 17, 10240);
+    packed_mtp_test::Projection(q::WeightType::kQ6_K, 17, 2560);
+    packed_mtp_test::Projection(q::WeightType::kQ6_K, 320, 10240);
+    packed_mtp_test::Projection(q::WeightType::kQ5_0, 17, 320);
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);

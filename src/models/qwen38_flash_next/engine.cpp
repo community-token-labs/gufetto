@@ -346,8 +346,13 @@ bool Session::SyncDraftVocab(std::string* error_msg) {
   draft_vocab_.CatchUp(
       tokens_, [&](std::int32_t token) { return model_->InDraftSubset(token); },
       &draft_added_);
-  return exec.AppendDraftRows(*session_, first + tabled, draft_added_,
-                              error_msg);
+  if (!exec.AppendDraftRows(*session_, first + tabled, draft_added_, error_msg))
+    return false;
+  if (perf::current != nullptr)
+    perf::current->draft_tables.push_back({tokens_.size(),
+                                           first + draft_vocab_.rare().size(),
+                                           kMtpDraftExtraRows});
+  return true;
 }
 
 Session::~Session() = default;
@@ -1188,6 +1193,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
     tokens_.push_back(anchor);
     sampler.Accept(static_cast<sampling::TokenId>(anchor));
     result->tokens.push_back(anchor);
+    perf::TraceMtpCycle(base, 0, 0, 0, 1);
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
@@ -1326,6 +1332,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const std::uint32_t mtp_accepted = std::min(keep - 1, mtp_drafts);
   stats_.lookup += pending.lookup;
   stats_.lookup_accepted += keep - 1 - mtp_accepted;
+  perf::TraceMtpCycle(base, k - 1, keep - 1, pending.lookup, keep);
   if (pending.lookup != 0) {
     lookup_.Observe(pending.lookup_start, pending.lookup,
                     keep - 1 - mtp_accepted);

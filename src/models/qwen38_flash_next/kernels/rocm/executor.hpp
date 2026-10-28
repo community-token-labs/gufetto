@@ -809,6 +809,8 @@ private:
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
+  // Scoped to packed-lowbit predictor forwards; never disables trunk mixers.
+  mutable bool mtp_f32_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.
   mutable bool moe_pending_{false};
   /// Set before an attention-side combine whose FFN combine fuses the MoE

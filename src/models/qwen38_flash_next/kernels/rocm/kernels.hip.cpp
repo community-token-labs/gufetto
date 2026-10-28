@@ -110,7 +110,59 @@ __device__ __forceinline__ float Bf16ToF32(std::uint16_t h) {
   return __uint_as_float(static_cast<std::uint32_t>(h) << 16);
 }
 
-/// Reads element i of a Q8_0 / F32 / BF16 / F16 row.
+// Packed MTP decoders: numerical definitions match GetQKScaleMin /
+// Q6KValue in qwen/hip/quant_ops.hpp, not its unrelated dispatch machinery.
+// CPU ggml_dequant.cpp remains the independent operator oracle.
+__device__ __forceinline__ float PackedElement(const void* row, WeightType type,
+                                               std::uint32_t i) {
+  const auto* p = static_cast<const std::uint8_t*>(row);
+  if (type == WeightType::kQ5_0) {
+    p += (i / 32) * 22;
+    const unsigned j = i % 32;
+    const unsigned low = (p[6 + j % 16] >> (4 * (j / 16))) & 15U;
+    const unsigned high = (p[2 + j / 8] >> (j % 8)) & 1U;
+    return Materialize(
+        __half2float(*reinterpret_cast<const __half*>(p)) *
+        static_cast<float>(static_cast<int>(low | (high << 4)) - 16));
+  }
+  const unsigned j = i % 256;
+  if (type == WeightType::kQ4_K) {
+    p += (i / 256) * 144;
+    const auto* scales = p + 4;
+    const unsigned s = j / 32;
+    const unsigned sc =
+        s < 4 ? scales[s] & 63U
+              : (scales[s + 4] & 15U) | ((scales[s - 4] >> 6) << 4);
+    const unsigned mn = s < 4 ? scales[s + 4] & 63U
+                              : (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4);
+    const unsigned q = (p[16 + (j / 64) * 32 + j % 32] >> (4 * (s % 2))) & 15U;
+    // Materialize scale products to keep decode contraction independent of
+    // the token-group specialization and its surrounding dot products.
+    const float d =
+        Materialize(__half2float(*reinterpret_cast<const __half*>(p)) *
+                    static_cast<float>(sc));
+    const float m =
+        Materialize(__half2float(*reinterpret_cast<const __half*>(p + 2)) *
+                    static_cast<float>(mn));
+    return Materialize(Materialize(d * static_cast<float>(q)) - m);
+  }
+  p += (i / 256) * 210;
+  const unsigned half = j / 128;
+  const unsigned segment = (j % 128) / 32;
+  const unsigned lane = j % 32;
+  const unsigned low =
+      (p[half * 64 + (segment % 2) * 32 + lane] >> (segment >= 2 ? 4 : 0)) &
+      15U;
+  const unsigned high = (p[128 + half * 32 + lane] >> (2 * segment)) & 3U;
+  const int q = static_cast<int>(low | (high << 4)) - 32;
+  const auto* scales = reinterpret_cast<const std::int8_t*>(p + 192);
+  const float d = Materialize(
+      __half2float(*reinterpret_cast<const __half*>(p + 208)) *
+      static_cast<float>(scales[half * 8 + segment * 2 + lane / 16]));
+  return Materialize(d * static_cast<float>(q));
+}
+
+/// Reads element i of a supported packed or unquantized row.
 __device__ __forceinline__ float RowElement(const void* row, WeightType type,
                                             std::uint32_t i) {
   switch (type) {
@@ -120,6 +172,10 @@ __device__ __forceinline__ float RowElement(const void* row, WeightType type,
       return Bf16ToF32(static_cast<const std::uint16_t*>(row)[i]);
     case WeightType::kF16:
       return __half2float(static_cast<const __half*>(row)[i]);
+    case WeightType::kQ4_K:
+    case WeightType::kQ5_0:
+    case WeightType::kQ6_K:
+      return PackedElement(row, type, i);
     case WeightType::kQ8_0: {
       const auto* blk = static_cast<const std::uint8_t*>(row) + (i / 32) * 34;
       const __half d = *reinterpret_cast<const __half*>(blk);
@@ -127,8 +183,11 @@ __device__ __forceinline__ float RowElement(const void* row, WeightType type,
           static_cast<const void*>(blk + 2))[i % 32];
       return __half2float(d) * static_cast<float>(q);
     }
+    case WeightType::kQ5_1:
+    case WeightType::kQ5_K:
+    default:
+      return NAN;  // No generic decoder: never fabricate a zero weight.
   }
-  return 0.0f;
 }
 
 __device__ __forceinline__ std::size_t RowBytes(WeightType type,
@@ -141,8 +200,17 @@ __device__ __forceinline__ std::size_t RowBytes(WeightType type,
       return static_cast<std::size_t>(k) * 2;
     case WeightType::kQ8_0:
       return static_cast<std::size_t>(k / 32) * 34;
+    case WeightType::kQ5_0:
+      return static_cast<std::size_t>(k / 32) * 22;
+    case WeightType::kQ4_K:
+      return static_cast<std::size_t>(k / 256) * 144;
+    case WeightType::kQ6_K:
+      return static_cast<std::size_t>(k / 256) * 210;
+    case WeightType::kQ5_1:
+    case WeightType::kQ5_K:
+    default:
+      return 0;  // Unsupported row geometry; callers must not launch it.
   }
-  return 0;
 }
 
 /// Sum over one wave; every lane receives the total. The wave-per-row
@@ -1414,7 +1482,13 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
         float dot = 0.0f;
 #pragma unroll
         for (unsigned r = 0; r < 4; ++r) {
-          dot += wv[st][r] * xv[st][j][r];
+          if constexpr (type == WeightType::kQ4_K ||
+                        type == WeightType::kQ5_0 ||
+                        type == WeightType::kQ6_K) {
+            dot = Materialize(__builtin_fmaf(wv[st][r], xv[st][j][r], dot));
+          } else {
+            dot += wv[st][r] * xv[st][j][r];
+          }
         }
         acc[j] = Materialize(acc[j] + dot);
       }
@@ -6007,6 +6081,20 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
                  float* res, std::uint32_t n_tokens, std::uint32_t hidden,
                  std::uint32_t streams, hipStream_t stream) {
+  switch (type) {
+    case WeightType::kF32:
+    case WeightType::kF16:
+    case WeightType::kBF16:
+    case WeightType::kQ8_0:
+    case WeightType::kQ5_0:
+    case WeightType::kQ4_K:
+    case WeightType::kQ6_K:
+      break;
+    case WeightType::kQ5_1:
+    case WeightType::kQ5_K:
+    default:
+      throw std::invalid_argument("unsupported embedding weight type");
+  }
   hipLaunchKernelGGL(EmbedKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
                      table, type, tokens, res, hidden, streams);
 }
@@ -7504,7 +7592,8 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
 template<WeightType type, unsigned tokens>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      std::uint32_t k, hipStream_t stream) {
-  if constexpr (type != WeightType::kQ8_0) {
+  if constexpr (type == WeightType::kF32 || type == WeightType::kF16 ||
+                type == WeightType::kBF16) {
     // Rows of whole four-step passes (K 2560: router and GDN alpha/beta in
     // F16, indexer in BF16) take the unchecked vector loads, four steps at a
     // time at any width: the same products in the same order.
@@ -7575,6 +7664,15 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
     case WeightType::kF16:
       return SmallGemmForType<WeightType::kF16>(w, x, out, n_tokens, m, k,
                                                 stream);
+    case WeightType::kQ4_K:
+      return SmallGemmForType<WeightType::kQ4_K>(w, x, out, n_tokens, m, k,
+                                                 stream);
+    case WeightType::kQ5_0:
+      return SmallGemmForType<WeightType::kQ5_0>(w, x, out, n_tokens, m, k,
+                                                 stream);
+    case WeightType::kQ6_K:
+      return SmallGemmForType<WeightType::kQ6_K>(w, x, out, n_tokens, m, k,
+                                                 stream);
     default:
       throw std::logic_error("unsupported small projection format");
   }

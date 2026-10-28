@@ -72,6 +72,12 @@ WeightType SmallType(GgmlType type) {
       return WeightType::kF16;
     case GgmlType::kQ8_0:
       return WeightType::kQ8_0;
+    case GgmlType::kQ4_K:
+      return WeightType::kQ4_K;
+    case GgmlType::kQ5_0:
+      return WeightType::kQ5_0;
+    case GgmlType::kQ6_K:
+      return WeightType::kQ6_K;
     case GgmlType::kF32:
       return WeightType::kF32;
     default:
@@ -1781,7 +1787,9 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     }
     return true;
   }
-  if (!MatrixRows(n_tokens)) {
+  // Packed MTP rows must never reach the unquantized hipBLAS path.
+  if (!MatrixRows(n_tokens) || w.type == GgmlType::kQ4_K ||
+      w.type == GgmlType::kQ5_0 || w.type == GgmlType::kQ6_K) {
     SmallGemm(w.data, SmallType(w.type), x, out, n_tokens, w.rows, w.cols,
               stream_);
     return true;
@@ -2046,7 +2054,8 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
-  xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
+  xn_half_ = wide_mixer_ && !mtp_f32_mixer_ && MatrixRows(n_tokens) &&
+             gamma != nullptr;
   xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
   // The next mixer's inject pass reads only the F16 norm written here.
   const float* fused_inject = xn_half_ && n_tokens >= 96 ? inject_w : nullptr;
@@ -2060,7 +2069,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
     const float* fused_w = deferred ? fused_inject : nullptr;
-    if (wide_mixer_ && MatrixRows(n_tokens) &&
+    if (wide_mixer_ && !mtp_f32_mixer_ && MatrixRows(n_tokens) &&
         HcCombineMoeF16(
             res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
             c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
@@ -2101,7 +2110,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
   // combine writes those rows as well.
-  if (!MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
+  if (!mtp_f32_mixer_ && !MatrixRows(n_tokens) && UnpaddedQ8(c.HcDim()) &&
       HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
                     s_.xn_q8_1, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
                     stream_)) {
@@ -2109,7 +2118,7 @@ void Executor::Combine(float* res, const float* gamma, std::uint32_t n_tokens,
     return;
   }
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, n_tokens,
-            c.hidden_size, c.hc_count, c.rms_eps, stream_);
+            c.hidden_size, c.hc_count, c.rms_eps, stream_, mtp_f32_mixer_);
 }
 
 bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
@@ -2184,8 +2193,8 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       half_only && (inject == nullptr || m.inject.empty() || fused_inject);
   const float* xn = s_.xn;
   const bool vectorized =
-      xn_half_ ||
-      (MatrixRows(n_tokens) && c.hc_count == 4 && c.hidden_size % 4 == 0);
+      xn_half_ || (!mtp_f32_mixer_ && MatrixRows(n_tokens) && c.hc_count == 4 &&
+                   c.hidden_size % 4 == 0);
   // `mixed` is being rewritten: whatever the input caches held of it is
   // stale. The wide F16 route also emits the F16 and tiled Q8 copies the
   // projections that follow read.
@@ -4616,6 +4625,26 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP residual requires a full known-hidden forward");
     return false;
   }
+  // Low-bit HC down/up/inject consume the existing F32 route. Restore the
+  // policy on every exit, including cancellation/errors; trunk wide HC stays
+  // eligible. The batched predictor already uses this F32 mix/combine path.
+  struct RestoreMixerPolicy {
+    bool& policy;
+    bool previous;
+    ~RestoreMixerPolicy() { policy = previous; }
+  } restore_mixer{mtp_f32_mixer_, mtp_f32_mixer_};
+  const auto packed = [](GgmlType type) {
+    return type == GgmlType::kQ4_K || type == GgmlType::kQ5_0 ||
+           type == GgmlType::kQ6_K;
+  };
+  const auto packed_mixer = [&](const DeviceMixer& mixer) {
+    return packed(mixer.down.type) || packed(mixer.up.type) ||
+           packed(mixer.inject.type);
+  };
+  const auto& predictor = model_->mtp();
+  mtp_f32_mixer_ = packed_mixer(predictor.hc_attn) ||
+                   packed_mixer(predictor.hc_ffn) ||
+                   packed_mixer(predictor.nextn_head);
   const std::uint32_t pos = session.mtp_.position;
   if (pos + n > session.max_context_) {
     AssignError(error_msg, "MTP context is full");
@@ -4663,6 +4692,11 @@ bool Executor::MtpForward(Session& session,
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
+  // Count once per execution, including replay, never during graph capture.
+  if (!output.kv_only &&
+      (output.token != nullptr || output.candidates != nullptr))
+    perf::TraceMtpHead(1, subset, subset, model_->draft_output().rows,
+                       model_->output().rows, kMtpDraftExtraRows);
   if (output.token != nullptr) {
     *output.token = *mtp_token_host_;
   }

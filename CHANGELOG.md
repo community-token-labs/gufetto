@@ -54,6 +54,13 @@ Notable user-facing changes are recorded here. Gufo follows
 * **qwen:** keep a stable cache boundary after system instructions ([#773](https://github.com/gufo-org/gufo/issues/773)) ([1b8ad79](https://github.com/gufo-org/gufo/commit/1b8ad798a4bc443393754b6676ae6654a624dd0a))
 * **qwen:** keep a stable cache boundary after system instructions REVERT ([#815](https://github.com/gufo-org/gufo/issues/815)) ([2479613](https://github.com/gufo-org/gufo/commit/2479613924ced6aab9b1411d0ba84fd00a87b9c7))
 
+## Fork experiment: shared-Q4 MTP
+
+- **Experimental, not GPU-qualified on this port:** shared Q4_K_M MTP with
+  role-scoped Q4_K/Q6_K dense and Q5_0 HC projections, F32 predictor HC,
+  separate K/V-only catch-up and opt-in trace counters. Defaults unchanged.
+  See [qualification gates](docs/models/qwen3.8-flash-next/MTP-Q4KM.md).
+
 ## [0.24.0](https://github.com/gufo-org/gufo/compare/v0.23.0...v0.24.0) (2026-10-25)
 
 

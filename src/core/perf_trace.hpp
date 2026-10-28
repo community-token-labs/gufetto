@@ -106,6 +106,24 @@ struct Shape {
   bool prefill;
   std::vector<std::pair<std::uint64_t, std::uint64_t>> sessions;
 };
+// Vocabulary rows are weight-matrix rows per projection, not output elements.
+struct Projection {
+  const char* kind;
+  std::uint64_t vocabulary_rows, activation_rows;
+};
+struct MtpHead {
+  const char* mode;
+  const char* fallback;
+  std::uint64_t cohort, logical_subset_rows, subset_rows;
+  std::vector<Projection> projections;
+};
+struct MtpCycle {
+  std::uint64_t context_depth, neural_proposed, neural_accepted;
+  std::uint64_t lookup_proposed, lookup_accepted, committed;
+};
+struct DraftTable {
+  std::uint64_t context_depth, used_rows, capacity;
+};
 struct Record {
   const char* kind;
   std::uint64_t start_ns{Now()}, thread_id{0};
@@ -118,6 +136,9 @@ struct Record {
   std::vector<Wait> route_waits;
   std::vector<Gpu> gpu;
   std::vector<Shape> forwards;
+  std::vector<MtpHead> mtp_heads;
+  std::vector<MtpCycle> mtp_cycles;
+  std::vector<DraftTable> draft_tables;
 };
 inline thread_local Record* current = nullptr;
 inline thread_local std::uint64_t forward_counter = 0;
@@ -201,7 +222,55 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
     o << "\"}";
     sep = ",";
   }
-  o << "]}";
+  o << "]";
+  if (!r.mtp_heads.empty()) {
+    o << ",\"mtp_heads\":[";
+    sep = "";
+    for (const auto& h : r.mtp_heads) {
+      o << sep << "{\"mode\":\"" << h.mode << "\",\"fallback\":\"" << h.fallback
+        << "\",\"cohort\":" << h.cohort
+        << ",\"logical_subset_rows\":" << h.logical_subset_rows
+        << ",\"subset_rows\":" << h.subset_rows << ",\"projections\":[";
+      const char* projection_sep = "";
+      for (const auto& p : h.projections) {
+        o << projection_sep << "{\"kind\":\"" << p.kind
+          << "\",\"vocabulary_rows\":" << p.vocabulary_rows
+          << ",\"activation_rows\":" << p.activation_rows
+          << ",\"logit_values\":" << p.vocabulary_rows * p.activation_rows
+          << '}';
+        projection_sep = ",";
+      }
+      o << "]}";
+      sep = ",";
+    }
+    o << ']';
+  }
+  if (!r.mtp_cycles.empty()) {
+    o << ",\"mtp_cycles\":[";
+    sep = "";
+    for (const auto& c : r.mtp_cycles) {
+      o << sep << "{\"context_depth\":" << c.context_depth
+        << ",\"neural_proposed\":" << c.neural_proposed
+        << ",\"neural_accepted\":" << c.neural_accepted
+        << ",\"lookup_proposed\":" << c.lookup_proposed
+        << ",\"lookup_accepted\":" << c.lookup_accepted
+        << ",\"committed\":" << c.committed << '}';
+      sep = ",";
+    }
+    o << ']';
+  }
+  if (!r.draft_tables.empty()) {
+    o << ",\"draft_tables\":[";
+    sep = "";
+    for (const auto& t : r.draft_tables) {
+      o << sep << "{\"context_depth\":" << t.context_depth
+        << ",\"used_rows\":" << t.used_rows << ",\"capacity\":" << t.capacity
+        << '}';
+      sep = ",";
+    }
+    o << ']';
+  }
+  o << '}';
   return o.str();
 }
 
@@ -246,6 +315,51 @@ inline void Decode(std::uint64_t slot, std::uint64_t rows,
       s.accepted_tokens += accepted;
       return;
     }
+}
+
+// Called outside graph bodies: capture is not execution, replay skips bodies.
+// Each entry describes one completed head's projection operations, not GPU
+// hardware counters or bytes fetched from memory/cache.
+inline void TraceMtpHead(std::uint64_t cohort, std::uint64_t logical_subset,
+                         std::uint64_t subset, std::uint64_t prefix,
+                         std::uint64_t full, std::uint64_t table) {
+  if (current == nullptr)
+    return;
+  const bool all = subset == cohort;
+  const char* mode = cohort == 1   ? (all ? "scalar_subset" : "scalar_full")
+                     : all         ? "all_subset"
+                     : subset != 0 ? "mixed_full_gather"
+                                   : "full";
+  MtpHead h{mode,
+            logical_subset != 0 && subset == 0 ? "scratch"
+            : subset != 0 && !all              ? "mixed"
+            : subset == 0                      ? "logical_full"
+                                               : "none",
+            cohort,
+            logical_subset,
+            subset,
+            {}};
+  if (all) {
+    h.projections.push_back({"prefix", prefix, cohort});
+    for (std::uint64_t i = 0; i < cohort; ++i)
+      h.projections.push_back({"table", table, 1});
+  } else {
+    h.projections.push_back({"full", full, cohort});
+  }
+  current->mtp_heads.push_back(std::move(h));
+}
+
+// proposed/accepted exclude the anchor; committed includes it. Lookup copies
+// trail neural proposals, so the kept prefix classifies acceptance exactly.
+inline void TraceMtpCycle(std::uint64_t depth, std::uint64_t proposed,
+                          std::uint64_t accepted, std::uint64_t lookup,
+                          std::uint64_t committed) {
+  if (current == nullptr)
+    return;
+  const auto neural = proposed - lookup;
+  const auto neural_accepted = accepted < neural ? accepted : neural;
+  current->mtp_cycles.push_back({depth, neural, neural_accepted, lookup,
+                                 accepted - neural_accepted, committed});
 }
 
 class HostPhase {

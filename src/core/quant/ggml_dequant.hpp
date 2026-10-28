@@ -54,6 +54,14 @@ struct block_q8_K {
   std::int16_t bsums[16];
 };
 
+// Q5_0: fp16 scale, 32 high bits, 16 packed nibble pairs (QK=32).
+struct block_q5_0 {
+  std::uint16_t d;
+  std::uint8_t qh[4];
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(block_q5_0) == 22);
+
 // Q8_0: fp16 scale + 32 int8 quantized values (QK=32).
 struct block_q8_0 {
   std::uint16_t d;
@@ -174,6 +182,8 @@ float DotProductQ8_K(const void* row_data, std::span<const float> vec,
                      std::size_t k);
 
 // Dequantize row of Q8_0 to float
+void DequantizeQ5_0(const void* src, float* dst, std::size_t k);
+
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ4_NL to float
