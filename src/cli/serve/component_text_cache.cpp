@@ -322,6 +322,10 @@ struct ComponentTextCache::Impl {
         index(ledger),
         retention(ledger, index, &events),
         ram_enabled(ram_on) {
+    if (!ram_enabled && pins.enabled() && !pins.lazy)
+      throw std::invalid_argument(
+          "RAM-warm pinned prefixes require an enabled RAM cache; use "
+          "pin-prefix-lazy for existing disk pins with cache-ram-bytes off");
     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
                    .Convert();
     crypto::Sha256Hasher hash;
@@ -1150,6 +1154,22 @@ void ComponentTextCache::InitializePins(
     throw std::runtime_error(
         "pinned prefix is corrupt or truncated; repair its directory "
         "explicitly");
+  // Off may read existing lazy disk pins, but creating a pin needs a RAM
+  // checkpoint. Check the whole set before retiring any old registration.
+  if (!impl_->ram_enabled) {
+    for (const auto& registration : registrations) {
+      const auto existing =
+          std::ranges::any_of(disk.Entries(), [&](const auto& e) {
+            const auto& manifest = e.Manifest();
+            return manifest.compatibility == impl_->digest &&
+                   manifest.input.empty() &&
+                   manifest.tokens == registration.tokens;
+          });
+      if (!existing)
+        throw std::invalid_argument(
+            "creating pinned prefixes requires an enabled RAM cache");
+    }
+  }
   // The existing v2 manifests ARE the registry: no migration or per-pin
   // subdirectories/budgets. One owned DiskStore bounds the sum, including
   // temporaries and orphans, and uses one shared staging buffer. The explicit
@@ -1684,7 +1704,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     // Restore/reset may clear the attachment; install this request again.
     impl_->runner->SetPromptContext(*request.state, context);
     impl_->runner->ReconcileComponentState(*request.state, request.cached);
-    if (request.pin_hit && impl_->lazy_pins) {
+    if (request.pin_hit && impl_->lazy_pins && impl_->ram_enabled) {
       auto& pin = *request.pin_hit;
       bool warm = false;
       {
