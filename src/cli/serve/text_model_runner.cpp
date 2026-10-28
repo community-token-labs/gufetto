@@ -1529,8 +1529,8 @@ std::optional<std::size_t> TextRunnerPool::Request::PrepareSinglePassPrefill(
     return std::nullopt;
   if (impl_->runner->CheckpointPosition(state) != offset)
     throw std::logic_error("single-pass prefill has stale native frontier");
-  // Reuse the real component/native ownership and preservation/admission hook.
-  // Failure is BEFORE decoder proposals; no weaker scheduler reservation.
+  // Reuse preservation; PreparePrefill/GrowAhead is a non-blocking growth hint,
+  // NOT a failable reservation/admission certificate for future mixed work.
   impl_->lease.PreparePrefill(*count);
   impl_->prepared_single_pass = Impl::PreparedSinglePass{offset, *count};
   return count;

@@ -22,13 +22,18 @@ it. A large quiet pass is not preempted by an arrival. Component cache stays ON
 and is specifically included in the CPU fixture; no parallel fake engine or
 replacement continuation cache is introduced.
 
-`serial-shadow` reserves a conservative verifier-row upper bound for the frozen
+`serial-shadow` budgets a conservative verifier-row upper bound for the frozen
 cohort and prepares a legal positive single-pass prompt cut at K minus that bound.
-It executes prompt and legacy decoders separately. The pool uses its real
-preservation/admission hook before decoder mutation and freezes the actual cut;
-changed range/frontier rejects before execution. A pending capture is deferred,
-not synchronously waited on while runnable decoders can progress. Unsupported
-planning is counted and falls back visibly, not relabelled as a valid shadow.
+It executes prompt and legacy decoders separately. The pool prepares
+preservation and freezes the actual cut; changed range/frontier rejects before
+execution.
+`PreparePrefill` / `GrowAhead` is only a non-blocking memory-growth hint, NOT a
+failable memory reservation or admission guarantee. Serial SC executes the
+prompt before its decoders; future mixed work requires a real reservation/admission
+contract before decoder mutation and cannot treat this hint as that proof.
+A pending capture is deferred, not synchronously waited on while runnable
+decoders can progress. Unsupported planning is counted and falls back visibly, not
+relabelled as a valid shadow.
 
 **All production component shadow cycles remain mixed-ineligible/unsupported.**
 The Qwen3.8 Flash Next runner always uses the component cache; its existing
@@ -82,18 +87,22 @@ sets; private physical grouping/load multiplicity is explicitly missing. Expert
 sets or address overlap are NOT eliminated loads/DRAM savings.
 
 Scheduler cohort/plan/iteration and actual backend/model-filter counts are
-attached where available. A backend MTP batch reduced to a model singleton is
-not retroactively a generic scalar call. Numerical starting-state proof remains
-null; a session pointer is not a lineage/checkpoint certificate. Host spans can
+attached where available. AD creates a fresh association when its actual ready
+roster freezes after the preceding prompt cut; it does not reuse that cut's
+pre-cut count or claim SC-style same-cut pairing. SC retains its prepared-cut
+association through the frozen drain. A backend MTP batch reduced to a model
+singleton is not retroactively a generic scalar call. Numerical starting-state
+proof remains null; a session pointer is not a lineage/checkpoint certificate. Host spans can
 overlap each other/GPU work. Critical-path removability, GPU busy time, U/L/H and
 saved DRAM remain null/inconclusive rather than inferred from span sums/overlap.
 Lost/incomplete diagnostics are missing evidence, never a zero-cost/removal GO.
 
-The compile-time OFF path contains no new diagnostic includes, state, runtime
-checks or calls. Actual native object/ISA comparison with identical toolchain/
-flags is still required to prove that claim; a CPU header probe or source-only
-comparison cannot qualify the F16 paths. No GPU execution is part of this change's
-CPU prerequisite acceptance.
+The compile-time OFF path excludes the new diagnostic includes, state, checks
+and calls. Actual matched native object comparison, not a header/source probe,
+qualifies that boundary only for its exact source/toolchain/flags. The earlier
+8c9b7b97-versus-ba7c7119 preflight established six identical OFF objects; that
+receipt does NOT transfer across the q8-v2 rebase or these follow-up edits.
+No GPU execution is part of CPU prerequisite acceptance.
 
 ## Checks and limits
 
@@ -105,15 +114,24 @@ receipts live in the private project evidence, not this product tree.
 
 Design acceptance: private project `gufo-agent-concurrency` commit `50089e0`,
 `docs/pd-interference-phase3-design-review-r2.md` (design/spec only, with the
-explicit accepted E1 correction). Completed outgoing-code Opus review, full CPU
-compile/link/format checks and actual native OFF proof are still pending at this
-WIP revision. Native quality, performance, profiler/runtime qualification,
-immutable execution packet and explicit host/time release remain separate.
-Owner integration policy retains correct, safe partial experiments on fork
-main, default OFF. Landing requires a green immutable prerequisite preflight
-(three links, 5/5 focused CPU tests, formatting and six strict OFF-object matches)
-and the one focused outgoing-code Opus review. The coordinator performs that
-landing under the maintainer lease; this branch worker does not push fork main.
+explicit accepted E1 correction). Qualification is recorded by immutable
+revision, not inferred from the presence of these flags:
+
+- 8c9b7b97 versus ba7c7119 passed owner r3: three links, 5/5 focused CPU tests,
+  formatting and six strict OFF-object matches.
+- ee1defc1 versus 8542bb22 passed the same matched gates in owner r4; this is
+  the q8-v2-based baseline, not qualification of the follow-up fix.
+- Full Opus CODE review of 8c9b7b97 returned BLOCK for missing drain trace scopes;
+  default-OFF safety, scheduling behavior and E1 sampler/routes were upheld.
+- This follow-up adds the trace repair/regression and bounded corrections.
+  Landing requires the NEW commit's matched preflight against 8542bb22 plus the
+  authorized narrow fix-diff Opus PASS. Consult the private evidence ledger for
+  the accepted commit and verdict; the historical BLOCK is not rewritten.
+
+Native quality, performance, profiler/runtime qualification, immutable execution
+packet and explicit host/time release remain separate. Owner integration policy
+retains correct, safe partial experiments on fork main, default OFF. The
+coordinator performs landing under the maintainer lease; this branch worker does not push fork main.
 Integration is not release, deployment, activation, native quality, GPU execution
 or a mixed-step feasibility certificate. Keep experimental and inconclusive
 labels until their separate gates are actually met.

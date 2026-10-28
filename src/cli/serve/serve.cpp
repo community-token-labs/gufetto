@@ -450,9 +450,9 @@ void AddPrefillPrerequisiteOptions(
         return true;
       });
   parser.AddOption("", "--experimental-prefill-budget", "N",
-                   "Experimental policy budget64..4224; prompt rows for "
+                   "Experimental policy budget 64..4224; prompt rows for "
                    "adaptive, TOTAL rows "
-                   "for serial-shadow (default:0/off; at most8 sessions)",
+                   "for serial-shadow (default: 0/off; at most 8 sessions)",
                    "Scheduling", &options->tokens);
 }
 #endif

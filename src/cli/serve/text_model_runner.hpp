@@ -635,8 +635,8 @@ public:
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-    /// Freeze/admit a legal serial prompt cut before any decoder mutation.
-    /// A pending capture/model decline returns null; no progress is invented.
+    /// Freeze a legal serial cut; pending capture/model decline returns null.
+    /// PreparePrefill/GrowAhead is a growth hint, NOT a memory reservation.
     [[nodiscard]] std::optional<std::size_t> PrepareSinglePassPrefill(
         std::size_t max_input_tokens);
 #endif

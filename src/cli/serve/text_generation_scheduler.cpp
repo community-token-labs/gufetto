@@ -1980,10 +1980,24 @@ struct TextGenerationScheduler::Impl {
   }
 
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  void BeginPrerequisiteAssociation(std::size_t frozen) {
+    prerequisite_association = {};
+    const auto sequence = ++prerequisite_sequence;
+    prerequisite_association.iteration = sequence;
+    prerequisite_association.cohort = sequence;
+    prerequisite_association.plan = sequence;
+    prerequisite_association.scheduler_frozen = frozen;
+    // Execution provenance only; no numerical starting-state certificate.
+  }
+#endif
+
+  template<typename TraceQueue>
   bool RunPrerequisitePolicy(
       std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
       std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
-      std::deque<std::shared_ptr<ScheduledRequest>>& capturing) {
+      std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
+      const TraceQueue& trace_queue) {
     const auto& config = prefill_policy.prerequisites;
     if (!config.Enabled())
       return false;
@@ -2004,6 +2018,8 @@ struct TextGenerationScheduler::Impl {
                              ? std::min(candidates.size(), plan.physical_width)
                              : 1;
       candidates.resize(width);
+      perf::Work perf_decode(width == 1 ? "decode_single" : "decode_batch");
+      trace_queue(perf_decode);
       for (const auto& request : candidates) {
         std::erase(decoding, request);
         prerequisite_cohort.ServedOrDeferred(request->id);
@@ -2044,6 +2060,11 @@ struct TextGenerationScheduler::Impl {
     if (config.mode == detail::PrefillPrerequisiteMode::kAdaptive &&
         !prerequisite_prefill_next && ready != 0) {
       prerequisite_cohort.Freeze(std::span(ids).first(ready));
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      // AD freezes AFTER the preceding cut. Give the actual roster its own
+      // association instead of reusing the cut's earlier ready count.
+      BeginPrerequisiteAssociation(ready);
+#endif
       return true;
     }
     if (config.mode == detail::PrefillPrerequisiteMode::kSerialShadow)
@@ -2054,14 +2075,7 @@ struct TextGenerationScheduler::Impl {
     auto request = std::move(prefilling.front());
     prefilling.pop_front();
 #if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
-    prerequisite_association = {};
-    const auto sequence = ++prerequisite_sequence;
-    prerequisite_association.iteration = sequence;
-    prerequisite_association.cohort = sequence;
-    prerequisite_association.plan = sequence;
-    prerequisite_association.scheduler_frozen = ready;
-    // No numerical starting-state certificate exists: leave starting_state
-    // null.
+    BeginPrerequisiteAssociation(ready);
 #endif
     if (config.mode == detail::PrefillPrerequisiteMode::kSerialShadow &&
         ready) {
@@ -2092,6 +2106,10 @@ struct TextGenerationScheduler::Impl {
     }
     if (!IsTerminal(request)) {
       perf::Work work("prefill");
+      trace_queue(work);
+      // Include the selected cut, which was already popped from the queue.
+      if (auto* trace = work.get())
+        ++trace->prefilling_waiting;
       TraceRequest(request, true);
 #if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
       qfn_pd::AssociationScope association(prerequisite_association);
@@ -2196,7 +2214,7 @@ struct TextGenerationScheduler::Impl {
 
       progress.fetch_add(1, std::memory_order_relaxed);
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-      if (RunPrerequisitePolicy(prefilling, decoding, capturing))
+      if (RunPrerequisitePolicy(prefilling, decoding, capturing, trace_queue))
         continue;
 #endif
       const bool due_decoder = HasDueDecoder(decoding);

@@ -1,7 +1,9 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -32,6 +34,10 @@
 #include "src/core/json.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#include "src/core/perf_trace.hpp"
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 namespace {
 
@@ -1425,6 +1431,327 @@ void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
 }
 
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+std::filesystem::path prerequisite_trace_path;
+
+void RemovePrerequisiteTrace() {
+  std::error_code error;
+  std::filesystem::remove(prerequisite_trace_path, error);
+}
+
+void InitializePrerequisiteTrace() {
+  const char* supplied = std::getenv("GUFO_PERF_TRACE");
+  if (supplied != nullptr && *supplied != '\0') {
+    prerequisite_trace_path = supplied;  // Retain operator-owned artifacts.
+  } else {
+    prerequisite_trace_path =
+        std::filesystem::temp_directory_path() /
+        ("gufo-prerequisite-trace-" +
+         std::to_string(gufo::platform::ProcessId()) + "-" +
+         std::to_string(gufo::perf::Now()) + ".jsonl");
+    // Register BEFORE the first Sink(): Windows must close its ofstream before
+    // unlink. Do not delete an externally supplied trace, even on failure.
+    Expect(std::atexit(RemovePrerequisiteTrace) == 0,
+           "register private trace cleanup before constructing the sink");
+    Expect(gufo::platform::SetEnv("GUFO_PERF_TRACE",
+                                  prerequisite_trace_path.string()),
+           "configure the private CPU trace");
+  }
+  Expect(gufo::platform::SetEnv("GUFO_PERF_TRACE_MOE", "1"),
+         "sample every synthetic CPU forward");
+  Expect(gufo::perf::Enabled(), "the CPU regression requires an enabled trace");
+}
+
+// json::Value stores numbers as doubles. Join nanosecond identities using the
+// serialized integers, including on hosts whose steady clock exceeds 2^53.
+std::optional<std::uint64_t> TraceInteger(std::string_view line,
+                                          std::string_view key) {
+  const auto field = std::string("\"") + std::string(key) + "\":";
+  const auto position = line.find(field);
+  if (position == std::string_view::npos)
+    return std::nullopt;
+  const auto* begin = line.data() + position + field.size();
+  std::uint64_t value = 0;
+  const auto parsed = std::from_chars(begin, line.data() + line.size(), value);
+  if (parsed.ec != std::errc{})
+    return std::nullopt;
+  return value;
+}
+
+void TestPrerequisiteCohortDecodeTrace() {
+  namespace perf = gufo::perf;
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+  namespace pd = gufo::models::qwen38_flash_next::pd;
+#endif
+  constexpr std::size_t prompt_tokens = 193;
+  for (const auto mode : {PrefillPrerequisiteMode::kAdaptive,
+                          PrefillPrerequisiteMode::kSerialShadow}) {
+    for (const std::size_t width : {1U, 2U}) {
+      struct Observation {
+        std::uint64_t work_start, forward;
+      };
+      std::vector<Observation> observations;
+      std::size_t cohort_callbacks = 0;
+      bool initial_ad_drain_checked = false;
+      std::string callback_failure;
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+      std::size_t association_callbacks = 0;
+      std::string association_failure;
+#endif
+      auto control = std::make_shared<FakeControl>();
+      control->max_context = 512;
+      control->block_advance_label = 1;
+      control->supports_batched_advance = width == 2;
+      control->maximum_plan_width = 2;
+      control->single_pass_limit = [](std::span<const TextRunnerToken> prompt,
+                                      std::size_t offset, std::size_t budget) {
+        return std::optional{std::min(budget, prompt.size() - offset)};
+      };
+      control->advance_callback = [&](TextRunnerToken label, std::size_t step) {
+        if (label == 9 || (label == 1 && step == 0))
+          return;
+        // Advance calls this OUTSIDE control->mutex. Only actual cuts of the
+        // long prompt select observations; final legacy decode cannot pass.
+        const auto events = control->Events();
+        std::size_t consumed = 0;
+        for (const auto& event : events)
+          if (event.kind == EventKind::kPrefill && event.label == 9)
+            consumed += event.count;
+        if (consumed >= prompt_tokens)
+          return;
+        if (consumed > 0)
+          ++cohort_callbacks;
+        const auto require = [&](bool condition, const char* message) {
+          if (!condition && callback_failure.empty())
+            callback_failure = message;
+          return condition;
+        };
+        // Every callback after the initial gate, including AD's first pre-cut
+        // drain, is policy work while the long prompt remains pending. Defer
+        // failures until join, but diagnose B1 before checking association.
+        auto* work = perf::current;
+        if (!require(work != nullptr,
+                     "B1: missing active work scope in prerequisite drain"))
+          return;
+        const auto dispatched_width =
+            consumed == 0 ? work->sessions.size() : width;
+        require(std::string_view(work->kind) ==
+                    (dispatched_width == 1 ? "decode_single" : "decode_batch"),
+                "cohort work has its actual decode kind");
+        require(!work->sessions.empty() &&
+                    work->sessions.size() == dispatched_width &&
+                    std::all_of(work->sessions.begin(), work->sessions.end(),
+                                [](const auto& s) { return s.request_id > 0; }),
+                "cohort work has populated sessions at runner entry");
+        require(work->prefilling_waiting > 0,
+                "cohort work records the still-pending prefiller");
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+        ++association_callbacks;
+        const auto& a = pd::current_association;
+        if ((!a.iteration || !a.cohort || !a.plan || !a.scheduler_frozen ||
+             *a.iteration == 0 || *a.cohort == 0 || *a.plan == 0 ||
+             *a.scheduler_frozen != work->sessions.size()) &&
+            association_failure.empty())
+          association_failure = "association must match the frozen roster";
+#endif
+        if (consumed == 0) {
+          if (mode == PrefillPrerequisiteMode::kAdaptive && label == 1 &&
+              step == 1)
+            initial_ad_drain_checked = require(
+                work->sessions.size() == 1,
+                "AD's first freeze contains exactly the original decoder");
+          return;
+        }
+        perf::Forward forward(false);
+        perf::HostPhase phase("SYNTHETIC_prerequisite_decode");
+        for (const auto& session : work->sessions)
+          forward.Rows(session.context_depth, 1);
+        require(perf::forward_id != 0 && perf::sample_moe,
+                "the actual cohort work activates the forward pipeline");
+        observations.push_back({work->start_ns, perf::forward_id});
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+        pd::HostSpan span("SYNTHETIC_prerequisite_decode", "cpu_fake_only");
+        std::vector<pd::Row> rows;
+        for (const auto& session : work->sessions)
+          rows.push_back({static_cast<std::uint32_t>(rows.size()),
+                          session.request_id, session.context_depth});
+        const std::array<pd::Tensor, 3> tensors{{
+            {.tensor = pd::TensorRole::kGate},
+            {.tensor = pd::TensorRole::kUp},
+            {.tensor = pd::TensorRole::kDown},
+        }};
+        // SYNTHETIC, deliberately Missing maps: RecordLayer's unsupported
+        // dispatch path calls Missing(..., "unobserved_dispatch_layout"). No
+        // native layout, address quality, download or device call is claimed.
+        pd::RecordLayer(tensors, pd::ForwardRole::kDecoder, rows,
+                        pd::DeviceRouting{},
+                        [&](const std::int32_t*, std::span<std::int32_t>) {
+                          require(false, "synthetic maps must not download");
+                          return false;
+                        });
+#endif
+      };
+      auto scheduler = MakeScheduler(
+          control, width + 1, {.prerequisites = {.mode = mode, .tokens = 64}});
+      struct ReleaseGate {
+        std::shared_ptr<FakeControl> control;
+        ~ReleaseGate() { control->ReleaseAdvance(); }
+      } release_gate{control};
+      std::vector<TextGenerationScheduler::Request> decoders;
+      decoders.push_back(scheduler->Submit({1}, 32, 0.0F));
+      bool entered = false;
+      {
+        std::unique_lock<std::mutex> lock(control->mutex);
+        entered = control->condition.wait_for(lock, kTestTimeout, [&] {
+          return control->advance_gate_entered &&
+                 control->advance_gate_label == 1;
+        });
+      }
+      if (!entered) {
+        control->ReleaseAdvance();
+        scheduler.reset();
+        Expect(false, "initial decoder enters the bounded existing gate");
+      }
+      // Admit the second decoder before the long prompt so every selected W2
+      // drain has two ready members, not one legacy final decoder.
+      if (width == 2)
+        decoders.push_back(scheduler->Submit({2}, 32, 0.0F));
+      auto prompt = scheduler->Submit(
+          std::vector<TextRunnerToken>(prompt_tokens, 9), 2, 0.0F);
+      control->ReleaseAdvance();
+      auto completion = std::async(std::launch::async, [&] {
+        bool exact = prompt.Wait().tokens == ExpectedTokens(9, 2);
+        for (std::size_t i = 0; i < decoders.size(); ++i)
+          exact = (decoders[i].Wait().tokens ==
+                   ExpectedTokens(static_cast<TextRunnerToken>(i + 1), 32)) &&
+                  exact;
+        return exact;
+      });
+      const bool completed =
+          completion.wait_for(kTestTimeout) == std::future_status::ready;
+      if (!completed) {
+        prompt.Cancel();
+        for (auto& decoder : decoders)
+          decoder.Cancel();
+      }
+      scheduler.reset();  // Join and flush ALL work records before parsing.
+      Expect(completed, "CPU prerequisite trace requests finish within budget");
+      Expect(completion.get(), "trace instrumentation preserves trajectories");
+      Expect(callback_failure.empty(), callback_failure);
+      Expect(mode != PrefillPrerequisiteMode::kAdaptive ||
+                 initial_ad_drain_checked,
+             "AD's FIRST pre-cut frozen drain has real traced work");
+      Expect(cohort_callbacks > 0,
+             "each mode/width executes a cohort after a partial long prefill");
+      Expect(!observations.empty(), "each case records actual cohort work");
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+      Expect(association_callbacks > 0, "each case observes a real freeze");
+      Expect(association_failure.empty(), association_failure);
+#endif
+      std::ifstream input(prerequisite_trace_path);
+      Expect(input.is_open(), "open flushed CPU trace");
+      struct TraceLine {
+        gufo::json::Value value;
+        std::uint64_t work_start;
+        bool core;
+      };
+      std::vector<TraceLine> lines;
+      std::string line;
+      while (std::getline(input, line)) {
+        const auto value = gufo::json::parse(line);
+        if (TraceInteger(line, "run_id") != perf::Sink().run_id)
+          continue;
+        const bool core = !value.contains("work_start_ns");
+        const auto start =
+            TraceInteger(line, core ? "start_ns" : "work_start_ns");
+        if (start &&
+            std::any_of(observations.begin(), observations.end(),
+                        [&](const auto& o) { return o.work_start == *start; }))
+          lines.push_back({value, *start, core});
+      }
+      for (const auto& observation : observations) {
+        std::size_t works = 0;
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+        bool span = false;
+        std::array<bool, 3> maps{};
+#endif
+        for (const auto& record : lines) {
+          if (record.work_start != observation.work_start)
+            continue;
+          const auto& value = record.value;
+          if (record.core) {
+            ++works;
+            Expect(
+                value.member_str("kind") ==
+                        (width == 1 ? "decode_single" : "decode_batch") &&
+                    value.find("sessions")->size() == width &&
+                    value.find("queue")->member_size("prefilling_waiting") > 0,
+                "joined work retains decode kind, sessions and queue");
+            bool forward = false, phase = false;
+            for (const auto& f : value.find("forwards")->items())
+              if (f.member_size("forward") == observation.forward)
+                forward = !f.find("prefill")->as_bool() &&
+                          f.find("sessions")->size() == width;
+            for (const auto& p : value.find("phases")->items())
+              phase = phase ||
+                      p.member_str("name") == "SYNTHETIC_prerequisite_decode";
+            Expect(forward && phase, "joined work contains forward and phase");
+          }
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+          else if (value.member_size("forward") == observation.forward) {
+            Expect(value.member_size("iteration") > 0 &&
+                       value.member_size("cohort") > 0 &&
+                       value.member_size("plan") > 0 &&
+                       value.member_size("scheduler_frozen") == width,
+                   "joined diagnostics retain the actual frozen association");
+            if (value.member_str("kind") == "host_span") {
+              span = span || value.member_str("name") ==
+                                 "SYNTHETIC_prerequisite_decode";
+            } else if (value.member_str("kind") == "packed_requests") {
+              const auto* cover = value.find("coverage");
+              Expect(cover &&
+                         cover->member_str("missing") ==
+                             "unobserved_dispatch_layout" &&
+                         !cover->find("addresses_complete")->as_bool() &&
+                         !cover->find("physical_tiles_complete")->as_bool() &&
+                         value.find("requested_unique_bytes")->is_null() &&
+                         value.find("rows")->size() == width,
+                     "SYNTHETIC maps stay Missing, not native layout proof");
+              const auto tensor = value.member_str("tensor");
+              maps[0] = maps[0] || tensor == "gate";
+              maps[1] = maps[1] || tensor == "up";
+              maps[2] = maps[2] || tensor == "down";
+            }
+          }
+#endif
+        }
+        Expect(works == 1, "each cohort joins exactly one flushed work");
+#if defined(GUFO_PD_PROFILE_AVAILABLE)
+        Expect(span && std::all_of(maps.begin(), maps.end(),
+                                   [](bool found) { return found; }),
+               "each cohort forward joins a host span and three Missing maps");
+#endif
+      }
+      if (width == 2) {
+        const auto batches = control->AdvanceBatches();
+        const bool pair_dispatched =
+            std::any_of(batches.begin(), batches.end(), [](const auto& batch) {
+              return batch.size() == 2 &&
+                     std::find(batch.begin(), batch.end(), 1) != batch.end() &&
+                     std::find(batch.begin(), batch.end(), 2) != batch.end();
+            });
+        Expect(pair_dispatched,
+               "the real pool dispatches both decoders through AdvanceBatch");
+      }
+      std::cout << "Prerequisite trace "
+                << (mode == PrefillPrerequisiteMode::kAdaptive
+                        ? "adaptive"
+                        : "serial-shadow")
+                << " W" << width << ": " << observations.size()
+                << " decoder forwards during partial prefill\n";
+    }
+  }
+}
+
 void TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals() {
   // Five ready members cannot drain in one W2 call. One fails, another is
   // cancelled after freeze, and both a newcomer and a capture resume arrive
@@ -3184,7 +3511,23 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
-int main() {
+int main(int argc, char** argv) {
+  const bool trace_only =
+      argc == 2 && std::string_view(argv[1]) == "--prerequisite-trace-only";
+  Expect(argc == 1 || trace_only,
+         "usage: text_generation_scheduler_test [--prerequisite-trace-only]");
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  // Sink configuration is read once. Normal prerequisite-ON execution stays
+  // traced for the entire suite; flag-OFF behavior is unchanged.
+  InitializePrerequisiteTrace();
+  TestPrerequisiteCohortDecodeTrace();
+  if (trace_only) {
+    std::cout << "All prerequisite cohort trace cases passed\n";
+    return 0;
+  }
+#else
+  Expect(!trace_only, "trace-only mode requires prefill prerequisites ON");
+#endif
   TestPublicationWaitUsesRecentSubstantialPrefill();
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals();
