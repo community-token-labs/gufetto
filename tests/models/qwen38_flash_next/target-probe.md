@@ -2,7 +2,7 @@
 
 Code-only qualification support; no GPU result is claimed. This probe is
 Flash-Next-specific and is **not an HTTP option or supported public API**.
-It does not alter payload ABI20, transfer compatibility, kernels, graph policy,
+It does not alter payload ABI21, transfer compatibility, kernels, graph policy,
 sampling, rollback, or cache ownership. Do not use the older
 `GUFO_FLASH_NEXT_DUMP_DIR` activation dump for this procedure: that dump disables
 graphs and does not capture these target selections.

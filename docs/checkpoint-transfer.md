@@ -1,10 +1,9 @@
 # Portable continuation checkpoints (experimental, opt-in)
 
-Roadmap C step 2; based on `gac/cache-lookup-r2` (`355cddef`). This is a
-**separate claim class** from advisory lookup. CPU tests do not establish GPU
+Checkpoint transfer is a **separate claim class** from advisory lookup. CPU tests do not establish GPU
 restoration, cross-host numerical parity, production readiness or transfer speed.
-No model arithmetic or Flash-Next payload ABI changes: payload version remains
-**20**. Linux x86-64 / gfx1151 / Qwen3.8 Flash-Next only.
+Transfer does not change model arithmetic. This product's Flash-Next payload
+version is **21**, with explicit F16/q8 storage identity. Linux x86-64 / gfx1151 / Qwen3.8 Flash-Next only.
 
 ## Enable and call
 
@@ -108,7 +107,7 @@ The header carries both the raw identity and inspectable configuration:
   callers must supply valid fingerprints. Native identity also binds context,
   position/RoPE/YaRN policy, MTP/draft limits/concurrency, prefill capacity and
   component ABI/layout. There is no human model-name-only compatibility.
-- Payload version 20, exact executable SHA-256 (including kernel code), loaded
+- Payload version 21 and K/V storage dtype, exact executable SHA-256 (including kernel code), loaded
   runtime-object content hashes, fixed Linux/x86-64/little-endian/gfx1151 lane,
   image-encoder identity, one SHA-256 over the sorted, u64-length-prefixed
   relevant environment block, prefill chunk/decode-active policy and server
@@ -147,7 +146,7 @@ lineage. No sharing is inferred from token equality or sender IDs. Re-exported
 payloads are byte-identical; local envelope IDs may differ.
 
 Compatibility is deliberately stricter than native disk ABI. Different builds
-are rejected even if their payload version is still 20. This closes the U1
+are rejected even if their payload version is unchanged. This closes the U1
 failure mode: arithmetic changes cannot inherit stale remote state merely
 because a payload-version bump was missed. V1 does not promise compatibility
 across compilers, runtime lanes, architectures or future protocol versions.
@@ -244,54 +243,28 @@ network, destination verification+spool, RAM admission and subsequent restore,
 not just bytes/link-rate. Avoid repeated multi-GiB writes on QLC SSDs without a
 budget. A future direct/chunked preparation protocol needs a separate contract.
 
-## Verification and later GPU gate
+## Verification and remaining qualification
 
-On the Agent PC, the HIP-OFF build and 10 focused CTests pass; the envelope and
-component suites also pass ThreadSanitizer (`halt_on_error=1`). All 40 existing
-lookup-harness unit tests pass. Changed C++ files pass Clang 22.1.8 formatting;
-the full shared check still flags inherited, untouched
-`src/core/json_constraint.cpp:2003`. No HIP build or GPU run is claimed.
+CPU targets `checkpoint_transfer_test`, `component_text_cache_test` and
+`http_server_test` exercise byte-exact round trips, truncation/corruption,
+compatibility, bounded sizes, budget refusal, RAM/disk sources, input identity,
+borrowed sources, quota release, HTTP streaming and auth-before-100. Shared
+runner/cache/chat/scheduler tests remain adjacent to upstream's tests.
+These fixtures use no weights or device; they are not GPU restore evidence.
 
-CPU targets: `checkpoint_transfer_test`, `component_text_cache_test`,
-`http_server_test`, plus existing runner/disk/cache/chat/scheduler regressions.
-They exercise byte-exact wire and payload round trips, every truncation of a
-small fixture, header/object corruption, extra bytes, incompatible model/ABI/
-build configuration, bounded size refusal, capacity refusal, RAM/disk sources,
-image-identity misses, borrowed sources, quota release, 9 MiB HTTP streaming,
-auth-before-100, and serving/lookup during import receive and owner admission.
-No weights or GPU are used. CPU/HIP-OFF compilation is not HIP compilation.
+Before promotion, use an allocated hostlease job and identical immutable builds
+on both hosts. Validate exact imported-warm/cold token and full-logit equality
+(including teacher-forced suffix rows), actual admitted/reused depth, AR/MTP,
+tools/images/thinking and learned boundaries. Reject changed builds, dtype,
+ABI, model/context/runtime, corrupt/oversized blobs and insufficient budgets.
+Exercise unrelated sessions, pin pressure, cancellation and quota recovery.
+Measure full spool/network/verify/admit/restore latency and SSD traffic, not
+link rate alone. Preserve failed/partial runs; never relax a gate to hide one.
 
-Before deployment, reserve **both hosts through their `~/gac/QUEUE.md` and
-operation locks**. Package the exact private revision once on an unloaded
-builder, install identical immutable runtime images on both hosts, then validate:
-
-1. A exports; fresh B imports with no prefill. Check exact admitted depth and
-   actual `cached_tokens/cache_n` on the unchanged next chat. Repeat B→A.
-2. At 2K, 32K, 100K and an unaligned learned boundary (including 2415), compare
-   greedy imported-warm to cold bypass on B and the same cold reference on A.
-   Compare **all output token IDs, stop/counts, top-k IDs/order and raw target
-   logits at the restored boundary and teacher-forced suffix rows**, not text
-   alone. Run AR and real-MTP, tool framing, preserve-thinking on/off and images.
-   HTTP logprobs are not implemented: extend the native/component integration
-   driver or use a private, bounded test-only target-logit probe in **identical
-   server builds on both hosts**. That GPU transfer driver/probe remains to be
-   prepared for the queued run; the current CPU driver is not it. A different
-   helper executable must not bypass the executable epoch to import a blob.
-   Observe logits from the restored executing slot, not just the copied logit
-   payload; never pretend HTTP text or payload byte equality proves numerics.
-3. Reject cross-build (even ABI20), ABI18/19, changed target/MTP/vision, context,
-   numerics environment/default policy; reject truncated, bit-flipped, oversized
-   and under-budget imports. No admitted record/live-session change for invalid
-   blobs. Advance unrelated busy slots throughout import; compare their outputs
-   with a no-transfer control. Check pin survival, eviction and R2 latency.
-4. Measure 100K blob bytes, SHA/CRC/spool/copy/restore phases and end-to-end
-   latency, peak RSS/MemAvailable and SSD bytes for ordinary LAN and USB4 IP
-   `10.44.0.1/10.44.0.2`, both directions, three repetitions. Keep transfer and
-   inference-interference timings separate. Compare against measured cold
-   re-prefill, not the historical ~65–70 s estimate.
-
-Require exact same-build token/logit parity (including top-k), zero unsafe
-admissions and preserved unrelated sessions. If cold cross-host controls already
-differ, stop and localize; do not loosen tolerances to qualify transfer. Preserve
-failed/partial runs. No GPU run, queue modification or production change is
-part of this code-only implementation.
+The bounded native target-logit probe is documented beside its
+[model tests](../tests/models/qwen38_flash_next/target-probe.md). Live transfer
+attempts remain NONPASS, and later offline orchestration passes are not
+scientific qualification. GPU restoration, cross-host parity, isolation and
+throughput remain **UNQUALIFIED** on this product. See immutable reports and
+the inherited shared disk-verification risk in
+[the qualification ledger](STRIX-QUALIFICATION.md).

@@ -8,9 +8,9 @@ recorded. Expert IDs are represented only by a routing-set bitset.
 ## Enable
 
 ```sh
-GUFO_PERF_TRACE=/tmp/gufo-perf.jsonl gufo serve <normal serving options>
+GUFO_PERF_TRACE="$HOME/.cache/gufo-perf.jsonl" gufo serve <normal serving options>
 # Separate, short routing study; do not use these timings as a latency baseline:
-GUFO_PERF_TRACE=/tmp/gufo-routes.jsonl GUFO_PERF_TRACE_MOE=1 \
+GUFO_PERF_TRACE="$HOME/.cache/gufo-routes.jsonl" GUFO_PERF_TRACE_MOE=1 \
   gufo serve <normal serving options>
 ```
 
@@ -117,40 +117,16 @@ normal phase timings with MoE sampling off and expert sets in a separate run.
 Failed optional HIP-event creation/readback omits the measurement; it does not
 fabricate an all-zero routing set. Failed pinned allocation omits vector samples.
 
-## Offline report
+## Analysis and qualification
 
-In the separate `gufo-agent-concurrency` repository:
+The schema is usable by any JSON-lines reader. The separate evidence project
+maintains `bench/perf_trace_report.py`; it is not a Gufo runtime dependency.
+Partition by run/thread/forward, distinguish selected scheduler cohorts from
+successful native forwards, and keep incomplete/failed work visible. Expert
+set overlap is observational, not predicted weight reuse or concurrency.
 
-```sh
-python3 bench/perf_trace_report.py /tmp/gufo-perf.jsonl
-python3 bench/perf_trace_report.py /tmp/gufo-perf.jsonl --depth-bin 4096 --json
-(cd bench && python3 -m unittest -v test_perf_trace_report)
-```
-
-The report includes time by work kind, inclusive phase totals, T_prefill by actual
-chunk size and starting depth bucket (weighted token/s), T_decode_round by native
-session/row shape (accepted token/s), per-chunk RouteHints count/wait, per-layer
-mean decoder expert union, prompt coverage versus chunk size, and decoder expert
-coverage by the nearest actual prompt work unit on the same scheduler thread.
-
-Overlap is observational, **not predicted weight-cache reuse or concurrency**.
-It pairs with the closest actual prompt unit (previous on equal-distance ties),
-and only if both corresponding layer sets were sampled. It never bridges an
-unsampled adjacent prompt chunk to manufacture a match. JSON output retains
-pair gaps/relations and both equal-pair and expert-count-weighted overlap.
-Large gaps or sparse/aliased samples can make this evidence unrepresentative.
-A decode scheduler unit is one selected physical cohort, not necessarily one
-complete due-cohort round; failed/retried native shapes can appear in the same
-unit. Use `forwards` and zero-consumption rows when auditing such cases.
-The reader rejects malformed/partial lines with line numbers; stop/flush the
-server or trim only an incomplete final line from a copy before analysis.
-
-## Local validation / remaining qualification
-
-CPU-only checks cover collector disabled mode, scope restoration, integer/bitset
-serialization, concurrent whole-line append, and synthetic analyzer timelines,
-shape grouping, waits, expert overlap, missing samples and restarted streams.
-The scheduler/pool translation units can be syntax-checked with a C++20 host
-compiler. No HIP toolchain or GPU was available on the editing host: native
-compilation, HIP-event behavior, sampled graph/eager numerical replay and enabled/
-disabled performance overhead require the nimo-1 build/qualification loop.
+CPU tests cover disabled collection, scope restoration, integer/bitset
+serialization and concurrent whole-line append. The integrated GPU event path,
+sampled graph/eager numerical replay and enabled/disabled overhead need fresh
+GPU qualification. Instrumented timings must not be presented as uninstrumented
+production measurements. See [the qualification ledger](../STRIX-QUALIFICATION.md).
