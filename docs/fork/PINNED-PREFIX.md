@@ -36,6 +36,21 @@ file is tokenized as framing. Such a mismatch is a safe miss, not permission
 to restore a merely similar prefix. Prefer a clean system/tools fixture and
 verify the first request's actual selected token depth.
 
+### RAM cache off versus automatic sizing
+
+`--cache-ram-bytes 0` keeps automatic sizing and normal pin creation and RAM
+warmth. `--cache-ram-bytes off` keeps no RAM checkpoint, including registered
+pins, and never demand-warms a lazy disk pin. Existing compatible registrations
+can still be read with `--pin-prefix-lazy`; live-session reuse also remains.
+Without ordinary `--cache-disk`, these restores need no cache backing.
+Ordinary disk captures still use upstream's bounded 512 MiB backing when off.
+
+Mandatory RAM-warm startup with off is rejected explicitly. Creating or
+replacing an incompatible pin also requires RAM caching to be enabled, even
+in lazy mode: startup checks the complete requested set before retiring any
+old registration. Enable AUTO or an explicit RAM budget to create the pins,
+then restart with off and lazy mode to use them without RAM retention.
+
 ## Identity and compatibility
 
 The registration key is the complete exact token vector, empty supplemental
