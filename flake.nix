@@ -291,6 +291,8 @@
               ".clang-format"
               "CMakeLists.txt"
               "docs/RELEASING.md"
+              "flake.nix"
+              "version.txt"
               "tools/prof/prof.py"
               "tools/bench/speculative-corpus.py"
             ];
@@ -472,6 +474,7 @@
               pkgsSys.ccache
               pkgsSys.cmake
               pkgsSys.ninja
+              pkgsSys.git
               pkgsSys.pkg-config
               (if full then pkgsSys.python3.withPackages (ps: [ ps.numpy ]) else pkgsSys.python3)
               pkgsSys.icu

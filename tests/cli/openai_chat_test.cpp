@@ -203,6 +203,15 @@ public:
   }
   [[nodiscard]] bool supports_images() const override { return image_support; }
   bool image_support{true};
+  std::optional<CacheLookupResult> cache_lookup(
+      const gufo::server::ChatRequest& request) const override {
+    ++lookup_calls;
+    lookup_request = request;
+    return lookup_result;
+  }
+  mutable int lookup_calls{0};
+  mutable gufo::server::ChatRequest lookup_request;
+  std::optional<CacheLookupResult> lookup_result;
 
   bool WaitForFirstPiece() {
     std::unique_lock<std::mutex> lock(mutex);
@@ -6471,7 +6480,84 @@ void TestParallelCallSeparatorIsNotContent() {
     }
 }
 
+void TestCacheLookup() {
+  FakeBackend backend;
+  const std::string input = R"({
+    "model":"test-model", "stream":true, "cache_prompt":false,
+    "chat_template_kwargs":{"preserve_thinking":true},
+    "messages":[{"role":"system","content":"private-system-sentinel"},
+                {"role":"user","content":"private-user-sentinel"}]
+  })";
+  auto request = Request(input);
+  request.path = "/v1/cache/lookup";
+  const auto unsupported = gufo::server::HandleCacheLookup(request, backend);
+  Expect(unsupported.status == 501, "unsupported lookup is explicit");
+  Expect(backend.chat_calls == 0, "lookup never generates");
+
+  backend.lookup_result =
+      gufo::server::TextGenerationBackend::CacheLookupResult{
+          .total_tokens = 31,
+          .matched_tokens = 16,
+          .tier = "ram",
+          .epoch = "compatibility-digest",
+          .restore_estimate_ms = 0.25,
+          .prefill_estimate_ms = 1.5,
+          .lookup_ms = 0.1,
+          .index_version = 42,
+          .snapshot_age_ms = 3.5,
+          .observation_id = 64,
+      };
+  const auto response = gufo::server::HandleCacheLookup(request, backend);
+  Expect(response.status == 200 && !response.streaming_body,
+         "lookup is JSON even with stream=true");
+  const auto body = gufo::json::parse(response.body);
+  Expect(body.member_size("total_tokens") == 31 &&
+             body.member_size("matched_tokens") == 16 &&
+             body.member_str("tier") == "ram" &&
+             body.member_str("epoch") == "compatibility-digest",
+         "lookup fields come from engine, not request history");
+  Expect(body.member_double("restore_estimate_ms") == 0.25 &&
+             body.member_double("prefill_estimate_ms") == 1.5 &&
+             body.member_double("lookup_ms") >= 0,
+         "lookup reports estimates and total processing latency");
+  Expect(body.member_str("semantics") == "advisory" &&
+             body.member_size("index_version") == 42 &&
+             body.member_double("snapshot_age_ms") == 3.5,
+         "lookup exposes advisory semantics and published inventory age");
+  Expect(!backend.lookup_request.cache_prompt &&
+             backend.lookup_request.reasoning.preserve_thinking == true &&
+             backend.lookup_request.messages.size() == 2,
+         "lookup uses chat parser and template options");
+  Expect(
+      response.body.find("sentinel") == std::string::npos &&
+          response.log_details == "cache_lookup_id=64" &&
+          !body.find("observation_id") && backend.chat_calls == 0,
+      "lookup correlation is logs-only, without prompt content or generation");
+
+  backend.lookup_result->restore_estimate_ms.reset();
+  backend.lookup_result->prefill_estimate_ms.reset();
+  const auto unknown =
+      gufo::json::parse(gufo::server::HandleCacheLookup(request, backend).body);
+  Expect(unknown.find("restore_estimate_ms")->is_null() &&
+             unknown.find("prefill_estimate_ms")->is_null(),
+         "unmeasured costs are null, not fabricated zeros");
+
+  const auto calls = backend.lookup_calls;
+  for (
+      const auto& invalid :
+      {R"({"model":"wrong","messages":[{"role":"user","content":"x"}]})",
+       R"({"model":"test-model","messages":[]})",
+       R"({"model":"test-model","cache_prompt":"yes","messages":[{"role":"user","content":"x"}]})"}) {
+    request.body = invalid;
+    Expect(gufo::server::HandleCacheLookup(request, backend).status >= 400,
+           "lookup applies chat validation before querying engine");
+  }
+  Expect(backend.lookup_calls == calls && backend.chat_calls == 0,
+         "invalid lookups never reach engine or generation");
+}
+
 int main() {
+  TestCacheLookup();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();

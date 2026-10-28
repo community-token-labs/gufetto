@@ -1,4 +1,8 @@
 #include "src/cli/serve/text_generation_scheduler.hpp"
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+namespace qfn_pd = gufo::models::qwen38_flash_next::pd;
+#endif
 
 #include <algorithm>
 #include <array>
@@ -173,8 +177,7 @@ void TraceRequest(const std::shared_ptr<ScheduledRequest>& request,
                                request->result.tokens.size() -
                                (request->preview_token.has_value() ? 1 : 0) -
                                (request->advance_pending ? 1 : 0);
-  perf::current->sessions.push_back(
-      {request->session, request->id, depth});
+  perf::current->sessions.push_back({request->session, request->id, depth});
 }
 
 struct PendingClient {
@@ -534,6 +537,9 @@ struct TextGenerationScheduler::Impl {
           "text generation scheduler runner pool must not be null");
     }
     sessions = std::make_shared<SessionTable>(runner_pool->capacity());
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    prefill_policy.prerequisites.Validate(runner_pool->capacity());
+#endif
     if (prefill_policy.decode_active_tokens == 0) {
       throw std::invalid_argument(
           "active-decode prefill budget must be at least one token");
@@ -567,6 +573,12 @@ struct TextGenerationScheduler::Impl {
         runner_pool->runner()
             .Descriptor()
             .capabilities.batched_multi_token_decode_max_width;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    if (prefill_policy.prerequisites.Enabled() &&
+        !incremental_prefill_supported)
+      throw std::invalid_argument(
+          "experimental prefill policy requires incremental prefill");
+#endif
     device_lost_requests.reserve(runner_pool->capacity());
     PrepareStructuredOutput(runner_pool->runner());
     worker = std::jthread(
@@ -1208,9 +1220,9 @@ struct TextGenerationScheduler::Impl {
       perf::Work perf_admit("admit");
       if (auto* trace = perf_admit.get()) {
         trace->prefilling_waiting = prefilling.size();
-        trace->decoders_due = static_cast<std::size_t>(std::count_if(
-            decoding.begin(), decoding.end(),
-            [](const auto& r) { return r->decode_due; }));
+        trace->decoders_due = static_cast<std::size_t>(
+            std::count_if(decoding.begin(), decoding.end(),
+                          [](const auto& r) { return r->decode_due; }));
         trace->capturing = capturing.size();
         trace->waiting = waiting.size();
         // The runner lease is not acquired yet; admission may restore it.
@@ -1313,7 +1325,12 @@ struct TextGenerationScheduler::Impl {
   }
 
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
-                   bool decoder_runnable, bool peer_waiting = false) {
+                   bool decoder_runnable, bool peer_waiting = false
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+                   ,
+                   std::optional<std::size_t> selected_budget = std::nullopt
+#endif
+  ) {
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -1326,9 +1343,15 @@ struct TextGenerationScheduler::Impl {
       // Long prefills alone retain the model's efficient chunk size.
       const bool bounded_prefill =
           incremental_prefill_supported && (decoder_runnable || peer_waiting);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+      const std::size_t budget = selected_budget.value_or(
+          bounded_prefill ? prefill_policy.decode_active_tokens
+                          : request->runner_request.prompt_tokens());
+#else
       const std::size_t budget = bounded_prefill
                                      ? prefill_policy.decode_active_tokens
                                      : request->runner_request.prompt_tokens();
+#endif
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
           !incremental_prefill_supported) {
         request->result.prefill_fallback_reason =
@@ -1956,6 +1979,155 @@ struct TextGenerationScheduler::Impl {
     waiting.clear();
   }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  void BeginPrerequisiteAssociation(std::size_t frozen) {
+    prerequisite_association = {};
+    const auto sequence = ++prerequisite_sequence;
+    prerequisite_association.iteration = sequence;
+    prerequisite_association.cohort = sequence;
+    prerequisite_association.plan = sequence;
+    prerequisite_association.scheduler_frozen = frozen;
+    // Execution provenance only; no numerical starting-state certificate.
+  }
+#endif
+
+  template<typename TraceQueue>
+  bool RunPrerequisitePolicy(
+      std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
+      const TraceQueue& trace_queue) {
+    const auto& config = prefill_policy.prerequisites;
+    if (!config.Enabled())
+      return false;
+    // Drain exactly the frozen ready roster before another prompt cut.
+    // Arrivals and capture resumes join the NEXT roster, not this one.
+    if (!prerequisite_cohort.Empty()) {
+      std::vector<std::shared_ptr<ScheduledRequest>> candidates;
+      for (const auto& request : decoding)
+        if (prerequisite_cohort.Contains(request->id))
+          candidates.push_back(request);
+      if (candidates.empty()) {
+        prerequisite_cohort = {};
+        prerequisite_prefill_next = true;
+        return true;
+      }
+      const auto plan = runner_pool->SelectDecodePlan(candidates.size());
+      const auto width = plan.kind == TextExecutionPlanKind::kBatched
+                             ? std::min(candidates.size(), plan.physical_width)
+                             : 1;
+      candidates.resize(width);
+      perf::Work perf_decode(width == 1 ? "decode_single" : "decode_batch");
+      trace_queue(perf_decode);
+      for (const auto& request : candidates) {
+        std::erase(decoding, request);
+        prerequisite_cohort.ServedOrDeferred(request->id);
+        request->decode_due = false;
+        TraceRequest(request);
+      }
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      qfn_pd::AssociationScope association(prerequisite_association);
+#endif
+      StepDecodeBatch(candidates);  // LITERAL legacy pool/backend dispatch.
+      if (prerequisite_cohort.Empty())
+        prerequisite_prefill_next = true;
+      for (auto& request : candidates) {
+        if (!IsTerminal(request)) {
+          if (request->runner_request.SnapshotPending())
+            capturing.push_back(std::move(request));
+          else
+            decoding.push_back(std::move(request));
+        }
+      }
+      return true;
+    }
+    if (prefilling.empty()) {
+      prerequisite_prefill_next = false;
+      return false;
+    }
+    std::array<std::uint64_t, 8> ids{};
+    std::array<std::size_t, 8> remaining{};
+    std::size_t ready = 0;
+    for (const auto& request : decoding) {
+      if (IsTerminal(request) || request->runner_request.SnapshotPending())
+        continue;
+      ids[ready] = request->id;
+      remaining[ready++] = request->token_limit -
+                           request->result.tokens.size() +
+                           (request->preview_token.has_value() ? 1 : 0);
+    }
+    if (config.mode == detail::PrefillPrerequisiteMode::kAdaptive &&
+        !prerequisite_prefill_next && ready != 0) {
+      prerequisite_cohort.Freeze(std::span(ids).first(ready));
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      // AD freezes AFTER the preceding cut. Give the actual roster its own
+      // association instead of reusing the cut's earlier ready count.
+      BeginPrerequisiteAssociation(ready);
+#endif
+      return true;
+    }
+    if (config.mode == detail::PrefillPrerequisiteMode::kSerialShadow)
+      prerequisite_cohort.Freeze(std::span(ids).first(ready));
+    prerequisite_prefill_next = false;
+    auto selected = detail::SelectPrerequisiteBudget(
+        config, ready, std::span(remaining).first(ready));
+    auto request = std::move(prefilling.front());
+    prefilling.pop_front();
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    BeginPrerequisiteAssociation(ready);
+#endif
+    if (config.mode == detail::PrefillPrerequisiteMode::kSerialShadow &&
+        ready) {
+      // This serial study does NOT enable a mixed target or component commit.
+      // The production component route is explicitly unsupported for mixing.
+      ++request->result.serial_shadow_unsupported;
+      request->result.serial_shadow_verifier_rows_upper +=
+          selected.verifier_rows_upper;
+      try {
+        const auto prepared = request->runner_request.PrepareSinglePassPrefill(
+            selected.prompt_tokens);
+        if (prepared) {
+          selected.prompt_tokens = *prepared;
+          ++request->result.serial_shadow_steps;
+        } else {
+          ++request->result.serial_shadow_plan_declined;
+          selected.prompt_tokens = prefill_policy.decode_active_tokens;
+          if (request->runner_request.SnapshotPending()) {
+            // Preparation started a REAL capture dependency. Do not call the
+            // blocking Prefill join while unrelated frozen decoders can run.
+            capturing.push_back(std::move(request));
+            return true;
+          }
+        }
+      } catch (...) {
+        CompleteFailure(request, std::current_exception());
+      }
+    }
+    if (!IsTerminal(request)) {
+      perf::Work work("prefill");
+      trace_queue(work);
+      // Include the selected cut, which was already popped from the queue.
+      if (auto* trace = work.get())
+        ++trace->prefilling_waiting;
+      TraceRequest(request, true);
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      qfn_pd::AssociationScope association(prerequisite_association);
+#endif
+      StepPrefill(request, ready != 0, false, selected.prompt_tokens);
+    }
+    if (!IsTerminal(request)) {
+      if (request->runner_request.SnapshotPending())
+        capturing.push_back(std::move(request));
+      else if (request->runner_request.prefill_complete())
+        decoding.push_back(std::move(request));
+      else
+        prefilling.push_back(std::move(request));
+    }
+    return true;
+  }
+#endif
+
   void Run(const std::stop_token& stop_token) noexcept {
     std::deque<std::shared_ptr<ScheduledRequest>> prefilling;
     std::deque<std::shared_ptr<ScheduledRequest>> decoding;
@@ -1965,9 +2137,9 @@ struct TextGenerationScheduler::Impl {
     const auto trace_queue = [&](perf::Work& work) {
       if (auto* trace = work.get()) {
         trace->prefilling_waiting = prefilling.size();
-        trace->decoders_due = static_cast<std::size_t>(std::count_if(
-            decoding.begin(), decoding.end(),
-            [](const auto& r) { return r->decode_due; }));
+        trace->decoders_due = static_cast<std::size_t>(
+            std::count_if(decoding.begin(), decoding.end(),
+                          [](const auto& r) { return r->decode_due; }));
         trace->capturing = capturing.size();
         trace->waiting = waiting.size();
       }
@@ -2041,6 +2213,10 @@ struct TextGenerationScheduler::Impl {
       }
 
       progress.fetch_add(1, std::memory_order_relaxed);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+      if (RunPrerequisitePolicy(prefilling, decoding, capturing, trace_queue))
+        continue;
+#endif
       const bool due_decoder = HasDueDecoder(decoding);
       const std::size_t resident_count = prefilling.size() + decoding.size();
       const bool preparing_multi_token_batch =
@@ -2101,7 +2277,8 @@ struct TextGenerationScheduler::Impl {
             plan.kind == TextExecutionPlanKind::kBatched
                 ? std::min(candidate_count, plan.physical_width)
                 : 1;
-        perf::Work perf_decode(batch_size == 1 ? "decode_single" : "decode_batch");
+        perf::Work perf_decode(batch_size == 1 ? "decode_single"
+                                               : "decode_batch");
         trace_queue(perf_decode);
         std::vector<std::shared_ptr<ScheduledRequest>> batch;
         batch.reserve(batch_size);
@@ -2153,6 +2330,14 @@ struct TextGenerationScheduler::Impl {
 
   std::shared_ptr<TextRunnerPool> runner_pool;
   TextPrefillPolicy prefill_policy;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  detail::ReadyDecodeCohort prerequisite_cohort;
+  bool prerequisite_prefill_next{false};
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  qfn_pd::Association prerequisite_association;
+  std::uint64_t prerequisite_sequence{0};
+#endif
+#endif
   TextSchedulerPolicy scheduler_policy;
   detail::PublicationWaitEstimate publication_prefill;
   std::shared_ptr<OutputBudget> output_budget;

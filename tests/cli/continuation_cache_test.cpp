@@ -2,11 +2,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "src/cli/serve/logging.hpp"
@@ -1363,7 +1367,461 @@ void TestNewBranchPreservesSharedSourceUnderBytePressure() {
          "the oldest unrelated continuation yields to the shared branch point");
 }
 
+void TestReadOnlyLookupKeepsLruAndUsesAcquirePlan() {
+  using namespace gufo::server;
+  using Tokens = std::vector<ContinuationToken>;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next = 0;
+  ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next++, &invalidations); });
+  const Tokens a{1, 2}, b{5, 6}, c{8, 9};
+  cache.Acquire(a).Commit(a);
+  cache.Acquire(b).Commit(b);
+  const auto before = invalidations;
+  for (int i = 0; i < 100; ++i) {
+    const auto lookup = cache.Lookup(a);
+    Expect(lookup && lookup->matched_tokens == 2 && lookup->tier == "live",
+           "metadata predicts exact live continuation");
+  }
+  Expect(invalidations == before, "lookup never invalidates a state");
+  cache.Acquire(c).Commit(c);
+  Expect(cache.Lookup(a)->matched_tokens == 0 &&
+             cache.Lookup(b)->matched_tokens == 2,
+         "lookup does not protect the oldest state from eviction");
+  auto first = cache.Acquire(a);
+  auto second = cache.Acquire(b);
+  const auto busy = cache.Lookup(c);
+  Expect(busy && busy->matched_tokens == 0 && busy->tier == "none" &&
+             busy->restore_bytes == 0,
+         "all leased live states return conservative metadata, never busy");
+}
+
+namespace {
+
+using LookupTokens = std::vector<gufo::server::ContinuationToken>;
+
+bool Reuses(const gufo::server::ContinuationCache& cache,
+            const LookupTokens& prompt, std::size_t tokens,
+            std::string_view tier, std::size_t bytes = 0) {
+  const auto result = cache.Lookup(prompt);
+  return result && result->matched_tokens == tokens && result->tier == tier &&
+         result->restore_bytes == bytes && result->index_version > 0 &&
+         result->snapshot_age_ms >= 0;
+}
+
+struct CallbackGate {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool entered{false};
+  bool released{false};
+
+  void Block() {
+    std::unique_lock lock(mutex);
+    entered = true;
+    condition.notify_all();
+    condition.wait(lock, [&] { return released; });
+  }
+  void WaitForEntry() {
+    std::unique_lock lock(mutex);
+    Expect(condition.wait_for(lock, std::chrono::seconds(5),
+                              [&] { return entered; }),
+           "fake GPU/cache callback is blocked before lookup");
+  }
+  void Release() {
+    const std::lock_guard lock(mutex);
+    released = true;
+    condition.notify_all();
+  }
+};
+
+void CheckBlockedLookup(CallbackGate& gate,
+                        const std::function<bool()>& check) {
+  gate.WaitForEntry();
+  auto reading = std::async(std::launch::async, [&] {
+    for (int i = 0; i < 256; ++i)
+      if (!check())
+        return false;
+    return true;
+  });
+  const bool prompt =
+      reading.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+  // Always release the writer, even if a regressed lookup waits on its mutex.
+  gate.Release();
+  const bool correct = reading.get();
+  Expect(prompt, "metadata lookup never waits for blocked cache/GPU work");
+  Expect(correct, "blocked lookup returns only published reusable metadata");
+}
+
+struct ProbedSnapshot final : gufo::server::ContinuationSnapshot {
+  std::function<void()> payload, preference, destruction;
+  ~ProbedSnapshot() override {
+    if (destruction)
+      destruction();
+  }
+  std::size_t PayloadBytes() const noexcept override {
+    if (payload)
+      payload();
+    return 8;
+  }
+  bool PrefersState(
+      const gufo::server::ContinuationState&) const noexcept override {
+    if (preference)
+      preference();
+    return false;
+  }
+};
+
+void TestLookupIdleSnapshotParityAndFreshness() {
+  using namespace gufo::server;
+  struct Case {
+    LookupTokens prompt;
+    bool root, marked, same_image, reuse;
+    std::size_t stable, live_count, matched;
+    std::string_view tier;
+  };
+  const std::vector<Case> cases{
+      {{1, 2, 3, 4, 5}, true, false, true, true, 2, 4, 4, "live"},
+      {{1, 2, 3, 4, 5}, false, false, true, true, 2, 4, 0, "none"},
+      {{1, 2, 3, 4, 5}, false, true, true, true, 2, 4, 4, "live"},
+      {{1, 2, 9}, true, false, true, true, 2, 4, 2, "ram"},
+      {{1, 2, 3, 4, 5}, true, false, false, true, 2, 4, 2, "ram"},
+      {{1, 2, 3, 4, 5}, true, true, true, false, 2, 4, 0, "none"},
+      {{1, 2, 3}, true, false, true, true, 0, 4, 3, "ram"},
+      {{1, 2, 3}, true, false, true, true, 0, 3, 3, "live"},
+      {{1, 2, 3, 4, 5}, true, true, true, true, 1, 4, 0, "none"},
+  };
+  for (const auto& test : cases) {
+    std::vector<std::size_t> invalidations(1);
+    ContinuationCache cache(
+        1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+        {.restore = [](auto&, const auto&) {},
+         .capacity_bytes = [] { return 32; },
+         .on_event = {}},
+        4);
+    const auto cold = cache.Lookup(test.prompt);
+    Expect(cold && cold->index_version > 0 && cold->snapshot_age_ms >= 0,
+           "even a cold metadata view carries its version and age");
+    const LookupTokens root{1, 2}, full{1, 2, 3};
+    LookupTokens live{1, 2, 3, 4};
+    live.resize(test.live_count);
+    const std::vector<std::uint8_t> image{7}, changed{8};
+    const std::vector<ContinuationInputPrefix> prefixes{{2, {}}};
+    auto seed =
+        cache.Acquire(full, {}, image, {}, true, test.marked ? 2 : 0, prefixes);
+    if (test.root) {
+      Expect(seed.TryReserveSnapshot(8, 2), "parity fallback fits");
+      seed.PublishSnapshot(root, std::make_shared<FakeSnapshot>(2, 8));
+    }
+    Expect(seed.TryReserveSnapshot(8, 3), "parity full checkpoint fits");
+    seed.Commit(full, std::make_shared<FakeSnapshot>(3, 8), live);
+    const auto& identity = test.same_image ? image : changed;
+    const auto lookup =
+        cache.Lookup(test.prompt, identity, test.reuse, test.stable, prefixes);
+    Expect(lookup && lookup->matched_tokens == test.matched &&
+               lookup->tier == test.tier &&
+               lookup->restore_bytes == (test.tier == "ram" ? 8U : 0U) &&
+               lookup->index_version > cold->index_version &&
+               lookup->snapshot_age_ms >= 0,
+           "idle metadata is exact for live, RAM, identity and fallback rules");
+    const auto repeated =
+        cache.Lookup(test.prompt, identity, test.reuse, test.stable, prefixes);
+    Expect(repeated->index_version == lookup->index_version &&
+               repeated->snapshot_age_ms >= lookup->snapshot_age_ms,
+           "lookup does not republish metadata or reset snapshot age");
+    auto lease = cache.Acquire(test.prompt, {}, identity, {}, test.reuse,
+                               test.stable, prefixes);
+    Expect(
+        lease.cached_tokens() == test.matched &&
+            lease.restored_snapshot_bytes() == lookup->restore_bytes,
+        "idle lookup agrees with acquisition, including extended live state");
+  }
+}
+
+void TestLookupRetainsCheckpointsWithAllSlotsBusy() {
+  using namespace gufo::server;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next = 0;
+  std::size_t restores = 0;
+  ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next++, &invalidations); },
+      {.restore = [&](auto&, const auto&) { ++restores; },
+       .capacity_bytes = [] { return 64; },
+       .on_event = {}},
+      6);
+  const LookupTokens root{1, 2}, full{1, 2, 3}, live{1, 2, 3, 4, 5};
+  const std::vector<std::uint8_t> image{9};
+  const std::vector<ContinuationInputPrefix> prefixes{{2, {}}};
+  auto seed = cache.Acquire(full, {}, image, {}, true, 2, prefixes);
+  Expect(seed.TryReserveSnapshot(8, 2), "root checkpoint fits");
+  seed.PublishSnapshot(root, std::make_shared<FakeSnapshot>(2, 8));
+  Expect(seed.TryReserveSnapshot(8, 3), "full checkpoint fits");
+  seed.Commit(full, std::make_shared<FakeSnapshot>(3, 8), live);
+  const auto idle = cache.Lookup(live, image, true, 2, prefixes);
+  Expect(idle && idle->matched_tokens == 5 && idle->tier == "live",
+         "idle lookup prefers the live frontier to an immutable checkpoint");
+  auto busy = cache.Acquire(live, {}, image, {}, true, 2, prefixes);
+  auto peer = cache.Acquire(LookupTokens{9});
+  const auto before = invalidations;
+  const auto restore_count = restores;
+  for (int i = 0; i < 1000; ++i) {
+    const auto result = cache.Lookup(live, image, true, 2, prefixes);
+    Expect(result && result->matched_tokens == 3 && result->tier == "ram" &&
+               result->restore_bytes == 8,
+           "busy live frontier is omitted but immutable checkpoint counts");
+    const auto changed = cache.Lookup(live, {}, true, 2, prefixes);
+    Expect(changed && changed->matched_tokens == 2,
+           "busy lookup preserves prefix image identities and fallback rules");
+    Expect(cache.Lookup(live, image, false, 2, prefixes)->matched_tokens == 0,
+           "reuse disabled still returns metadata while all slots are busy");
+  }
+  Expect(before == invalidations && restore_count == restores,
+         "metadata lookup neither invalidates nor restores a model state");
+  // Prefill publishes a checkpoint without releasing the execution slot.
+  const LookupTokens middle{1, 2, 3, 4};
+  Expect(busy.TryReserveSnapshot(8, 4), "intermediate checkpoint fits");
+  busy.PublishSnapshot(middle, std::make_shared<FakeSnapshot>(4, 8));
+  dynamic_cast<FakeState&>(busy.state()).value = 100;
+  const auto decoding = cache.Lookup(live, image, true, 2, prefixes);
+  Expect(decoding && decoding->matched_tokens == 4 && decoding->tier == "ram",
+         "mid-decode lookup omits unpublished frontier, keeps checkpoints");
+  busy.Invalidate();
+  Expect(cache.Lookup(live, image, true, 2, prefixes)->matched_tokens == 4,
+         "abandoning mutable state preserves published checkpoints");
+}
+
+void TestLookupDoesNotWaitForSelectionOrRestore() {
+  using namespace gufo::server;
+  for (const bool block_selection : {true, false}) {
+    CallbackGate gate;
+    std::atomic<std::size_t> payload_calls{0}, preference_calls{0};
+    std::vector<std::size_t> invalidations(1);
+    auto snapshot = std::make_shared<ProbedSnapshot>();
+    snapshot->payload = [&] { ++payload_calls; };
+    snapshot->preference = [&] {
+      ++preference_calls;
+      if (block_selection)
+        gate.Block();
+    };
+    ContinuationCache cache(
+        1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+        {.restore =
+             [&](auto&, const auto&) {
+               if (!block_selection)
+                 gate.Block();
+             },
+         .capacity_bytes = [] { return 64; },
+         .on_event = {}});
+    auto seed = cache.Acquire(LookupTokens{1, 2});
+    Expect(seed.TryReserveSnapshot(8, 2), "probed checkpoint fits");
+    seed.Commit({1, 2}, snapshot, {1, 2, 3, 4});
+    auto writer = std::async(std::launch::async, [&] {
+      return cache.Acquire(LookupTokens{1, 2, 3});
+    });
+    gate.WaitForEntry();
+    const auto payload_before = payload_calls.load();
+    const auto preference_before = preference_calls.load();
+    const auto owners_before = snapshot.use_count();
+    CheckBlockedLookup(gate, [&] {
+      return Reuses(cache, {1, 2, 3, 4, 5}, block_selection ? 4 : 2,
+                    block_selection ? "live" : "ram",
+                    block_selection ? 0 : 8) &&
+             Reuses(cache, {9}, 0, "none") && payload_calls == payload_before &&
+             preference_calls == preference_before &&
+             snapshot.use_count() == owners_before;
+    });
+    auto lease = writer.get();
+    Expect(lease.cache_hit() && lease.cached_tokens() == 2,
+           "lookup does not alter acquisition during blocked work");
+  }
+}
+
+void TestLookupRevokesLiveStateBeforeBlockedInvalidation() {
+  using namespace gufo::server;
+  CallbackGate gate;
+  struct BlockingState final : ContinuationState {
+    CallbackGate& gate;
+    explicit BlockingState(CallbackGate& gate) : gate(gate) {}
+    void Invalidate() noexcept override { gate.Block(); }
+  };
+  ContinuationCache cache(
+      1, [&] { return std::make_unique<BlockingState>(gate); });
+  cache.Acquire(LookupTokens{1, 2}).Commit({1, 2});
+  auto writer = std::async(std::launch::async,
+                           [&] { return cache.Acquire(LookupTokens{9}); });
+  CheckBlockedLookup(gate, [&] {
+    return Reuses(cache, {1, 2, 3}, 0, "none") && Reuses(cache, {9}, 0, "none");
+  });
+  auto lease = writer.get();
+}
+
+void TestLookupDuringBlockedCaptureAndEviction() {
+  using namespace gufo::server;
+  {
+    CallbackGate capture;
+    std::vector<std::size_t> invalidations(1);
+    ContinuationCache cache(
+        1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+        {.restore = [](auto&, const auto&) {},
+         .capacity_bytes = [] { return 32; },
+         .on_event = {}},
+        4);
+    auto seed = cache.Acquire(LookupTokens{1, 2});
+    Expect(seed.TryReserveSnapshot(8, 2), "existing checkpoint fits");
+    seed.Commit({1, 2}, std::make_shared<FakeSnapshot>(2, 8));
+    auto lease = cache.Acquire(LookupTokens{1, 2, 3, 4});
+    Expect(lease.TryReserveSnapshot(8, 4), "pending capture fits");
+    auto snapshot = std::make_shared<ProbedSnapshot>();
+    snapshot->payload = [&] { capture.Block(); };
+    auto writer = std::async(std::launch::async,
+                             [&] { lease.Commit({1, 2, 3, 4}, snapshot); });
+    CheckBlockedLookup(
+        capture, [&] { return Reuses(cache, {1, 2, 3, 4, 5}, 2, "ram", 8); });
+    writer.get();
+    Expect(Reuses(cache, {1, 2, 3, 4, 5}, 4, "ram", 8),
+           "finished capture publishes the new exact checkpoint");
+  }
+  for (const bool byte_pressure : {true, false}) {
+    CallbackGate destruction;
+    std::vector<std::size_t> invalidations(1);
+    ContinuationCache cache(
+        1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+        {.restore = [](auto&, const auto&) {},
+         .capacity_bytes = [=] { return byte_pressure ? 8 : 16; },
+         .on_event = {}},
+        1);
+    auto seed = cache.Acquire(LookupTokens{1, 2});
+    Expect(seed.TryReserveSnapshot(8, 2), "evicted checkpoint fits");
+    auto snapshot = std::make_shared<ProbedSnapshot>();
+    snapshot->destruction = [&] { destruction.Block(); };
+    std::weak_ptr<const ContinuationSnapshot> weak = snapshot;
+    seed.Commit({1, 2}, std::move(snapshot));
+    auto lease = cache.Acquire(LookupTokens{9});
+    auto writer = std::async(std::launch::async, [&] {
+      Expect(lease.TryReserveSnapshot(8, 1), "replacement checkpoint fits");
+      if (!byte_pressure)
+        lease.Commit({9}, std::make_shared<FakeSnapshot>(9, 8));
+    });
+    CheckBlockedLookup(destruction, [&] {
+      return weak.expired() && Reuses(cache, {1, 2}, 0, "none") &&
+             Reuses(cache, {9}, byte_pressure ? 0 : 1,
+                    byte_pressure ? "none" : "ram", byte_pressure ? 0 : 8);
+    });
+    writer.get();
+  }
+}
+
+void TestLookupRevokesStableFallbackBeforeEviction() {
+  using namespace gufo::server;
+  CallbackGate destruction;
+  std::vector<std::size_t> invalidations(1);
+  ContinuationCache cache(
+      1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+      {.restore = [](auto&, const auto&) {},
+       .capacity_bytes = [] { return 16; },
+       .on_event = {}},
+      4);
+  auto seed = cache.Acquire(LookupTokens{1, 2});
+  Expect(seed.TryReserveSnapshot(8, 2), "stable fallback fits");
+  auto snapshot = std::make_shared<ProbedSnapshot>();
+  snapshot->destruction = [&] { destruction.Block(); };
+  seed.Commit({1, 2}, std::move(snapshot));
+  auto full = cache.Acquire(LookupTokens{1, 2, 3});
+  Expect(full.TryReserveSnapshot(8, 3), "unmarked full checkpoint fits");
+  full.Commit({1, 2, 3}, std::make_shared<FakeSnapshot>(3, 8));
+  Expect(cache.Lookup(LookupTokens{1, 2, 3}, {}, true, 2)->matched_tokens == 3,
+         "an unmarked full checkpoint can reuse its retained stable fallback");
+  auto incoming = cache.Acquire(LookupTokens{9});
+  auto writer = std::async(std::launch::async, [&] {
+    Expect(incoming.TryReserveSnapshot(8, 1),
+           "reservation evicts the fallback");
+  });
+  CheckBlockedLookup(destruction, [&] {
+    const auto guarded = cache.Lookup(LookupTokens{1, 2, 3}, {}, true, 2);
+    return guarded && guarded->matched_tokens == 0 &&
+           Reuses(cache, {1, 2, 3}, 3, "ram", 8);
+  });
+  writer.get();
+}
+
+void TestLookupPublicationRaceStress() {
+  using namespace gufo::server;
+  for (const bool snapshot_mode : {false, true}) {
+    std::vector<std::size_t> invalidations(2);
+    std::size_t next = 0;
+    ContinuationCache::SnapshotSupport support;
+    if (snapshot_mode) {
+      support.restore = [](auto&, const auto&) {};
+      support.capacity_bytes = [] { return 64; };
+    }
+    ContinuationCache cache(
+        2, [&] { return std::make_unique<FakeState>(next++, &invalidations); },
+        std::move(support), 4);
+    const LookupTokens root{1, 2}, full{1, 2, 3}, live{1, 2, 3, 4};
+    auto seed = cache.Acquire(root);
+    if (snapshot_mode) {
+      Expect(seed.TryReserveSnapshot(8, 2), "stress root fits");
+      seed.Commit(root, std::make_shared<FakeSnapshot>(2, 8));
+    } else {
+      seed.Commit(live);
+    }
+    auto peer = cache.Acquire(LookupTokens{9});
+    std::atomic<bool> stop{false}, correct{true};
+    std::atomic<std::size_t> reads{0};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 3; ++i) {
+      readers.emplace_back([&] {
+        std::uint64_t last_version = 0;
+        do {
+          const auto result =
+              cache.Lookup(live, {}, true, snapshot_mode ? 2 : 0);
+          if (!result || result->index_version == 0 ||
+              result->index_version < last_version ||
+              result->snapshot_age_ms < 0 ||
+              !((result->matched_tokens == 0 && result->tier == "none" &&
+                 result->restore_bytes == 0) ||
+                (snapshot_mode && result->matched_tokens >= 2 &&
+                 result->matched_tokens <= 3 && result->tier == "ram" &&
+                 result->restore_bytes == 8) ||
+                (result->matched_tokens == 4 && result->tier == "live" &&
+                 result->restore_bytes == 0)))
+            correct = false;
+          if (result)
+            last_version = result->index_version;
+          ++reads;
+        } while (!stop.load());
+      });
+    }
+    for (int i = 0; i < 300; ++i) {
+      auto lease = cache.Acquire(live);
+      if (snapshot_mode) {
+        Expect(lease.TryReserveSnapshot(8, 3), "stress publication fits");
+        lease.PublishSnapshot(full, std::make_shared<FakeSnapshot>(3, 8));
+        lease.Commit({}, {}, live);
+      } else {
+        lease.Commit(live);
+      }
+    }
+    stop = true;
+    for (auto& reader : readers)
+      reader.join();
+    Expect(reads > 0 && correct,
+           "racing publication never returns busy, torn metadata or a payload");
+    Expect(Reuses(cache, live, 4, "live"),
+           "idle metadata is exact after racing publications stop");
+  }
+}
+
+}  // namespace
+
 int main() {
+  TestLookupRetainsCheckpointsWithAllSlotsBusy();
+  TestLookupIdleSnapshotParityAndFreshness();
+  TestLookupDoesNotWaitForSelectionOrRestore();
+  TestLookupRevokesLiveStateBeforeBlockedInvalidation();
+  TestLookupDuringBlockedCaptureAndEviction();
+  TestLookupRevokesStableFallbackBeforeEviction();
+  TestLookupPublicationRaceStress();
+  TestReadOnlyLookupKeepsLruAndUsesAcquirePlan();
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();
   TestColdMissThenExactExtensionHit();

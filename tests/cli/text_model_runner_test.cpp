@@ -520,6 +520,431 @@ public:
   }
 };
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+// Extend the existing snapshot fake with a token-dependent recurrent frontier
+// and real seeded sampling. This exercises the pool's ownership contract, NOT
+// native Qfn dispatch, MTP arithmetic, GPU state or a mixed implementation.
+class SampledSnapshotRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+
+  struct Observation {
+    std::size_t position, decode_count;
+    TextRunnerToken frontier, token;
+    std::uint64_t rng_before, rng_after;
+    std::optional<TextRunnerToken> pending_before, pending_after;
+    std::vector<TextRunnerToken> history;
+    std::vector<std::array<std::uint32_t, 3>> penalties;
+    bool direct;
+    bool operator==(const Observation&) const = default;
+  };
+
+  static TextRunnerToken Fold(TextRunnerToken state, TextRunnerToken token) {
+    return (state * 33 + token + 1) % 251;
+  }
+  static TextRunnerToken Frontier(std::span<const TextRunnerToken> tokens) {
+    TextRunnerToken value = 0;
+    for (const auto token : tokens)
+      value = Fold(value, token);
+    return value;
+  }
+  static std::array<float, 8> Logits(TextRunnerToken frontier) {
+    std::array<float, 8> logits{};
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      logits[i] = static_cast<float>((frontier + i * 17) % 29) / 9.0F;
+    return logits;
+  }
+  TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = SnapshotRunner::Descriptor();
+    descriptor.max_context = 8192;
+    descriptor.capabilities.multi_token_decode = true;
+    descriptor.capabilities.snapshot = snapshots_enabled;
+    descriptor.capabilities.fork = snapshots_enabled;
+    return descriptor;
+  }
+  TextPrefillStep Prefill(TextRunnerState& state,
+                          std::span<const TextRunnerToken> prompt,
+                          std::size_t offset,
+                          std::size_t budget) const override {
+    auto value = RequireFakeState(state).frontier.value_or(0);
+    const auto step = FakeRunner::Prefill(state, prompt, offset,
+                                          std::min(budget, pass_capacity));
+    for (const auto token : prompt.subspan(offset, step.consumed_tokens))
+      value = Fold(value, token);
+    last_state = &RequireFakeState(state);
+    last_state->frontier = value;
+    return step;
+  }
+  std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const override {
+    Expect(RequireFakeState(state).position == offset,
+           "planner reads the real snapshot frontier");
+    return std::min({budget, prompt.size() - offset, pass_capacity});
+  }
+  TextDecodeSelection SelectNext(
+      TextRunnerState& state,
+      gufo::sampling::SamplerState& sampler) const override {
+    const auto& fake = RequireFakeState(state);
+    const auto before = sampler.SaveDrawState();
+    const auto token = sampler.Sample(Logits(*fake.frontier));
+    const auto after = sampler.SaveDrawState();
+    std::vector<std::array<std::uint32_t, 3>> penalties;
+    for (const auto& penalty : sampler.penalties())
+      penalties.push_back(
+          {penalty.token, penalty.generated_count, penalty.repeated});
+    observations.push_back(
+        {fake.position,
+         fake.decode_count,
+         *fake.frontier,
+         token,
+         before.rng,
+         after.rng,
+         before.pending,
+         after.pending,
+         {sampler.history().begin(), sampler.history().end()},
+         std::move(penalties),
+         active_sampler == nullptr || active_sampler == &sampler});
+    return {.token = token, .piece = std::to_string(token)};
+  }
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& fake = RequireFakeState(state);
+    const auto value = Fold(*fake.frontier, token);
+    FakeRunner::Advance(state, token);
+    fake.frontier = value;
+    last_state = &fake;
+  }
+  gufo::server::TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t cap,
+      gufo::sampling::SamplerState& sampler) const override {
+    active_sampler = &sampler;
+    struct Clear {
+      const SampledSnapshotRunner& runner;
+      ~Clear() { runner.active_sampler = nullptr; }
+    } clear{*this};
+    if (!copied_decode || cap == 1) {
+      ++direct_steps;
+      return TextModelRunner::DecodeStep(state, cap, sampler);
+    }
+    // A copied-sampler RUNNER CONTRACT double: tentative Accepts stay private;
+    // the pool must accept only returned selections, once. A deferred next draw
+    // must survive into a subsequent generic remaining-one call.
+    auto working = sampler;
+    gufo::server::TextDecodeStep step;
+    for (std::size_t i = 0; i < std::min(cap, std::size_t{2}); ++i) {
+      auto selection = SelectNext(state, working);
+      Advance(state, selection.token);
+      working.Accept(selection.token);
+      step.selections.push_back(std::move(selection));
+    }
+    working.DeferSample(
+        working.Sample(Logits(*RequireFakeState(state).frontier)));
+    sampler.CopyDrawStateFrom(working);
+    ++copied_steps;
+    return step;
+  }
+
+  bool copied_decode{false};
+  bool snapshots_enabled{true};
+  std::size_t pass_capacity{4224};
+  mutable std::size_t direct_steps{0}, copied_steps{0};
+  mutable FakeState* last_state{nullptr};
+  mutable std::vector<Observation> observations;
+
+private:
+  mutable const gufo::sampling::SamplerState* active_sampler{nullptr};
+};
+
+gufo::sampling::SamplingConfig SeededSampling() {
+  return {.temperature = 0.8F,
+          .top_k = 6,
+          .top_p = 0.95F,
+          .seed = 91,
+          .repeat_penalty = 1.1F,
+          .repeat_last_n = 64,
+          .frequency_penalty = 0.2F,
+          .presence_penalty = 0.1F};
+}
+
+void ExpectSeededSelection(const SampledSnapshotRunner::Observation& actual,
+                           gufo::sampling::SamplerState& reference,
+                           TextRunnerToken frontier, std::size_t position,
+                           std::size_t generated, bool direct) {
+  const auto before = reference.SaveDrawState();
+  std::vector<std::array<std::uint32_t, 3>> penalties;
+  for (const auto& penalty : reference.penalties())
+    penalties.push_back(
+        {penalty.token, penalty.generated_count, penalty.repeated});
+  Expect(actual.position == position && actual.decode_count == generated &&
+             actual.frontier == frontier && actual.direct == direct &&
+             actual.rng_before == before.rng &&
+             actual.pending_before == before.pending &&
+             std::ranges::equal(actual.history, reference.history()) &&
+             actual.penalties == penalties,
+         "pool decoding preserves state, draw ownership and once-only history");
+  const auto token = reference.Sample(SampledSnapshotRunner::Logits(frontier));
+  const auto after = reference.SaveDrawState();
+  Expect(actual.token == token && actual.rng_after == after.rng &&
+             actual.pending_after == after.pending,
+         "seeded token and residual draw match the independent sampler");
+  reference.Accept(token);
+}
+
+std::vector<TextRunnerToken> CheckSeededContinuation(
+    TextRunnerPool::Request& request, const SampledSnapshotRunner& runner,
+    std::span<const TextRunnerToken> prompt,
+    std::span<const std::size_t> caps) {
+  gufo::sampling::SamplerState reference(SeededSampling(), prompt);
+  auto frontier = SampledSnapshotRunner::Frontier(prompt);
+  std::vector<TextRunnerToken> tokens;
+  for (const auto cap : caps) {
+    const auto begin = runner.observations.size();
+    const auto step = request.DecodeStep(cap);
+    const bool copied = runner.copied_decode && cap != 1;
+    Expect(
+        step.selections.size() == (copied ? std::min(cap, std::size_t{2}) : 1),
+        "the available runner interface retains its chosen decode route");
+    for (std::size_t i = 0; i < step.selections.size(); ++i) {
+      const auto& selection = step.selections[i];
+      ExpectSeededSelection(runner.observations.at(begin + i), reference,
+                            frontier, prompt.size() + tokens.size(),
+                            tokens.size(), !copied);
+      frontier = SampledSnapshotRunner::Fold(frontier, selection.token);
+      tokens.push_back(selection.token);
+    }
+    if (copied)
+      reference.DeferSample(
+          reference.Sample(SampledSnapshotRunner::Logits(frontier)));
+  }
+  // A real subsequent SelectNext observes the pool sampler AFTER all prior
+  // Accepts. Checking only runner-local working history would miss duplicates.
+  const auto probe = request.SelectNext();
+  ExpectSeededSelection(runner.observations.back(), reference, frontier,
+                        prompt.size() + tokens.size(), tokens.size(), true);
+  Expect(probe.token == runner.observations.back().token,
+         "the pool publishes the checked next selection");
+  return tokens;
+}
+
+void TestPoolSeededDirectAndCopiedSamplerOwnership() {
+  const std::vector<TextRunnerToken> prompt{2, 7, 1, 6};
+  std::vector<TextRunnerToken> direct_tokens;
+  for (const bool copied : {false, true}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<SampledSnapshotRunner>(stats);
+    runner->copied_decode = copied;
+    TextRunnerPool pool(runner, 1);
+    auto request = pool.Acquire(prompt, SeededSampling());
+    Expect(request.Prefill(64).decode_ready, "sampling prompt is ready");
+    const auto caps = copied ? std::vector<std::size_t>{3, 1, 3, 1}
+                             : std::vector<std::size_t>{3, 1, 3, 1, 3, 1};
+    const auto tokens = CheckSeededContinuation(request, *runner, prompt, caps);
+    if (copied)
+      Expect(tokens == direct_tokens && runner->copied_steps == 2 &&
+                 runner->direct_steps == 2,
+             "copied draws and direct tails preserve exact seeded output");
+    else {
+      direct_tokens = tokens;
+      Expect(runner->copied_steps == 0 && runner->direct_steps == 6,
+             "generic MTP-off contract never acquires a working sampler");
+    }
+    request.Invalidate();
+  }
+
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SampledSnapshotRunner>(stats);
+  TextRunnerPool pool(runner, 2);
+  auto first = pool.Acquire(prompt, SeededSampling());
+  const std::vector<TextRunnerToken> other{5, 3, 2};
+  auto second = pool.Acquire(other, SeededSampling());
+  Expect(first.Prefill(64).decode_ready && second.Prefill(64).decode_ready,
+         "both generic requests are ready");
+  std::array<TextRunnerPool::Request*, 2> requests{&first, &second};
+  const std::array<std::size_t, 2> caps{3, 1};
+  gufo::sampling::SamplerState a(SeededSampling(), prompt);
+  gufo::sampling::SamplerState b(SeededSampling(), other);
+  auto fa = SampledSnapshotRunner::Frontier(prompt);
+  auto fb = SampledSnapshotRunner::Frontier(other);
+  for (std::size_t round = 0; round < 3; ++round) {
+    const auto begin = runner->observations.size();
+    const auto steps =
+        pool.DecodeBatch(requests, caps, pool.SelectDecodePlan(2));
+    Expect(steps.size() == 2 && steps[0].selections.size() == 1 &&
+               steps[1].selections.size() == 1,
+           "generic multi-request DecodeBatch remains sequential scalar work");
+    ExpectSeededSelection(runner->observations.at(begin), a, fa,
+                          prompt.size() + round, round, true);
+    ExpectSeededSelection(runner->observations.at(begin + 1), b, fb,
+                          other.size() + round, round, true);
+    fa = SampledSnapshotRunner::Fold(fa, steps[0].selections[0].token);
+    fb = SampledSnapshotRunner::Fold(fb, steps[1].selections[0].token);
+  }
+  Expect(runner->copied_steps == 0 && runner->direct_steps == 6,
+         "a physical batch plan cannot invent a copied-sampler generic route");
+  (void)first.SelectNext();
+  ExpectSeededSelection(runner->observations.back(), a, fa, prompt.size() + 3,
+                        3, true);
+  (void)second.SelectNext();
+  ExpectSeededSelection(runner->observations.back(), b, fb, other.size() + 3, 3,
+                        true);
+  first.Invalidate();
+  second.Invalidate();
+}
+
+void TestPreparedRaggedCutsRestoreExactSeededContinuation() {
+  const std::vector<TextRunnerToken> prefix{2, 7, 1};
+  const std::vector<TextRunnerToken> prompt{2, 7, 1, 6, 3, 5, 2, 1, 4,
+                                            7, 6, 3, 2, 5, 1, 4, 6, 7};
+  // Restored p=3, stable b=11: proposals end b-1, b, b+1. No fake
+  // alignment grid may round these positive ragged cuts down to zero.
+  for (const std::size_t budget : {7U, 8U, 9U}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<SampledSnapshotRunner>(stats, 64, 256, 4096);
+    runner->pass_capacity = 9;
+    TextRunnerPool pool(runner, 2);
+    auto root = pool.Acquire(prefix, SeededSampling());
+    Expect(root.Prefill(3).decode_ready, "seed the unaligned real snapshot");
+    root.Commit();
+    auto pin = pool.Acquire(prefix, SeededSampling());
+    auto request = pool.Acquire(prompt, SeededSampling(), {}, {}, true, 11);
+    Expect(request.cached_prompt_tokens() == 3 &&
+               request.cache_restore_bytes() == sizeof(FakeSnapshot),
+           "the second physical slot restores the actual root payload");
+    const auto cut = request.PrepareSinglePassPrefill(budget);
+    Expect(cut == std::min(budget, std::size_t{8}),
+           "pool planning clips at the stable boundary, not the requested end");
+    const auto step = request.Prefill(*cut);
+    Expect(step.consumed_tokens == *cut && !step.decode_ready &&
+               request.prefill_position() == 3 + *cut,
+           "prepared work publishes only the actual consumed frontier");
+    for (const std::size_t next : {64U, 1U, 64U}) {
+      if (request.prefill_complete())
+        break;
+      auto prepared = request.PrepareSinglePassPrefill(next);
+      if (!prepared) {
+        Expect(request.SnapshotPending(), "decline waits on a real capture");
+        request.CapturePromptSnapshot();
+        prepared = request.PrepareSinglePassPrefill(next);
+      }
+      Expect(prepared && *prepared > 0 && *prepared <= next,
+             "alternating tiny/large proposals make positive legal progress");
+      Expect(request.Prefill(*prepared).consumed_tokens == *prepared,
+             "one prepared range is consumed exactly once");
+    }
+    Expect(request.prefill_complete(), "the short final tail is not discarded");
+    const auto state = runner->last_state;
+    Expect(state->position == prompt.size() && state->decode_count == 0 &&
+               state->frontier == SampledSnapshotRunner::Frontier(prompt),
+           "chunking preserves the token-dependent full recurrent payload");
+    request.Commit();
+    Expect(stats->snapshot_captures == 3,
+           "root, stable boundary and full prompt are each captured once");
+
+    // The only free destination held an unrelated later frontier. Poison it,
+    // then demand a real restore at b and compare warm and cold seeded output.
+    state->frontier = 777;
+    auto branch_prompt = prompt;
+    branch_prompt[11] = 99;
+    auto branch = pool.Acquire(branch_prompt, SeededSampling());
+    Expect(branch.cached_prompt_tokens() == 11 &&
+               branch.cache_restore_bytes() == sizeof(FakeSnapshot),
+           "restoring b cannot reuse a mislabeled later physical payload");
+    while (!branch.prefill_complete()) {
+      auto prepared = branch.PrepareSinglePassPrefill(64);
+      if (!prepared) {
+        branch.CapturePromptSnapshot();
+        prepared = branch.PrepareSinglePassPrefill(64);
+      }
+      Expect(prepared.has_value(), "the warm suffix has a legal single pass");
+      (void)branch.Prefill(*prepared);
+    }
+    const std::array<std::size_t, 2> caps{3, 1};
+    const auto warm =
+        CheckSeededContinuation(branch, *runner, branch_prompt, caps);
+    const auto warm_observations = runner->observations;
+    branch.Invalidate();
+    pin.Invalidate();
+
+    auto cold_runner =
+        std::make_shared<SampledSnapshotRunner>(std::make_shared<FakeStats>());
+    TextRunnerPool cold_pool(cold_runner, 1);
+    auto cold = cold_pool.Acquire(branch_prompt, SeededSampling());
+    Expect(cold.Prefill(64).decode_ready,
+           "independent cold reference is ready");
+    Expect(CheckSeededContinuation(cold, *cold_runner, branch_prompt, caps) ==
+                   warm &&
+               cold_runner->observations == warm_observations,
+           "warm equals cold in tokens/state/RNG/residual/history/penalties");
+    cold.Invalidate();
+  }
+}
+
+void TestPreparedNativeFrontierChangeRejectsBeforeMutation() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SampledSnapshotRunner>(stats);
+  runner->snapshots_enabled = false;
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> prompt{2, 7, 1, 6, 3, 5};
+  auto request = pool.Acquire(prompt, SeededSampling());
+  Expect(request.Prefill(2).consumed_tokens == 2,
+         "evolve a real token-dependent entry frontier");
+  const auto cut = request.PrepareSinglePassPrefill(4);
+  Expect(cut == 4, "freeze the complete remaining range");
+  const auto fingerprint = runner->last_state->frontier;
+  // A different native frontier must not be accepted merely because the pool
+  // still advertises p=2. This is a stale-plan guard negative, not the stronger
+  // native B3 claim of validating arbitrary self-consistently relabelled bytes.
+  runner->last_state->position = 1;
+  std::string error;
+  try {
+    (void)request.Prefill(*cut);
+  } catch (const std::logic_error& failure) {
+    error = failure.what();
+  }
+  Expect(error == "prepared single-pass boundary changed" &&
+             request.prefill_position() == 2 &&
+             stats->prefill_spans == std::vector<std::size_t>{2} &&
+             runner->last_state->frontier == fingerprint &&
+             runner->observations.empty(),
+         "stale state rejects before model execution or sampler mutation");
+  request.Invalidate();
+  auto retry = pool.Acquire(prompt, SeededSampling());
+  Expect(!retry.cache_hit() && retry.Prefill(64).decode_ready &&
+             runner->last_state->frontier ==
+                 SampledSnapshotRunner::Frontier(prompt),
+         "a stale plan cannot publish its mismatched state as reusable");
+  retry.Invalidate();
+}
+
+void TestPreparedNoGridCapacityAndTinyTails() {
+  for (const std::size_t capacity : {9U, 4096U, 4224U}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<SampledSnapshotRunner>(stats);
+    runner->pass_capacity = capacity;
+    // Disable snapshots to exercise the real no-boundary pool route, not its
+    // ordinary history grid. This is fake-model capacity coverage, not a
+    // native F16/OFF or Qfn capacity proof.
+    runner->snapshots_enabled = false;
+    TextRunnerPool pool(runner, 1);
+    auto request = pool.Acquire(std::vector<TextRunnerToken>(capacity + 2, 3),
+                                SeededSampling(), {}, {}, false);
+    const auto first = request.PrepareSinglePassPrefill(capacity + 1);
+    Expect(first == capacity,
+           "model capacity clips a larger positive proposal");
+    Expect(request.Prefill(*first).consumed_tokens == capacity,
+           "the no-grid pool does not gratuitously round the model cut");
+    for (std::size_t tail = 0; tail < 2; ++tail) {
+      const auto one = request.PrepareSinglePassPrefill(1);
+      Expect(one == 1, "remaining-one/two tails accept budget one");
+      const auto step = request.Prefill(*one);
+      Expect(step.consumed_tokens == 1 && step.decode_ready == (tail == 1),
+             "tiny tails neither overrun nor claim premature readiness");
+    }
+    request.Invalidate();
+  }
+}
+#endif
+
 class PartialRetentionRunner final : public SnapshotRunner {
 public:
   using SnapshotRunner::SnapshotRunner;
@@ -2579,9 +3004,41 @@ void TestServerInstructionsAreFraming() {
   }
 }
 
+void TestLookupRuntimeDefaultsAndDisabled() {
+  class IdentityRunner final : public FakeRunner {
+  public:
+    IdentityRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+    mutable std::size_t identity_calls{};
+    std::string LookupContextIdentity() const override {
+      ++identity_calls;
+      return "fake-sidecar";
+    }
+  };
+  const std::vector<TextRunnerToken> prompt{10};
+  auto disabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool no_lookup(disabled, 1, {}, {.publish_lookup = false});
+  Expect(disabled->identity_calls == 0,
+         "disabled lookup does not discover or hash an epoch");
+  Expect(no_lookup.Lookup(prompt).epoch.empty(),
+         "disabled lookup has no advisory epoch");
+  auto enabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool default_pool(enabled, 1);
+  Expect(
+      enabled->identity_calls == 1 &&
+          default_pool.Lookup(prompt).epoch.size() == 64,
+      "default CPU pools have a portable advisory epoch without strict pins");
+}
+
 }  // namespace
 
 int main() {
+  TestLookupRuntimeDefaultsAndDisabled();
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  TestPoolSeededDirectAndCopiedSamplerOwnership();
+  TestPreparedRaggedCutsRestoreExactSeededContinuation();
+  TestPreparedNoGridCapacityAndTinyTails();
+  TestPreparedNativeFrontierChangeRejectsBeforeMutation();
+#endif
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();

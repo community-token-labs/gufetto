@@ -452,6 +452,14 @@ Qwen27B and Flash-Next use the same options with these meanings:
 | `--cache-disk-staging-bytes` | Ignored, with an `event=option_ignored` warning. Disk transfers use an internal 1 MiB pinned buffer; checkpoints of any size stream through it. Its size did not change restore or write speed (#562), and a larger value only took pinned RAM and device heap. Earlier advice to raise staging no longer applies. |
 | `--cache-disk DIR` | Owned by one Qwen27B or Flash-Next server. A second one fails at startup, before committing its RAM budget, with an ownership error naming the directory. Other models do not take this lock. Startup removes earlier-release `*.kvc` and `.tmp-*` files from the directory, including those of another model's server sharing it. |
 
+Flash-Next additionally supports an opt-in operator-registered text prefix with
+`--pin-prefix-file FILE --pin-prefix-dir DIR`. Its one RAM root is outside the
+128 evictable records but charged to their same RAM ledger, and its dedicated
+byte-bounded store is outside normal disk LRU. Compatible restarts materialize
+it before readiness without re-prefill or another pin write. See
+[registered pinned prefixes](fork/PINNED-PREFIX.md) for exact rendering/identity
+requirements, lazy demand warming and the initial-creation RAM requirement.
+
 The 128-record limit stays internal. The following measured sizes and timings
 are Flash-Next evidence; Qwen27B qualification is recorded in its model card.
 Each Flash-Next checkpoint holds about 132 MB of

@@ -57,8 +57,8 @@ ResourceLedger ledger{{1ULL << 32, 1ULL << 32, 0, 0}};
 struct Directory {
   fs::path path;
   Directory() {
-    char name[] = "/tmp/gufo-disk-test-XXXXXX";
-    path = mkdtemp(name);
+    auto name = (fs::temp_directory_path() / "gufo-disk-test-XXXXXX").string();
+    path = mkdtemp(name.data());
   }
   ~Directory() { fs::remove_all(path); }
 };

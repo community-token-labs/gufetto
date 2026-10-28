@@ -28,6 +28,9 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_producer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_q8_prefill_view.hpp"
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -1021,7 +1024,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Optional pinned readback, reused by sampled scalar/batched routes.
     (void)e->host_allocations_.Allocate(
         &e->perf_ids_host_, std::size_t{e->options_.max_batch} *
-                               c.num_experts_used * sizeof(std::int32_t));
+                                c.num_experts_used * sizeof(std::int32_t));
   }
   const std::size_t T = e->options_.max_batch;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
@@ -1986,15 +1989,24 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  const auto wait_start = perf::current != nullptr && perf::forward_id != 0
-                              ? perf::Now()
-                              : 0;
+  const auto wait_start =
+      perf::current != nullptr && perf::forward_id != 0 ? perf::Now() : 0;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd::HostSpan pd_count_wait("route_count_readback_wait", "overlap_unknown",
+                             true, true);
+#endif
   const auto wait_status = hipEventSynchronize(counts_ready_);
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd_count_wait.Finish();
+#endif
   if (wait_start != 0)
     perf::RouteWait(perf::Now() - wait_start);
   if (!Check(wait_status, "expert counts", error_msg)) {
     return false;
   }
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd::HostSpan pd_map_build("route_tile_map_build", "host_only", true, true);
+#endif
   // The F16 expert GEMM launches one block per (expert, row tile of its
   // 16-padded bucket): the map is built here and uploaded ahead of the
   // launches on the same stream. Tile heights are multiples of 16, so a
@@ -2029,6 +2041,11 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd_map_build.Finish();
+  pd::HostSpan pd_map_upload("route_tile_map_upload", "enqueue_only", true,
+                             true);
+#endif
   return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
                                               n_tiles * sizeof(std::int32_t),
                                               hipMemcpyHostToDevice, stream_),
@@ -3249,6 +3266,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    pd::HostSpan pd_readback("route_count_readback", "enqueue_only", true,
+                             true);
+#endif
     if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
                               c.num_experts * sizeof(std::uint32_t),
                               hipMemcpyDeviceToHost, stream_),
@@ -3676,6 +3697,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
                    bool synchronize) const {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd::HostSpan pd_run("target_run", "host_wall_including_join_not_gpu_busy");
+#endif
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3713,6 +3737,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
               "graph capture", error_msg)) {
         return false;
       }
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      pd::HostSpan pd_capture("target_graph_capture_and_instantiate",
+                              "host_recording_and_instantiate_only");
+#endif
       const bool ok = body();
       if (!Check(hipStreamEndCapture(stream_, &captured), "graph capture end",
                  error_msg) ||
@@ -3879,7 +3907,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
   // Sampled eager calls observe actual ids; never capture host readbacks or
-  // reuse stale routing from a graph replay. Unsampled calls keep the fast path.
+  // reuse stale routing from a graph replay. Unsampled calls keep the fast
+  // path.
   perf::Forward perf_forward(mode == ForwardMode::kPrefill);
   perf_forward.Rows(start_pos, n);
   perf::HostPhase perf_trunk(mode == ForwardMode::kPrefill
@@ -4193,6 +4222,12 @@ bool Executor::ForwardBody(
   }
   const auto& layers = model_->layers();
   bool normed = normed_input;  ///< grouped norm of this bank's residual
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  // Narrow unsampled graph bodies run during capture, not on every replay.
+  // Leave body attribution missing there rather than invent replay timings.
+  pd::HostSpan pd_body("target_body", "host_submit_includes_private_state",
+                       prefill_phase || perf::sample_moe || n > kVecBatch);
+#endif
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;
@@ -4313,6 +4348,64 @@ bool Executor::ForwardBody(
                  false, no_f32) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
         return false;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      // sample_moe already forces eager target dispatch. Never read back while
+      // recording/replaying a graph, or use a synthetic order for compaction.
+      if (perf::sample_moe && perf::current != nullptr) {
+        try {
+          std::vector<pd::Row> observed_rows;
+          for (std::uint32_t r = 0; r < rows; ++r)
+            observed_rows.push_back({n - rows + r,
+                                     reinterpret_cast<std::uintptr_t>(&session),
+                                     std::uint64_t{start_pos} + n - rows + r});
+          const auto model = reinterpret_cast<std::uintptr_t>(model_);
+          const std::array tensors{
+              pd::Describe(l.ffn_gate_exps, model, il, pd::TensorRole::kGate),
+              pd::Describe(l.ffn_up_exps, model, il, pd::TensorRole::kUp),
+              pd::Describe(l.ffn_down_exps, model, il, pd::TensorRole::kDown)};
+          pd::DeviceRouting routing;
+          routing.execution = WmmaExperts(l, rows) ? pd::Execution::kRoutedF16
+                              : !ExpertMatrixRows(rows)
+                                  ? pd::Execution::kVector
+                                  : pd::Execution::kUnsupported;
+          routing.used = c.num_experts_used;
+          routing.ids = s_.ids;
+          if (routing.execution == pd::Execution::kRoutedF16) {
+            routing.bounds = s_.routed_bounds;
+            routing.tokens = s_.rows_token;
+            routing.slots = s_.rows_slot;
+            routing.compact_capacity = RoutedCompactRows(
+                std::size_t{rows} * c.num_experts_used, c.num_experts);
+            const bool wide = routed_64_tiles_ != 0;
+            routing.gate_tiles = {
+                tiles_host_ + (wide ? routed_pair_offset_ : 0),
+                wide ? routed_pair_tiles_ : routed_n_tiles_};
+            routing.down_tiles = {tiles_host_,
+                                  wide ? routed_64_tiles_ : routed_n_tiles_};
+            routing.gate_tile_rows = wide ? 128 : routed_tile_rows_;
+            routing.down_tile_rows = wide ? 64 : routed_tile_rows_;
+            routing.gate_output_rows = wide ? 64 : 128;
+          }
+          pd::RecordLayer(
+              tensors,
+              prefill_phase ? pd::ForwardRole::kPrompt
+                            : pd::ForwardRole::kDecoder,
+              observed_rows, routing,
+              [&](const std::int32_t* source, std::span<std::int32_t> host) {
+                const auto copy =
+                    hipMemcpyAsync(host.data(), source, host.size_bytes(),
+                                   hipMemcpyDeviceToHost, stream_);
+                // Always join before the temporary host storage is destroyed,
+                // including failed enqueue paths. Diagnostics never own
+                // scratch.
+                const auto joined = hipStreamSynchronize(stream_);
+                return copy == hipSuccess && joined == hipSuccess;
+              });
+        } catch (...) {
+          // Absent diagnostics are not successful coverage or serving errors.
+        }
+      }
+#endif
       if (perf::sample_moe)
         PerfRoutes(il, rows, ExpertMatrixRows(rows));
       Combine(s_.res, next_norm, rows, next_inject);
@@ -4337,9 +4430,16 @@ bool Executor::ForwardBody(
   }
   if (normed_output != nullptr)
     *normed_output = normed;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd_body.Finish();
+#endif
   if (end_layer < c.num_layers) {
     return true;
   }
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd::HostSpan pd_heads("target_heads_and_hidden_transfers", "host_submit",
+                        prefill_phase || perf::sample_moe || n > kVecBatch);
+#endif
   if (checkpoint) {
     if (checkpoint->hidden_rows != 0 &&
         !Check(hipMemcpyAsync(checkpoint->state->mtp_.target_hidden,

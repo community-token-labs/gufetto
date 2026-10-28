@@ -18,6 +18,7 @@
 #include "src/cache/adapter.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/pinned_prefix.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 #include "src/core/sampling.hpp"
@@ -57,6 +58,12 @@ struct TextRunnerRamCacheOptions {
   /// False keeps no RAM checkpoints and reserves no RAM-cache backing, and
   /// capacity_bytes is ignored. Sessions still reuse their own live state.
   bool enabled{true};
+  TextRunnerPinnedPrefixOptions pinned_prefix;
+  // Embedding pools expose portable advisory Lookup by default. The server
+  // wires this to its opt-in route flag: disabled lookup skips publication and
+  // epoch discovery/hashing. This does not enable strict pins or transfer.
+  bool publish_lookup{true};
+  bool transfer_api{false};
 };
 
 /// Parses a --cache-ram-bytes value: "off", or a byte count where 0 selects
@@ -301,6 +308,9 @@ public:
   TextModelRunner& operator=(TextModelRunner&&) = delete;
 
   [[nodiscard]] virtual TextRunnerDescriptor Descriptor() const = 0;
+  /// Additional loaded-model identity not carried by continuation persistence
+  /// (for example the vision projector). Called only when creating the pool.
+  [[nodiscard]] virtual std::string LookupContextIdentity() const { return {}; }
   [[nodiscard]] virtual TextRunnerResourceClaim ResourceClaim() const = 0;
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
@@ -364,6 +374,12 @@ public:
       return std::nullopt;
     return TextPreparedPrompt{std::move(*tokens), {}};
   }
+  /// Same rendering, identity and boundary planning, without image-cache LRU
+  /// touches. Runners with mutable prompt preparation must override this.
+  [[nodiscard]] virtual std::optional<TextPreparedPrompt> PrepareLookupPrompt(
+      const ChatRequest& request) const {
+    return PreparePrompt(request);
+  }
   /// Size a prompt without execution-context admission or inference. Image
   /// runners override this to include their model's visual token expansion.
   [[nodiscard]] virtual std::optional<std::size_t> CountPromptTokens(
@@ -408,6 +424,9 @@ public:
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const;
   /// Whether restored component state can select its next token. A boundary
   /// captured between prefill passes cannot, so it serves only longer prompts.
+  /// Whether every coherent full checkpoint is decodable without inspecting
+  /// opaque private bytes. Runners with partial-prefill frontiers override.
+  [[nodiscard]] virtual bool LookupFullCheckpointReady() const { return false; }
   [[nodiscard]] virtual bool HasDecodeFrontier(const TextRunnerState&) const {
     return true;
   }
@@ -461,6 +480,15 @@ public:
       const std::function<std::unique_ptr<TextRunnerSnapshot>()>& = {}) const {
     throw std::logic_error("runner does not support in-pass checkpoints");
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  /// Read-only model-owned limit for ONE target pass; null declines before
+  /// decoder/RNG mutation. Component ownership is still prepared by the pool.
+  [[nodiscard]] virtual std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
+      std::size_t) const {
+    return std::nullopt;
+  }
+#endif
   [[nodiscard]] virtual TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const = 0;
   virtual void Advance(TextRunnerState& state, TextRunnerToken token) const = 0;
@@ -606,6 +634,12 @@ public:
 
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    /// Freeze a legal serial cut; pending capture/model decline returns null.
+    /// PreparePrefill/GrowAhead is a growth hint, NOT a memory reservation.
+    [[nodiscard]] std::optional<std::size_t> PrepareSinglePassPrefill(
+        std::size_t max_input_tokens);
+#endif
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);
@@ -663,6 +697,20 @@ public:
       bool stop_at_eos = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
+  /// Read-only published Acquire inventory. Never waits for admission,
+  /// metadata mutation, a free execution slot or device work. Unknown reuse
+  /// during publication is conservatively omitted, not a busy error.
+  [[nodiscard]] TextGenerationBackend::CacheLookupResult Lookup(
+      std::span<const TextRunnerToken>, const TextPromptContext* = nullptr,
+      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0) const;
+
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Export(
+      std::span<const TextRunnerToken>, const TextPromptContext*, bool,
+      std::size_t stable, std::string_view configuration) const;
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Import(
+      const CheckpointTransferReader&, std::uint64_t,
+      std::string_view configuration) const;
+
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
   /// leasing a state. An upper bound: Acquire may still prefer a shorter one.
   [[nodiscard]] std::size_t CachedPrefixTokens(
@@ -681,6 +729,8 @@ private:
 
 /// Build output constraints and attach server-authored instructions as framing,
 /// preserving client message content and the model's native prompt layout.
+/// A null sampling pointer prepares framing only, without cached grammar
+/// binding.
 [[nodiscard]] std::optional<ChatRequest> ConstrainChatRequest(
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,

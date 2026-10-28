@@ -12,6 +12,7 @@
 #include <future>
 #include <initializer_list>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1029,6 +1030,24 @@ void TestIndexedPrefixLookup() {
       SaveTokens(store, runner, {7, 45}, *MakeSnapshot(runner, 999, 2)).stored,
       "shorter prefix splits an existing compressed edge");
   auto state = runner.CreateState();
+  const std::vector<TextRunnerToken> lookup_prompt{7, 45, 8, 9, 10};
+  const auto entries = store.entry_count(), retained = store.retained_bytes();
+  std::map<std::filesystem::path, std::filesystem::file_time_type> stamps;
+  for (const auto& file : std::filesystem::directory_iterator(directory.path()))
+    if (file.is_regular_file())
+      stamps[file.path()] = file.last_write_time();
+  for (int i = 0; i < 100; ++i) {
+    const auto lookup = store.Lookup(runner, lookup_prompt, {}, 2);
+    Expect(lookup && lookup->matched_tokens == 4 && lookup->tier == "disk",
+           "lookup shares the disk restore plan without reading payload");
+  }
+  Expect(store.Lookup(runner, lookup_prompt, {}, 1)->matched_tokens == 0,
+         "lookup honors the same stable fallback gate");
+  Expect(store.entry_count() == entries && store.retained_bytes() == retained,
+         "lookup never admits or evicts a disk record");
+  for (const auto& [file, stamp] : stamps)
+    Expect(std::filesystem::last_write_time(file) == stamp,
+           "lookup never touches disk LRU timestamps");
   Expect(RestoreTokens(store, runner, *state, {7, 45, 8, 9, 10}).token_count ==
                  4 &&
              RequireFakeState(*state).value == 45,

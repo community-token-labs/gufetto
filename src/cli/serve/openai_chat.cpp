@@ -2128,6 +2128,14 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["draft_rounds"] = result.draft_rounds;
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  metrics["serial_shadow_mixed_eligible"] = false;
+  metrics["serial_shadow_steps"] = result.serial_shadow_steps;
+  metrics["serial_shadow_unsupported"] = result.serial_shadow_unsupported;
+  metrics["serial_shadow_plan_declined"] = result.serial_shadow_plan_declined;
+  metrics["serial_shadow_verifier_rows_upper"] =
+      result.serial_shadow_verifier_rows_upper;
+#endif
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;
   metrics["max_prefill_chunk_tokens"] = result.max_prefill_chunk_tokens;
   metrics["queue_depth_at_submit"] = result.queue_depth_at_submit;
@@ -3909,6 +3917,157 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
                                     bool stream, std::string_view model) {
   return CreateCompatibilityResponse<AnthropicOutput>(
       request, backend, chat, max_tokens, sampling, stream, model);
+}
+
+namespace {
+HttpResponse TransferError(const CheckpointTransferError& error) {
+  const char* reason = "Bad Request";
+  switch (error.status) {
+    case 404:
+      reason = "Not Found";
+      break;
+    case 409:
+      reason = "Conflict";
+      break;
+    case 413:
+      reason = "Payload Too Large";
+      break;
+    case 503:
+      reason = "Service Unavailable";
+      break;
+    case 507:
+      reason = "Insufficient Storage";
+      break;
+  }
+  return Error(error.status, reason, error.code, error.code);
+}
+}  // namespace
+HttpResponse HandleCacheExport(const HttpRequest& request,
+                               TextGenerationBackend& backend) {
+  ParsedChatRequest parsed;
+  const auto defaults = backend.sampling_defaults();
+  parsed.max_tokens = defaults.max_tokens;
+  parsed.sampling = defaults.sampling;
+  if (auto error = ParseRequest(request, backend, &parsed))
+    return std::move(*error);
+  if (!backend.ready())
+    return Error(503, "Service Unavailable", "model service is not ready",
+                 "not_ready");
+  try {
+    auto blob = backend.cache_export(parsed.chat);
+    if (!blob)
+      return Error(501, "Not Implemented",
+                   "checkpoint transfer is not supported",
+                   "cache_transfer_unsupported");
+    return HttpResponse{
+        .headers = {{"Content-Type", "application/vnd.gufo.checkpoint"},
+                    {"Content-Length", std::to_string(blob->Bytes())},
+                    {"Cache-Control", "no-store"}},
+        .streaming_body = [blob](const HttpResponse::BodyWriter& writer) {
+          blob->Write([&](auto bytes) {
+            return writer(
+                {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+          });
+        }};
+  } catch (const CheckpointTransferError& error) {
+    return TransferError(error);
+  } catch (const TextGenerationError& error) {
+    return GenerationError(error);
+  } catch (const std::invalid_argument&) {
+    return Error(400, "Bad Request", "invalid export prompt",
+                 "cache_transfer_invalid_prompt");
+  } catch (const std::length_error&) {
+    return Error(400, "Bad Request", "export prompt exceeds context",
+                 "context_length_exceeded");
+  }
+}
+HttpResponse HandleCacheImport(const HttpRequest& request,
+                               TextGenerationBackend& backend) {
+  if (!backend.ready())
+    return Error(503, "Service Unavailable", "model service is not ready",
+                 "not_ready");
+  if (request.header("content-type") != "application/vnd.gufo.checkpoint")
+    return Error(415, "Unsupported Media Type",
+                 "checkpoint content type required",
+                 "cache_transfer_content_type");
+  if (!request.body_reader)
+    return Error(400, "Bad Request", "checkpoint Content-Length required",
+                 "cache_transfer_invalid");
+  try {
+    auto blob =
+        backend.cache_import(request.body_reader, request.content_length);
+    if (!blob)
+      return Error(501, "Not Implemented",
+                   "checkpoint transfer is not supported",
+                   "cache_transfer_unsupported");
+    json::Value body = json::Value::object();
+    body["admitted_tokens"] = blob->Header().manifest.tokens.size();
+    body["payload_bytes"] = blob->PayloadBytes();
+    body["epoch"] = blob->Header().epoch;
+    body["tier"] = "ram";
+    return HttpResponse{.body = body.dump(),
+                        .headers = {{"Content-Type", "application/json"},
+                                    {"Cache-Control", "no-store"}}};
+  } catch (const CheckpointTransferError& error) {
+    return TransferError(error);
+  }
+}
+
+HttpResponse HandleCacheLookup(const HttpRequest& request,
+                               TextGenerationBackend& backend) {
+  const auto started = std::chrono::steady_clock::now();
+  ParsedChatRequest parsed;
+  const auto defaults = backend.sampling_defaults();
+  parsed.max_tokens = defaults.max_tokens;
+  parsed.sampling = defaults.sampling;
+  if (auto error = ParseRequest(request, backend, &parsed))
+    return std::move(*error);
+  if (!backend.ready())
+    return Error(503, "Service Unavailable", "model service is not ready",
+                 "not_ready");
+  try {
+    const auto result = backend.cache_lookup(parsed.chat);
+    if (!result)
+      return Error(501, "Not Implemented",
+                   "cache lookup is not supported by the loaded backend",
+                   "cache_lookup_unsupported");
+    Logger::Info("cache", "schema=cache-lookup-v1 event=http_lookup request=" +
+                              request.request_id + " lookup_id=" +
+                              std::to_string(result->observation_id));
+    json::Value body = json::Value::object();
+    body["total_tokens"] = result->total_tokens;
+    body["matched_tokens"] = result->matched_tokens;
+    body["tier"] = result->tier;
+    body["restore_estimate_ms"] =
+        result->restore_estimate_ms ? json::Value(*result->restore_estimate_ms)
+                                    : json::Value();
+    body["prefill_estimate_ms"] =
+        result->prefill_estimate_ms ? json::Value(*result->prefill_estimate_ms)
+                                    : json::Value();
+    body["epoch"] = result->epoch;
+    body["semantics"] = "advisory";
+    body["index_version"] = result->index_version;
+    body["snapshot_age_ms"] = result->snapshot_age_ms;
+    // Includes HTTP body parsing, image decoding, rendering, tokenization and
+    // the index query, but excludes network I/O and JSON response encoding.
+    body["lookup_ms"] = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+    return HttpResponse{
+        .body = body.dump(),
+        .headers = {{"Content-Type", "application/json"},
+                    {"Cache-Control", "no-store"}},
+        .log_details =
+            "cache_lookup_id=" + std::to_string(result->observation_id),
+    };
+  } catch (const TextGenerationError& exception) {
+    return GenerationError(exception);
+  } catch (const std::invalid_argument&) {
+    return Error(400, "Bad Request", "invalid lookup prompt", "invalid_prompt");
+  } catch (const std::length_error&) {
+    return Error(400, "Bad Request", "lookup prompt exceeds context",
+                 "context_length_exceeded");
+  }
 }
 
 HttpResponse HandleOpenAiChat(const HttpRequest& request,

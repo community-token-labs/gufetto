@@ -8,6 +8,9 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -987,6 +990,10 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     }
     const auto& layers = model_->layers();
     bool normed = false;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    pd::HostSpan pd_body("target_batch_body",
+                         "host_submit_includes_private_state");
+#endif
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
       if (!AnyActive(items))
         return true;
@@ -1107,6 +1114,43 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         return false;
       if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
         return false;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      if (perf::sample_moe && perf::current != nullptr) {
+        try {
+          std::vector<pd::Row> observed_rows;
+          for (std::size_t i = 0; i < items.size(); ++i)
+            for (std::uint32_t r = 0; r < items[i].tokens.size(); ++r)
+              observed_rows.push_back(
+                  {offsets[i] + r,
+                   reinterpret_cast<std::uintptr_t>(items[i].session),
+                   std::uint64_t{items[i].session->position_} + r});
+          const auto model = reinterpret_cast<std::uintptr_t>(model_);
+          const std::array tensors{
+              pd::Describe(l.ffn_gate_exps, model, il, pd::TensorRole::kGate),
+              pd::Describe(l.ffn_up_exps, model, il, pd::TensorRole::kUp),
+              pd::Describe(l.ffn_down_exps, model, il, pd::TensorRole::kDown)};
+          // MoeBatch's Q4 route is explicitly vector; other formats segment
+          // into <=8-row vector calls. Internal vector grouping is not exposed,
+          // so only logical packed-address coverage (not tile loads) is
+          // claimed.
+          pd::DeviceRouting routing;
+          routing.execution = pd::Execution::kVector;
+          routing.used = c.num_experts_used;
+          routing.ids = base.ids;
+          pd::RecordLayer(
+              tensors, pd::ForwardRole::kDecoder, observed_rows, routing,
+              [&](const std::int32_t* source, std::span<std::int32_t> host) {
+                const auto copy =
+                    hipMemcpyAsync(host.data(), source, host.size_bytes(),
+                                   hipMemcpyDeviceToHost, stream_);
+                const auto joined = hipStreamSynchronize(stream_);
+                return copy == hipSuccess && joined == hipSuccess;
+              });
+        } catch (...) {
+          // Missing evidence is not positive coverage or a serving failure.
+        }
+      }
+#endif
       if (perf::sample_moe)
         PerfRoutes(il, rows);
       const float* next_norm =
@@ -1118,6 +1162,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       CombineBatch(base.res, next_norm, rows);
       normed = next_norm != nullptr;
     }
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    pd_body.Finish();
+    pd::HostSpan pd_heads("target_batch_heads_and_hidden_transfers",
+                          "host_submit");
+#endif
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
@@ -1146,7 +1195,13 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   }
   if (perf::current != nullptr)
     perf_events_.Stop(stream_);
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd::HostSpan pd_join("target_batch_join", "overlap_unknown");
+#endif
   const auto status = hipStreamSynchronize(stream_);
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  pd_join.Finish();
+#endif
   if (status == hipSuccess && ok)
     perf_target.Finish();
   UseScratch(base);

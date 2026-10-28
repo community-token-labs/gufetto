@@ -1,4 +1,7 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -22,6 +25,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/target_probe.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -763,6 +767,18 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
   return items.empty() || exec.MtpForwardBatch(items, error_msg);
 }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+std::optional<std::size_t> Session::SinglePassPrefillLimit(
+    std::size_t remaining, std::size_t budget) const noexcept {
+  if (!valid_ || image_prompt_ || remaining == 0 || budget == 0)
+    return std::nullopt;
+  return std::min<std::size_t>({budget, remaining,
+                                remaining <= model_->PrefillThroughCapacity()
+                                    ? model_->PrefillThroughCapacity()
+                                    : model_->PrefillCapacity()});
+}
+#endif
+
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
@@ -1073,6 +1089,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return true;
   }
   const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  // This is the live session distribution used by the executing sampler,
+  // including the restored first-decode frontier, not a checkpoint export.
+  detail::ProbeTargetLogits(static_cast<std::uint32_t>(tokens_.size()),
+                            logits_);
+  detail::ProbeTargetToken(static_cast<std::uint32_t>(tokens_.size()), anchor,
+                           is_stop(anchor));
   if (is_stop(anchor)) {
     result->stop = true;
     return true;
@@ -1195,7 +1217,20 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const auto is_stop = [&](std::int32_t token) {
     return request.stop_at_eos && model_->IsStopToken(token);
   };
+  // Snapshot only the requested target rows, before any verification work.
+  // ReadVerificationRows honors SelectBatchLogits' session offset. These are
+  // fresh target LM-head results, not MTP proposals or stored payload logits.
+  const auto probe = detail::TargetProbeRange(base + 1, k);
+  std::vector<float> probe_logits;
+  if (pending.speculative && probe.second != 0) {
+    probe_logits.resize(std::size_t{probe.second - probe.first} * vocab);
+    if (!exec.ReadVerificationRows(probe.first - base - 1, probe_logits,
+                                   error_msg))
+      return false;
+  }
   if (!pending.speculative) {
+    detail::ProbeTargetLogits(base + 1, logits_);
+    detail::ProbeTargetToken(base, anchor);
     draft_length_.ObserveArToken();
     hidden_base_ = base;
     tokens_.push_back(anchor);
@@ -1308,6 +1343,22 @@ bool Session::FinishDecode(const DecodeRequest& request,
     std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
                 logits_.begin());
   }
+  // Publish only committed teacher-forced rows, including the next-token
+  // frontier after the last kept input. Discarded candidate rows never leak
+  // into the comparison. Do not change verification, rollback or sampling.
+  if (!probe_logits.empty()) {
+    for (auto position = probe.first;
+         position < std::min(probe.second, base + keep + 1); ++position) {
+      detail::ProbeTargetLogits(
+          position,
+          std::span<const float>(probe_logits)
+              .subspan(std::size_t{position - probe.first} * vocab, vocab));
+    }
+  }
+  for (std::uint32_t i = 0; i < keep; ++i)
+    detail::ProbeTargetToken(base + i, chain[i]);
+  if (result->stop)
+    detail::ProbeTargetToken(base + keep, 0, true);
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
@@ -1360,6 +1411,12 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   valid_ = false;
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+  auto provenance = pd::current_association;
+  provenance.model_filtered = 1;
+  // Preserve backend-MTP-batch provenance when isolation leaves a singleton.
+  pd::AssociationScope association(provenance);
+#endif
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
@@ -1451,6 +1508,11 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
   std::string shared_error;
   try {
     if (!active.empty()) {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+      auto provenance = pd::current_association;
+      provenance.model_filtered = active.size();
+      pd::AssociationScope association(provenance);
+#endif
       if constexpr (std::is_same_v<Request, DecodeRequest>)
         (void)DecodeBatchImpl(active, &shared_error);
       else

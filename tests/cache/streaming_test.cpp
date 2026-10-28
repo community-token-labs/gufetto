@@ -20,8 +20,9 @@ namespace {
 struct Directory {
   fs::path path;
   Directory() {
-    char pattern[] = "/tmp/gufo-streaming-test-XXXXXX";
-    path = mkdtemp(pattern);
+    auto pattern =
+        (fs::temp_directory_path() / "gufo-streaming-test-XXXXXX").string();
+    path = mkdtemp(pattern.data());
   }
   ~Directory() { fs::remove_all(path); }
 };

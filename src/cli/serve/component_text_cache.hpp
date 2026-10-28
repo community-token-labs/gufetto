@@ -7,8 +7,10 @@
 
 #include "src/cache/checkpoint.hpp"
 #include "src/cache/streaming.hpp"
+#include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/pinned_prefix.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 
 namespace gufo::server {
@@ -56,6 +58,10 @@ struct ComponentCacheResources {
   // usable without a pool-capacity contract.
   std::size_t transfer_batch_size{1};
   std::size_t reassignment_batch_size{1};
+  // Deterministic CPU fixtures only; empty in production providers. Hooks may
+  // pause at lookup_observed, admission, selected, or mutation (owner locked).
+  // They must not re-enter this cache from the same thread.
+  std::function<void(std::string_view)> test_barrier;
 };
 
 class ComponentTextCache {
@@ -107,12 +113,26 @@ public:
                      std::size_t ram_bytes,
                      const std::optional<TextRunnerDiskCacheOptions>&,
                      bool automatic_ram = false, std::size_t ceiling_bytes = 0,
-                     bool ram_enabled = true);
+                     const TextRunnerPinnedPrefixOptions& pins = {},
+                     bool ram_enabled = true, bool publish_lookup = true);
   ~ComponentTextCache();
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,
       const ContinuationCache::CancellationCheck&,
       std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool);
+  [[nodiscard]] std::optional<ContinuationReuse> Lookup(
+      std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
+      std::size_t stable) const;
+  [[nodiscard]] std::span<const std::uint8_t> CompatibilityIdentity() const;
+  // Transfer never acquires/replaces an execution slot. Export pins only
+  // immutable checkpoints; Import publishes once after complete verification.
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Export(
+      std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
+      std::size_t stable, std::string configuration) const;
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> Import(
+      const CheckpointTransferReader&, std::uint64_t content_length,
+      std::string_view configuration);
+
   // A disk job is writing a prefix of the prompt much deeper than any
   // restorable boundary; admission may wait for it instead of prefilling.
   // A nonzero checkpoint ID follows that one job, even if another deeper job
@@ -126,6 +146,7 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
+  void InitializePins(const TextRunnerPinnedPrefixOptions&);
   std::unique_ptr<Impl> impl_;
 };
 

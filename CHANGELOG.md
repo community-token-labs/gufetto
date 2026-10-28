@@ -61,6 +61,21 @@ Notable user-facing changes are recorded here. Gufo follows
   separate K/V-only catch-up and opt-in trace counters. Defaults unchanged.
   See [qualification gates](docs/models/qwen3.8-flash-next/MTP-Q4KM.md).
 
+## Fork experiment: P/D prerequisites
+
+- Add experimental adaptive-decoder (AD) and serial-shadow (SC) measurement
+  prerequisites, plus gated prompt/decode diagnostics. Both build flags are OFF
+  by default; enabled prerequisite builds still default to runtime `legacy` with
+  budget zero. No mixed-step kernel is added, and production mixed-step
+  feasibility remains **INCONCLUSIVE**. See
+  [scope and qualification limits](docs/experimental-prefill-prerequisites.md).
+- Preserve the Phase 2 finding: fixed 2048/1024 prompt grants are rejected for
+  throughput at S2, S3 and S4. They nevertheless reduced peer-overlap payload-gap
+  p95 by about 42–43% / 64–65% respectively in S2/S3; these are client-side proxy
+  gaps, not native token percentiles or a full-32K responsiveness qualification.
+  Native mean publication ITL worsened; the partial tail-relief result is retained,
+  not promoted to a throughput, quality or adoption win.
+
 ## [0.24.0](https://github.com/gufo-org/gufo/compare/v0.23.0...v0.24.0) (2026-10-25)
 
 

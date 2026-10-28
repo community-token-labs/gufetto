@@ -183,6 +183,14 @@ public:
   /// Token count of raw text (no generation).
   [[nodiscard]] std::size_t count_tokens(std::string_view text) const override;
 
+  [[nodiscard]] std::optional<CacheLookupResult> cache_lookup(
+      const ChatRequest& request) const override;
+
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> cache_export(
+      const ChatRequest&) const override;
+  [[nodiscard]] std::shared_ptr<CheckpointTransferBlob> cache_import(
+      const CheckpointTransferReader&, std::uint64_t) const override;
+
   /// Prompt tokens of a chat request as generation would prepare them.
   [[nodiscard]] std::optional<std::size_t> count_chat_tokens(
       const ChatRequest& request) const override;
@@ -197,5 +205,13 @@ private:
 };
 
 }  // namespace gufo::server
+
+// Keep optional diagnostic includes after the original declarations. Inserting
+// lines at the top of inference_backend.cpp would change HIP_CHECK's __LINE__
+// even when diagnostics are OFF. The prerequisite helper is already supplied
+// by text_generation_scheduler.hpp when its build option is enabled.
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+#include "src/models/qwen38_flash_next/pd_profile.hpp"
+#endif
 
 #endif  // GUFO_SERVER_INFERENCE_BACKEND_HPP_

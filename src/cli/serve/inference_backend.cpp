@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/kv_cache_options.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
@@ -50,6 +51,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/target_probe.hpp"
 #endif
 
 namespace gufo::server {
@@ -137,7 +139,7 @@ std::optional<std::size_t> CountQwenPromptTokens(
 TextPreparedPrompt PrepareQwenPrompt(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache) {
+    std::uint32_t max_context, models::qwen::vision::ImageCache* image_cache) {
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
   const auto options = QwenChatOptions(request, max_context);
@@ -149,9 +151,9 @@ TextPreparedPrompt PrepareQwenPrompt(
               : std::span<const tokenization::ChatTool>{request.tools},
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
-          max_context, request.cache_prompt ? &image_cache : nullptr));
-  if (has_images && Logger::Enabled(LogLevel::kDebug)) {
-    const auto stats = image_cache.GetStats();
+          max_context, request.cache_prompt ? image_cache : nullptr));
+  if (image_cache && has_images && Logger::Enabled(LogLevel::kDebug)) {
+    const auto stats = image_cache->GetStats();
     Logger::LogFormatted(LogLevel::kDebug, "vision",
                          "event=image_cache enabled=%d entries=%zu "
                          "pixel_bytes=%zu encoded_bytes=%zu "
@@ -1043,6 +1045,10 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
 
 class QwenTextRunner final : public HipTextModelRunner {
 public:
+  std::string LookupContextIdentity() const override {
+    const auto encoder = model_->VisionEncoder();
+    return encoder ? std::string(encoder->identity()) : std::string{};
+  }
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
@@ -1115,6 +1121,9 @@ public:
     if (!qwen.frontier())
       qwen.set_frontier(
           0);  // Partial prefill: the suffix computes its frontier.
+  }
+  [[nodiscard]] bool LookupFullCheckpointReady() const override {
+    return false;
   }
   [[nodiscard]] bool HasDecodeFrontier(
       const TextRunnerState& state) const override {
@@ -1246,7 +1255,13 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             image_cache_);
+                             &image_cache_);
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PrepareLookupPrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->GetTokenizer(),
+                             model_->VisionEncoder(), max_context_, nullptr);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -2337,6 +2352,9 @@ bool FingerprintArtifactFile(std::string_view label,
 constexpr std::string_view kQwenFlashNextStateAbi =
     "qwen38-flash-next-rocm-session-v1";
 
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+namespace qfn_pd = models::qwen38_flash_next::pd;
+#endif
 using QwenFlashNextModel = models::qwen38_flash_next::Model;
 using QwenFlashNextSession = models::qwen38_flash_next::Session;
 
@@ -2412,6 +2430,14 @@ const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
 
 class QwenFlashNextTextRunner final : public HipTextModelRunner {
 public:
+  // Flash-Next's existing HasDecodeFrontier contract treats every coherent
+  // private-state boundary as selectable. PrefixIndex checks exact per-
+  // component positions; it never rounds a hybrid frontier to a token LCP.
+  bool LookupFullCheckpointReady() const override { return true; }
+  std::string LookupContextIdentity() const override {
+    const auto encoder = model_->VisionEncoder();
+    return encoder ? std::string(encoder->identity()) : std::string{};
+  }
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
@@ -2425,9 +2451,9 @@ public:
         use_mtp_(use_mtp),
         max_draft_tokens_(max_draft_tokens) {
     // The typed in-process API owns an immutable loaded model but need not
-    // supply file fingerprints when disk caching is disabled. Its model
-    // lifetime is an exact process-local identity; durable caches still
-    // require the validated full artifact fingerprints below.
+    // supply file fingerprints when disk caching and prefix pins are disabled.
+    // Its model lifetime is an exact process-local identity; durable caches
+    // still require the validated full artifact fingerprints below.
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
@@ -2584,7 +2610,13 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->tokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             image_cache_);
+                             &image_cache_);
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PrepareLookupPrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->tokenizer(),
+                             model_->VisionEncoder(), max_context_, nullptr);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
@@ -2678,6 +2710,22 @@ public:
     };
   }
 
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  [[nodiscard]] std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const override {
+    const auto& qfn = RequireQwenFlashNextState(state);
+    if (offset != qfn.position() || offset >= prompt.size() ||
+        qfn.session().Tokens().size() != offset)
+      return std::nullopt;
+    // Ordinary text Sync below uses this same native capacity rule. The pool
+    // ends this serial cut at captures; no SyncThrough/interior checkpoint.
+    // This admits SERIAL component work, NOT mixed component eligibility.
+    const auto remaining = prompt.size() - offset;
+    return qfn.session().SinglePassPrefillLimit(remaining, budget);
+  }
+#endif
+
   [[nodiscard]] std::optional<std::size_t> PrefillCheckpointBytes(
       const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget,
@@ -2760,7 +2808,12 @@ public:
           "Qwen3.8-Flash-Next token selection has no logits");
     }
     const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
-    if (EndsTurn(qfn, *model_, token)) {
+    const bool stop = EndsTurn(qfn, *model_, token);
+    models::qwen38_flash_next::detail::ProbeTargetLogits(
+        static_cast<std::uint32_t>(qfn.position()), logits);
+    models::qwen38_flash_next::detail::ProbeTargetToken(
+        static_cast<std::uint32_t>(qfn.position()), token, stop);
+    if (stop) {
       return {.stop = true, .token = 0, .piece = {}};
     }
     return {
@@ -2792,7 +2845,20 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    auto provenance = qfn_pd::current_association;
+    provenance.backend_filtered = provenance.backend_filtered.value_or(1);
+    provenance.route = !use_mtp_ || max_tokens == 1
+                           ? qfn_pd::LegacyRoute::kGeneric
+                           : qfn_pd::LegacyRoute::kScalarMtp;
+    qfn_pd::AssociationScope association(provenance);
+#endif
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    if (detail::QfnBackendRoute(use_mtp_, 1, max_tokens) ==
+        detail::DecodeRoute::kGenericScalar) {
+#else
     if (!use_mtp_ || max_tokens == 1) {
+#endif
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -2867,7 +2933,20 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+    auto provenance = qfn_pd::current_association;
+    provenance.backend_filtered = decodes.size();
+    provenance.route = use_mtp_ && decodes.size() >= 2
+                           ? qfn_pd::LegacyRoute::kBackendMtpBatch
+                           : qfn_pd::LegacyRoute::kGeneric;
+    qfn_pd::AssociationScope association(provenance);
+#endif
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+    if (detail::QfnBackendRoute(use_mtp_, decodes.size(), 0) !=
+        detail::DecodeRoute::kEngineBatch) {
+#else
     if (decodes.size() < 2 || !use_mtp_) {
+#endif
       return TextModelRunner::DecodeBatch(decodes);
     }
     const auto count = decodes.size();
@@ -2950,7 +3029,12 @@ private:
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
+    State(TextPrefillPolicy prefill, TextSchedulerPolicy scheduler)
+        : prefill_policy(prefill), scheduler_policy(scheduler) {}
+    TextPrefillPolicy prefill_policy;
+    TextSchedulerPolicy scheduler_policy;
     std::shared_ptr<TextGenerationScheduler> scheduler;
+    std::shared_ptr<TextRunnerPool> runner_pool;
     std::string model_id;
     std::vector<std::string> extra_model_ids;
     SamplingDefaults sampling_defaults;
@@ -3077,6 +3161,12 @@ bool InferenceBackend::load(
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
+  if (ram_cache_config.pinned_prefix.enabled() && architecture != "qwen4exp") {
+    SetError(error,
+             "Pinned prefixes require Qwen3.8-Flash-Next (GGUF architecture "
+             "qwen4exp); this model is unsupported");
+    return false;
+  }
   if (!cli::ValidateKvCacheTypeForArchitecture(kv_cache_type, architecture,
                                                error))
     return false;
@@ -3228,17 +3318,20 @@ bool InferenceBackend::load(
               " original_context=" + std::to_string(qwen4exp_native_context) +
               " context=" + std::to_string(max_context));
     }
-    // RAM checkpoints cannot outlive this loaded model. Their process-local
-    // identity is sufficient; hashing every shard here adds a complete model
-    // read on each fresh container start even when disk caching is disabled.
-    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+    // Transfer, like durable tiers, requires full artifact hashes even with
+    // ordinary disk caching disabled.
+    if ((DiskCacheEnabled(resolved_disk_cache_config) ||
+         ram_cache_config.pinned_prefix.enabled() ||
+         ram_cache_config.transfer_api) &&
         resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
         !FingerprintArtifact(
             "Qwen3.8-Flash-Next", *reader,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+    if ((DiskCacheEnabled(resolved_disk_cache_config) ||
+         ram_cache_config.pinned_prefix.enabled() ||
+         ram_cache_config.transfer_api) &&
         speculative_config.backend == TextSpeculativeBackend::kMtp &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
@@ -3310,6 +3403,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
+    return false;
+  }
+  if (ram_cache_config.pinned_prefix.enabled()) {
+    SetError(error,
+             "Pinned prefixes require Qwen3.8-Flash-Next (qwen4exp); "
+             "ordinary Qwen models are unsupported");
     return false;
   }
   if (max_context == 0)
@@ -3407,7 +3506,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     }
 
     PrepareVision(model->VisionEncoder());
-    auto new_state = std::make_shared<Impl::State>();
+    auto new_state =
+        std::make_shared<Impl::State>(prefill_policy, scheduler_policy);
     new_state->sampling_defaults.model =
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
@@ -3428,11 +3528,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     }
     Logger::Info("loader",
                  "event=load_phase phase=sessions " + Logger::MemoryStatus());
-    auto runner_pool = std::make_shared<TextRunnerPool>(
+    auto& runner_pool = new_state->runner_pool;
+    runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3453,6 +3554,12 @@ bool InferenceBackend::load(
     TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
+    return false;
+  }
+  if (ram_cache_config.pinned_prefix.enabled()) {
+    SetError(error,
+             "Pinned prefixes require Qwen3.8-Flash-Next (qwen4exp); "
+             "DeepSeek models are unsupported");
     return false;
   }
   if (max_context == 0)
@@ -3496,7 +3603,8 @@ bool InferenceBackend::load(
   }
 
   try {
-    auto new_state = std::make_shared<Impl::State>();
+    auto new_state =
+        std::make_shared<Impl::State>(prefill_policy, scheduler_policy);
     new_state->sampling_defaults.model =
         sampling::TextModelPreset::kDeepSeekV4Flash;
     new_state->sampling_defaults.supplied = {};
@@ -3515,11 +3623,12 @@ bool InferenceBackend::load(
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
+    auto& runner_pool = new_state->runner_pool;
+    runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3570,6 +3679,16 @@ bool InferenceBackend::load(
              "floors are unsupported");
     return false;
   }
+  if ((ram_cache_config.pinned_prefix.enabled() ||
+       ram_cache_config.transfer_api) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)))) {
+    SetError(error,
+             "Qwen3.8-Flash-Next pinned prefixes require valid model and "
+             "enabled MTP draft artifact SHA-256 fingerprints");
+    return false;
+  }
   if (DiskCacheEnabled(disk_cache_config) &&
       (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
        (speculative_config.backend == TextSpeculativeBackend::kMtp &&
@@ -3582,7 +3701,8 @@ bool InferenceBackend::load(
   }
   try {
     PrepareVision(model->VisionEncoder());
-    auto new_state = std::make_shared<Impl::State>();
+    auto new_state =
+        std::make_shared<Impl::State>(prefill_policy, scheduler_policy);
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
@@ -3602,11 +3722,12 @@ bool InferenceBackend::load(
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
       };
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
+    auto& runner_pool = new_state->runner_pool;
+    runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3990,6 +4111,89 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
 #else
   (void)text;
   return 0;
+#endif
+}
+
+std::optional<InferenceBackend::CacheLookupResult>
+InferenceBackend::cache_lookup(const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto started = Clock::now();
+  const auto state = impl_->Snapshot();
+  if (!state || !state->runner_pool)
+    return std::nullopt;
+  const auto& runner = state->scheduler->runner();
+  // Share framing with generation, but do not bind/touch cached grammars.
+  auto constrained = ConstrainChatRequest(request, runner, nullptr);
+  const auto& effective = constrained ? *constrained : request;
+  auto prompt = runner.PrepareLookupPrompt(effective);
+  if (!prompt || prompt->tokens.empty())
+    return std::nullopt;
+  auto result = state->runner_pool->Lookup(
+      prompt->tokens, prompt->context.get(), request.cache_prompt,
+      prompt->cache_prefix_tokens);
+  const auto& policy = state->scheduler_policy;
+  std::ostringstream flags;
+  flags << policy.max_pending_requests << ':'
+        << policy.max_pending_requests_per_client << ':'
+        << policy.max_output_bytes_per_request << ':'
+        << policy.max_buffered_output_bytes_per_request << ':'
+        << policy.max_buffered_output_bytes_total << ':'
+        << policy.request_timeout.count() << ':' << policy.stall_timeout.count()
+        << ':' << policy.device_probe_interval.count() << ':'
+        << policy.stream_start_delay.count() << ':' << policy.log_progress;
+  result.epoch =
+      CacheLookupConfiguredEpoch(result.epoch, state->reasoning_defaults,
+                                 state->prefill_policy.decode_active_tokens,
+                                 flags.str(), state->build_info);
+  result.lookup_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+  return result;
+#else
+  (void)request;
+  return std::nullopt;
+#endif
+}
+
+std::shared_ptr<CheckpointTransferBlob> InferenceBackend::cache_export(
+    const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (!state || !state->runner_pool)
+    return {};
+  const auto& runner = state->scheduler->runner();
+  if (runner.Descriptor().state_abi != kQwenFlashNextStateAbi)
+    return {};
+  auto constrained = ConstrainChatRequest(request, runner, nullptr);
+  const auto& effective = constrained ? *constrained : request;
+  auto prompt = runner.PrepareLookupPrompt(effective);
+  if (!prompt || prompt->tokens.empty())
+    return {};
+  return state->runner_pool->Export(
+      prompt->tokens, prompt->context.get(), request.cache_prompt,
+      prompt->cache_prefix_tokens,
+      CheckpointTransferPolicy(state->reasoning_defaults,
+                               state->prefill_policy.decode_active_tokens));
+#else
+  (void)request;
+  return {};
+#endif
+}
+std::shared_ptr<CheckpointTransferBlob> InferenceBackend::cache_import(
+    const CheckpointTransferReader& reader, std::uint64_t length) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (!state || !state->runner_pool ||
+      state->scheduler->runner().Descriptor().state_abi !=
+          kQwenFlashNextStateAbi)
+    return {};
+  return state->runner_pool->Import(
+      reader, length,
+      CheckpointTransferPolicy(state->reasoning_defaults,
+                               state->prefill_policy.decode_active_tokens));
+#else
+  (void)reader;
+  (void)length;
+  return {};
 #endif
 }
 

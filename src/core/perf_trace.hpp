@@ -1,8 +1,6 @@
 #ifndef GUFO_CORE_PERF_TRACE_HPP_
 #define GUFO_CORE_PERF_TRACE_HPP_
 
-#include <unistd.h>
-
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -22,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/platform/os_info.hpp"
+
 namespace gufo::perf {
 
 inline std::uint64_t Now() noexcept {
@@ -38,7 +38,7 @@ public:
     if (path == nullptr || *path == '\0')
       return;
     run_id = Now();
-    process_id = static_cast<std::uint64_t>(getpid());
+    process_id = static_cast<std::uint64_t>(platform::ProcessId());
     stream_.open(path, std::ios::app);
     enabled = stream_.is_open();
     if (!enabled) {
@@ -78,7 +78,9 @@ inline Writer& Sink() {
   static Writer writer;
   return writer;
 }
-inline bool Enabled() { return Sink().enabled; }
+inline bool Enabled() {
+  return Sink().enabled;
+}
 
 struct Session {
   std::uint64_t slot, request_id, context_depth;
@@ -153,10 +155,11 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
   o << "{\"schema\":1,\"run_id\":" << Sink().run_id
     << ",\"pid\":" << Sink().process_id << ",\"thread_id\":" << r.thread_id
     << ",\"kind\":\"" << r.kind << "\",\"start_ns\":" << r.start_ns
-    << ",\"end_ns\":" << end << ",\"queue\":{\"prefilling_waiting\":"
-    << r.prefilling_waiting << ",\"decoders_due\":" << r.decoders_due
-    << ",\"capturing\":" << r.capturing
-    << ",\"waiting\":" << r.waiting << "},\"tokens_budget\":" << r.tokens_budget
+    << ",\"end_ns\":" << end
+    << ",\"queue\":{\"prefilling_waiting\":" << r.prefilling_waiting
+    << ",\"decoders_due\":" << r.decoders_due
+    << ",\"capturing\":" << r.capturing << ",\"waiting\":" << r.waiting
+    << "},\"tokens_budget\":" << r.tokens_budget
     << ",\"tokens_requested\":" << r.tokens_requested
     << ",\"tokens_processed\":" << r.tokens_processed
     << ",\"through\":" << (r.through ? "true" : "false")
@@ -172,8 +175,8 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
   o << "],\"forwards\":[";
   sep = "";
   for (const auto& f : r.forwards) {
-    o << sep << "{\"forward\":" << f.forward << ",\"prefill\":"
-      << (f.prefill ? "true" : "false") << ",\"sessions\":[";
+    o << sep << "{\"forward\":" << f.forward
+      << ",\"prefill\":" << (f.prefill ? "true" : "false") << ",\"sessions\":[";
     const char* row_sep = "";
     for (const auto& [depth, rows] : f.sessions) {
       o << row_sep << "{\"context_depth\":" << depth << ",\"rows\":" << rows

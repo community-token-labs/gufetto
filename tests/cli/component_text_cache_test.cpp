@@ -3,12 +3,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cassert>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
@@ -16,11 +21,16 @@
 #include <thread>
 
 #include "src/cache/retention.hpp"
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+#include "src/cli/serve/text_generation_scheduler.hpp"
+#endif
+#include "src/core/platform/env.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -44,13 +54,17 @@ public:
   bool in_pass{};
   bool partial{};
   std::size_t private_blocks{128};
+  std::size_t row_blocks{2048};
+  std::uint32_t max_context{4096};
   cache::Rows rows_per_chunk{4};
   mutable std::size_t through_calls{};
+  std::function<void(std::string_view)> barrier;
   bool UsesComponentCache() const override { return true; }
+  bool LookupFullCheckpointReady() const override { return true; }
   TextRunnerDescriptor Descriptor() const override {
     return {.model_id = "component-fake",
             .state_abi = "component-fake-v1",
-            .max_context = 4096,
+            .max_context = max_context,
             .capabilities = {.incremental_prefill = true,
                              .snapshot = true,
                              .fork = true,
@@ -95,11 +109,12 @@ public:
     auto blocks = std::make_shared<std::vector<Block>>();
     // Physical backing commits once, before any request; assigned owner tokens
     // account for the entire block including unused bytes.
-    auto data = std::make_shared<std::vector<std::byte>>(2048 * 16 +
+    auto data = std::make_shared<std::vector<std::byte>>(row_blocks * 16 +
                                                          private_blocks * 64);
-    for (std::size_t i = 0; i < 2048 + private_blocks; ++i) {
-      const auto size = i < 2048 ? 16ULL : 64ULL;
-      const auto offset = i < 2048 ? i * 16 : 2048 * 16 + (i - 2048) * 64;
+    for (std::size_t i = 0; i < row_blocks + private_blocks; ++i) {
+      const auto size = i < row_blocks ? 16ULL : 64ULL;
+      const auto offset =
+          i < row_blocks ? i * 16 : row_blocks * 16 + (i - row_blocks) * 64;
       auto reservation =
           ledger.Reserve(cache::ResourceCategory::kBackingFree, size);
       auto bytes = std::span(*data).subspan(offset, size);
@@ -115,6 +130,10 @@ public:
       if (defer_idle && std::this_thread::get_id() != foreground)
         return {};
       return std::make_unique<FakeStream>(true);
+    };
+    resources->test_barrier = [this](std::string_view point) {
+      if (barrier)
+        barrier(point);
     };
     resources->transfer_batch_size = 4;
     resources->allocate = [this, blocks,
@@ -177,6 +196,15 @@ public:
                      prompt.subspan(offset, count));
     return {count, offset + count == prompt.size()};
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  std::optional<std::size_t> SinglePassPrefillLimit(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const override {
+    if (offset != CheckpointPosition(state) || offset >= prompt.size())
+      return std::nullopt;
+    return std::min(budget, prompt.size() - offset);
+  }
+#endif
   std::optional<std::size_t> PrefillCheckpointBytes(
       const TextRunnerState&, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget,
@@ -432,6 +460,11 @@ void FailedRestoreResetsOnce() {
   auto failed = cache.Acquire(prompt, {}, {}, true, 0, true);
   assert(!failed->cache_hit());
   assert(runner->adapter->Invalidations() == before + 2);
+  const auto metrics = failed->Metrics();
+  assert(metrics.restore_attempts == 1 && metrics.restore_failures == 1);
+  assert(metrics.restore_failure_reason == "ram_transfer");
+  // A rejected source must not remain advertised as executable after fallback.
+  assert(cache.Lookup(prompt, nullptr, true, 0)->matched_tokens == 0);
   auto& cold = dynamic_cast<State&>(failed->state());
   runner->adapter->Append(cold.slot, prompt, prompt);
   assert(runner->adapter->RecurrentHash(cold.slot) ==
@@ -739,6 +772,7 @@ void PartialFrontierDoesNotServeAnEqualPrompt() {
         ready.push_back(CheckpointPosition(state));
       return step;
     }
+    bool LookupFullCheckpointReady() const override { return false; }
     bool HasDecodeFrontier(const TextRunnerState& state) const override {
       return std::ranges::find(ready, CheckpointPosition(state)) != ready.end();
     }
@@ -761,7 +795,10 @@ void PartialFrontierDoesNotServeAnEqualPrompt() {
     }
     const std::vector<TextRunnerToken> equal(prompt.begin(),
                                              prompt.begin() + 16);
+    const auto lookup = pool.Lookup(equal);
+    assert(lookup.matched_tokens < equal.size());
     auto resend = pool.Acquire(equal, {}, {}, {}, true, 0);
+    assert(resend.cached_prompt_tokens() == lookup.matched_tokens);
     assert(resend.cached_prompt_tokens() < equal.size());
     Prefill(resend);
     (void)Generate(resend);
@@ -891,7 +928,10 @@ void ReuseAndBranches() {
   assert(!failed_restore.cache_hit());
   Prefill(failed_restore);
   assert(Generate(failed_restore) == token);
-  failed_restore.Invalidate();
+  // The rejected checkpoint is quarantined. Re-publish only after the cold
+  // execution has rebuilt and verified this boundary, not by retrying poison.
+  assert(failed_restore.component_cache_metrics()->restore_failures == 1);
+  assert(failed_restore.Commit().snapshot_bytes > 0);
   auto history = prompt;
   history.push_back(token);
   auto continued = pool.Acquire(history);
@@ -1009,11 +1049,44 @@ void RestartAndCorruption() {
   {
     auto runner = std::make_shared<Runner>();
     TextRunnerPool pool(runner, 1, disk);
+    const auto lookup = pool.Lookup(prompt);
+    assert(lookup.tier == "disk" && lookup.matched_tokens == prompt.size());
+    const auto captures = runner->captures;
+    for (int i = 0; i < 20; ++i)
+      assert(pool.Lookup(prompt).matched_tokens == prompt.size());
+    assert(runner->captures == captures);
     auto retry = pool.Acquire(prompt);
+    assert(retry.cached_prompt_tokens() == lookup.matched_tokens);
     assert(retry.cache_disk_hit());
     assert(retry.cached_prompt_tokens() == prompt.size());
     assert(Generate(retry) == token);
     (void)retry.Commit();
+  }
+  for (const bool enabled : {true, false}) {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache exporter(runner, 1, 1 << 22, disk, false, 0, {},
+                                enabled);
+    assert(exporter.Lookup(prompt, nullptr, true, 0)->tier == "disk");
+    auto blob = exporter.Export(prompt, nullptr, true, 0, "disk-transfer-v20");
+    std::vector<std::uint8_t> wire;
+    blob->Write([&](auto bytes) {
+      wire.insert(wire.end(), bytes.begin(), bytes.end());
+      return true;
+    });
+    auto destination_runner = std::make_shared<Runner>();
+    ComponentTextCache destination(destination_runner, 1, 1 << 22, {});
+    std::size_t offset = 0;
+    (void)destination.Import(
+        [&](std::span<std::uint8_t> out) {
+          const auto n = std::min(out.size(), wire.size() - offset);
+          std::memcpy(out.data(), wire.data() + offset, n);
+          offset += n;
+          return n;
+        },
+        wire.size(), "disk-transfer-v20");
+    assert(destination.Lookup(prompt, nullptr, true, 0)->tier == "ram");
+    auto restored = destination.Acquire(prompt, {}, {}, true, 0, true);
+    assert(restored->cached_tokens() == prompt.size());
   }
   for (const auto& kind : {"chunks", "private"}) {
     for (const auto& file :
@@ -2415,6 +2488,991 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   assert(log.find("event=capture_failed") == std::string::npos);
   std::filesystem::remove_all(directory);
 }
+// Registered pins intentionally retain the strict Linux runtime contract.
+#if defined(__linux__)
+class PinRunner final : public Runner {
+public:
+  mutable std::size_t prefilled{};
+  TextRunnerDescriptor Descriptor() const override {
+    auto descriptor = Runner::Descriptor();
+    descriptor.persistence = TextRunnerPersistenceDescriptor{{1, 2, 3}, 1};
+    return descriptor;
+  }
+  std::vector<TextRunnerToken> TokenizeControl(
+      std::string_view text) const override {
+    std::istringstream input{std::string(text)};
+    std::vector<TextRunnerToken> tokens;
+    TextRunnerToken token;
+    while (input >> token)
+      tokens.push_back(token);
+    return tokens;
+  }
+  TextPrefillStep Prefill(TextRunnerState& state,
+                          std::span<const TextRunnerToken> prompt,
+                          std::size_t offset,
+                          std::size_t budget) const override {
+    const auto step = Runner::Prefill(state, prompt, offset, budget);
+    prefilled += step.consumed_tokens;
+    return step;
+  }
+  TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& s = dynamic_cast<State&>(state);
+    const auto hash = s.adapter.RecurrentHash(s.slot);
+    std::array<float, 8> logits;
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      logits[i] = static_cast<float>((hash >> (8 * i)) & 255) / 64;
+    return {.token = static_cast<TextRunnerToken>(sampler.Sample(logits)),
+            .piece = "x"};
+  }
+};
+struct PinFixture {
+  TemporaryDirectory temporary{"gufo-pinned-prefix-test"};
+  std::filesystem::path root{temporary.path()};
+  TextRunnerPinnedPrefixOptions options;
+  std::vector<TextRunnerToken> tokens{10, 11, 12, 13, 14, 15, 16, 17};
+  PinFixture() {
+    options.files = {root / "rendered.txt"};
+    options.directory = root / "pins";
+    options.capacity_bytes = 1 << 20;
+    WriteTokens();
+  }
+  void WriteTokens() const {
+    std::ofstream file(options.files.front());
+    for (const auto token : tokens)
+      file << token << ' ';
+  }
+  void AddTokens(std::span<const TextRunnerToken> prefix) {
+    options.files.push_back(
+        root / ("rendered-" + std::to_string(options.files.size()) + ".txt"));
+    std::ofstream file(options.files.back());
+    for (const auto token : prefix)
+      file << token << ' ';
+  }
+  std::uintmax_t ManagedBytes() const {
+    std::uintmax_t bytes = 0;
+    for (const auto& file :
+         std::filesystem::recursive_directory_iterator(options.directory))
+      if (file.is_regular_file())
+        bytes += file.file_size();
+    return bytes;
+  }
+  auto Files() const {
+    std::map<std::filesystem::path,
+             std::pair<std::uintmax_t, std::filesystem::file_time_type>>
+        result;
+    for (const auto& file :
+         std::filesystem::recursive_directory_iterator(options.directory))
+      if (file.is_regular_file())
+        result[file.path()] = {file.file_size(), file.last_write_time()};
+    return result;
+  }
+};
+void PinnedPrefixRestartReplayAndNoRewrite() {
+  for (const bool ordinary_disk : {false, true}) {
+    PinFixture fixture;
+    std::optional<TextRunnerDiskCacheOptions> disk;
+    if (ordinary_disk)
+      disk = TextRunnerDiskCacheOptions{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20};
+    auto prompt = fixture.tokens;
+    prompt.insert(prompt.end(), {100, 101, 102});
+    std::array<std::vector<TextRunnerToken>, 2> expected;
+    for (std::size_t mode = 0; mode < expected.size(); ++mode) {
+      auto cold_runner = std::make_shared<PinRunner>();
+      TextRunnerPool cold(cold_runner, 1);
+      auto request = cold.Acquire(
+          prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
+      Prefill(request);
+      for (int i = 0; i < 8; ++i)
+        expected[mode].push_back(Generate(request));
+      request.Invalidate();
+    }
+    {
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = fixture.options});
+      assert(runner->prefilled == fixture.tokens.size());
+      const auto lookup = pool.Lookup(prompt);
+      assert(lookup.tier == "ram" &&
+             lookup.matched_tokens == fixture.tokens.size());
+      for (std::size_t mode = 0; mode < expected.size(); ++mode) {
+        auto request = pool.Acquire(
+            prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
+        assert(request.cached_prompt_tokens() == fixture.tokens.size());
+        assert(!request.cache_disk_hit());
+        Prefill(request);
+        for (const auto token : expected[mode])
+          assert(Generate(request) == token);
+        request.Invalidate();
+      }
+    }
+    const auto published = fixture.Files();
+    for (const bool lazy : {false, true}) {
+      auto options = fixture.options;
+      options.lazy = lazy;
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
+      assert(runner->prefilled == 0);  // restart must not recompute the root
+      const auto lookup = pool.Lookup(prompt);
+      assert(lookup.tier == (lazy ? "disk" : "ram"));
+      assert(lookup.matched_tokens == fixture.tokens.size());
+      assert(fixture.Files() == published);
+      for (std::size_t mode = 0; mode < expected.size(); ++mode) {
+        auto request = pool.Acquire(
+            prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
+        assert(request.cached_prompt_tokens() == fixture.tokens.size());
+        assert(request.cache_disk_hit() == (lazy && mode == 0));
+        Prefill(request);
+        for (const auto token : expected[mode])
+          assert(Generate(request) == token);
+        request.Invalidate();
+      }
+      assert(fixture.Files() == published);
+    }
+  }
+}
+void PinnedPrefixesRespectOffAndAutomaticRam() {
+  PinFixture fixture;
+  // 0 is AUTO, not off: creating the registered RAM checkpoint still works.
+  auto automatic = *ParseRamCacheOption("0", nullptr);
+  automatic.pinned_prefix = fixture.options;
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, automatic);
+    assert(runner->prefilled == fixture.tokens.size());
+    assert(runner->captures != 0);
+  }
+  const auto published = fixture.Files();
+  auto off = *ParseRamCacheOption("off", nullptr);
+  off.pinned_prefix = fixture.options;
+  // A request for mandatory RAM warmth is incompatible with off, even when
+  // a durable pin already exists. Refusal must not change the registry.
+  {
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {}, off);
+    } catch (const std::invalid_argument& e) {
+      refused = std::string(e.what()).find("RAM-warm") != std::string::npos;
+    }
+    assert(refused && fixture.Files() == published);
+  }
+  off.pinned_prefix.lazy = true;
+  automatic.pinned_prefix.lazy = true;
+  for (const auto& options : {off, automatic}) {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, options);
+    assert(runner->prefilled == 0 && runner->captures == 0);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      auto request = pool.Acquire(fixture.tokens);
+      assert(request.cached_prompt_tokens() == fixture.tokens.size());
+      // Off always reads the disk pin; AUTO warms it on first use.
+      assert(request.cache_disk_hit() == (!options.enabled || attempt == 0));
+      request.Invalidate();  // Do not let live reuse hide a RAM promotion.
+    }
+    assert((runner->captures != 0) == options.enabled);
+    assert(fixture.Files() == published);
+  }
+  // Incompatible/new registrations need capture. Check the complete set
+  // before retiring the old identity, not after a failed attempt to warm it.
+  fixture.tokens.front() = 999;
+  fixture.WriteTokens();
+  bool refused = false;
+  try {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {}, off);
+  } catch (const std::invalid_argument& e) {
+    refused = std::string(e.what()).find("creating pinned prefixes") !=
+              std::string::npos;
+  }
+  assert(refused && fixture.Files() == published);
+}
+void PinnedPrefixPressureIdentityAndAccounting(bool record_pressure = false) {
+  PinFixture fixture;
+  const std::vector<TextRunnerToken> second{300, 301, 302, 303, 304};
+  fixture.AddTokens(second);
+  auto runner = std::make_shared<PinRunner>();
+  // Keep separate backing- and record-pressure cases. In the latter, all 128
+  // ordinary records fit simultaneously, in addition to the permanent root.
+  runner->private_blocks = record_pressure ? 256 : 4;
+  ComponentTextCache cache(runner, 1, 1 << 22, {}, false, 0, fixture.options);
+  const auto published = fixture.Files();
+  {
+    auto lease = cache.Acquire(fixture.tokens, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == fixture.tokens.size());
+    assert(lease->Metrics().spill.foreground_bytes == 0);
+  }
+  for (TextRunnerToken family = 100; family < 240; ++family) {
+    const std::vector<TextRunnerToken> prompt(8, family);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(!lease->cache_hit());
+    auto& state = dynamic_cast<TextRunnerState&>(lease->state());
+    (void)runner->Prefill(state, prompt, 0, prompt.size());
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    auto snapshot = lease->Capture();
+    assert(lease->Commit(prompt, std::move(snapshot), prompt) > 0);
+  }
+  auto prompt = fixture.tokens;
+  prompt.push_back(999);
+  {
+    auto lease = cache.Acquire(prompt, {}, {}, true, prompt.size(), true);
+    assert(lease->cached_tokens() == fixture.tokens.size());
+    assert(lease->HasSnapshotFor(fixture.tokens));
+    const auto metrics = lease->Metrics();
+    assert(metrics.ledger.ram_bytes > 0);
+    assert(metrics.ledger.total_bytes == metrics.ledger.ram_bytes + (1 << 20));
+    assert(metrics.ledger.bytes[static_cast<std::size_t>(
+               cache::ResourceCategory::kPrivateState)] > 0);
+    lease->Invalidate();
+  }
+  {
+    auto lease = cache.Acquire(second, {}, {}, true, 0, true);
+    assert(lease->cached_tokens() == second.size());
+    assert(lease->HasSnapshotFor(second));
+    assert(lease->Metrics().ledger.bytes[static_cast<std::size_t>(
+               cache::ResourceCategory::kPrivateState)] >= 2 * 64);
+    lease->Invalidate();
+  }
+  auto changed = prompt;
+  changed.front() ^= 1;
+  assert(!cache.Acquire(changed, {}, {}, true, 0, true)->cache_hit());
+  auto image = std::make_shared<TextPromptContext>();
+  image->cache_identity = {42};
+  assert(!cache.Acquire(prompt, {}, image, true, 0, true)->cache_hit());
+  image->cache_prefixes = {{fixture.tokens.size(), {}}};
+  assert(cache.Acquire(prompt, {}, image, true, 0, true)->cached_tokens() ==
+         fixture.tokens.size());
+  assert(!cache.Acquire(prompt, {}, {}, false, 0, true)->cache_hit());
+  assert(fixture.Files() == published);
+}
+void PinnedPrefixIdentityReplacementAndBudgets() {
+  PinFixture fixture;
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+  }
+  // Relevant numerics environment changes cannot restore the old checkpoint.
+  const char* previous = std::getenv("GUFO_TEST_PIN_NUMERICS");
+  const std::optional<std::string> saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  assert(platform::SetEnv("GUFO_TEST_PIN_NUMERICS", "new-build-lane"));
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == fixture.tokens.size());
+  }
+  if (saved)
+    assert(platform::SetEnv("GUFO_TEST_PIN_NUMERICS", *saved));
+  else
+    assert(platform::UnsetEnv("GUFO_TEST_PIN_NUMERICS"));
+  fixture.tokens.back() = 77;
+  fixture.WriteTokens();
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == fixture.tokens.size());
+  }
+  auto options = fixture.options;
+  options.capacity_bytes = 1;
+  bool refused = false;
+  try {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = options});
+  } catch (const std::runtime_error&) {
+    refused = true;
+  }
+  assert(refused);  // reduced budget never evicts a compatible pin
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == 0);
+  }
+}
+void MultiplePinsChooseLongestAndRestart() {
+  for (const bool ordinary_disk : {false, true}) {
+    PinFixture fixture;
+    std::optional<TextRunnerDiskCacheOptions> disk;
+    if (ordinary_disk)
+      disk = TextRunnerDiskCacheOptions{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20};
+    {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, disk,
+                          {.pinned_prefix = fixture.options});
+    }
+    const auto single = fixture.Files();
+    auto longer = fixture.tokens;
+    longer.insert(longer.end(), {20, 21, 22, 23});
+    const std::vector<TextRunnerToken> other{50, 51, 52, 53, 54};
+    fixture.AddTokens(longer);
+    fixture.AddTokens(other);
+    {
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 1, disk, {.pinned_prefix = fixture.options});
+      // Extending the legacy single-manifest directory preserves that pin.
+      assert(runner->prefilled == longer.size() + other.size());
+      const auto added = fixture.Files();
+      for (const auto& file : single)
+        assert(added.at(file.first) == file.second);
+    }
+    const auto published = fixture.Files();
+    // Option order and file names do not participate in identity.
+    std::reverse(fixture.options.files.begin(), fixture.options.files.end());
+    const auto renamed = fixture.root / "renamed.txt";
+    std::filesystem::copy_file(fixture.options.files.front(), renamed);
+    fixture.options.files.front() = renamed;
+    for (const bool lazy : {false, true}) {
+      auto options = fixture.options;
+      options.lazy = lazy;
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 1, disk, {.pinned_prefix = options});
+      assert(runner->prefilled == 0);
+      const std::array prefixes{fixture.tokens, longer, other};
+      for (const auto& prefix : prefixes) {
+        auto prompt = prefix;
+        prompt.push_back(999);
+        for (const float temperature : {0.0F, 0.8F}) {
+          const sampling::SamplingConfig sampling{.temperature = temperature,
+                                                  .seed = 1234};
+          TextRunnerPool cold(std::make_shared<PinRunner>(), 1);
+          auto control = cold.Acquire(prompt, sampling, {}, {}, false);
+          Prefill(control);
+          auto request = pool.Acquire(prompt, sampling);
+          assert(request.cached_prompt_tokens() == prefix.size());
+          assert(request.cache_disk_hit() == (lazy && temperature == 0.0F));
+          Prefill(request);
+          for (int i = 0; i < 8; ++i)
+            assert(Generate(request) == Generate(control));
+          request.Invalidate();
+          control.Invalidate();
+        }
+      }
+      auto changed = longer;
+      changed.back() ^= 1;
+      auto request = pool.Acquire(changed);
+      assert(request.cached_prompt_tokens() == fixture.tokens.size());
+      request.Invalidate();
+      changed.front() ^= 1;
+      request = pool.Acquire(changed);
+      assert(!request.cache_hit());
+      request.Invalidate();
+      changed = fixture.tokens;
+      changed.pop_back();  // a partial registration is not a checkpoint
+      request = pool.Acquire(changed);
+      assert(!request.cache_hit());
+      request.Invalidate();
+      auto image = std::make_shared<TextPromptContext>();
+      image->cache_identity = {42};
+      request = pool.Acquire(longer, {}, {}, image);
+      assert(!request.cache_hit());
+      request.Invalidate();
+      image->cache_prefixes = {{fixture.tokens.size(), {}}};
+      request = pool.Acquire(longer, {}, {}, image);
+      assert(request.cached_prompt_tokens() == fixture.tokens.size());
+      request.Invalidate();
+      request = pool.Acquire(longer, {}, {}, {}, false);
+      assert(!request.cache_hit());
+      request.Invalidate();
+      assert(fixture.Files() == published);
+    }
+  }
+}
+void MultiplePinsAggregateDiskBudget() {
+  for (const bool ordinary_disk : {false, true}) {
+    for (const bool lazy : {false, true}) {
+      PinFixture fixture;
+      std::optional<TextRunnerDiskCacheOptions> disk;
+      if (ordinary_disk)
+        disk = TextRunnerDiskCacheOptions{
+            .directory = fixture.root / "ordinary", .capacity_bytes = 1 << 20};
+      {
+        TextRunnerPool pool(std::make_shared<PinRunner>(), 1, disk,
+                            {.pinned_prefix = fixture.options});
+      }
+      const auto single_bytes = fixture.ManagedBytes();
+      const auto single = fixture.Files();
+      const std::vector<TextRunnerToken> other{50, 51, 52, 53, 54};
+      fixture.AddTokens(other);
+      auto options = fixture.options;
+      options.lazy = lazy;
+      options.capacity_bytes = single_bytes;
+      bool refused = false;
+      try {
+        TextRunnerPool pool(std::make_shared<PinRunner>(), 1, disk,
+                            {.pinned_prefix = options});
+      } catch (const cache::DiskCapacityExhausted&) {
+        refused = true;
+      }
+      assert(refused);  // not an independent byte budget for every manifest
+      assert(fixture.Files() == single);
+      {
+        auto runner = std::make_shared<PinRunner>();
+        TextRunnerPool pool(runner, 1, disk,
+                            {.pinned_prefix = fixture.options});
+        assert(runner->prefilled == other.size());
+      }
+      const auto total = fixture.ManagedBytes();
+      assert(total > single_bytes && total < 2 * single_bytes);
+      const auto published = fixture.Files();
+      options.capacity_bytes = total - 1;
+      refused = false;
+      try {
+        TextRunnerPool pool(std::make_shared<PinRunner>(), 1, disk,
+                            {.pinned_prefix = options});
+      } catch (const std::runtime_error&) {
+        refused = true;
+      }
+      assert(refused);
+      assert(fixture.Files() == published);  // neither compatible pin evicted
+      options.capacity_bytes = total;
+      {
+        auto runner = std::make_shared<PinRunner>();
+        ComponentTextCache cache(runner, 1, 1 << 22, disk, false, 0, options);
+        assert(runner->prefilled == 0);
+        auto lease = cache.Acquire(other, {}, {}, true, 0, true);
+        const auto metrics = lease->Metrics();
+        const auto staging = ordinary_disk ? 2 << 20 : 1 << 20;
+        assert(metrics.ledger.total_bytes ==
+               metrics.ledger.ram_bytes + staging);
+      }
+      assert(fixture.Files() == published);
+      // Managed temporary/orphan bytes count too, even in lazy startup.
+      const auto orphan = options.directory / "v2" / "tmp" /
+                          "1234567890abcdef1234567890abcdef.bin";
+      {
+        std::ofstream file(orphan);
+        assert(file);
+        file << "orphan";
+      }
+      const auto with_orphan = fixture.Files();
+      refused = false;
+      try {
+        TextRunnerPool pool(std::make_shared<PinRunner>(), 1, disk,
+                            {.pinned_prefix = options});
+      } catch (const std::runtime_error&) {
+        refused = true;
+      }
+      assert(refused && fixture.Files() == with_orphan);
+      std::filesystem::remove(orphan);
+    }
+  }
+}
+void MultiplePinsAggregateRamAndIndependentLazyWarming() {
+  PinFixture fixture;
+  const std::vector<TextRunnerToken> other{50, 51, 52, 53, 54};
+  fixture.AddTokens(other);
+  {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  auto runner = std::make_shared<PinRunner>();
+  runner->private_blocks = 1;  // either root fits, but not both simultaneously
+  bool refused = false;
+  try {
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+  } catch (const std::exception&) {
+    refused = true;
+  }
+  assert(refused && runner->prefilled == 0);
+  assert(fixture.Files() == published);
+  auto options = fixture.options;
+  options.lazy = true;
+  runner = std::make_shared<PinRunner>();
+  runner->private_blocks = 1;
+  TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+  for (int pass = 0; pass < 3; ++pass) {
+    for (const auto& prefix : {fixture.tokens, other}) {
+      auto request = pool.Acquire(prefix);
+      assert(request.cached_prompt_tokens() == prefix.size());
+      assert(request.cache_disk_hit() == (pass == 0 || prefix == other));
+      request.Invalidate();
+    }
+  }
+  assert(runner->prefilled == 0 && fixture.Files() == published);
+}
+void MultiplePinsExplicitReplacementAndValidation() {
+  PinFixture fixture;
+  const std::vector<TextRunnerToken> other{50, 51, 52, 53, 54};
+  fixture.AddTokens(other);
+  {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  const auto duplicate_file = fixture.root / "same-tokens.txt";
+  std::filesystem::copy_file(fixture.options.files.front(), duplicate_file);
+  for (const bool duplicate : {false, true}) {
+    auto invalid = fixture.options;
+    invalid.files.push_back(duplicate ? duplicate_file
+                                      : fixture.root / "missing.txt");
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = invalid});
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    assert(refused && fixture.Files() == published);
+  }
+  {
+    auto invalid = fixture.options;
+    invalid.files.assign(TextRunnerPinnedPrefixOptions::kMaxRegistrations + 1,
+                         invalid.files.front());
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = invalid});
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    assert(refused && fixture.Files() == published);
+  }
+  // Only a changed registration is re-prefilled; the other remains durable.
+  fixture.tokens.back() = 77;
+  fixture.WriteTokens();
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    assert(runner->prefilled == fixture.tokens.size());
+  }
+  // Relevant numerics identity changes reject every registration, lazy too.
+  const char* previous = std::getenv("GUFO_TEST_MULTI_PIN_NUMERICS");
+  const std::optional<std::string> saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  assert(platform::SetEnv("GUFO_TEST_MULTI_PIN_NUMERICS", "changed"));
+  auto options = fixture.options;
+  options.lazy = true;
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+    assert(runner->prefilled == fixture.tokens.size() + other.size());
+  }
+  if (saved)
+    assert(platform::SetEnv("GUFO_TEST_MULTI_PIN_NUMERICS", *saved));
+  else
+    assert(platform::UnsetEnv("GUFO_TEST_MULTI_PIN_NUMERICS"));
+  // Shrinking the explicit set returns to a single-manifest legacy layout.
+  options = fixture.options;
+  options.files.resize(1);
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+    assert(runner->prefilled == fixture.tokens.size());
+  }
+  {
+    auto runner = std::make_shared<PinRunner>();
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+    assert(runner->prefilled == 0);
+    auto request = pool.Acquire(other);
+    assert(!request.cache_hit());
+    request.Invalidate();
+  }
+  const auto manifests = options.directory / "v2" / "manifests";
+  assert(std::distance(std::filesystem::directory_iterator(manifests),
+                       std::filesystem::directory_iterator{}) == 1);
+}
+void MultiplePinsLazyCorruptionPreservesOtherRegistrations() {
+  PinFixture fixture;
+  auto longer = fixture.tokens;
+  longer.insert(longer.end(), {20, 21, 22, 23});
+  const std::vector<TextRunnerToken> other{50, 51, 52, 53, 54};
+  fixture.AddTokens(longer);
+  fixture.AddTokens(other);
+  {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = fixture.options});
+  }
+  std::filesystem::path damaged;
+  {
+    cache::ResourceLedger ledger({1 << 22, 1 << 22, 0, 1 << 22});
+    cache::DiskStore disk(ledger, fixture.options.directory, 1 << 20);
+    for (const auto& entry : disk.Entries()) {
+      if (entry.Manifest().tokens != longer)
+        continue;
+      for (const auto& component : entry.Manifest().components)
+        if (component.private_state)
+          damaged = fixture.options.directory / "v2" / "private" /
+                    cache::DiskFileName(component.private_state->file);
+    }
+  }
+  assert(!damaged.empty());
+  auto options = fixture.options;
+  options.lazy = true;
+  auto runner = std::make_shared<PinRunner>();
+  TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+  {
+    // Corruption after lazy indexing must quarantine only affected roots.
+    std::fstream file(damaged, std::ios::binary | std::ios::in | std::ios::out);
+    assert(file);
+    char byte;
+    file.read(&byte, 1);
+    byte ^= 0x5a;
+    file.seekp(0);
+    file.write(&byte, 1);
+  }
+  const auto corrupt_files = fixture.Files();
+  for (const auto& prompt : {longer, other, longer}) {
+    auto request = pool.Acquire(prompt, {.temperature = 0});
+    const auto depth = prompt == longer ? fixture.tokens.size() : other.size();
+    assert(request.cached_prompt_tokens() == depth);
+    TextRunnerPool cold(std::make_shared<PinRunner>(), 1);
+    auto control = cold.Acquire(prompt, {.temperature = 0}, {}, {}, false);
+    Prefill(request);
+    Prefill(control);
+    for (int i = 0; i < 8; ++i)
+      assert(Generate(request) == Generate(control));
+    request.Invalidate();
+    control.Invalidate();
+  }
+  assert(fixture.Files() ==
+         corrupt_files);  // no repair/republication on demand
+}
+void PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk() {
+  PinFixture fixture;
+  const TextRunnerDiskCacheOptions disk{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20};
+  {
+    auto runner = std::make_shared<PinRunner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk, false, 0,
+                             fixture.options);
+    auto lease = cache.Acquire(fixture.tokens, {}, {}, false, 0, true);
+    auto& state = dynamic_cast<TextRunnerState&>(lease->state());
+    (void)runner->Prefill(state, fixture.tokens, 0, fixture.tokens.size());
+    assert(lease->TryReserveSnapshot(
+        lease->CaptureBytes(), fixture.tokens.size(), false,
+        SnapshotPurpose::kContinuation, fixture.tokens));
+    auto snapshot = lease->Capture();
+    assert(lease->Commit(fixture.tokens, std::move(snapshot), fixture.tokens) >
+           0);
+  }  // drain a compatible equal-depth ordinary publication
+  const auto path = std::filesystem::directory_iterator(
+                        fixture.options.directory / "v2" / "private")
+                        ->path();
+  {
+    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+    char byte;
+    file.read(&byte, 1);
+    byte ^= 0x5a;
+    file.seekp(0);
+    file.write(&byte, 1);
+  }
+  bool refused = false;
+  try {
+    ComponentTextCache cache(std::make_shared<PinRunner>(), 1, 1 << 22, disk,
+                             false, 0, fixture.options);
+  } catch (const std::runtime_error&) {
+    refused = true;
+  }
+  assert(refused);
+}
+void PinnedPrefixLazySurvivesRamRefusal() {
+  PinFixture fixture;
+  {
+    TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  auto options = fixture.options;
+  options.lazy = true;
+  auto runner = std::make_shared<PinRunner>();
+  runner->private_blocks = 0;  // restore fits the slot, but RAM captures cannot
+  TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+  assert(runner->prefilled == 0);
+  for (const TextRunnerToken suffix : {100, 101}) {
+    auto prompt = fixture.tokens;
+    prompt.push_back(suffix);
+    const auto lookup = pool.Lookup(prompt);
+    assert(lookup.tier == "disk");
+    assert(lookup.matched_tokens == fixture.tokens.size());
+    assert(fixture.Files() == published);
+    auto request = pool.Acquire(prompt);
+    assert(request.cached_prompt_tokens() == lookup.matched_tokens);
+    assert(request.cache_disk_hit());
+    Prefill(request);
+    const auto actual = Generate(request);
+    request.Invalidate();
+    TextRunnerPool cold(std::make_shared<PinRunner>(), 1);
+    auto control = cold.Acquire(prompt);
+    Prefill(control);
+    assert(Generate(control) == actual);
+    control.Invalidate();
+  }
+  assert(fixture.Files() == published);
+}
+void PinnedPrefixCorruptionFailsClosed() {
+  for (const bool truncate : {false, true}) {
+    PinFixture fixture;
+    {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = fixture.options});
+    }
+    const auto path = std::filesystem::directory_iterator(
+                          fixture.options.directory / "v2" / "private")
+                          ->path();
+    if (truncate) {
+      std::filesystem::resize_file(path, 1);
+    } else {
+      std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+      char byte;
+      file.read(&byte, 1);
+      byte ^= 0x5a;
+      file.seekp(0);
+      file.write(&byte, 1);
+    }
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = fixture.options});
+    } catch (const std::runtime_error&) {
+      refused = true;
+    }
+    assert(refused);  // no partial state execution or silent repeated writes
+  }
+}
+#endif  // defined(__linux__)
+
+void CheckpointImportRespectsRamOff() {
+  for (const bool with_disk : {false, true}) {
+    const TemporaryDirectory temp("gufo-component-import-off");
+    std::optional<TextRunnerDiskCacheOptions> disk;
+    if (with_disk)
+      disk = TextRunnerDiskCacheOptions{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20};
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache target(runner, 1, 1 << 22, disk, false, 0, {}, false);
+    const std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
+    {
+      auto live = target.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(live->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      (void)live->Commit({}, {}, prompt);
+    }
+    for (const std::uint64_t length : {0, 1024}) {
+      bool read = false, refused = false;
+      try {
+        (void)target.Import(
+            [&](std::span<std::uint8_t>) {
+              read = true;
+              return std::size_t{0};
+            },
+            length, "off-policy");
+      } catch (const CheckpointTransferError& e) {
+        refused = e.status == 507 &&
+                  std::string_view(e.code) == "cache_transfer_budget";
+      }
+      assert(refused && !read && runner->captures == 0);
+      const auto lookup = target.Lookup(prompt, nullptr, true, 0);
+      assert(lookup && lookup->tier == "live" &&
+             lookup->matched_tokens == prompt.size());
+    }
+  }
+}
+void CheckpointTransferRoundTripAndConcurrentServing() {
+  class ImportRunner final : public Runner {
+  public:
+    bool refuse{};
+    std::function<void()> preparing;
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->can_capture = [this](auto) {
+        if (preparing)
+          preparing();
+        return !refuse;
+      };
+      return resources;
+    }
+  };
+  auto source_runner = std::make_shared<Runner>();
+  source_runner->defer_idle = true;
+  ComponentTextCache source(source_runner, 1, 1 << 20, {});
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto context = std::make_shared<TextPromptContext>();
+  context->cache_identity = {3, 7, 20};
+  auto seed = source.Acquire(prompt, {}, context, true, 0, true);
+  auto& seed_state = dynamic_cast<State&>(seed->state());
+  source_runner->adapter->Append(seed_state.slot, prompt, prompt);
+  const auto expected_hash =
+      source_runner->adapter->RecurrentHash(seed_state.slot);
+  assert(seed->TryReserveSnapshot(seed->CaptureBytes(), prompt.size(), false,
+                                  SnapshotPurpose::kContinuation, prompt));
+  assert(seed->PublishSnapshot(prompt, seed->Capture(), false));
+  // Exercise borrowed rows still in a busy slot, without capturing live state.
+  auto blob =
+      source.Export(prompt, context.get(), true, 0, "payload=20;build=A");
+  std::vector<std::uint8_t> wire;
+  blob->Write([&](auto bytes) {
+    wire.insert(wire.end(), bytes.begin(), bytes.end());
+    return true;
+  });
+  bool busy = false;
+  try {
+    (void)source.Export(prompt, context.get(), true, 0, "payload=20;build=A");
+  } catch (const CheckpointTransferError& error) {
+    busy = error.status == 503;
+  }
+  assert(busy);
+  blob.reset();
+  auto target_runner = std::make_shared<ImportRunner>();
+  ComponentTextCache target(target_runner, 2, 1 << 20, {});
+  const std::vector<TextRunnerToken> other{100, 101, 102, 103};
+  auto serving = target.Acquire(other, {}, {}, false, 0, true);
+  auto& live = dynamic_cast<State&>(serving->state());
+  target_runner->adapter->Append(live.slot, other, other);
+  const auto live_hash = target_runner->adapter->RecurrentHash(live.slot);
+  auto reader = [&](const auto& bytes) -> CheckpointTransferReader {
+    return
+        [&bytes, offset = std::size_t{0}](std::span<std::uint8_t> out) mutable {
+          const auto n = std::min(out.size(), bytes.size() - offset);
+          std::memcpy(out.data(), bytes.data() + offset, n);
+          offset += n;
+          return n;
+        };
+  };
+  const auto allocations = target_runner->captures;
+  for (const auto bad : {0, 1, 2}) {
+    auto invalid = wire;
+    if (bad == 0)
+      invalid.pop_back();
+    if (bad == 1)
+      invalid.back() ^= 1;
+    bool rejected = false;
+    try {
+      (void)target.Import(
+          reader(invalid), wire.size(),
+          bad == 2 ? "payload=19;build=B" : "payload=20;build=A");
+    } catch (const CheckpointTransferError& error) {
+      rejected = error.status == (bad == 2 ? 409 : 400);
+    }
+    assert(rejected && target_runner->captures == allocations);
+    assert(!target.Lookup(prompt, context.get(), true, 0)->matched_tokens);
+  }
+  target_runner->refuse = true;
+  bool refused = false;
+  try {
+    (void)target.Import(reader(wire), wire.size(), "payload=20;build=A");
+  } catch (const CheckpointTransferError& error) {
+    refused = error.status == 507;
+  }
+  assert(refused);
+  assert(target_runner->adapter->RecurrentHash(live.slot) == live_hash);
+  target_runner->refuse = false;
+  std::binary_semaphore reading(0), proceed(0), allocating(0), publish(0);
+  target_runner->preparing = [&] {
+    allocating.release();
+    publish.acquire();
+  };
+  std::exception_ptr failure;
+  std::jthread importing([&] {
+    try {
+      auto input = reader(wire);
+      bool first = true;
+      auto imported = target.Import(
+          [&](auto out) {
+            if (std::exchange(first, false)) {
+              reading.release();
+              proceed.acquire();
+            }
+            return input(out);
+          },
+          wire.size(), "payload=20;build=A");
+      assert(imported->Header().manifest.tokens == prompt);
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+  reading.acquire();
+  for (int i = 0; i < 100; ++i)
+    assert(!target.Lookup(prompt, context.get(), true, 0)->matched_tokens);
+  // Generation advances while import is blocked on network input.
+  const std::array<TextRunnerToken, 1> next{104};
+  target_runner->adapter->Append(live.slot, next, next);
+  proceed.release();
+  allocating.acquire();  // Import holds the publication owner, not a GPU slot.
+  for (int i = 0; i < 100; ++i)
+    assert(!target.Lookup(prompt, context.get(), true, 0)->matched_tokens);
+  const std::array<TextRunnerToken, 1> next_decode{105};
+  target_runner->adapter->Append(live.slot, next_decode, next_decode);
+  const auto advanced_hash = target_runner->adapter->RecurrentHash(live.slot);
+  publish.release();
+  importing.join();
+  target_runner->preparing = {};
+  if (failure)
+    std::rethrow_exception(failure);
+  assert(target_runner->adapter->RecurrentHash(live.slot) == advanced_hash);
+  assert(target.Lookup(prompt, context.get(), true, 0)->matched_tokens ==
+         prompt.size());
+  auto changed = std::make_shared<TextPromptContext>();
+  changed->cache_identity = {3, 7, 21};
+  assert(!target.Lookup(prompt, changed.get(), true, 0)->matched_tokens);
+  auto restored = target.Acquire(prompt, {}, context, true, 0, true);
+  assert(restored->cached_tokens() == prompt.size());
+  auto& restored_state = dynamic_cast<State&>(restored->state());
+  assert(target_runner->adapter->RecurrentHash(restored_state.slot) ==
+         expected_hash);
+  auto again =
+      target.Export(prompt, context.get(), true, 0, "payload=20;build=A");
+  auto original = CheckpointTransferBlob::Import(reader(wire), wire.size(),
+                                                 again->Header().identity,
+                                                 "payload=20;build=A");
+  const auto old_payloads =
+      CheckpointTransferPayloads(original->Header().manifest);
+  const auto new_payloads =
+      CheckpointTransferPayloads(again->Header().manifest);
+  assert(old_payloads.size() == new_payloads.size());
+  for (std::size_t i = 0; i < old_payloads.size(); ++i) {
+    std::vector<std::uint8_t> a(old_payloads[i]->bytes),
+        b(new_payloads[i]->bytes);
+    original->Read(i, 0, a);
+    again->Read(i, 0, b);
+    assert(a == b);
+  }
+}
+void LookupRuntimeDefaultsAndDisabled() {
+  class IdentityRunner final : public Runner {
+  public:
+    TextRunnerDescriptor Descriptor() const override {
+      auto descriptor = Runner::Descriptor();
+      descriptor.persistence = TextRunnerPersistenceDescriptor{{1, 2, 3}, 21};
+      return descriptor;
+    }
+    mutable std::size_t identity_calls{};
+    std::string LookupContextIdentity() const override {
+      ++identity_calls;
+      return "fake-sidecar";
+    }
+  };
+  const std::vector<TextRunnerToken> prompt{10};
+  auto disabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool no_lookup(disabled, 1, {}, {.publish_lookup = false});
+  assert(disabled->identity_calls == 0);
+  assert(no_lookup.Lookup(prompt).epoch.empty());
+  auto enabled = std::make_shared<IdentityRunner>();
+  TextRunnerPool default_pool(enabled, 1);
+  assert(enabled->identity_calls == 1);
+  assert(default_pool.Lookup(prompt).epoch.size() == 64);
+  if (!platform::CheckpointTransferRuntimeSupported()) {
+    bool unsupported = false;
+    try {
+      TextRunnerPool transfer(std::make_shared<IdentityRunner>(), 1, {},
+                              {.transfer_api = true});
+    } catch (const CheckpointTransferError& error) {
+      unsupported = error.status == 501 && std::string_view(error.code) ==
+                                               "cache_transfer_unsupported";
+    }
+    assert(unsupported);
+    std::cout << "SKIP: executable-bound transfer requires Linux x86-64\n";
+  } else {
+    auto runner = std::make_shared<IdentityRunner>();
+    TextRunnerPool transfer(runner, 1, {},
+                            {.publish_lookup = false, .transfer_api = true});
+    assert(runner->identity_calls == 1);
+    assert(transfer.Lookup(prompt).epoch.empty());
+  }
+}
+#include "tests/cli/cache_lookup_checks.hpp"
+#include "tests/cli/cache_lookup_r3_checks.hpp"
 }  // namespace
 // An off RAM cache commits no backing, grows none before prefill and takes no
 // capture, yet a session keeps its own live frontier and its metrics stay
@@ -2437,7 +3495,7 @@ void RamCacheOffCommitsNoBackingAndKeepsLiveFrontiers() {
   };
   for (const bool enabled : {true, false}) {
     auto runner = std::make_shared<CountingRunner>();
-    ComponentTextCache cache(runner, 2, 1 << 22, {}, false, 0, enabled);
+    ComponentTextCache cache(runner, 2, 1 << 22, {}, false, 0, {}, enabled);
     std::vector<TextRunnerToken> conversation(12, 7);
     for (int turn = 0; turn < 2; ++turn) {
       auto lease = cache.Acquire(conversation, {}, {}, true, 0, true);
@@ -2501,7 +3559,7 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
   std::uint64_t hash;
   {
     auto runner = std::make_shared<CountingRunner>();
-    ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, false);
+    ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, {}, false);
     assert(runner->committed != 0 && runner->committed <= 512ULL << 20);
     auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
     assert(!lease->TryReserveSnapshot(0, prompt.size(), false,
@@ -2520,7 +3578,7 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
     (void)lease->Commit(prompt, {}, prompt);
   }
   auto runner = std::make_shared<CountingRunner>();
-  ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, false);
+  ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, {}, false);
   auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
   assert(lease->restored_from_disk() &&
          lease->cached_tokens() == prompt.size());
@@ -2536,7 +3594,7 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
     const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
                                           .capacity_bytes = 1 << 20};
     auto runner = std::make_shared<Runner>();
-    ComponentTextCache cache(runner, 2, 1 << 22, disk, false, 0, enabled);
+    ComponentTextCache cache(runner, 2, 1 << 22, disk, false, 0, {}, enabled);
     std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
     for (int turn = 0; turn < 2; ++turn) {
       auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
@@ -2560,6 +3618,216 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
     }
   }
 }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+namespace {
+void PreparedSerialCutKeepsRealComponentBoundaries() {
+  auto runner = std::make_shared<Runner>();
+  runner->in_pass = true;
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> prompt(40, 7);
+  auto request =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 16);
+  // B1/B2: a large proposed range is clipped to the actual stable boundary,
+  // not published at the proposed end or through an interior capture.
+  auto cut = request.PrepareSinglePassPrefill(31);
+  assert(cut && *cut == 16);
+  assert(request.prefill_position() == 0);  // Planning did not execute rows.
+  assert(request.Prefill(*cut).consumed_tokens == 16);
+  assert(request.prefill_position() == 16 && runner->through_calls == 0);
+  while (!request.prefill_complete()) {
+    cut = request.PrepareSinglePassPrefill(7);
+    if (!cut) {
+      // Join the exact capture once. It may finish between the failed poll
+      // and this call, so asserting a second transient Pending flag is racy.
+      // This fake's valid model plan does not decline; no sleep/retry loop.
+      const auto position = request.prefill_position();
+      request.CapturePromptSnapshot();
+      assert(request.prefill_position() == position);
+      cut = request.PrepareSinglePassPrefill(7);
+    }
+    assert(cut && *cut > 0 && *cut <= 7);
+    assert(request.Prefill(*cut).consumed_tokens == *cut);
+  }
+  const auto token = request.SelectNext().token;
+  (void)request.Commit();
+  auto warm = pool.Acquire(prompt);
+  assert(warm.cached_prompt_tokens() == prompt.size());
+  assert(warm.SelectNext().token == token);
+  warm.Invalidate();
+
+  // B3/B4: a frozen cut cannot be relabelled with a different budget and
+  // execute/publish under that identity. Rejection precedes component mutation.
+  auto changed = prompt;
+  changed.front() = 8;
+  auto other = pool.Acquire(changed);
+  cut = other.PrepareSinglePassPrefill(9);
+  assert(cut && *cut == 9);
+  bool rejected = false;
+  try {
+    (void)other.Prefill(10);
+  } catch (const std::logic_error&) {
+    rejected = true;
+  }
+  assert(rejected && other.prefill_position() == 0);
+  other.Invalidate();
+}
+
+void AdaptiveSchedulingUsesRealComponentCache(bool capturing) {
+  class AdaptiveRunner final : public Runner {
+  public:
+    explicit AdaptiveRunner(bool capturing) : capturing(capturing) {}
+    const bool capturing;
+    mutable std::binary_semaphore entered{0};
+    mutable std::binary_semaphore resume{0};
+    mutable std::atomic<bool> resumed{false}, timed_out{false};
+    mutable std::atomic<bool> arm_capture{false};
+    mutable std::mutex capture_mutex;
+    mutable std::thread::id capture_thread;
+    mutable bool selected{false}, blocked{false};
+    mutable std::size_t advances{};
+    mutable std::vector<std::pair<TextRunnerToken, std::size_t>> cuts;
+    void Resume() const {
+      if (!resumed.exchange(true))
+        resume.release();
+    }
+    void Block() const {
+      entered.release();
+      if (!resume.try_acquire_for(std::chrono::seconds(5))) {
+        timed_out = true;
+        throw std::runtime_error("adaptive component fixture barrier timeout");
+      }
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->allocate =
+          [this, allocate = resources->allocate](const auto& request) {
+            auto buffer = allocate(request);
+            if (arm_capture.exchange(false)) {
+              const std::lock_guard lock(capture_mutex);
+              capture_thread = std::this_thread::get_id();
+            }
+            return buffer;
+          };
+      resources->stream = [this, stream = resources->stream] {
+        bool hold;
+        {
+          const std::lock_guard lock(capture_mutex);
+          hold = capture_thread == std::this_thread::get_id();
+          if (hold)
+            capture_thread = {};
+        }
+        // Only the decoder's post-selection capture worker is held. All its
+        // buffers are allocated, and Lease::Capture's transfer factory holds
+        // neither the cache metadata mutex nor this fixture's mutex. Admission
+        // and the peer slot's prefill can proceed while it is pending.
+        if (hold)
+          Block();
+        return stream();
+      };
+      return resources;
+    }
+    TextPrefillStep Prefill(TextRunnerState& state,
+                            std::span<const TextRunnerToken> prompt,
+                            std::size_t offset,
+                            std::size_t budget) const override {
+      assert(CheckpointPosition(state) == offset);
+      cuts.emplace_back(prompt.front(), budget);
+      const bool first_long = prompt.front() == 22 && offset == 1;
+      if (first_long) {
+        if (capturing) {
+          // Do not release the capture at Submit: it must stay pending until
+          // the scheduler has granted and the real pool has clipped this cut.
+          assert(!resumed && !timed_out && advances == 0);
+          Resume();
+        } else {
+          assert(resumed && advances != 0);
+        }
+      }
+      const auto step = Runner::Prefill(state, prompt, offset, budget);
+      assert(step.consumed_tokens == std::min(budget, prompt.size() - offset));
+      if (first_long)
+        assert(step.consumed_tokens == budget);  // No hidden frontier clipping.
+      assert(CheckpointPosition(state) == offset + step.consumed_tokens);
+      return step;
+    }
+    TextDecodeSelection SelectNext(
+        TextRunnerState& state,
+        sampling::SamplerState& sampler) const override {
+      if (capturing && !std::exchange(selected, true))
+        arm_capture = true;
+      return Runner::SelectNext(state, sampler);
+    }
+    void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+      if (!capturing && !std::exchange(blocked, true)) {
+        // Request::Advance is reached only AFTER PreparePromptSnapshot has
+        // completed. Blocking SelectNext instead leaves an async capture and
+        // correctly gives the next prompt the quiet budget, not active 64.
+        Block();
+      }
+      Runner::Advance(state, token);
+      ++advances;
+    }
+  };
+  auto runner = std::make_shared<AdaptiveRunner>(capturing);
+  runner->row_blocks = 4096;
+  runner->max_context = 8192;
+  assert(runner->UsesComponentCache());  // CreateState throws on wrong path.
+  auto pool = std::make_shared<TextRunnerPool>(runner, 2);
+  {
+    const std::vector<TextRunnerToken> prefix{22};
+    auto warm = pool->Acquire(prefix);
+    Prefill(warm);
+    (void)warm.Commit();
+  }
+  runner->cuts.clear();
+  TextGenerationScheduler scheduler(
+      pool,
+      {.decode_active_tokens = 512,
+       .prerequisites = {.mode = detail::PrefillPrerequisiteMode::kAdaptive,
+                         .tokens = 64}});
+  struct ResumeOnExit {
+    const AdaptiveRunner& runner;
+    ~ResumeOnExit() { runner.Resume(); }
+  } cleanup{*runner};  // Release before scheduler joins, including on failure.
+  auto decoder = scheduler.Submit({11}, 4, 0.0f);
+  if (!runner->entered.try_acquire_for(std::chrono::seconds(5)))
+    throw std::runtime_error(
+        "adaptive component fixture did not enter barrier");
+  // One reused row leaves exactly 4096 new rows. The 2048 grid is less than
+  // 2048 rows from reuse, and 4096 is within the final 128-row tail, so neither
+  // is a planned checkpoint. Both budgets reach the model without clipping;
+  // context and physical row backing also fit the complete prompt plus output.
+  std::vector<TextRunnerToken> prompt(4097, 22);
+  auto prefill = scheduler.Submit(prompt, 1, 0.0f);
+  if (!capturing)
+    runner->Resume();
+  const auto first = decoder.Wait();
+  const auto second = prefill.Wait();
+  assert(!runner->timed_out);
+  assert(first.tokens.size() == 4 && second.tokens.size() == 1);
+  assert(second.cached_prompt_tokens == 1);
+  assert(second.prefill_tokens == 4096);
+  const auto first_long =
+      std::find_if(runner->cuts.begin(), runner->cuts.end(),
+                   [](const auto& cut) { return cut.first == 22; });
+  assert(first_long != runner->cuts.end());
+  if (capturing)
+    assert(first_long->second == 4096);
+  else
+    assert(first_long->second == 64);
+  // Independent cold component pool: altered cuts preserve exact state/output.
+  auto cold_runner = std::make_shared<Runner>();
+  cold_runner->row_blocks = 4096;
+  cold_runner->max_context = 8192;
+  TextRunnerPool cold(cold_runner, 1);
+  auto reference = cold.Acquire(prompt, sampling::SamplingConfig{});
+  while (!reference.prefill_complete())
+    (void)reference.Prefill(4096);
+  assert(second.tokens.front() == reference.SelectNext().token);
+}
+}  // namespace
+#endif
 int main() {
   if (std::getenv("GUFO_TEST_ROTATED_PROCESS_LOCAL_ONLY") != nullptr) {
     packed_ingress_cpu::RotatedWithoutFingerprintDisk();
@@ -2574,6 +3842,40 @@ int main() {
     std::cout << "CPU packed disk admission PASS\n";
     return 0;
   }
+#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
+  PreparedSerialCutKeepsRealComponentBoundaries();
+  AdaptiveSchedulingUsesRealComponentCache(false);
+  AdaptiveSchedulingUsesRealComponentCache(true);
+#endif
+  LookupRuntimeDefaultsAndDisabled();
+  CheckpointTransferRoundTripAndConcurrentServing();
+  CheckpointImportRespectsRamOff();
+  LookupIsReadOnlyAndMatchesAcquire();
+  LookupRespectsRamOffWithoutDisablingLiveReuse();
+  LookupDoesNotWaitForAdmission();
+  LookupWhileAllSlotsPrefillAndDecode();
+  LookupInvalidatesBeforeLiveRetirement();
+  LookupPublicationDisabled();
+  LookupPublicationStress();
+  LookupMeasuredRatesAndEpoch();
+  LookupR3BarrierFixtures();
+#if defined(__linux__)
+  MultiplePinsChooseLongestAndRestart();
+  MultiplePinsAggregateDiskBudget();
+  MultiplePinsAggregateRamAndIndependentLazyWarming();
+  MultiplePinsExplicitReplacementAndValidation();
+  MultiplePinsLazyCorruptionPreservesOtherRegistrations();
+  PinnedPrefixRestartReplayAndNoRewrite();
+  PinnedPrefixesRespectOffAndAutomaticRam();
+  PinnedPrefixPressureIdentityAndAccounting();
+  PinnedPrefixPressureIdentityAndAccounting(true);
+  PinnedPrefixIdentityReplacementAndBudgets();
+  PinnedPrefixCorruptionFailsClosed();
+  PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk();
+  PinnedPrefixLazySurvivesRamRefusal();
+#else
+  std::cout << "SKIP: registered pins require strict Linux fingerprinting\n";
+#endif
   PublishedResidentCheckpointKeepsDiskStep();
   CancelledPrefillKeepsCompletedSteps();
   SharedPeerReusesTheCurrentStableCapture();
