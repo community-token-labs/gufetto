@@ -82,6 +82,10 @@ void LookupMeasuredRatesAndEpoch() {
       .max_context = 4096,
       .persistence = TextRunnerPersistenceDescriptor{{1, 2, 3}, 20}};
   const auto base = CacheLookupEpoch(descriptor, {}, 1, {}, {});
+  const auto automatic = *ParseRamCacheOption("0", nullptr);
+  const auto off = *ParseRamCacheOption("off", nullptr);
+  assert(base == CacheLookupEpoch(descriptor, {}, 1, {}, automatic));
+  assert(base != CacheLookupEpoch(descriptor, {}, 1, {}, off));
   descriptor.persistence->payload_version = 21;
   assert(base != CacheLookupEpoch(descriptor, {}, 1, {}, {}));
   descriptor.persistence->payload_version = 20;
