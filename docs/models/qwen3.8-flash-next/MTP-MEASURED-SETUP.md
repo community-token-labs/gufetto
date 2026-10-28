@@ -2,11 +2,12 @@
 
 **Internal recommendation, 2026-10-27:** use `--speculative mtp` with the
 shared-Q8_0 sidecar for the tested C1–C4 profile. Q8 won every measured
-concurrency; neither a slot cutoff nor a new flag is justified. Shared-Q4_K_M
+concurrency on both hosts; neither a slot cutoff nor a new flag is justified.
+The two-host addendum below preserves the distinct product revisions and limits. Shared-Q4_K_M
 remains a supported, experimental lower-weight-memory option, not the measured
 throughput winner. This recommendation changes no compiled CLI default.
 
-## What was measured
+## Original nimo-1 measurement
 
 Coordinator-only nimo-1 runs used the native binary built from Gufo
 `8f487a48611a33ad6fbe17276c2c86e5d1c312b6`, target UD-Q4_K_XL,
@@ -14,7 +15,8 @@ shared target Q8 embedding/output head, four sessions, context **65536**,
 prefill chunk4096, RAM cache **4294967296 bytes**, thinking off, temperature0,
 F16 KV and YaRN off. **No pinned prefixes; deployment pin behaviour not measured.**
 This is not the production200000-context/11329267712-byte/pinned-prefix profile,
-not production-container ELF equivalence and not stable/public qualification.
+not production-container ELF equivalence or, by itself, stable/public qualification.
+Current channel approval is recorded separately in [STRIX-STATUS](../../STRIX-STATUS.md).
 
 The ordinary Gufo `tools/serving/gufo-serving-bench.py` performed the measurement;
 no custom map/registry monitoring was used. The client workspace revision95089ca9
@@ -119,21 +121,65 @@ report a C8 net slowdown of **0.81–0.87×**. Their published setup is not matc
 to this host/workload/implementation. Our C4 gain of1.21× neither contradicts
 that result nor predicts C8. No universal concurrency cutoff is established.
 
-## Promotion boundary and deferred stable packet
+## Two-host addendum — 2026-10-27
 
-This is an internal recommendation from one host, sequential arm order and a
-small, unpaired run—not preregistered quality/performance qualification.
-Main already contains the experimental MTP implementation. The coordinator owns
-approval of any nightly-prefix promotion after native Nimo build and short smoke;
-this docs-only commit does not push nightly, main or stable or activate a service.
+Coordinator called and completed nimo-2 lease **a8e32788276a**: worker success,
+production VERIFIED,809s. It reused the same r2 and identity scripts with only
+the installation path changed and the same measurement settings. N2 used the
+C2 production binary SHA256
+`2cdbea45de3e34b7300c35144bbd38305b77f5d84a68bd0a1c9f19a377762c82`;
+**2cdbea45 is a binary hash, not a Git revision**. Its non-test product code is
+identical to C2t/main/stable `242b4fcf477109e1ee10a281581e11badc90238c`, as
+recorded by the coordinator and STRIX-STATUS. N1 used the earlier8f build.
+Thus this repeats benefit/identity across two hosts, not a same-build paired
+experiment isolating hardware effects.
 
-For a later stable packet, **do not queue work now**: q8 C admission goes first
-on nimo-2. Once corrected C exists and is coordinator-approved, preregister the
-same r2 rate matrix plus fixed-suite OFF→Q8 identity scripts, versions, settings,
-quality/performance thresholds and repetition/order controls on nimo-1 and
-nimo-2. Native portability and unchanged output/cache/sampling behavior must be
-checked on that exact corrected prefix. Keep production200K/pin behaviour,
-rotated KV, YaRN, longer outputs and C>4 out of the claim unless separately
-measured. Stable requires coordinator approval plus preregistered quality/perf
-and two-host portability; only stable is a public/upstream-candidate line, not
-permission to publish.
+N2 canonical output t/s; parentheses are **N2 versus N1 percent deltas**:
+
+| C | OFF N2 (delta) | Q8 N2 (delta) | Q4 N2 (delta) | Q8/OFF N2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 28.46 (+0.91%) | **39.61 (-0.48%)** | 37.66 (+3.92%) | **1.392×** |
+| 2 | 43.41 (+0.86%) | **58.83 (-4.42%)** | 55.01 (-1.06%) | **1.355×** |
+| 3 | 54.97 (+1.25%) | **69.30 (+0.24%)** | 65.95 (-0.37%) | **1.261×** |
+| 4 | 64.56 (+1.89%) | **77.99 (+1.93%)** | 74.47 (+1.14%) | **1.208×** |
+
+Q4/OFF on N2 is1.323×/1.267×/1.200×/1.154×. **Q8 wins every C on both
+hosts; MTP remains positive at C4. Recommendation unchanged: Q8 ON through C4,
+Q4 lower-weight-memory option, no slot policy or new flags.**
+
+### Is the C2 Q8 spread noise?
+
+N2 is **2.72t/s (-4.42%)** below N1's61.54t/s. The three individual round
+rates are N1 **63.23,64.26,57.58** and N2 **56.78,58.17,61.75**t/s. Their ranges
+overlap; sample round-rate CV is5.84% and4.35%, respectively. The aggregate
+headline is still ratio-of-sums, not the arithmetic mean used for that CV.
+The gap is consistent with observed round variation, **not established as
+noise or equivalence**. Three unpaired rounds, different nonce prompts, hosts,
+builds and sequential arm order cannot identify a host penalty or regression.
+It does not overturn Q8's within-host win; no further run is requested.
+
+C2 client TTFT, milliseconds **median / p95**:
+
+| Host | OFF | Q8 | Q8 median change | Q8 p95 change |
+| --- | ---: | ---: | ---: | ---: |
+| nimo-1 | 603.69 / 805.89 | 818.14 / 818.19 | +214.46ms (+35.52%) | +12.30ms (+1.53%) |
+| nimo-2 | 600.42 / 801.63 | 816.57 / 818.05 | +216.14ms (+36.00%) | +16.42ms (+2.05%) |
+
+The same median/tail tradeoff repeats; small-sample quantiles are not tail
+SLO guarantees. Fixed-suite N2 output rates are29.26→58.22t/s at C1 (**1.990×**)
+and64.48→91.90 at C4 (**1.425×**). Q8 matches OFF **3/3 C1 and4/4 C4** against
+both same-C and OFF-C1 references. All compared OFF/Q8 fixed-suite hashes also
+match across hosts for those seven requests. Different corpus: do not pool these
+rates with the canonical matrix. No Q4 fixed-suite identity claim is added.
+
+### Channel and qualification scope after the repeat
+
+MTP support and the earlier recommendation docs already belong to approved
+main/stable C2t. This addendum records bounded two-host performance and identity;
+it neither independently promotes a prefix nor retroactively turns these
+opportunistic measurements into preregistered public qualification. Preserve the
+coordinator's adopted C2t acceptance and its limitations in STRIX-STATUS. There
+is no claim for production200K/pins, rotated KV, YaRN, longer outputs or C>4 from
+these runs. Stable is a public/upstream-candidate line, **not publication permission**.
+This docs-only feature is based on origin/nightly; the coordinator lands it.
+MTP is done and idle: no further model, harness or repeat is queued.
