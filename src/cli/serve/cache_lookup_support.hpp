@@ -67,8 +67,8 @@ inline std::string CacheLookupEpoch(
   flags << descriptor.max_context << ':' << slots << ':'
         << (descriptor.persistence ? descriptor.persistence->payload_version
                                    : 0)
-        << ':' << ram.capacity_bytes << ':' << ram.pinned_prefix.enabled()
-        << ':' << ram.pinned_prefix.lazy << ':'
+        << ':' << ram.enabled << ':' << ram.capacity_bytes << ':'
+        << ram.pinned_prefix.enabled() << ':' << ram.pinned_prefix.lazy << ':'
         << ram.pinned_prefix.capacity_bytes;
   for (const auto& file : ram.pinned_prefix.files)
     flags << ':' << file.string();
