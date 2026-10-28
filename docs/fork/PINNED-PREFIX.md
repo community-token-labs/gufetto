@@ -202,6 +202,10 @@ GAC_HOST=nimo-2 tools/nimo-build.sh gpu-test component_text_cache_test
 build/gpu-test/component_text_cache_test
 ```
 
+Registered pins currently require Linux's strict executable/runtime fingerprint
+lane; unsupported hosts are designed to refuse this optional feature rather
+than accept weaker identity. Native Windows builds/execution remain unverified.
+
 `tests/functional/pinned_prefix.py` probes an **already running** server with
 the same rendered file, checks cold greedy equality, seeded RAM replay, reused
 depth/prefill accounting, and writes restart-replay evidence. After an

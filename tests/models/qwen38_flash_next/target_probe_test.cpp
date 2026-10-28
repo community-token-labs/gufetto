@@ -10,6 +10,8 @@
 #include <iterator>
 
 #include "src/core/platform/env.hpp"
+#include "src/core/platform/runtime_fingerprint.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 namespace probe = gufo::models::qwen38_flash_next::detail;
 namespace fs = std::filesystem;
@@ -33,11 +35,9 @@ std::vector<std::uint8_t> Read(const fs::path& path) {
   return {std::istreambuf_iterator<char>(file), {}};
 }
 struct Temporary {
-  fs::path path;
-  ~Temporary() {
-    gufo::platform::UnsetEnv("GUFO_FLASH_NEXT_TARGET_PROBE");
-    fs::remove_all(path);
-  }
+  TemporaryDirectory directory{"qfn-target-probe"};
+  const fs::path& path{directory.path()};
+  ~Temporary() { gufo::platform::UnsetEnv("GUFO_FLASH_NEXT_TARGET_PROBE"); }
 };
 }  // namespace
 
@@ -48,6 +48,14 @@ int main() {
     const std::array<float, 3> logits{1.25F, -0.0F, -4.5F};
     probe::ProbeTargetLogits(2415, logits);  // Fully disabled: no directory.
     if (std::string_view(gufo::platform::HostOsName()) != "Linux") {
+      try {
+        (void)gufo::platform::StrictRuntimeFingerprint("unsupported-test");
+        throw std::logic_error("unsupported pin fingerprint was accepted");
+      } catch (const std::runtime_error& error) {
+        Require(std::string_view(error.what()).find("unsupported") !=
+                    std::string_view::npos,
+                "unsupported pin fingerprint error is unclear");
+      }
       Require(gufo::platform::SetEnv("GUFO_FLASH_NEXT_TARGET_PROBE",
                                      "unsupported-private-probe"),
               "cannot set probe environment");
@@ -66,14 +74,8 @@ int main() {
       std::cout << "target_probe_test passed (optional probe unsupported)\n";
       return 0;
     }
-    const auto directory =
-        fs::temp_directory_path() /
-        ("qfn-target-probe-" + std::to_string(gufo::platform::ProcessId()));
-    Require(fs::create_directory(directory),
-            "temporary probe directory failed");
-    Temporary temporary{directory};
-    Require(gufo::platform::RestrictToOwner(directory),
-            "cannot restrict probe directory");
+    Temporary temporary;
+    const auto& directory = temporary.path;
     Require(gufo::platform::SetEnv("GUFO_FLASH_NEXT_TARGET_PROBE",
                                    directory.string()),
             "cannot set probe environment");

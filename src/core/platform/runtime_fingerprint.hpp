@@ -8,13 +8,13 @@
 
 #if defined(__linux__)
 #include <link.h>
-#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <set>
 #include <string>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/platform/os_info.hpp"
 #endif
 
 namespace gufo::platform {
@@ -46,11 +46,11 @@ inline std::array<std::uint8_t, 32> StrictRuntimeFingerprint(
     add(object);
     add(crypto::Sha256FileHex(object));
   }
-  utsname system{};
-  if (uname(&system) != 0)
+  const auto system = QueryHostIdentity();
+  if (!system)
     throw std::runtime_error("cannot identify pinned-prefix runtime");
-  add(system.release);
-  add(system.machine);
+  add(system->release);
+  add(system->machine);
   std::set<std::string> environment;
   for (auto** p = environ; p && *p; ++p) {
     const std::string_view entry(*p);
