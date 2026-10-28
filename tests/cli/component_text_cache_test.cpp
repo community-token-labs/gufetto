@@ -3632,10 +3632,12 @@ void PreparedSerialCutKeepsRealComponentBoundaries() {
   while (!request.prefill_complete()) {
     cut = request.PrepareSinglePassPrefill(7);
     if (!cut) {
-      // A real asynchronous component capture is a dependency, not a model
-      // decline. Join that exact copy once; no sleeping/retry-until-green.
-      assert(request.SnapshotPending());
+      // Join the exact capture once. It may finish between the failed poll
+      // and this call, so asserting a second transient Pending flag is racy.
+      // This fake's valid model plan does not decline; no sleep/retry loop.
+      const auto position = request.prefill_position();
       request.CapturePromptSnapshot();
+      assert(request.prefill_position() == position);
       cut = request.PrepareSinglePassPrefill(7);
     }
     assert(cut && *cut > 0 && *cut <= 7);
