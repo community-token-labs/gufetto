@@ -18,6 +18,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
+#include "src/models/qwen38_flash_next/target_probe.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace gufo::models::qwen38_flash_next {
@@ -1003,6 +1004,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return true;
   }
   const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  // This is the live session distribution used by the executing sampler,
+  // including the restored first-decode frontier, not a checkpoint export.
+  detail::ProbeTargetLogits(static_cast<std::uint32_t>(tokens_.size()),
+                            logits_);
+  detail::ProbeTargetToken(static_cast<std::uint32_t>(tokens_.size()), anchor,
+                           is_stop(anchor));
   if (is_stop(anchor)) {
     result->stop = true;
     return true;
@@ -1125,7 +1132,20 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const auto is_stop = [&](std::int32_t token) {
     return request.stop_at_eos && model_->IsStopToken(token);
   };
+  // Snapshot only the requested target rows, before any verification work.
+  // ReadVerificationRows honors SelectBatchLogits' session offset. These are
+  // fresh target LM-head results, not MTP proposals or stored payload logits.
+  const auto probe = detail::TargetProbeRange(base + 1, k);
+  std::vector<float> probe_logits;
+  if (pending.speculative && probe.second != 0) {
+    probe_logits.resize(std::size_t{probe.second - probe.first} * vocab);
+    if (!exec.ReadVerificationRows(probe.first - base - 1, probe_logits,
+                                   error_msg))
+      return false;
+  }
   if (!pending.speculative) {
+    detail::ProbeTargetLogits(base + 1, logits_);
+    detail::ProbeTargetToken(base, anchor);
     draft_length_.ObserveArToken();
     hidden_base_ = base;
     tokens_.push_back(anchor);
@@ -1237,6 +1257,22 @@ bool Session::FinishDecode(const DecodeRequest& request,
     std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
                 logits_.begin());
   }
+  // Publish only committed teacher-forced rows, including the next-token
+  // frontier after the last kept input. Discarded candidate rows never leak
+  // into the comparison. Do not change verification, rollback or sampling.
+  if (!probe_logits.empty()) {
+    for (auto position = probe.first;
+         position < std::min(probe.second, base + keep + 1); ++position) {
+      detail::ProbeTargetLogits(
+          position,
+          std::span<const float>(probe_logits)
+              .subspan(std::size_t{position - probe.first} * vocab, vocab));
+    }
+  }
+  for (std::uint32_t i = 0; i < keep; ++i)
+    detail::ProbeTargetToken(base + i, chain[i]);
+  if (result->stop)
+    detail::ProbeTargetToken(base + keep, 0, true);
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
