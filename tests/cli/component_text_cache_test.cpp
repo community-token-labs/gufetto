@@ -1042,9 +1042,9 @@ void RestartAndCorruption() {
     assert(Generate(retry) == token);
     (void)retry.Commit();
   }
-  {
+  for (const bool enabled : {true, false}) {
     auto runner = std::make_shared<Runner>();
-    ComponentTextCache exporter(runner, 1, 1 << 22, disk);
+    ComponentTextCache exporter(runner, 1, 1 << 22, disk, false, 0, {}, enabled);
     assert(exporter.Lookup(prompt, nullptr, true, 0)->tier == "disk");
     auto blob = exporter.Export(prompt, nullptr, true, 0, "disk-transfer-v20");
     std::vector<std::uint8_t> wire;
@@ -2669,6 +2669,42 @@ void PinnedPrefixCorruptionFailsClosed() {
     assert(refused);  // no partial state execution or silent repeated writes
   }
 }
+void CheckpointImportRespectsRamOff() {
+  for (const bool with_disk : {false, true}) {
+    const TemporaryDirectory temp("gufo-component-import-off");
+    std::optional<TextRunnerDiskCacheOptions> disk;
+    if (with_disk)
+      disk = TextRunnerDiskCacheOptions{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20};
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache target(runner, 1, 1 << 22, disk, false, 0, {}, false);
+    const std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
+    {
+      auto live = target.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(live->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      (void)live->Commit({}, {}, prompt);
+    }
+    for (const std::uint64_t length : {0, 1024}) {
+      bool read = false, refused = false;
+      try {
+        (void)target.Import(
+            [&](std::span<std::uint8_t>) {
+              read = true;
+              return std::size_t{0};
+            },
+            length, "off-policy");
+      } catch (const CheckpointTransferError& e) {
+        refused = e.status == 507 &&
+                  std::string_view(e.code) == "cache_transfer_budget";
+      }
+      assert(refused && !read && runner->captures == 0);
+      const auto lookup = target.Lookup(prompt, nullptr, true, 0);
+      assert(lookup && lookup->tier == "live" &&
+             lookup->matched_tokens == prompt.size());
+    }
+  }
+}
 void CheckpointTransferRoundTripAndConcurrentServing() {
   class ImportRunner final : public Runner {
   public:
@@ -2980,6 +3016,7 @@ void RamCacheOffRefusesCapturesWithinTheDiskStep() {
 }
 int main() {
   CheckpointTransferRoundTripAndConcurrentServing();
+  CheckpointImportRespectsRamOff();
   LookupIsReadOnlyAndMatchesAcquire();
   LookupRespectsRamOffWithoutDisablingLiveReuse();
   LookupDoesNotWaitForAdmission();
