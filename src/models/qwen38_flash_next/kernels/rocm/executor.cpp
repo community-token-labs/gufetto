@@ -1315,6 +1315,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
             e->npu_whole_c_[bank].push_back(id);
         }
       }
+      if (ok) {
+        void* control = nullptr;
+        if (!Check(e->host_allocations_.Allocate(
+                       &control, sizeof(Session::Control)),
+                   "pinned pair control buffer", error_msg))
+          return nullptr;
+        e->pair_control_host_ = static_cast<Session::Control*>(control);
+      }
       e->npu_whole_enabled_ = ok;
       if (!ok)
         std::fprintf(stderr, "NPU whole buffers unavailable: %s\n",
@@ -2531,14 +2539,18 @@ bool Executor::NpuPairEnabled() const {
   if (!StrixNpuEnabled() || two_bank == nullptr ||
       std::strcmp(two_bank, "1") != 0 || !npu_whole_enabled_ ||
       npu == nullptr || !npu->Healthy() || npu->tokens() != 4096 ||
-      options_.max_batch < 8192)
+      options_.max_batch < 8192 || config().num_layers == 0 ||
+      (config().ple_layer >= 0 &&
+       static_cast<std::uint32_t>(config().ple_layer) + 1 >= config().num_layers))
     return false;
   for (const auto& l : model_->layers()) {
     const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
     const auto& ids = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
     if (w.type != GgmlType::kQ8_0 || w.cols != npu->k() ||
         ids.empty() || ids.size() > 16 ||
-        w.rows != ids.size() * npu->n())
+        w.rows != ids.size() * npu->n() ||
+        (l.linear && (l.ssm_alpha_beta.empty() ||
+                      l.ssm_alpha_beta.cols != w.cols)))
       return false;
   }
   return true;
@@ -2547,56 +2559,90 @@ bool Executor::NpuPairEnabled() const {
 #endif
 }
 
-bool Executor::NpuWholeProjection(const DeviceTensor& w,
-                                   const std::vector<int>& weights,
-                                   const float* x, float* out,
-                                   std::uint32_t rows,
-                                   std::string* error_msg) const {
+bool Executor::CanForwardPair(const Session& session) const {
+  // MTP requires a contiguous hidden carry. Keep its original chunk path.
+  return NpuPairEnabled() && pair_control_host_ != nullptr &&
+         session.owner_ == this && !session.mtp_enabled_ &&
+         session.VisionLayout().PrefixLength() == 0 &&
+         session.spec_tokens_ == 0 &&
+         std::uint64_t{session.position_} + 8192 <= session.max_context_;
+}
+
+void Executor::SaveCache(BankCache* cache) const {
+  cache->q8t_src = q8t_src_;
+  cache->q8t_rows = q8t_rows_;
+  cache->q8t_cols = q8t_cols_;
+  cache->half_src = half_src_;
+  cache->half_rows = half_rows_;
+  cache->half_cols = half_cols_;
+  cache->half_bf16 = half_bf16_;
+  cache->xn_half = xn_half_;
+  cache->moe_pending = moe_pending_;
+  cache->defer_residual = defer_residual_;
+  cache->res_deferred = res_deferred_;
+  cache->shexp_half_ready = shexp_half_ready_;
+  cache->shexp_npu_pending = shexp_npu_pending_;
+  cache->inject_parts = inject_parts_;
+  cache->inject_fused = inject_fused_;
+  cache->q8_slot = q8_slot_;
+  cache->xn_q8_ready = xn_q8_ready_;
+  cache->mixed_q8_ready = mixed_q8_ready_;
+}
+
+void Executor::LoadCache(const BankCache& cache) const {
+  q8t_src_ = cache.q8t_src;
+  q8t_rows_ = cache.q8t_rows;
+  q8t_cols_ = cache.q8t_cols;
+  half_src_ = cache.half_src;
+  half_rows_ = cache.half_rows;
+  half_cols_ = cache.half_cols;
+  half_bf16_ = cache.half_bf16;
+  xn_half_ = cache.xn_half;
+  moe_pending_ = cache.moe_pending;
+  defer_residual_ = cache.defer_residual;
+  res_deferred_ = cache.res_deferred;
+  shexp_half_ready_ = cache.shexp_half_ready;
+  shexp_npu_pending_ = cache.shexp_npu_pending;
+  inject_parts_ = cache.inject_parts;
+  inject_fused_ = cache.inject_fused;
+  q8_slot_ = cache.q8_slot;
+  xn_q8_ready_ = cache.xn_q8_ready;
+  mixed_q8_ready_ = cache.mixed_q8_ready;
+}
+
+bool Executor::PrefetchNpu(const DeviceLayer& l, std::uint32_t bank,
+                           bool normed, PreparedNpu* prepared,
+                           std::string* error_msg) const {
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
   NpuGemm* npu = model_->npu();
-  if (rows != 8192 || !NpuPairEnabled() || w.type != GgmlType::kQ8_0 ||
-      w.cols != npu->k() || weights.empty() || weights.size() > 16 ||
-      w.rows != weights.size() * npu->n()) {
-    AssignError(error_msg, "unsupported whole NPU projection");
+  const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
+  const auto& weights = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
+  constexpr std::uint32_t rows = 4096;
+  const bool half_only = l.linear && DenseF16Route(l.ssm_in, rows) &&
+                        l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                        l.ssm_alpha_beta.cols == l.ssm_in.cols;
+  if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, rows,
+             error_msg, half_only))
     return false;
-  }
-  PrepareHalfInput(x, rows, w.cols);
+  PrepareHalfInput(s_.mixed, rows, w.cols);
   npu_used_ = true;
-  // Two private staging banks, each retaining a complete 4096-token group
-  // until both submissions have reaped. Residuals and GPU consumers stay F32.
-  for (std::uint32_t bank = 0; bank < 2; ++bank) {
-    NpuEncodeActivations(static_cast<const __half*>(s_.x_half) +
-                            std::size_t(bank) * npu->tokens() * w.cols,
-                        w.cols, npu->tokens(), npu->k(), 0, npu->k(),
-                        npu->Device(npu_whole_a_[bank]), stream_);
-    if (!npu->Submit(stream_, npu_whole_a_[bank], weights.data(),
-                     npu_whole_c_[bank].data(),
-                     static_cast<int>(weights.size()))) {
-      (void)npu->Wait(stream_);
-      AssignError(error_msg, "NPU whole projection submit failed");
-      return false;
-    }
-  }
-  if (!npu->Wait(stream_)) {
-    AssignError(error_msg, "NPU whole projection wait failed");
+  NpuEncodeActivations(static_cast<const __half*>(s_.x_half), w.cols, rows,
+                       npu->k(), 0, npu->k(),
+                       npu->Device(npu_whole_a_[bank]), stream_);
+  if (!npu->Submit(stream_, npu_whole_a_[bank], weights.data(),
+                   npu_whole_c_[bank].data(),
+                   static_cast<int>(weights.size()))) {
+    (void)npu->Wait(stream_);
+    AssignError(error_msg, "NPU interleaved projection submit failed");
     return false;
   }
-  for (std::uint32_t bank = 0; bank < 2; ++bank) {
-    for (std::size_t slice = 0; slice < weights.size(); ++slice) {
-      NpuDecodeOutput(npu->Staged(stream_, npu_whole_c_[bank][slice]),
-                      out + std::size_t(bank) * npu->tokens() * w.rows,
-                      npu->tokens(), npu->n(), w.rows,
-                      static_cast<std::uint32_t>(slice) * npu->n(),
-                      false, stream_);
-    }
-  }
+  *prepared = {npu->Ticket(), bank};
   return true;
 #else
-  (void)w;
-  (void)weights;
-  (void)x;
-  (void)out;
-  (void)rows;
+  (void)l;
+  (void)bank;
+  (void)normed;
+  (void)prepared;
   AssignError(error_msg, "NPU support is not compiled");
   return false;
 #endif
@@ -2626,16 +2672,6 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         (void)hipStreamWaitEvent(stream, event, 0);
     }
   } z_join{stream_};
-#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
-  if (!projections_ready && !speculative && prefill_phase &&
-      n_tokens == 8192 && NpuPairEnabled()) {
-    if (!NpuWholeProjection(l.ssm_in, l.npu_ssm_all, x, s_.qkvz,
-                             n_tokens, error_msg) ||
-        !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg))
-      return false;
-    projections_ready = true;
-  }
-#endif
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
@@ -2865,15 +2901,6 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   const bool rotated = KvIsRotated(options_.kv_cache_type);
   bool prepared = false;
-#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
-  if (!projections_ready && prefill_phase && n_tokens == 8192 &&
-      NpuPairEnabled()) {
-    if (!NpuWholeProjection(l.attn_qkv, l.npu_qkv_all, x, s_.qg,
-                             n_tokens, error_msg))
-      return false;
-    projections_ready = true;
-  }
-#endif
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && WidePrefill(n_tokens) &&
@@ -3460,6 +3487,37 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
                                      ? WeightType::kQ5_K
                                      : WeightType::kQ4_K;
+    const auto rejected = [&](const char* operation) {
+      // RouteHints has already downloaded and joined these counts. Negative
+      // path only: do not issue another transfer or change zero-work/math.
+      std::uint64_t count_sum = 0;
+      for (std::uint32_t e = 0; e < c.num_experts; ++e)
+        count_sum += counts_host_[e];
+      const bool paired = routed_64_tiles_ != 0;
+      char detail[768];
+      std::snprintf(
+          detail, sizeof(detail),
+          "routed F16 %s GEMM failed: countsum=%llu expected=%llu "
+          "tokens=%u used=%u gate_tiles=%u gate_tile_rows=%u "
+          "gate_output_rows=%u down_tiles=%u down_tile_rows=%u "
+          "narrow_tiles=%u narrow_tile_rows=%u pair_offset=%u max_rows=%u "
+          "gate_type=%u up_type=%u down_type=%u layer=%d bank=%d start=%u",
+          operation, static_cast<unsigned long long>(count_sum),
+          static_cast<unsigned long long>(n_tokens) * used, n_tokens, used,
+          paired ? routed_pair_tiles_ : routed_n_tiles_,
+          paired ? 128U : routed_tile_rows_, paired ? 64U : 128U,
+          paired ? routed_64_tiles_ : routed_n_tiles_,
+          paired ? 64U : routed_tile_rows_, routed_n_tiles_, routed_tile_rows_,
+          routed_pair_offset_, routed_max_rows_,
+          static_cast<unsigned>(l.ffn_gate_exps.type),
+          static_cast<unsigned>(l.ffn_up_exps.type),
+          static_cast<unsigned>(l.ffn_down_exps.type),
+          dump_frame != nullptr ? static_cast<int>(dump_frame->layer) : -1,
+          pair_bank_, pair_bank_ >= 0 ? pair_start_
+                                    : dump_frame != nullptr ? dump_frame->start
+                                                            : 0U);
+      AssignError(error_msg, detail);
+    };
     const bool gated_ok =
         routed_64_tiles_ != 0
             ? RoutedGatedF16Gemm(
@@ -3478,7 +3536,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                              s_.rows_slot, s_.gate_e, nullptr, up_half,
                              c.expert_ff, c.hidden_size, stream_));
     if (!gated_ok) {
-      AssignError(error_msg, "routed F16 gate/up GEMM failed");
+      rejected("gate/up");
       return false;
     }
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
@@ -3496,7 +3554,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                        s_.rows_slot, s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
                        c.expert_ff, stream_)) {
-      AssignError(error_msg, "routed F16 down GEMM failed");
+      rejected("down");
       return false;
     }
   } else {
@@ -3746,6 +3804,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         (void)hipStreamSynchronize(stream);
     }
   } pinned_inputs{stream_};
+  if (mode == ForwardMode::kPrefill && checkpoint == nullptr && n == 8192 &&
+      n_logits == 1 && logits != nullptr && CanForwardPair(session)) {
+    // Once selected, any submission/consumer failure is fatal for this pass.
+    // Never replay GPU work over partially mutated GDN/KV state.
+    const bool ok = ForwardPair(session, tokens, logits, error_msg);
+    pinned_inputs.completed = ok;
+    return ok;
+  }
   // Start the disk rows before protecting checkpoint rows, which can commit
   // device pages: layer 0 alone cannot hide the whole read.
   if (session.continuation_hooks_) {
@@ -3872,6 +3938,222 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   return true;
 }
 
+bool Executor::ForwardPair(Session& session,
+                           std::span<const std::int32_t> tokens,
+                           float* logits, std::string* error_msg) const {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  constexpr std::uint32_t rows = 4096;
+  const Config& c = config();
+  const std::uint32_t start = session.position_;
+  const Scratch saved = s_;
+  // Every persistent wide representation has a private 4096-row partition of
+  // the existing max_batch >= 8192 allocation. Stage/route/conv workspaces
+  // have one GPU consumer at a time and stay shared on this same stream.
+  std::array<Scratch, 2> scratch{saved, saved};
+  auto& b = scratch[1];
+  b.tokens += rows;
+  b.res += std::size_t{rows} * c.HcDim();
+  b.xn += std::size_t{rows} * c.HcDim();
+  b.xn_half += std::size_t{rows} * c.HcDim();
+  b.xn_q8t = static_cast<std::uint8_t*>(b.xn_q8t) +
+             Q8TiledBytes(rows, c.HcDim());
+  b.lo += std::size_t{rows} * c.hc_low_rank;
+  b.mixed += std::size_t{rows} * c.hidden_size;
+  b.inject += std::size_t{rows} * c.hc_count * HcInjectParts(c.hidden_size);
+  b.block_out += std::size_t{rows} * c.hidden_size;
+  b.hc_defer_w += std::size_t{rows} * c.hc_count;
+  b.x_half = static_cast<__half*>(b.x_half) +
+             std::size_t{rows} * model_->max_half_cols();
+  b.x_q8t = static_cast<std::uint8_t*>(b.x_q8t) +
+            Q8TiledBytes(rows, model_->max_q8_cols());
+  if (c.ple_layer >= 0) {
+    b.ple_query = b.xn;
+    b.ple_conv = b.xn;
+    b.ple_value = b.block_out;
+  }
+
+  struct Restore {
+    const Executor* e;
+    Scratch scratch;
+    bool completed{false};
+    ~Restore() {
+      // Includes submit/wait callbacks on ALL failure and exception exits.
+      if (!completed) {
+        // A cancellation/consumer error may leave the other bank prefetched
+        // but unconsumed. Join its worker ticket before any input/C reuse.
+        if (e->npu_used_)
+          (void)e->model_->npu()->Wait(e->stream_);
+        (void)hipStreamSynchronize(e->stream_);
+      }
+      e->s_ = scratch;
+      // Pair work overwrote these allocations; pre-pair identities are
+      // stale even though the outer scratch addresses are restored.
+      e->LoadCache(BankCache{});
+      e->pair_bank_ = -1;
+      e->pair_start_ = 0;
+    }
+  } restore{this, saved};
+  // PLE staging is single-buffered. Neither bank may trigger a next-chunk
+  // prefetch until both prefixes have consumed their own disk rows.
+  const auto next = prefetch_next_;
+  struct RestoreHint {
+    std::span<const std::int32_t>& slot;
+    std::span<const std::int32_t> hint;
+    ~RestoreHint() { slot = hint; }
+  } restore_hint{prefetch_next_, next};
+  prefetch_next_ = {};
+
+  if (session.continuation_hooks_) {
+    const auto end = start + 2 * rows;
+    session.continuation_hooks_->BeforeWrite(
+        false, start, end, session.blocks_,
+        c.compress_ratio > 0 && end > c.indexer_top_k
+            ? end / c.compress_ratio : session.blocks_);
+  }
+  const auto old_ngram = session.ngram_;
+  if (c.ple_layer >= 0 &&
+      (ngram_ == nullptr ||
+       !PleFetch(session, tokens.first(rows), false, error_msg))) {
+    if (ngram_ == nullptr)
+      AssignError(error_msg, "n-gram table is not open");
+    return false;
+  }
+  try {
+    session.PreserveSnapshots(start, session.mtp_.position);
+  } catch (...) {
+    (void)WaitPle(nullptr);
+    session.ngram_ = old_ngram;
+    throw;
+  }
+  ++session.mutation_epoch_;
+  session.spec_base_ = start;
+  session.spec_tokens_ = 0;
+  std::copy(tokens.begin(), tokens.end(), tokens_host_);
+
+  std::array<bool, 2> sparse{};
+  std::array<std::uint32_t, 2> pool{};
+  std::array<std::uint32_t, 2> blocks{};
+  std::uint32_t previous = session.blocks_;
+  for (std::uint32_t bank = 0; bank < 2; ++bank) {
+    const auto end = start + (bank + 1) * rows;
+    sparse[bank] = c.compress_ratio > 0 && end > c.indexer_top_k;
+    const auto complete = c.compress_ratio > 0 ? end / c.compress_ratio : 0;
+    blocks[bank] = previous;
+    pool[bank] = sparse[bank] && complete > previous ? complete - previous : 0;
+    if (sparse[bank])
+      previous = complete;
+  }
+  std::array<Session::Control*, 2> controls{control_host_, pair_control_host_};
+  for (std::uint32_t bank = 0; bank < 2; ++bank) {
+    auto* control = controls[bank];
+    control->position = start + bank * rows;
+    control->blocks = blocks[bank];
+    control->mtp_position = session.mtp_.position;
+    control->mtp_blocks = session.mtp_.blocks;
+    control->hidden_row = -1;
+  }
+  std::array<BankCache, 2> cache{};
+  std::array<PreparedNpu, 2> prepared{};
+  auto select = [&](std::uint32_t bank) {
+    s_ = scratch[bank];
+    LoadCache(cache[bank]);
+    pair_bank_ = static_cast<int>(bank);
+    pair_start_ = start + bank * rows;
+  };
+  auto control_upload = [&](std::uint32_t bank) {
+    return Check(hipMemcpyAsync(
+                     session.control_, controls[bank], sizeof(Session::Control),
+                     hipMemcpyHostToDevice, stream_),
+                 "interleaved bank control upload", error_msg);
+  };
+  perf::Forward perf_forward(true);
+  perf_forward.Rows(start, 2 * rows);
+  perf::HostPhase perf_trunk("prefill_trunk_forward");
+  PerfTarget perf_target(perf_events_, stream_);
+
+  // Finish the PLE prefix A then B before reusing its coherent host staging.
+  // GDN, KV, PLE history and pooling all observe A before B at every layer.
+  const auto prefix_end = c.ple_layer >= 0
+                              ? static_cast<std::uint32_t>(c.ple_layer) + 1
+                              : 0U;
+  for (std::uint32_t bank = 0; bank < 2; ++bank) {
+    select(bank);
+    if (bank == 1 && c.ple_layer >= 0 &&
+        !PleFetch(session, tokens.subspan(rows), false, error_msg))
+      return false;
+    if (!control_upload(bank) ||
+        !Check(hipMemcpyAsync(s_.tokens, tokens_host_ + bank * rows,
+                              rows * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "interleaved bank token upload", error_msg))
+      return false;
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                s_.tokens, s_.res, rows, c.hidden_size, c.hc_count, stream_);
+    if (prefix_end != 0 &&
+        !ForwardBody(session, rows, 0, false, false, sparse[bank],
+                     start + bank * rows, pool[bank], 0, prefix_end,
+                     error_msg, nullptr, false, false, false,
+                     &cache[bank].normed))
+      return false;
+    SaveCache(&cache[bank]);
+    if (c.ple_layer >= 0 &&
+        !Check(hipStreamSynchronize(stream_), "interleaved PLE staging drain",
+               error_msg))
+      return false;
+  }
+
+  const auto& layers = model_->layers();
+  auto prefetch = [&](std::uint32_t bank, std::uint32_t layer) {
+    select(bank);
+    if (!PrefetchNpu(layers[layer], bank, cache[bank].normed,
+                     &prepared[bank], error_msg))
+      return false;
+    SaveCache(&cache[bank]);
+    return true;
+  };
+  if (!prefetch(0, prefix_end) || !prefetch(1, prefix_end))
+    return false;
+  for (std::uint32_t layer = prefix_end; layer < c.num_layers; ++layer) {
+    for (std::uint32_t bank = 0; bank < 2; ++bank) {
+      select(bank);
+      if (!control_upload(bank) ||
+          !ForwardBody(session, rows, bank == 1 ? 1 : 0, bank == 1,
+                       false, sparse[bank], start + bank * rows, pool[bank],
+                       layer, layer + 1, error_msg, nullptr, false, false,
+                       cache[bank].normed, &cache[bank].normed, &prepared[bank]))
+        return false;
+      SaveCache(&cache[bank]);
+      // A(next) is submitted before B(current)'s GPU consumer; B(next)
+      // before A(next)'s consumer. Wait only the consumed bank's ticket,
+      // never the global latest ticket that includes the other bank.
+      if (layer + 1 < c.num_layers && !prefetch(bank, layer + 1))
+        return false;
+    }
+  }
+  if (!Check(hipStreamSynchronize(stream_), "interleaved trunk drain",
+             error_msg))
+    return false;
+  if (!model_->npu()->Healthy()) {
+    AssignError(error_msg, "NPU run failed; interleaved batch discarded");
+    return false;
+  }
+  perf_target.Finish();
+  perf_trunk.Finish();
+  perf_forward.Finish();
+  std::copy_n(logits_host_, c.vocab_size, logits);
+  session.position_ = start + 2 * rows;
+  session.blocks_ = previous;
+  restore.completed = true;
+  return true;
+#else
+  (void)session;
+  (void)tokens;
+  (void)logits;
+  AssignError(error_msg, "NPU support is not compiled");
+  return false;
+#endif
+}
+
 bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t n_logits, bool download_logits,
                            bool speculative, bool sparse,
@@ -3879,9 +4161,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t first_layer, std::uint32_t end_layer,
                            std::string* error_msg,
                            PrefillCheckpoint* checkpoint,
-                           bool embeddings_ready) const {
+                           bool embeddings_ready, bool initialize,
+                           bool normed_input, bool* normed_output,
+                           const PreparedNpu* prepared) const {
   const Config& c = config();
-  if (first_layer == 0) {
+  if (first_layer == 0 && initialize) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
                               sizeof(Session::Control), hipMemcpyHostToDevice,
                               stream_),
@@ -3897,7 +4181,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                  c.hc_count, stream_);
   }
   const auto& layers = model_->layers();
-  bool normed = false;  ///< xn holds the next mixer's grouped norm of res
+  bool normed = normed_input;  ///< grouped norm of this bank's residual
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;
@@ -3914,10 +4198,35 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            l.linear && DenseF16Route(l.ssm_in, n) &&
                            l.ssm_alpha_beta.type == GgmlType::kF16 &&
                            l.ssm_alpha_beta.cols == l.ssm_in.cols;
-    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-               half_only)) {
+    if (prepared == nullptr &&
+        !HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
+                half_only)) {
       return false;
     }
+    bool projections_ready = false;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+    if (prepared != nullptr) {
+      NpuGemm* npu = model_->npu();
+      // Alpha/beta stays on the original GPU dense route. Queue it ahead of
+      // the ticket wait, while this bank's full SSM projection is in flight.
+      if (l.linear &&
+          !Dense(l.ssm_alpha_beta, s_.mixed, s_.alpha_beta, n, error_msg))
+        return false;
+      if (!npu->Wait(stream_, prepared->ticket)) {
+        AssignError(error_msg, "NPU interleaved projection wait failed");
+        return false;
+      }
+      const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
+      const auto& ids = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
+      float* out = l.linear ? s_.qkvz : s_.qg;
+      for (std::size_t slice = 0; slice < ids.size(); ++slice)
+        NpuDecodeOutput(
+            npu->Staged(stream_, npu_whole_c_[prepared->bank][slice]), out,
+            n, npu->n(), w.rows,
+            static_cast<std::uint32_t>(slice) * npu->n(), false, stream_);
+      projections_ready = true;
+    }
+#endif
     // The last target layer's query outputs have no later cache consumer.
     // Preserve all K/V/indexer rows and the final query's original tile.
     const bool last_attention = WidePrefill(n) && !session.mtp_enabled_ &&
@@ -3930,14 +4239,15 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                                      checkpoint->tokens}
                      : GdnCheckpoint{};
       if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
-                           speculative, error_msg, false, true, capture)) {
+                           speculative, error_msg, projections_ready, true,
+                           capture)) {
         return false;
       }
     } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
                           &session.control_->position,
                           &session.control_->blocks, start_pos, pool_grid,
                           session.max_context_, sparse, error_msg,
-                          last_attention, false, true,
+                          last_attention, projections_ready, true,
                           checkpoint ? checkpoint->tokens : 0)) {
       return false;
     }
@@ -3994,6 +4304,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     normed = next_norm != nullptr;
   }
+  if (normed_output != nullptr)
+    *normed_output = normed;
   if (end_layer < c.num_layers) {
     return true;
   }

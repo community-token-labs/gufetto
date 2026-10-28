@@ -307,6 +307,7 @@ public:
   /// Logit rows remain in batch order until SelectBatchLogits is called.
   /// Opt-in paired admission; ordinary scheduler chunks remain 4096.
   [[nodiscard]] bool NpuPairEnabled() const;
+  [[nodiscard]] bool CanForwardPair(const Session& session) const;
   [[nodiscard]] bool ForwardBatch(std::span<const BatchItem> items,
                                   std::string* error_msg) const;
   [[nodiscard]] bool SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
@@ -591,6 +592,47 @@ private:
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool candidates, const Session* draft,
                std::string* error_msg) const;
+  /// Producer-written Q8_1 rows (see ReadyQ8): source, rows and width.
+  struct ReadyRows {
+    const float* src{nullptr};
+    const void* data{nullptr};
+    std::uint32_t n{0};
+    std::uint32_t k{0};
+  };
+  struct PreparedNpu {
+    std::uint64_t ticket{0};
+    std::uint32_t bank{0};
+  };
+  /// Per-bank representation identities. Device storage is partitioned from
+  /// the Executor's fixed 8192-row allocation; transient GPU stages are shared.
+  struct BankCache {
+    const float* q8t_src{nullptr};
+    std::uint32_t q8t_rows{0};
+    std::size_t q8t_cols{0};
+    const float* half_src{nullptr};
+    std::uint32_t half_rows{0};
+    std::size_t half_cols{0};
+    bool half_bf16{false};
+    bool xn_half{false};
+    bool moe_pending{false};
+    bool defer_residual{false};
+    bool res_deferred{false};
+    bool shexp_half_ready{false};
+    bool shexp_npu_pending{false};
+    std::uint32_t inject_parts{1};
+    const float* inject_fused{nullptr};
+    unsigned q8_slot{0};
+    ReadyRows xn_q8_ready;
+    ReadyRows mixed_q8_ready;
+    bool normed{false};
+  };
+  void SaveCache(BankCache* cache) const;
+  void LoadCache(const BankCache& cache) const;
+  bool ForwardPair(Session& session, std::span<const std::int32_t> tokens,
+                   float* logits, std::string* error_msg) const;
+  bool PrefetchNpu(const DeviceLayer& layer, std::uint32_t bank,
+                   bool normed, PreparedNpu* prepared,
+                   std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -598,7 +640,10 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
                    PrefillCheckpoint* checkpoint = nullptr,
-                   bool embeddings_ready = false) const;
+                   bool embeddings_ready = false,
+                   bool initialize = true, bool normed_input = false,
+                   bool* normed_output = nullptr,
+                   const PreparedNpu* prepared = nullptr) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
@@ -842,19 +887,13 @@ private:
   /// s_.inject, so the following HcMix skips its inject pass.
   mutable const float* inject_fused_{nullptr};
   mutable unsigned q8_slot_{0};
-  /// Producer-written Q8_1 rows (see ReadyQ8): source, rows and width.
-  struct ReadyRows {
-    const float* src{nullptr};
-    const void* data{nullptr};
-    std::uint32_t n{0};
-    std::uint32_t k{0};
-  };
-  bool NpuWholeProjection(const DeviceTensor& w, const std::vector<int>& weights,
-                          const float* x, float* out, std::uint32_t rows,
-                          std::string* error_msg) const;
   std::array<int, 2> npu_whole_a_{{-1, -1}};
   std::array<std::vector<int>, 2> npu_whole_c_;
   bool npu_whole_enabled_{false};
+  Session::Control* pair_control_host_{nullptr};
+  // Host-only negative-path attribution; no device diagnostics or math changes.
+  mutable int pair_bank_{-1};
+  mutable std::uint32_t pair_start_{0};
   mutable bool shexp_npu_pending_{false};
   mutable bool npu_used_{false};
   std::vector<int> npu_a_;

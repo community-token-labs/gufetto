@@ -772,7 +772,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
     const bool pair = prefill && !image_prompt_ && !checkpoint && !consume &&
-                      remaining >= 8192 && exec.NpuPairEnabled();
+                      remaining >= 8192 && exec.CanForwardPair(*session_);
     const auto capacity = pair ? 8192U
                           : remaining <= model_->PrefillThroughCapacity()
                               ? model_->PrefillThroughCapacity()
