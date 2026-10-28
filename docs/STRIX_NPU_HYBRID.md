@@ -1,10 +1,20 @@
 # Experimental Strix Halo hybrid projections
 
-Implementation candidate on `feature/strix-npu-hybrid`, refreshed onto nightly
-`fee869c2`. **Default OFF; not deployment or quality qualification.** The first
-queued build still pins `4958802d` and is unchanged. This next source snapshot
-adds layer interleaving; its native compilation and measurements are pending. The owner target is a working
-hybrid by October 27 17:00Z; 5–10% prefill gain is a goal, not an acceptance gate.
+**Default OFF; experimental, not correct/faster or release-qualified yet.**
+Frozen `99ab429f` built OFF/ON on nimo-2 in lease `d4ed1f0d2152` (focused CPU
+5/5 OFF, 6/6 ON). Our runtime completed 555 Process calls and 3511 successful
+reaps, with no selected kernel fault or boot change. Model prefill then failed
+at layer 44, bank 1: routed gate/up counts were zero. No completed hybrid timed
+row or speed gain was obtained. Production was verified restored on attempt 1;
+the freshly captured prior controls were **high/auto**, not auto/auto.
+
+This follow-up, based on nightly `5722416e`, fixes statistics synchronization,
+failed stream-release ownership and NPU backing-byte reporting. It adds bounded
+numerical and trace-cost diagnostics; it does **not** claim the route-count cause
+is fixed. Trace-ON O_DSYNC times are diagnostic, not ordinary worker/device
+performance. Soft owner target: stable/PR-ready about October 27 19:00Z, only
+after real two-host gates and separate Opus/GPT-6.1-sol reviews. A 5–10% prefill
+gain remains a goal, not a prerequisite for useful experimental progress.
 
 ## Enable explicitly
 
@@ -14,6 +24,17 @@ OFF builds do not look up or link XRT. Runtime requires both
 `GUFO_STRIX_NPU=1` and `GUFO_NPU_DIR` pointing at the donor's fixed
 `final_4096x2560x1024_128x64x128.xclbin` and matching
 `insts_4096x2560x1024_128x64x128.txt`. A directory alone does not enable it.
+
+The next explicit **shared-expert-only ablation** uses `GUFO_NPU_SLICES=0`,
+`GUFO_NPU_GATE_SLICES=0`, `GUFO_NPU_WHOLE=0`, `GUFO_TWO_BANK=0`, and
+`GUFO_NPU_SHEXP=1`. It is a distinct declared configuration, not a silent retry
+or fallback after selected work fails. Its correctness/performance are pending.
+Full interleaving remains separately diagnostic until its failure is resolved.
+`GUFO_NPU_PROJECTION_REFERENCE=1` with the existing bounded dump controls adds
+an independent first-16-row Q8/F16 GPU projection for localization only, never
+for consumption/fallback. Its narrow arithmetic is not a wide-parity oracle.
+`GUFO_NPU_BENCH_MARKERS=1` logs prefill/session-release boundaries outside the
+timer; disabled by default. Raw activation/logit dumps must remain private.
 
 Experiments on the shared Nimos require coordinator host time, qualified
 hostlease-r4 with production stopped, a stock-top FCLK hold and independent

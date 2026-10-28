@@ -111,7 +111,9 @@ public:
   const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
-  [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  /// Requested backing bytes, including pinned/private NPU storage when ON.
+  /// Not measured RSS or driver/context overhead; imported aliases count once.
+  [[nodiscard]] std::size_t resident_bytes() const noexcept;
   /// Null unless explicitly enabled and at least one projection was staged.
   /// Streams used by this engine must remain valid until it has drained.
   NpuGemm* npu() const noexcept {

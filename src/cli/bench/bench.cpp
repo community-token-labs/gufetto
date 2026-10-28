@@ -4,6 +4,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -1066,6 +1067,35 @@ int RunQwen38FlashNextBenchmark(
                                prompt_length % chunk == 0;
       for (std::size_t repetition = warm_prefix ? 1 : 0;
            repetition <= options.repetitions; ++repetition) {
+        const char* marker_env = std::getenv("GUFO_NPU_BENCH_MARKERS");
+        const bool markers =
+            marker_env != nullptr && std::string_view(marker_env) == "1";
+        // Declared before session: the end marker follows its destruction.
+        // Logging is outside the prefill timer and disabled by default.
+        struct CycleMarker {
+          bool enabled;
+          std::size_t tokens, repetition;
+          double seconds{-1};
+          bool completed{false};
+          void Emit(const char* event) const {
+            if (!enabled)
+              return;
+            const double epoch =
+                std::chrono::duration<double>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+            std::fprintf(
+                stderr,
+                "npu bench cycle {\"event\":\"%s\",\"epoch\":%.6f,"
+                "\"prompt_tokens\":%zu,\"repetition\":%zu,\"warmup\":%s,"
+                "\"completed\":%s,\"elapsed_s\":%.9f}\n",
+                event, epoch, tokens, repetition,
+                repetition == 0 ? "true" : "false",
+                completed ? "true" : "false", seconds);
+          }
+          ~CycleMarker() { Emit("end_after_session_release"); }
+        } cycle{markers, prompt_length, repetition};
+        cycle.Emit("begin");
         auto session = model->CreateSession(
             options.speculative_backend.empty()
                 ? gufo::core::SessionMode::kAutoregressive
@@ -1086,6 +1116,8 @@ int RunQwen38FlashNextBenchmark(
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
+        cycle.seconds = seconds;
+        cycle.completed = true;
         if (repetition > 0) {
           runs.push_back(static_cast<double>(prompt_length) / seconds);
         }

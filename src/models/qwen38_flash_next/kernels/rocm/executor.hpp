@@ -561,7 +561,8 @@ private:
                  std::uint32_t max_context, bool sparse, std::string* error_msg,
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
-                 std::uint32_t checkpoint_tokens = 0) const;
+                 std::uint32_t checkpoint_tokens = 0,
+                 bool qkv_only_precomputed = false) const;
   /// Orders the main stream after the work queued on side_stream_.
   bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
@@ -630,9 +631,8 @@ private:
   void LoadCache(const BankCache& cache) const;
   bool ForwardPair(Session& session, std::span<const std::int32_t> tokens,
                    float* logits, std::string* error_msg) const;
-  bool PrefetchNpu(const DeviceLayer& layer, std::uint32_t bank,
-                   bool normed, PreparedNpu* prepared,
-                   std::string* error_msg) const;
+  bool PrefetchNpu(const DeviceLayer& layer, std::uint32_t bank, bool normed,
+                   PreparedNpu* prepared, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -640,9 +640,8 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
                    PrefillCheckpoint* checkpoint = nullptr,
-                   bool embeddings_ready = false,
-                   bool initialize = true, bool normed_input = false,
-                   bool* normed_output = nullptr,
+                   bool embeddings_ready = false, bool initialize = true,
+                   bool normed_input = false, bool* normed_output = nullptr,
                    const PreparedNpu* prepared = nullptr) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
@@ -890,6 +889,7 @@ private:
   std::array<int, 2> npu_whole_a_{{-1, -1}};
   std::array<std::vector<int>, 2> npu_whole_c_;
   bool npu_whole_enabled_{false};
+  float* npu_diag_projection_{nullptr};  ///< opt-in 16-row diagnostic only
   Session::Control* pair_control_host_{nullptr};
   // Host-only negative-path attribution; no device diagnostics or math changes.
   mutable int pair_bank_{-1};

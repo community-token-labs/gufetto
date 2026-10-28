@@ -4,8 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -811,11 +811,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
-    const auto next = rest.first(std::min<std::size_t>(
-        rest.size() <= model_->PrefillThroughCapacity()
-            ? model_->PrefillThroughCapacity()
-            : model_->PrefillCapacity(),
-        rest.size()));
+    const auto next = rest.first(
+        std::min<std::size_t>(rest.size() <= model_->PrefillThroughCapacity()
+                                  ? model_->PrefillThroughCapacity()
+                                  : model_->PrefillCapacity(),
+                              rest.size()));
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
                       capture.get(), next)) {
       return false;

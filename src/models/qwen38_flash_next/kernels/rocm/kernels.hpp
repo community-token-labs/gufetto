@@ -671,7 +671,8 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t vocab, hipStream_t stream);
 
 #ifdef GUFO_ENABLE_NPU
-// Donor split APIs: unsupported F16 weight copies return false for GPU fallback.
+// Donor split APIs: unsupported F16 weight copies return false for GPU
+// fallback.
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,

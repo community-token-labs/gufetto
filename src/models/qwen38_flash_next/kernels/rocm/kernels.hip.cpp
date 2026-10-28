@@ -7400,9 +7400,11 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       const qwen::vision::DeviceRope* rope,
                       const YarnRope& yarn, KvCacheType cache_type,
                       bool half_weights, std::uint32_t skip_gate_heads) {
-  if (half_weights || skip_gate_heads > 24) return false;
+  if (half_weights || skip_gate_heads > 24)
+    return false;
 #ifndef GUFO_ENABLE_NPU
-  if (skip_gate_heads != 0) return false;
+  if (skip_gate_heads != 0)
+    return false;
 #endif
   // Rotated mode deliberately uses Dense + the separate rotated Prepare.
   // Never reinterpret its 544-byte rows as F16 or rotate quantized bytes.
@@ -7413,9 +7415,8 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
     return false;
-  AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
-                                   keys,    values,  position, theta,
-                                   eps,     rope,    yarn};
+  AttentionProjectionOutput output{q_gamma,  k_gamma, query, gate, keys, values,
+                                   position, theta,   eps,   rope, yarn};
 #ifdef GUFO_ENABLE_NPU
   output.skip_gate_heads = skip_gate_heads;
 #endif
@@ -9124,7 +9125,8 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
       out + row * (out_pitch != 0 ? out_pitch : valid_cols) + out_col0 + col;
   if (valid_cols - col < 8) {
     const auto* values = reinterpret_cast<const __half*>(packed);
-    for (std::uint32_t i = 0; i < valid_cols - col; ++i) dst[i] = values[i];
+    for (std::uint32_t i = 0; i < valid_cols - col; ++i)
+      dst[i] = values[i];
   } else {
     *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(packed);
   }
@@ -9134,7 +9136,8 @@ void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
                std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
                std::size_t out_pitch, std::uint32_t out_col0) {
-  if (tokens == 0 || cols == 0 || valid_cols == 0) return;
+  if (tokens == 0 || cols == 0 || valid_cols == 0)
+    return;
   if ((gate_lo == nullptr) != (up_lo == nullptr))
     throw std::invalid_argument("NPU SwiGLU residual streams must be paired");
   const std::size_t groups = std::size_t{tokens} * cols / 8;
@@ -9268,8 +9271,8 @@ void SsmConv4Streams(const std::uint8_t* const* streams,
     }
     return;
   }
-  const auto kernel = half_out ? SsmConv4StreamsKernel<true>
-                               : SsmConv4StreamsKernel<false>;
+  const auto kernel =
+      half_out ? SsmConv4StreamsKernel<true> : SsmConv4StreamsKernel<false>;
   hipLaunchKernelGGL(
       kernel,
       dim3(Blocks(channels),
@@ -9287,8 +9290,9 @@ __device__ inline float4 LoadHalf4(const __half* p) {
 
 template<bool kHalf = false>
 __global__ void NpuGdnPrepKqKernel(const void* conv_raw, float* scales,
-                                std::uint32_t n_tokens, std::uint32_t k_heads,
-                                std::uint32_t channels, float eps) {
+                                   std::uint32_t n_tokens,
+                                   std::uint32_t k_heads,
+                                   std::uint32_t channels, float eps) {
   constexpr std::uint32_t d = kGdnDim;
   const std::uint32_t lane = threadIdx.x;
   const std::uint32_t kh = blockIdx.x;
@@ -9326,13 +9330,13 @@ __global__ void NpuGdnPrepKqKernel(const void* conv_raw, float* scales,
   }
 }
 
-
 template<int kRows, int kWaves, bool kHalf = false>
 __launch_bounds__(kWaves * 32) __global__
     void NpuGdnRowSplitKernelT(const void* conv_raw, const float* scales,
-                            const float* ab, float* state, float* raw,
-                            std::uint32_t n_tokens, std::uint32_t k_heads,
-                            std::uint32_t v_heads, GdnCheckpoint checkpoint) {
+                               const float* ab, float* state, float* raw,
+                               std::uint32_t n_tokens, std::uint32_t k_heads,
+                               std::uint32_t v_heads,
+                               GdnCheckpoint checkpoint) {
   constexpr int d = kGdnDim;
   constexpr int kThreadsPerBlock = kWaves * 32;
   constexpr int kKeysPerLane = 32;
@@ -9720,7 +9724,8 @@ __global__ void NpuPrepareAttentionKernel(
   const std::size_t width = std::size_t(heads) * d,
                     kv_width = std::size_t(kv_heads) * d;
   const float* row = nullptr;
-  if constexpr (!kStreams) row = packed + std::size_t(t) * stride;
+  if constexpr (!kStreams)
+    row = packed + std::size_t(t) * stride;
   // kStreams: the packed query/gate rows are still in the NPU's C streams
   // (1024 columns per stream, one stream set per stream_tokens tokens).
   const auto packed_at = [&](std::uint32_t col) -> float {
@@ -9782,10 +9787,12 @@ __global__ void NpuPrepareAttentionKernel(
   if (tid < half) {
     float freq = powf(
         theta, -2.0f * static_cast<float>(tid) / static_cast<float>(rotary));
-    if (yarn.enabled != 0) freq = YarnFrequency(freq, tid, yarn);
+    if (yarn.enabled != 0)
+      freq = YarnFrequency(freq, tid, yarn);
     sincosf(qwen::vision::RopePosition(rope, *start_pos + t, tid) * freq, &sine,
             &cosine);
-    if (yarn.enabled != 0) YarnScale(sine, cosine, yarn);
+    if (yarn.enabled != 0)
+      YarnScale(sine, cosine, yarn);
   }
 #pragma unroll
   for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
@@ -9817,7 +9824,6 @@ __global__ void NpuPrepareAttentionKernel(
     }
   }
 }
-
 
 constexpr int kGd = 128;
 constexpr int kGkh = 16;
@@ -10250,7 +10256,6 @@ __global__ __launch_bounds__(256) void NpuGdnChunkScanKernel(
   }
 }
 
-
 static void NpuGatedDeltaNet(
     const float* qkv, std::uint32_t qkv_stride, const float* z,
     std::uint32_t z_stride, const float* alpha_beta, const float* conv_w,
@@ -10265,13 +10270,13 @@ static void NpuGatedDeltaNet(
     const std::uint8_t* const* z_streams, std::uint32_t z_stream_stride,
     std::uint32_t z_tokens, std::uint32_t z_gpu_cols, bool conv_half,
     void* chunk_scratch, std::size_t chunk_scratch_bytes) {
-  if (n_tokens == 0) return;
+  if (n_tokens == 0)
+    return;
   if (z_streams != nullptr && (z_tokens == 0 || z_stream_stride == 0))
     throw std::invalid_argument("invalid NPU GDN Z stream geometry");
-  if (conv_half && (!convolved || !row_split || d != kGdnDim ||
-                    kernel != kSsmConvTaps ||
-                    state_snapshots.rows[0] != nullptr ||
-                    conv_snapshots.rows[0] != nullptr))
+  if (conv_half &&
+      (!convolved || !row_split || d != kGdnDim || kernel != kSsmConvTaps ||
+       state_snapshots.rows[0] != nullptr || conv_snapshots.rows[0] != nullptr))
     throw std::invalid_argument("unsupported NPU F16 convolution consumer");
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
@@ -10418,7 +10423,6 @@ static void NpuGatedDeltaNet(
       out_half_stride, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
 }
 
-
 void PrepareQueryHeadsStreams(
     const std::uint8_t* const* streams, std::uint32_t stream_stride,
     std::uint32_t stream_tokens, const float* q_gamma, float* q, float* gate,
@@ -10427,7 +10431,8 @@ void PrepareQueryHeadsStreams(
     float theta, float eps, hipStream_t stream,
     const qwen::vision::DeviceRope* rope, std::uint32_t q_heads,
     std::uint32_t first_token, const YarnRope& yarn) {
-  if (n_tokens == 0 || q_heads == 0) return;
+  if (n_tokens == 0 || q_heads == 0)
+    return;
   if (streams == nullptr || stream_stride == 0 || stream_tokens == 0 ||
       q_heads > heads || d == 0 || d > 256 || rotary_dim == 0 ||
       rotary_dim > d || rotary_dim % 2 != 0)
@@ -10474,10 +10479,11 @@ void PrepareQueryHeads(const float* packed, std::uint32_t stride,
 }
 
 __global__ void NpuSsmConvBoundaryKernel(const float* qkv, const float* w,
-                                      const float* history, float* out,
-                                      std::uint32_t n_tokens,
-                                      std::uint32_t channels,
-                                      std::uint32_t stride, std::uint32_t c_end) {
+                                         const float* history, float* out,
+                                         std::uint32_t n_tokens,
+                                         std::uint32_t channels,
+                                         std::uint32_t stride,
+                                         std::uint32_t c_end) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t t = blockIdx.y * kSsmProjectionTileTokens + blockIdx.z;
   if (c >= c_end || t >= n_tokens) {
@@ -10535,7 +10541,8 @@ void SsmConvTail(const float* qkvz, const float* conv_w, const float* history,
                  float* convolved, std::uint32_t n_tokens,
                  std::uint32_t channels, std::uint32_t stride,
                  std::uint32_t c_begin, hipStream_t stream) {
-  if (n_tokens == 0 || c_begin >= channels) return;
+  if (n_tokens == 0 || c_begin >= channels)
+    return;
   hipLaunchKernelGGL(
       SsmConvRangeKernel,
       dim3(Blocks(channels - c_begin),
@@ -10551,11 +10558,13 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      hipStream_t stream, std::uint32_t checkpoint_tokens,
                      bool half_weights, std::uint32_t gpu_rows) {
   // Only Q8_0 offload geometry is enabled here; retain the original GPU route.
-  if (half_weights) return false;
+  if (half_weights)
+    return false;
   if ((gpu_rows == 0 || gpu_rows == m) && m == 16384)
-    return DenseF16SsmGemm(w, x, conv_w, history, qkvz, convolved, n_tokens,
-                           m, k, channels, kernel, stream, checkpoint_tokens);
-  if (gpu_rows == 0) gpu_rows = m;
+    return DenseF16SsmGemm(w, x, conv_w, history, qkvz, convolved, n_tokens, m,
+                           k, channels, kernel, stream, checkpoint_tokens);
+  if (gpu_rows == 0)
+    gpu_rows = m;
   if (n_tokens == 0 || (m != 16384 && m != channels) || k != 2560 ||
       channels != 10240 || kernel != kSsmConvTaps || gpu_rows > m ||
       gpu_rows % 256 != 0 || w == nullptr || x == nullptr)
@@ -10567,12 +10576,13 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      nullptr, nullptr, nullptr, conv_w, convolved,
                      AttentionProjectionOutput{}, checkpoint_tokens);
   const std::uint32_t conv_channels = gpu_rows < channels ? gpu_rows : channels;
-  hipLaunchKernelGGL(NpuSsmConvBoundaryKernel,
-                     dim3(Blocks(conv_channels),
-                          (n_tokens + kSsmProjectionTileTokens - 1) /
-                              kSsmProjectionTileTokens, 3),
-                     dim3(kThreads), 0, stream, qkvz, conv_w, history,
-                     convolved, n_tokens, channels, m, conv_channels);
+  hipLaunchKernelGGL(
+      NpuSsmConvBoundaryKernel,
+      dim3(Blocks(conv_channels),
+           (n_tokens + kSsmProjectionTileTokens - 1) / kSsmProjectionTileTokens,
+           3),
+      dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
+      channels, m, conv_channels);
   return true;
 }
 
@@ -10585,18 +10595,20 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t skip_gate_heads) {
   // This overload is the donor NPU split API: Q8_0 weights and plain F16 KV.
   // YaRN, quantized KV and other weight types remain on the existing GPU API.
-  if (half_weights || skip_gate_heads > 24) return false;
+  if (half_weights || skip_gate_heads > 24)
+    return false;
   if (skip_gate_heads == 0)
     return AttentionF16Gemm(weights, input, q_gamma, k_gamma, query, gate, keys,
-                           values, n_tokens, position, theta, eps, stream, rope);
+                            values, n_tokens, position, theta, eps, stream,
+                            rope);
   if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
     return false;
-  const AttentionProjectionOutput output{q_gamma, k_gamma, query, gate, keys,
-                                         values, position, theta, eps, rope,
-                                         YarnRope{}, skip_gate_heads};
+  const AttentionProjectionOutput output{
+      q_gamma,  k_gamma, query, gate, keys,       values,
+      position, theta,   eps,   rope, YarnRope{}, skip_gate_heads};
   hipLaunchKernelGGL(
       (DenseF16GEMMKernel<256, 128, 1, 8, 1, 4, false, false, true>),
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,

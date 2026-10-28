@@ -13,8 +13,8 @@
 #include <deque>
 #include <exception>
 #include <fstream>
-#include <mutex>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -43,6 +43,10 @@ std::int64_t NowMs() {
       .count();
 }
 
+// Per-thread write costs: the worker publishes its Process deltas separately.
+thread_local double trace_write_us = 0;
+thread_local std::uint64_t trace_write_calls = 0;
+
 // GUFO_NPU_TRACE=<path>: one line per NPU-path event, written through O_DSYNC
 // so the last line survives a hang or a freeze.
 void Trace(const char* what, long a = 0, long b = 0) {
@@ -59,7 +63,12 @@ void Trace(const char* what, long a = 0, long b = 0) {
   const int n = std::snprintf(line, sizeof line, "%lld %s %ld %ld\n",
                               static_cast<long long>(NowMs()), what, a, b);
   if (n > 0) {
+    const auto t0 = std::chrono::steady_clock::now();
     (void)!write(fd, line, static_cast<std::size_t>(n));
+    trace_write_us += std::chrono::duration<double, std::micro>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    ++trace_write_calls;
   }
 }
 
@@ -230,15 +239,21 @@ struct NpuGemm::Impl {
 
   // GUFO_NPU_STATS=1: wall-clock accounting printed every 36 waits.
   const bool stats{std::getenv("GUFO_NPU_STATS") != nullptr};
-  double submit_us{0};
-  // Phase totals of the worker (GUFO_NPU_STATS): where the NPU path spends
-  // time.
-  double copy_a_us{0};    // A host->private copy + sync
-  double launch_us{0};    // kernel(...) submissions
-  double run_wait_us{0};  // waiting for the NPU itself
-  double copy_c_us{0};    // C sync + private->host copy
-  double wait_us{0};
-  std::uint64_t waits{0};
+  // Independent lifetime totals, not a transactional per-ticket snapshot.
+  // Wait(T) may read while Process(T+1) or the heartbeat updates phases.
+  // Never take the engine mutex in WaitNow: that would serialize both banks.
+  std::atomic<double> submit_us{
+      0};  // worker Process wall time, including trace
+  std::atomic<double> copy_a_us{0};  // includes setup/weight/heartbeat copies
+  std::atomic<double> launch_us{0};
+  std::atomic<double> run_wait_us{
+      0};  // host run.wait wall time, incl. heartbeat
+  std::atomic<double> copy_c_us{0};
+  std::atomic<double> wait_us{0};  // host-blocked remainder, NOT device compute
+  std::atomic<double> worker_trace_us{0};  // write syscall wall time only
+  std::atomic<std::uint64_t> worker_trace_calls{0};
+  std::atomic<std::uint64_t> processes{0};
+  std::atomic<std::uint64_t> waits{0};
 
   // Keepalive: the driver suspends the NPU after 5 s without a job, and waking
   // it re-initializes the SMU, PSP and mailbox while the GPU may be running
@@ -283,7 +298,7 @@ struct NpuGemm::Impl {
       copy_pool.Copy(b.private_host, b.host, b.bytes);
     }
     NpuBo(id).sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    copy_a_us += Since(t0);
+    copy_a_us.fetch_add(Since(t0), std::memory_order_relaxed);
   }
 
   void CopyFromNpu(int id) {
@@ -293,7 +308,7 @@ struct NpuGemm::Impl {
     if (isolate) {
       copy_pool.Copy(b.host, b.private_host, b.bytes);
     }
-    copy_c_us += Since(t0);
+    copy_c_us.fetch_add(Since(t0), std::memory_order_relaxed);
   }
 
   void Fail(const std::exception& e) {
@@ -327,7 +342,7 @@ struct NpuGemm::Impl {
     Trace("reap_begin", c);
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = WaitRun(run);
-    run_wait_us += Since(t0);
+    run_wait_us.fetch_add(Since(t0), std::memory_order_relaxed);
     if (!ok) {
       abandoned.push_back(std::move(run));
     }
@@ -401,7 +416,16 @@ struct NpuGemm::Impl {
       Call call = std::move(queue.front());
       queue.pop_front();
       lock.unlock();
+      const auto t0 = std::chrono::steady_clock::now();
+      const double trace_before = trace_write_us;
+      const auto calls_before = trace_write_calls;
       Process(call);
+      submit_us.fetch_add(Since(t0), std::memory_order_relaxed);
+      worker_trace_us.fetch_add(trace_write_us - trace_before,
+                                std::memory_order_relaxed);
+      worker_trace_calls.fetch_add(trace_write_calls - calls_before,
+                                   std::memory_order_relaxed);
+      processes.fetch_add(1, std::memory_order_relaxed);
       lock.lock();
       ++completed;
       queue_idle.notify_all();
@@ -422,7 +446,6 @@ struct NpuGemm::Impl {
     Trace("process_wait_lock", call.a_id);
     const std::lock_guard lock(mutex);
     Trace("process_begin", call.a_id, static_cast<long>(call.b_ids.size()));
-    const auto t0 = std::chrono::steady_clock::now();
     last_submit_ms = NowMs();
     if (failed) {
       return;
@@ -453,7 +476,7 @@ struct NpuGemm::Impl {
         run.set_arg(4, NpuBo(call.b_ids[i]));
         run.set_arg(5, NpuBo(call.c_ids[i]));
         run.start();
-        launch_us += Since(t_launch);
+        launch_us.fetch_add(Since(t_launch), std::memory_order_relaxed);
       }
       while (!pending.empty() && !failed) {
         ReapOldest();
@@ -462,9 +485,6 @@ struct NpuGemm::Impl {
       Fail(e);
       // Preserve pending runs and their resources on uncertain completion.
     }
-    submit_us += std::chrono::duration<double, std::micro>(
-                     std::chrono::steady_clock::now() - t0)
-                     .count();
     Trace("process_end", call.a_id);
   }
 
@@ -477,18 +497,36 @@ struct NpuGemm::Impl {
         return ticket != 0 ? completed >= ticket : completed == enqueued;
       });
     }
-    wait_us += std::chrono::duration<double, std::micro>(
-                   std::chrono::steady_clock::now() - t0)
-                   .count();
+    wait_us.fetch_add(Since(t0), std::memory_order_relaxed);
     Trace("wait_end");
-    if (stats && ++waits % 36 == 0) {
-      std::fprintf(stderr,
-                   "npu stats: %llu layers | worker %.0f us (A copy %.0f, "
-                   "launch %.0f, NPU wait %.0f, C copy %.0f), stream blocked "
-                   "in wait %.0f us (per layer averages)\n",
-                   static_cast<unsigned long long>(waits), submit_us / waits,
-                   copy_a_us / waits, launch_us / waits, run_wait_us / waits,
-                   copy_c_us / waits, wait_us / waits);
+    const auto wait_count = waits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (stats && wait_count % 36 == 0) {
+      std::fprintf(
+          stderr,
+          "npu stats: waitcount %llu processcount %llu | cumulative "
+          "worker_us %.0f A_copy_us %.0f launch_us %.0f "
+          "run_wait_us %.0f C_copy_us %.0f host_blocked_wait_us %.0f "
+          "worker_trace_us %.0f worker_trace_calls %llu\n"
+          "npu stats meaning: waitcount counts wait completions, NOT "
+          "model layers; times are lifetime totals (no layer divisor). "
+          "Phases include setup/heartbeat; worker includes Process "
+          "lock/trace costs; worker_trace is write syscall wall time. "
+          "Host-blocked wait is remainder, NOT device compute time. "
+          "Processcount counts worker Process invocations, including "
+          "unhealthy skips. Concurrent totals may be sampled at "
+          "different instants. Timing requires trace OFF.\n",
+          static_cast<unsigned long long>(wait_count),
+          static_cast<unsigned long long>(
+              processes.load(std::memory_order_relaxed)),
+          submit_us.load(std::memory_order_relaxed),
+          copy_a_us.load(std::memory_order_relaxed),
+          launch_us.load(std::memory_order_relaxed),
+          run_wait_us.load(std::memory_order_relaxed),
+          copy_c_us.load(std::memory_order_relaxed),
+          wait_us.load(std::memory_order_relaxed),
+          worker_trace_us.load(std::memory_order_relaxed),
+          static_cast<unsigned long long>(
+              worker_trace_calls.load(std::memory_order_relaxed)));
     }
   }
 };
@@ -497,11 +535,18 @@ NpuGemm::NpuGemm() = default;
 
 bool NpuGemm::ReleaseStream(hipStream_t stream) {
   const std::lock_guard lock(impl_->api_mutex);
+  // Relinquish the borrowed handle on EVERY release path. The executor owns
+  // destruction, even when synchronization fails; we must never revisit it.
+  if (std::erase(impl_->streams, stream) == 0) {
+    return Healthy();  // already released, or never used by this runtime
+  }
   if (hipStreamSynchronize(stream) != hipSuccess) {
     impl_->failed = true;
+    process_failed = true;
+    // Callbacks/DMA may still refer to Impl: its destructor will quarantine the
+    // whole allocation, not free resources or try this borrowed handle again.
     return false;
   }
-  std::erase(impl_->streams, stream);
   return Healthy();
 }
 
@@ -526,7 +571,7 @@ NpuGemm::~NpuGemm() {
 }
 
 std::unique_ptr<NpuGemm> NpuGemm::Create(const Config& config,
-                                        std::string* error) {
+                                         std::string* error) {
   auto fail = [&](const std::string& message) -> std::unique_ptr<NpuGemm> {
     if (error != nullptr) {
       *error = message;
@@ -632,6 +677,28 @@ std::size_t NpuGemm::BBytes() const noexcept {
 std::size_t NpuGemm::CBytes() const noexcept {
   return std::size_t{impl_->config.tokens} * impl_->config.n / 8 * kBytesPer8;
 }
+NpuGemm::MemoryFootprint NpuGemm::MemoryFootprintBytes() const {
+  const std::lock_guard lock(impl_->mutex);
+  MemoryFootprint result;
+  for (const auto& buffer : impl_->buffers) {
+    result.logical_buffer_bytes += buffer.bytes;
+    result.pinned_host_bytes += buffer.bytes;
+    if (impl_->isolate) {
+      result.private_bo_bytes += buffer.bytes;
+    } else {
+      result.imported_alias_bytes += buffer.bytes;
+    }
+  }
+  result.instruction_bo_bytes = impl_->instruction_words * sizeof(int);
+  for (const auto& program : impl_->extra_programs) {
+    result.instruction_bo_bytes += program.words * sizeof(int);
+  }
+  result.total_backing_bytes = result.pinned_host_bytes +
+                               result.private_bo_bytes +
+                               result.instruction_bo_bytes;
+  return result;
+}
+
 std::uint32_t NpuGemm::tokens() const noexcept {
   return impl_->config.tokens;
 }
@@ -652,8 +719,8 @@ int NpuGemm::NewBuffer(std::size_t bytes, std::string* error) {
     return -1;
   }
   void* host = nullptr;
-  // Isolate mode wants ordinary cached pages on the CPU side; the GPU path is
-  // flushed by kernel boundaries.
+  // Preserve the mapped transport policy. Mapped overrides NonCoherent in
+  // HIP; these flags alone are not target-host visibility qualification.
   const unsigned flags =
       hipHostMallocMapped | (i.isolate ? hipHostMallocNonCoherent : 0U);
   if (hipHostMalloc(&host, bytes, flags) != hipSuccess) {

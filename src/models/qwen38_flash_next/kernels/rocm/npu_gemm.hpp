@@ -24,9 +24,9 @@ namespace gufo::models::qwen38_flash_next::rocm {
 /// return enqueue status, not device completion: synchronize that stream and
 /// check Healthy() before accepting results. Never reuse A/C buffers until
 /// their ticket's Wait has executed; weights must remain immutable while used.
-/// Destruction drains callbacks; streams must remain valid until destruction,
-/// and public calls must not race destruction. Failed device resources are
-/// quarantined until process exit, with no automatic GPU retry.
+/// Destruction drains callbacks; streams must remain valid until ReleaseStream
+/// or destruction, and public calls must not race destruction. Failed device
+/// resources are quarantined until process exit, with no automatic GPU retry.
 class NpuGemm {
 public:
   struct Config {
@@ -38,7 +38,7 @@ public:
   };
 
   static std::unique_ptr<NpuGemm> Create(const Config& config,
-                                        std::string* error);
+                                         std::string* error);
   ~NpuGemm();
   NpuGemm(const NpuGemm&) = delete;
   NpuGemm& operator=(const NpuGemm&) = delete;
@@ -47,6 +47,21 @@ public:
   std::size_t ABytes() const noexcept;
   std::size_t BBytes() const noexcept;
   std::size_t CBytes() const noexcept;
+
+  struct MemoryFootprint {
+    std::size_t pinned_host_bytes{0};
+    std::size_t private_bo_bytes{0};
+    std::size_t imported_alias_bytes{0};  // subset of pinned, NOT extra backing
+    std::size_t instruction_bo_bytes{0};
+    std::size_t logical_buffer_bytes{
+        0};  // all operand/scratch/heartbeat buffers
+    std::size_t total_backing_bytes{0};  // pinned + private + instructions
+  };
+  /// Allocation-size ledger, NOT empirically observed physical RAM or driver
+  /// overhead. Weights versus scratch are classified by the caller. Includes
+  /// heartbeat buffers and instructions; imports alias pinned storage once.
+  /// Setup/reporting only: may wait for Process's engine lock.
+  MemoryFootprint MemoryFootprintBytes() const;
 
   /// Allocates a pinned buffer of `bytes` visible to the GPU; returns its id,
   /// or -1. Host(id) is the CPU view and Device(id) the GPU pointer.
@@ -70,19 +85,23 @@ public:
   std::size_t ABytes(std::uint32_t k) const noexcept;
   std::size_t BBytes(std::uint32_t k) const noexcept;
   /// Blocks the stream until every submitted run has finished and its C buffer
-  /// is readable by the GPU. This enqueues a wait; it does not block the caller.
+  /// is readable by the GPU. This enqueues a wait; it does not block the
+  /// caller.
   bool Wait(hipStream_t stream);
   /// Blocks the stream until the first `ticket` submissions have finished.
   bool Wait(hipStream_t stream, std::uint64_t ticket);
   /// Number of submissions made so far; pass to Wait to wait for them only.
   std::uint64_t Ticket() const noexcept;
 
-  /// The GPU's view of C buffer `id`, to read after the queued Wait executes. A single
-  /// pass over the pinned pages is cheaper than copying them first.
+  /// The GPU's view of C buffer `id`, to read after the queued Wait executes. A
+  /// single pass over the pinned pages is cheaper than copying them first.
   void* Staged(hipStream_t stream, int id);
 
-  /// Drain callbacks and forget a stream before its owner destroys it.
-  /// No Submit/Wait calls may race this operation for the same stream.
+  /// Attempt to drain callbacks and always unregister the borrowed stream.
+  /// The caller owns stream destruction even on false; failure poisons the
+  /// process and retains callback/DMA resources until exit, without revisiting
+  /// the handle. No Submit/Wait calls may race this operation for the same
+  /// stream, nor reuse that stream after release.
   bool ReleaseStream(hipStream_t stream);
 
   /// False once a run timed out or failed: results since then are invalid.

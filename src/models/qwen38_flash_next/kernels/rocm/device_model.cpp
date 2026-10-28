@@ -6,8 +6,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
-#include <string_view>
 #include <initializer_list>
+#include <string_view>
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
@@ -351,6 +351,14 @@ struct Uploader {
 
 }  // namespace
 
+std::size_t DeviceModel::resident_bytes() const noexcept {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (npu_ != nullptr)
+    return bytes_ + npu_->MemoryFootprintBytes().total_backing_bytes;
+#endif
+  return bytes_;
+}
+
 DeviceModel::~DeviceModel() {
 #ifdef GUFO_ENABLE_NPU
   // Drain NPU callbacks before releasing GPU weights. The executor must keep
@@ -431,7 +439,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     if (!early_npu->Healthy() || early_npu->k() != 2560 ||
         early_npu->n() != 1024 || early_npu->tokens() != 4096) {
       if (error_msg != nullptr)
-        *error_msg = "NPU runtime unhealthy or fixed projection geometry mismatch";
+        *error_msg =
+            "NPU runtime unhealthy or fixed projection geometry mismatch";
       return nullptr;
     }
     // Buffer isolation is a runtime policy: leave its default-on private BO
@@ -512,12 +521,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::uint32_t whole_layers = 0;
     const auto z_slices = NpuCount("GUFO_NPU_SLICES", 6, 12);
     const auto gate_slices = NpuCount("GUFO_NPU_GATE_SLICES", 12, 12);
-    const auto layer_limit = NpuCount("GUFO_NPU_LAYERS", UINT32_MAX, UINT32_MAX);
+    const auto layer_limit =
+        NpuCount("GUFO_NPU_LAYERS", UINT32_MAX, UINT32_MAX);
     const bool whole = NpuFlag("GUFO_NPU_WHOLE");
     const bool shexp = NpuFlag("GUFO_NPU_SHEXP", true);
     const auto eligible = [&](const DeviceTensor& t, std::uint32_t rows) {
-      return !t.empty() && t.type == core::GgmlType::kQ8_0 &&
-             t.experts == 1 && t.cols == npu->k() && t.rows == rows;
+      return !t.empty() && t.type == core::GgmlType::kQ8_0 && t.experts == 1 &&
+             t.cols == npu->k() && t.rows == rows;
     };
     const auto fail = [&](const std::string& message) {
       if (error_msg != nullptr)
@@ -570,8 +580,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         }
         if (z_slices != 0 && z_layers < layer_limit) {
           if (!l.npu_ssm_all.empty()) {
-            l.npu_z.assign(l.npu_ssm_all.end() - z_slices,
-                           l.npu_ssm_all.end());
+            l.npu_z.assign(l.npu_ssm_all.end() - z_slices, l.npu_ssm_all.end());
           } else if (!stage(l.ssm_in, (16 - z_slices) * npu->n(), z_slices,
                             npu->n(), l.npu_z)) {
             return nullptr;
@@ -612,10 +621,19 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     }
     std::fprintf(stderr,
                  "NPU: z %u, attention query/gate %u, shared expert %u, "
-                 "whole %u layers; %.2f GiB encoded weights staged "
-                 "(separate from GPU resident bytes)\n",
+                 "whole %u layers; %.2f GiB logical encoded weights staged "
+                 "(not total backing memory)\n",
                  z_layers, gate_layers, shexp_layers, whole_layers,
                  static_cast<double>(staged) / (1024.0 * 1024.0 * 1024.0));
+    const auto memory = npu->MemoryFootprintBytes();
+    std::fprintf(stderr,
+                 "NPU allocation ledger: pinned=%zu private=%zu "
+                 "imported_alias=%zu instructions=%zu backing=%zu bytes; "
+                 "requested sizes, not measured RSS/driver overhead; "
+                 "executor buffers added after staging\n",
+                 memory.pinned_host_bytes, memory.private_bo_bytes,
+                 memory.imported_alias_bytes, memory.instruction_bo_bytes,
+                 memory.total_backing_bytes);
     // Shared-expert-only and attention-only staging must retain the engine.
     if (z_layers != 0 || gate_layers != 0 || shexp_layers != 0 ||
         whole_layers != 0)

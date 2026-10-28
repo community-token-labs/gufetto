@@ -43,7 +43,6 @@ using core::GgmlType;
 }
 [[maybe_unused]] constexpr std::uint32_t kNpuSlicesMax = 12;
 
-
 void AssignError(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr) {
     *error_msg = message;
@@ -1316,9 +1315,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         }
       }
       if (ok) {
+        // Diagnostic-only independent projection, never a consumer/fallback.
+        if (DumpDirectory() != nullptr &&
+            std::getenv("GUFO_NPU_PROJECTION_REFERENCE") != nullptr) {
+          e->npu_diag_projection_ = Alloc<float>(a, 16 * 16384, error_msg);
+          if (e->npu_diag_projection_ == nullptr)
+            return nullptr;
+        }
         void* control = nullptr;
-        if (!Check(e->host_allocations_.Allocate(
-                       &control, sizeof(Session::Control)),
+        if (!Check(e->host_allocations_.Allocate(&control,
+                                                 sizeof(Session::Control)),
                    "pinned pair control buffer", error_msg))
           return nullptr;
         e->pair_control_host_ = static_cast<Session::Control*>(control);
@@ -2531,7 +2537,6 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
   return true;
 }
 
-
 bool Executor::NpuPairEnabled() const {
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
   const char* two_bank = std::getenv("GUFO_TWO_BANK");
@@ -2541,16 +2546,16 @@ bool Executor::NpuPairEnabled() const {
       npu == nullptr || !npu->Healthy() || npu->tokens() != 4096 ||
       options_.max_batch < 8192 || config().num_layers == 0 ||
       (config().ple_layer >= 0 &&
-       static_cast<std::uint32_t>(config().ple_layer) + 1 >= config().num_layers))
+       static_cast<std::uint32_t>(config().ple_layer) + 1 >=
+           config().num_layers))
     return false;
   for (const auto& l : model_->layers()) {
     const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
     const auto& ids = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
-    if (w.type != GgmlType::kQ8_0 || w.cols != npu->k() ||
-        ids.empty() || ids.size() > 16 ||
-        w.rows != ids.size() * npu->n() ||
-        (l.linear && (l.ssm_alpha_beta.empty() ||
-                      l.ssm_alpha_beta.cols != w.cols)))
+    if (w.type != GgmlType::kQ8_0 || w.cols != npu->k() || ids.empty() ||
+        ids.size() > 16 || w.rows != ids.size() * npu->n() ||
+        (l.linear &&
+         (l.ssm_alpha_beta.empty() || l.ssm_alpha_beta.cols != w.cols)))
       return false;
   }
   return true;
@@ -2619,16 +2624,16 @@ bool Executor::PrefetchNpu(const DeviceLayer& l, std::uint32_t bank,
   const auto& weights = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
   constexpr std::uint32_t rows = 4096;
   const bool half_only = l.linear && DenseF16Route(l.ssm_in, rows) &&
-                        l.ssm_alpha_beta.type == GgmlType::kF16 &&
-                        l.ssm_alpha_beta.cols == l.ssm_in.cols;
-  if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, rows,
-             error_msg, half_only))
+                         l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                         l.ssm_alpha_beta.cols == l.ssm_in.cols;
+  if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, rows, error_msg,
+             half_only))
     return false;
   PrepareHalfInput(s_.mixed, rows, w.cols);
   npu_used_ = true;
   NpuEncodeActivations(static_cast<const __half*>(s_.x_half), w.cols, rows,
-                       npu->k(), 0, npu->k(),
-                       npu->Device(npu_whole_a_[bank]), stream_);
+                       npu->k(), 0, npu->k(), npu->Device(npu_whole_a_[bank]),
+                       stream_);
   if (!npu->Submit(stream_, npu_whole_a_[bank], weights.data(),
                    npu_whole_c_[bank].data(),
                    static_cast<int>(weights.size()))) {
@@ -2681,10 +2686,12 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
       NpuGemm* npu = model_->npu();
       if (StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0 &&
-          npu->Healthy() && !npu_a_.empty() && l.ssm_in.rows == 16384 && l.ssm_in.cols == 2560 &&
-          channels == 10240 && c.ssm_conv_kernel == 4 && npu->n() == 1024 &&
-          !l.npu_z.empty() && l.npu_z.size() <= kNpuSlicesMax &&
-          l.npu_z.size() * npu->n() <= l.ssm_in.rows && n_tokens % npu->tokens() == 0 &&
+          npu->Healthy() && !npu_a_.empty() && l.ssm_in.rows == 16384 &&
+          l.ssm_in.cols == 2560 && channels == 10240 &&
+          c.ssm_conv_kernel == 4 && npu->n() == 1024 && !l.npu_z.empty() &&
+          l.npu_z.size() <= kNpuSlicesMax &&
+          l.npu_z.size() * npu->n() <= l.ssm_in.rows &&
+          n_tokens % npu->tokens() == 0 &&
           n_tokens / npu->tokens() <= npu_a_.size() &&
           l.ssm_in.cols == npu->k()) {
         // The last rows of the projection run on the NPU while the GPU does
@@ -2703,10 +2710,9 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                   static_cast<std::size_t>(g) * group_tokens * l.ssm_in.cols,
               l.ssm_in.cols, group_tokens, npu->k(), 0, npu->k(),
               npu->Device(npu_a_[g]), stream_);
-          if (!npu->Submit(
-                  stream_, npu_a_[g], l.npu_z.data(),
-                  npu_c_.data() + std::size_t(g) * kNpuSlicesMax,
-                  static_cast<int>(l.npu_z.size()))) {
+          if (!npu->Submit(stream_, npu_a_[g], l.npu_z.data(),
+                           npu_c_.data() + std::size_t(g) * kNpuSlicesMax,
+                           static_cast<int>(l.npu_z.size()))) {
             (void)npu->Wait(stream_);
             AssignError(error_msg, "NPU split SSM submit failed");
             return false;
@@ -2729,9 +2735,11 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         for (std::uint32_t g = 0; g < groups; ++g) {
           for (std::size_t i = 0; i < l.npu_z.size(); ++i) {
             NpuDecodeOutput(npu->Staged(stream_, npu_c_[g * kNpuSlicesMax + i]),
-                s_.qkvz + gpu_rows + std::size_t(g) * group_tokens * l.ssm_in.rows,
-                group_tokens, npu->n(), l.ssm_in.rows,
-                static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
+                            s_.qkvz + gpu_rows +
+                                std::size_t(g) * group_tokens * l.ssm_in.rows,
+                            group_tokens, npu->n(), l.ssm_in.rows,
+                            static_cast<std::uint32_t>(i) * npu->n(), false,
+                            stream_);
           }
         }
         if (gpu_rows < channels)
@@ -2881,7 +2889,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::uint32_t max_context, bool sparse,
                          std::string* error_msg, bool last_only,
                          bool projections_ready, bool project_output,
-                         std::uint32_t checkpoint_tokens) const {
+                         std::uint32_t checkpoint_tokens,
+                         bool qkv_only_precomputed) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
   const bool view_eligible = options_.kv_cache_type == KvCacheType::kQ8_0 &&
@@ -2917,8 +2926,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       // GPU does the rest; the attention kernel is their first reader.
       NpuGemm* npu = model_->npu();
       if (StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0 &&
-          npu->Healthy() && !npu_a_.empty() && yarn_.enabled == 0 && options_.kv_cache_type == KvCacheType::kF16 &&
-          npu->n() == 1024 && npu_c_dev_ != nullptr && !l.npu_gate.empty() &&
+          npu->Healthy() && !npu_a_.empty() && yarn_.enabled == 0 &&
+          options_.kv_cache_type == KvCacheType::kF16 && npu->n() == 1024 &&
+          npu_c_dev_ != nullptr && !l.npu_gate.empty() &&
           l.npu_gate.size() <= kNpuSlicesMax && n_tokens % npu->tokens() == 0 &&
           n_tokens / npu->tokens() <= npu_a_.size() &&
           l.attn_qkv.cols == npu->k()) {
@@ -2931,10 +2941,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   static_cast<std::size_t>(g) * group_tokens * l.attn_qkv.cols,
               l.attn_qkv.cols, group_tokens, npu->k(), 0, npu->k(),
               npu->Device(npu_a_[g]), stream_);
-          if (!npu->Submit(
-                  stream_, npu_a_[g], l.npu_gate.data(),
-                  npu_c_.data() + std::size_t(g) * kNpuSlicesMax,
-                  static_cast<int>(l.npu_gate.size()))) {
+          if (!npu->Submit(stream_, npu_a_[g], l.npu_gate.data(),
+                           npu_c_.data() + std::size_t(g) * kNpuSlicesMax,
+                           static_cast<int>(l.npu_gate.size()))) {
             (void)npu->Wait(stream_);
             AssignError(error_msg, "NPU attention submit failed");
             return false;
@@ -2955,10 +2964,14 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
         prepared = AttentionF16Gemm(
             l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
             l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-            s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-            s.rope, yarn_, options_.kv_cache_type);
+            s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps,
+            stream_, s.rope, yarn_, options_.kv_cache_type);
       }
       if (!prepared) {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+        if (npu_gate_groups != 0)
+          (void)npu->Wait(stream_);
+#endif
         AssignError(error_msg, "fused attention projection failed");
         return false;
       }
@@ -2969,9 +2982,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           return false;
         }
         PrepareQueryHeadsStreams(npu_c_dev_, kNpuSlicesMax, npu->tokens(),
-            l.attn_q_norm.f32(), s_.q, s_.attn_gate, n_tokens, c.num_heads,
-            c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-            c.rms_eps, stream_, s.rope, skip_gate_heads);
+                                 l.attn_q_norm.f32(), s_.q, s_.attn_gate,
+                                 n_tokens, c.num_heads, c.num_kv_heads,
+                                 c.head_dim, c.rotary_dim, pos, c.rope_theta,
+                                 c.rms_eps, stream_, s.rope, skip_gate_heads);
       }
 #endif
     } else {
@@ -3029,7 +3043,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Raw keys survive only until pooling. The ring holds the initial
   // pre-budget backlog and a batch, independently for trunk and predictor.
   if (s.index_k != nullptr) {
-    if (!(projections_ready
+    // NPU only supplies QKV: retain the ordinary wide GPU index-key route.
+    // The separate MTP/decode-batch caller still needs DenseBatch.
+    if (!(projections_ready && !qkv_only_precomputed
               ? DenseBatch(l.indexer_k, x, s_.ik, n_tokens, error_msg)
               : Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg))) {
       return false;
@@ -3226,8 +3242,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
   }
+  DumpRows("router-logits", s_.router, n_tokens, c.num_experts + 1, stream_);
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  DumpRows("router-ids", s_.ids, n_tokens, used, stream_);
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
@@ -3250,13 +3268,13 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   NpuGemm* npu = model_->npu();
   std::uint32_t npu_shexp_groups = 0;
   if (StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0 &&
-      npu->Healthy() && !npu_a_.empty() && l.npu_shexp.size() == 2 && !last_only && n_tokens >= 1024 &&
-      n_tokens <= options_.max_batch && n_tokens % npu->tokens() == 0 &&
+      npu->Healthy() && !npu_a_.empty() && l.npu_shexp.size() == 2 &&
+      !last_only && n_tokens >= 1024 && n_tokens <= options_.max_batch &&
+      n_tokens % npu->tokens() == 0 &&
       n_tokens / npu->tokens() <= npu_a_.size() &&
       l.shexp_up.type == GgmlType::kQ8_0 &&
-      l.shexp_gate.type == GgmlType::kQ8_0 &&
-      l.shexp_up.cols == npu->k() && l.shexp_up.rows <= npu->n() &&
-      l.shexp_gate.rows == l.shexp_up.rows &&
+      l.shexp_gate.type == GgmlType::kQ8_0 && l.shexp_up.cols == npu->k() &&
+      l.shexp_up.rows <= npu->n() && l.shexp_gate.rows == l.shexp_up.rows &&
       l.shexp_gate.cols == l.shexp_up.cols &&
       l.shexp_down.cols == l.shexp_up.rows &&
       DenseF16Route(l.shexp_down, n_tokens)) {
@@ -3270,9 +3288,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
               static_cast<std::size_t>(g) * group_tokens * l.shexp_up.cols,
           l.shexp_up.cols, group_tokens, npu->k(), 0, npu->k(),
           npu->Device(npu_a_[g]), stream_);
-      if (!npu->Submit(
-              stream_, npu_a_[g], l.npu_shexp.data(),
-              npu_c_.data() + std::size_t(g) * kNpuSlicesMax, 2)) {
+      if (!npu->Submit(stream_, npu_a_[g], l.npu_shexp.data(),
+                       npu_c_.data() + std::size_t(g) * kNpuSlicesMax, 2)) {
         (void)npu->Wait(stream_);
         AssignError(error_msg, "NPU shared expert submit failed");
         return false;
@@ -3283,9 +3300,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
               static_cast<std::size_t>(g) * group_tokens * l.shexp_up.cols,
           l.shexp_up.cols, group_tokens, npu->k(), 0, npu->k(),
           npu->Device(npu_a_lo_[g]), stream_, true);
-      if (!npu->Submit(
-              stream_, npu_a_lo_[g], l.npu_shexp.data(),
-              npu_c_.data() + std::size_t(g) * kNpuSlicesMax + 2, 2)) {
+      if (!npu->Submit(stream_, npu_a_lo_[g], l.npu_shexp.data(),
+                       npu_c_.data() + std::size_t(g) * kNpuSlicesMax + 2, 2)) {
         (void)npu->Wait(stream_);
         AssignError(error_msg, "NPU shared expert residual submit failed");
         return false;
@@ -3405,7 +3421,6 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
               npu->Staged(stream_, npu_c_[c0 + 2]),
               npu->Staged(stream_, npu_c_[c0 + 3]), s_.shexp_half + base,
               group_tokens, npu->n(), ff, stream_);
-
   }
   if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
                     l.shexp_down.rows, l.shexp_down.cols, stream_)) {
@@ -3417,13 +3432,14 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (WmmaExperts(l, n_tokens)) {
     moe_pending_ = out == s_.block_out;
     if (!moe_pending_)
-      MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e),
-          s_.weights, s_.shexp_out, s_.router + c.num_experts,
-          c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
+      MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e), s_.weights,
+                         s_.shexp_out, s_.router + c.num_experts,
+                         c.num_experts + 1, out, n_tokens, used, c.hidden_size,
+                         stream_);
   } else {
     MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
-        s_.router + c.num_experts, c.num_experts + 1, out, n_tokens, used,
-        c.hidden_size, stream_);
+                    s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
+                    used, c.hidden_size, stream_);
   }
   return true;
 #else
@@ -3513,9 +3529,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
           static_cast<unsigned>(l.ffn_up_exps.type),
           static_cast<unsigned>(l.ffn_down_exps.type),
           dump_frame != nullptr ? static_cast<int>(dump_frame->layer) : -1,
-          pair_bank_, pair_bank_ >= 0 ? pair_start_
-                                    : dump_frame != nullptr ? dump_frame->start
-                                                            : 0U);
+          pair_bank_,
+          pair_bank_ >= 0         ? pair_start_
+          : dump_frame != nullptr ? dump_frame->start
+                                  : 0U);
       AssignError(error_msg, detail);
     };
     const bool gated_ok =
@@ -3749,7 +3766,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   npu_used_ = false;
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
   if (model_->npu() != nullptr && !model_->npu()->Healthy()) {
-    AssignError(error_msg, "NPU runtime failed; restart the process before reuse");
+    AssignError(error_msg,
+                "NPU runtime failed; restart the process before reuse");
     return false;
   }
 #endif
@@ -3906,8 +3924,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     return false;
   }
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
-  if (npu_used_ && model_->npu() != nullptr &&
-      !model_->npu()->Healthy()) {
+  if (npu_used_ && model_->npu() != nullptr && !model_->npu()->Healthy()) {
     AssignError(error_msg, "NPU run failed; batch result discarded");
     return false;
   }
@@ -3939,8 +3956,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
 }
 
 bool Executor::ForwardPair(Session& session,
-                           std::span<const std::int32_t> tokens,
-                           float* logits, std::string* error_msg) const {
+                           std::span<const std::int32_t> tokens, float* logits,
+                           std::string* error_msg) const {
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
   constexpr std::uint32_t rows = 4096;
   const Config& c = config();
@@ -3955,8 +3972,8 @@ bool Executor::ForwardPair(Session& session,
   b.res += std::size_t{rows} * c.HcDim();
   b.xn += std::size_t{rows} * c.HcDim();
   b.xn_half += std::size_t{rows} * c.HcDim();
-  b.xn_q8t = static_cast<std::uint8_t*>(b.xn_q8t) +
-             Q8TiledBytes(rows, c.HcDim());
+  b.xn_q8t =
+      static_cast<std::uint8_t*>(b.xn_q8t) + Q8TiledBytes(rows, c.HcDim());
   b.lo += std::size_t{rows} * c.hc_low_rank;
   b.mixed += std::size_t{rows} * c.hidden_size;
   b.inject += std::size_t{rows} * c.hc_count * HcInjectParts(c.hidden_size);
@@ -4007,8 +4024,8 @@ bool Executor::ForwardPair(Session& session,
     const auto end = start + 2 * rows;
     session.continuation_hooks_->BeforeWrite(
         false, start, end, session.blocks_,
-        c.compress_ratio > 0 && end > c.indexer_top_k
-            ? end / c.compress_ratio : session.blocks_);
+        c.compress_ratio > 0 && end > c.indexer_top_k ? end / c.compress_ratio
+                                                      : session.blocks_);
   }
   const auto old_ngram = session.ngram_;
   if (c.ple_layer >= 0 &&
@@ -4061,9 +4078,9 @@ bool Executor::ForwardPair(Session& session,
     pair_start_ = start + bank * rows;
   };
   auto control_upload = [&](std::uint32_t bank) {
-    return Check(hipMemcpyAsync(
-                     session.control_, controls[bank], sizeof(Session::Control),
-                     hipMemcpyHostToDevice, stream_),
+    return Check(hipMemcpyAsync(session.control_, controls[bank],
+                                sizeof(Session::Control), hipMemcpyHostToDevice,
+                                stream_),
                  "interleaved bank control upload", error_msg);
   };
   perf::Forward perf_forward(true);
@@ -4073,9 +4090,8 @@ bool Executor::ForwardPair(Session& session,
 
   // Finish the PLE prefix A then B before reusing its coherent host staging.
   // GDN, KV, PLE history and pooling all observe A before B at every layer.
-  const auto prefix_end = c.ple_layer >= 0
-                              ? static_cast<std::uint32_t>(c.ple_layer) + 1
-                              : 0U;
+  const auto prefix_end =
+      c.ple_layer >= 0 ? static_cast<std::uint32_t>(c.ple_layer) + 1 : 0U;
   for (std::uint32_t bank = 0; bank < 2; ++bank) {
     select(bank);
     if (bank == 1 && c.ple_layer >= 0 &&
@@ -4091,22 +4107,20 @@ bool Executor::ForwardPair(Session& session,
                 s_.tokens, s_.res, rows, c.hidden_size, c.hc_count, stream_);
     if (prefix_end != 0 &&
         !ForwardBody(session, rows, 0, false, false, sparse[bank],
-                     start + bank * rows, pool[bank], 0, prefix_end,
-                     error_msg, nullptr, false, false, false,
-                     &cache[bank].normed))
+                     start + bank * rows, pool[bank], 0, prefix_end, error_msg,
+                     nullptr, false, false, false, &cache[bank].normed))
       return false;
     SaveCache(&cache[bank]);
-    if (c.ple_layer >= 0 &&
-        !Check(hipStreamSynchronize(stream_), "interleaved PLE staging drain",
-               error_msg))
+    if (c.ple_layer >= 0 && !Check(hipStreamSynchronize(stream_),
+                                   "interleaved PLE staging drain", error_msg))
       return false;
   }
 
   const auto& layers = model_->layers();
   auto prefetch = [&](std::uint32_t bank, std::uint32_t layer) {
     select(bank);
-    if (!PrefetchNpu(layers[layer], bank, cache[bank].normed,
-                     &prepared[bank], error_msg))
+    if (!PrefetchNpu(layers[layer], bank, cache[bank].normed, &prepared[bank],
+                     error_msg))
       return false;
     SaveCache(&cache[bank]);
     return true;
@@ -4117,10 +4131,11 @@ bool Executor::ForwardPair(Session& session,
     for (std::uint32_t bank = 0; bank < 2; ++bank) {
       select(bank);
       if (!control_upload(bank) ||
-          !ForwardBody(session, rows, bank == 1 ? 1 : 0, bank == 1,
-                       false, sparse[bank], start + bank * rows, pool[bank],
-                       layer, layer + 1, error_msg, nullptr, false, false,
-                       cache[bank].normed, &cache[bank].normed, &prepared[bank]))
+          !ForwardBody(session, rows, bank == 1 ? 1 : 0, bank == 1, false,
+                       sparse[bank], start + bank * rows, pool[bank], layer,
+                       layer + 1, error_msg, nullptr, false, false,
+                       cache[bank].normed, &cache[bank].normed,
+                       &prepared[bank]))
         return false;
       SaveCache(&cache[bank]);
       // A(next) is submitted before B(current)'s GPU consumer; B(next)
@@ -4154,16 +4169,13 @@ bool Executor::ForwardPair(Session& session,
 #endif
 }
 
-bool Executor::ForwardBody(Session& session, std::uint32_t n,
-                           std::uint32_t n_logits, bool download_logits,
-                           bool speculative, bool sparse,
-                           std::uint32_t start_pos, std::uint32_t pool_grid,
-                           std::uint32_t first_layer, std::uint32_t end_layer,
-                           std::string* error_msg,
-                           PrefillCheckpoint* checkpoint,
-                           bool embeddings_ready, bool initialize,
-                           bool normed_input, bool* normed_output,
-                           const PreparedNpu* prepared) const {
+bool Executor::ForwardBody(
+    Session& session, std::uint32_t n, std::uint32_t n_logits,
+    bool download_logits, bool speculative, bool sparse,
+    std::uint32_t start_pos, std::uint32_t pool_grid, std::uint32_t first_layer,
+    std::uint32_t end_layer, std::string* error_msg,
+    PrefillCheckpoint* checkpoint, bool embeddings_ready, bool initialize,
+    bool normed_input, bool* normed_output, const PreparedNpu* prepared) const {
   const Config& c = config();
   if (first_layer == 0 && initialize) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
@@ -4198,9 +4210,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            l.linear && DenseF16Route(l.ssm_in, n) &&
                            l.ssm_alpha_beta.type == GgmlType::kF16 &&
                            l.ssm_alpha_beta.cols == l.ssm_in.cols;
-    if (prepared == nullptr &&
-        !HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-                half_only)) {
+    if (prepared == nullptr && !HcMix(l.hc_attn, s_.res, normed, s_.mixed,
+                                      s_.inject, n, error_msg, half_only)) {
       return false;
     }
     bool projections_ready = false;
@@ -4209,9 +4220,15 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       NpuGemm* npu = model_->npu();
       // Alpha/beta stays on the original GPU dense route. Queue it ahead of
       // the ticket wait, while this bank's full SSM projection is in flight.
+      const auto& input_weight = l.linear ? l.ssm_in : l.attn_qkv;
+      DumpRows("npu-input-half", static_cast<const __half*>(s_.x_half), n,
+               input_weight.cols, stream_);
       if (l.linear &&
           !Dense(l.ssm_alpha_beta, s_.mixed, s_.alpha_beta, n, error_msg))
         return false;
+      if (l.linear)
+        DumpRows("npu-alpha-beta", s_.alpha_beta, n, l.ssm_alpha_beta.rows,
+                 stream_);
       if (!npu->Wait(stream_, prepared->ticket)) {
         AssignError(error_msg, "NPU interleaved projection wait failed");
         return false;
@@ -4221,9 +4238,24 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       float* out = l.linear ? s_.qkvz : s_.qg;
       for (std::size_t slice = 0; slice < ids.size(); ++slice)
         NpuDecodeOutput(
-            npu->Staged(stream_, npu_whole_c_[prepared->bank][slice]), out,
-            n, npu->n(), w.rows,
-            static_cast<std::uint32_t>(slice) * npu->n(), false, stream_);
+            npu->Staged(stream_, npu_whole_c_[prepared->bank][slice]), out, n,
+            npu->n(), w.rows, static_cast<std::uint32_t>(slice) * npu->n(),
+            false, stream_);
+      DumpRows("npu-decoded-projection", out, n, w.rows, stream_);
+      if (npu_diag_projection_ != nullptr) {
+        // Same Q8 weights/F16 inputs; a narrow GPU reference localizes
+        // nonfinite/scale errors. It is NOT a wide-arithmetic parity oracle.
+        const auto sample_rows = std::min<std::uint32_t>(16, n);
+        if (w.rows > 16384 ||
+            !DenseF16Gemm(w.data, static_cast<const __half*>(s_.x_half),
+                          npu_diag_projection_, sample_rows, w.rows, w.cols,
+                          stream_)) {
+          AssignError(error_msg, "NPU diagnostic GPU projection failed");
+          return false;
+        }
+        DumpRows("npu-gpu-narrow-reference", npu_diag_projection_, sample_rows,
+                 w.rows, stream_);
+      }
       projections_ready = true;
     }
 #endif
@@ -4243,12 +4275,12 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            capture)) {
         return false;
       }
-    } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
-                          &session.control_->position,
-                          &session.control_->blocks, start_pos, pool_grid,
-                          session.max_context_, sparse, error_msg,
-                          last_attention, projections_ready, true,
-                          checkpoint ? checkpoint->tokens : 0)) {
+    } else if (!Attention(
+                   l, session.attention_[il], s_.mixed, s_.block_out, n,
+                   &session.control_->position, &session.control_->blocks,
+                   start_pos, pool_grid, session.max_context_, sparse,
+                   error_msg, last_attention, projections_ready, true,
+                   checkpoint ? checkpoint->tokens : 0, prepared != nullptr)) {
       return false;
     }
 
