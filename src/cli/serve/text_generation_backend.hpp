@@ -17,6 +17,7 @@
 
 #include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
+#include "src/cli/serve/logprobs.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -142,7 +143,7 @@ struct ChatRequest {
 ///
 /// Implementations retain ownership of tokenization, templates, complete
 /// continuation state, and execution resources. The transport observes only
-/// generated text pieces and aggregate request metrics.
+/// generated text pieces, optional token probabilities and aggregate metrics.
 class TextGenerationBackend {
 public:
   /// Point-in-time local reuse hint, not a reservation or transferable state
@@ -168,7 +169,7 @@ public:
   };
 
   using CancellationCheck = std::function<bool()>;
-  using TokenCallback = std::function<bool(std::string_view)>;
+  using TokenCallback = std::function<bool(const TokenPiece&)>;
 
   /// llama-server `prompt_progress`; `processed` includes cached tokens.
   struct PromptProgress {
@@ -225,6 +226,7 @@ public:
   struct Result {
     std::optional<ComponentCacheMetrics> component_cache;
     std::string text;
+    std::vector<DecodedLogprobs> logprobs;
     std::vector<tokenization::TokenId> tokens;
     /// Internal trace evidence: exact committed prefix, if retention succeeded.
     std::optional<std::size_t> committed_tokens;
