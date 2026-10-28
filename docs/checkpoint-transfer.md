@@ -68,6 +68,13 @@ chat request afterwards. The ordinary engine still verifies token/image matches,
 stable dependencies and all model restore/Validate conditions before execution.
 No suffix-only protocol, imported RNG rewind or automatic request retry.
 
+With `--cache-ram-bytes off`, import returns `507 cache_transfer_budget`
+before reading or spooling the upload: this API admits only RAM checkpoints,
+even when an ordinary disk cache is configured. Zero-byte payloads cannot
+bypass that policy. `--cache-ram-bytes 0` remains AUTO and allows normal
+budgeted admission. Export can still read existing immutable disk checkpoints
+while RAM is off; it never captures a live frontier or enables RAM retention.
+
 ### Errors
 
 | Status | Stable code / meaning |
