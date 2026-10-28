@@ -2309,6 +2309,10 @@ std::shared_ptr<CheckpointTransferBlob> ComponentTextCache::Export(
 std::shared_ptr<CheckpointTransferBlob> ComponentTextCache::Import(
     const CheckpointTransferReader& reader, std::uint64_t length,
     std::string_view configuration) {
+  // Import admits a RAM checkpoint, not a durable disk publication. Off is a
+  // policy even for zero-byte payloads; do not spool an unusable upload first.
+  if (!impl_->ram_enabled)
+    throw CheckpointTransferError(507, "cache_transfer_budget");
   auto quota = std::make_shared<TransferQuota>(impl_->transfer_gate);
   auto blob = CheckpointTransferBlob::Import(
       reader, length, impl_->resources->adapter->CompatibilityIdentity(),
