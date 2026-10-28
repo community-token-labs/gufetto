@@ -1,18 +1,29 @@
 # Experimental Strix Halo hybrid projections
 
-**Default OFF; experimental, not correct/faster or release-qualified yet.**
-Frozen `99ab429f` built OFF/ON on nimo-2 in lease `d4ed1f0d2152` (focused CPU
-5/5 OFF, 6/6 ON). Our runtime completed 555 Process calls and 3511 successful
-reaps, with no selected kernel fault or boot change. Model prefill then failed
-at layer 44, bank 1: routed gate/up counts were zero. No completed hybrid timed
-row or speed gain was obtained. Production was verified restored on attempt 1;
-the freshly captured prior controls were **high/auto**, not auto/auto.
+**Default OFF; experimental nightly candidate, not main/stable qualification.**
+The measured **shared-expert-only** profile completed pp8K/16K and eight fresh
+Session cycles in one Model process on nimo-2, lease `b732f8607982`, source
+`8d518692`. Same-binary runtime OFF/ON: **1882.90 → 1843.28 tok/s** at8K
+(−2.10%), **1834.00 → 1832.43 tok/s** at16K (−0.086%): no speedup established.
+The short memory screen has flat post-warmup endpoints within each shape, one
+24 KiB RSS step, and constant GTT peak/VRAM/fd envelope; not long-run stability.
+Full-logit quality, two-host portability and concurrent decode remain unrun.
 
-This follow-up, based on nightly `5722416e`, fixes statistics synchronization,
-failed stream-release ownership and NPU backing-byte reporting. It adds bounded
-numerical and trace-cost diagnostics; it does **not** claim the route-count cause
-is fixed. Trace-ON O_DSYNC times are diagnostic, not ordinary worker/device
-performance. Soft owner target: stable/PR-ready about October 27 19:00Z, only
+The separate **whole/two-bank profile is broken**: routed counts became zero
+at layer34/bank1. First sampled NaNs appear after GDN/output projection;
+preceding NPU/GPU projection samples are finite with0.87–1.05% relative L2
+error. That localizes an interval, not a proved race or root-cause fix.
+All stages had no selected kernel faults. Production was verified restored;
+the freshly captured prior controls were **high/auto**, not auto/auto.
+Earlier exact99/d4ed completed555Process/3511reaps then failed at layer44.
+
+This landing generation rebases only the NPU feature onto nightly C
+`aba4e33a`; it does not alter C's q8 policy, guards or qualified history.
+Rebased native build/CPU qualification must be recorded separately from the
+8d hardware results. Statistics synchronization, failed stream-release
+ownership, QKV-only index-key policy and backing accounting are fixed in
+source. Trace-ON O_DSYNC costs were93.9–94.0% of measured worker time;
+1178.18 tok/s traced admission is diagnostic, not clean cold performance. Soft owner target: stable/PR-ready about October 27 19:00Z, only
 after real two-host gates and separate Opus/GPT-6.1-sol reviews. A 5–10% prefill
 gain remains a goal, not a prerequisite for useful experimental progress.
 
@@ -29,7 +40,22 @@ The next explicit **shared-expert-only ablation** uses `GUFO_NPU_SLICES=0`,
 `GUFO_NPU_GATE_SLICES=0`, `GUFO_NPU_WHOLE=0`, `GUFO_TWO_BANK=0`, and
 `GUFO_NPU_SHEXP=1`. It is a distinct declared configuration, not a silent retry
 or fallback after selected work fails. Its correctness/performance are pending.
-Full interleaving remains separately diagnostic until its failure is resolved.
+Use this full shared-only configuration, not merely `GUFO_STRIX_NPU=1`:
+
+```sh
+GUFO_STRIX_NPU=1 GUFO_NPU_DIR=/path/to/programs \
+GUFO_NPU_SLICES=0 GUFO_NPU_GATE_SLICES=0 GUFO_NPU_WHOLE=0 \
+GUFO_TWO_BANK=0 GUFO_NPU_SHEXP=1 GUFO_NPU_ISOLATE=1 GUFO_NPU_KEEPALIVE=0 \
+gufo bench -m /path/to/model.gguf -p 8192,16384 -n 1 -r 3 --speculative off
+```
+
+The ordinary opt-in defaults can also select SSM/attention slices; those are
+**not** qualified by the shared-only screen. Full interleaving remains
+separately diagnostic until its failure is resolved. Persisted cache identity
+does not yet separate NPU arithmetic; do not mix ON/OFF durable state. MTP,
+checkpointed/cached serving, q8-KV attention and true decode contention are not
+covered by these pp numbers. Never describe successful completion as full
+numerical-quality acceptance.
 `GUFO_NPU_PROJECTION_REFERENCE=1` with the existing bounded dump controls adds
 an independent first-16-row Q8/F16 GPU projection for localization only, never
 for consumption/fallback. Its narrow arithmetic is not a wide-parity oracle.
