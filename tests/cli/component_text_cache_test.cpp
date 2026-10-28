@@ -1044,7 +1044,8 @@ void RestartAndCorruption() {
   }
   for (const bool enabled : {true, false}) {
     auto runner = std::make_shared<Runner>();
-    ComponentTextCache exporter(runner, 1, 1 << 22, disk, false, 0, {}, enabled);
+    ComponentTextCache exporter(runner, 1, 1 << 22, disk, false, 0, {},
+                                enabled);
     assert(exporter.Lookup(prompt, nullptr, true, 0)->tier == "disk");
     auto blob = exporter.Export(prompt, nullptr, true, 0, "disk-transfer-v20");
     std::vector<std::uint8_t> wire;
