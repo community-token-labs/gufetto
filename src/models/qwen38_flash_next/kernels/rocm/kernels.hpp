@@ -371,27 +371,23 @@ struct GdnCheckpoint {
 /// cannot be queued. `convolved`
 /// consumes convolution rows already in conv_scratch; it requires null
 /// speculative snapshots.
-bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
-                   std::uint32_t z_stride, const float* alpha_beta,
-                   const float* conv_w, const float* a, const float* dt,
-                   const float* norm_w, float* conv_state, float* conv_scratch,
-                   float* qn, float* kn, float* raw, float* state, float* out,
-                   void* out_q8, RollbackRows state_snapshots,
-                   RollbackRows conv_snapshots, std::uint32_t n_tokens,
-                   std::uint32_t k_heads, std::uint32_t v_heads,
-                   std::uint32_t d, std::uint32_t kernel, bool row_split,
-                   bool convolved, float eps, hipStream_t stream,
-                   __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
-                   std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
-                   hipEvent_t z_ready = nullptr,
-
-                   void (*before_epilogue)(void*) = nullptr,
-                   void* before_epilogue_arg = nullptr,
-                   const std::uint8_t* const* z_streams = nullptr,
-                   std::uint32_t z_stream_stride = 0,
-                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0,
-                   bool conv_half = false, void* chunk_scratch = nullptr,
-                   std::size_t chunk_scratch_bytes = 0);
+bool GatedDeltaNet(
+    const float* qkv, std::uint32_t qkv_stride, const float* z,
+    std::uint32_t z_stride, const float* alpha_beta, const float* conv_w,
+    const float* a, const float* dt, const float* norm_w, float* conv_state,
+    float* conv_scratch, float* qn, float* kn, float* raw, float* state,
+    float* out, void* out_q8, RollbackRows state_snapshots,
+    RollbackRows conv_snapshots, std::uint32_t n_tokens, std::uint32_t k_heads,
+    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
+    bool row_split, bool convolved, float eps, hipStream_t stream,
+    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
+    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
+    hipEvent_t z_ready = nullptr, void (*before_epilogue)(void*) = nullptr,
+    void* before_epilogue_arg = nullptr,
+    const std::uint8_t* const* z_streams = nullptr,
+    std::uint32_t z_stream_stride = 0, std::uint32_t z_tokens = 0,
+    std::uint32_t z_gpu_cols = 0, bool conv_half = false,
+    void* chunk_scratch = nullptr, std::size_t chunk_scratch_bytes = 0);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.

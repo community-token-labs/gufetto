@@ -7775,24 +7775,21 @@ static void NpuGatedDeltaNet(
     void* chunk_scratch, std::size_t chunk_scratch_bytes);
 #endif
 
-bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
-                   std::uint32_t z_stride, const float* alpha_beta,
-                   const float* conv_w, const float* a, const float* dt,
-                   const float* norm_w, float* conv_state, float* conv_scratch,
-                   float* qn, float* kn, float* raw, float* state, float* out,
-                   void* out_q8, RollbackRows state_snapshots,
-                   RollbackRows conv_snapshots, std::uint32_t n_tokens,
-                   std::uint32_t k_heads, std::uint32_t v_heads,
-                   std::uint32_t d, std::uint32_t kernel, bool row_split,
-                   bool convolved, float eps, hipStream_t stream,
-                   __half* out_half, GdnCheckpoint checkpoint,
-                   std::uint32_t out_half_stride, void* out_q8_1,
-                   hipEvent_t z_ready,
-                   void (*before_epilogue)(void*), void* before_epilogue_arg,
-                   const std::uint8_t* const* z_streams,
-                   std::uint32_t z_stream_stride, std::uint32_t z_tokens,
-                   std::uint32_t z_gpu_cols, bool conv_half,
-                   void* chunk_scratch, std::size_t chunk_scratch_bytes) {
+bool GatedDeltaNet(
+    const float* qkv, std::uint32_t qkv_stride, const float* z,
+    std::uint32_t z_stride, const float* alpha_beta, const float* conv_w,
+    const float* a, const float* dt, const float* norm_w, float* conv_state,
+    float* conv_scratch, float* qn, float* kn, float* raw, float* state,
+    float* out, void* out_q8, RollbackRows state_snapshots,
+    RollbackRows conv_snapshots, std::uint32_t n_tokens, std::uint32_t k_heads,
+    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
+    bool row_split, bool convolved, float eps, hipStream_t stream,
+    __half* out_half, GdnCheckpoint checkpoint, std::uint32_t out_half_stride,
+    void* out_q8_1, hipEvent_t z_ready, void (*before_epilogue)(void*),
+    void* before_epilogue_arg, const std::uint8_t* const* z_streams,
+    std::uint32_t z_stream_stride, std::uint32_t z_tokens,
+    std::uint32_t z_gpu_cols, bool conv_half, void* chunk_scratch,
+    std::size_t chunk_scratch_bytes) {
 #ifdef GUFO_ENABLE_NPU
   if (before_epilogue != nullptr || z_streams != nullptr || conv_half ||
       chunk_scratch != nullptr) {
@@ -7802,13 +7799,13 @@ bool GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
         hipStreamWaitEvent(stream, z_ready, 0) != hipSuccess)
       return false;
     NpuGatedDeltaNet(qkv, qkv_stride, z, z_stride, alpha_beta, conv_w, a, dt,
-                    norm_w, conv_state, conv_scratch, qn, kn, raw, state, out,
-                    out_q8, state_snapshots, conv_snapshots, n_tokens, k_heads,
-                    v_heads, d, kernel, row_split, convolved, eps, stream,
-                    out_half, checkpoint, out_half_stride, out_q8_1,
-                    before_epilogue, before_epilogue_arg, z_streams,
-                    z_stream_stride, z_tokens, z_gpu_cols, conv_half,
-                    chunk_scratch, chunk_scratch_bytes);
+                     norm_w, conv_state, conv_scratch, qn, kn, raw, state, out,
+                     out_q8, state_snapshots, conv_snapshots, n_tokens, k_heads,
+                     v_heads, d, kernel, row_split, convolved, eps, stream,
+                     out_half, checkpoint, out_half_stride, out_q8_1,
+                     before_epilogue, before_epilogue_arg, z_streams,
+                     z_stream_stride, z_tokens, z_gpu_cols, conv_half,
+                     chunk_scratch, chunk_scratch_bytes);
     return true;
   }
 #else
@@ -10365,11 +10362,11 @@ static void NpuGatedDeltaNet(
                        eps, khat, khat_t, qhat, kkmat, qkmat);
     hipLaunchKernelGGL(NpuGdnChunkPrepKernel, dim3(kGh, chunks), dim3(256), 0,
                        stream, kkmat, qkmat, kn, xmat, mmat, gvec, wvec);
-    hipLaunchKernelGGL((NpuGdnChunkScanKernel<64>), dim3(kGh, kGd / 64), dim3(256),
-                       0, stream, reinterpret_cast<const __half*>(conv_scratch),
-                       khat, khat_t, qhat, xmat, mmat, gvec, wvec, state,
-                       reinterpret_cast<__half*>(raw),
-                       static_cast<int>(chunks));
+    hipLaunchKernelGGL(
+        (NpuGdnChunkScanKernel<64>), dim3(kGh, kGd / 64), dim3(256), 0, stream,
+        reinterpret_cast<const __half*>(conv_scratch), khat, khat_t, qhat, xmat,
+        mmat, gvec, wvec, state, reinterpret_cast<__half*>(raw),
+        static_cast<int>(chunks));
   } else if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
     if (conv_half) {
       hipLaunchKernelGGL(NpuGdnPrepKqKernel<true>, dim3(k_heads, n_tokens),

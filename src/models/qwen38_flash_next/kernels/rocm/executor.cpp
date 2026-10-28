@@ -2767,7 +2767,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         }
         z_ready = side_done_;
         z_join.event = side_done_;
-      }
+        }
       }
     }
     if (!projections_ready && !convolved &&
@@ -3445,7 +3445,6 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 #else
   return MoeExperts(l, x, out, n_tokens, error_msg) && JoinSide(error_msg);
 #endif
-
 }
 
 bool Executor::JoinSide(std::string* error_msg) const {
