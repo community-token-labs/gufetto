@@ -26,6 +26,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/env.hpp"
+#include "src/core/platform/runtime_fingerprint.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/support/temporary_directory.hpp"
 
@@ -3456,6 +3457,7 @@ void LookupRuntimeDefaultsAndDisabled() {
 }
 #include "tests/cli/cache_lookup_checks.hpp"
 #include "tests/cli/cache_lookup_r3_checks.hpp"
+#include "tests/cli/cache_packed_transfer_checks.hpp"
 }  // namespace
 // An off RAM cache commits no backing, grows none before prefill and takes no
 // capture, yet a session keeps its own live frontier and its metrics stay
@@ -3615,6 +3617,11 @@ int main() {
     std::cout << "CPU packed disk admission PASS\n";
     return 0;
   }
+  packed_transfer_cpu::MalformedImportsAndDisk();
+  packed_transfer_cpu::RotatedWithoutFingerprintImport();
+#if defined(__linux__)
+  packed_transfer_cpu::RotatedExistingPinsBeforeReady();
+#endif
   LookupRuntimeDefaultsAndDisabled();
   CheckpointTransferRoundTripAndConcurrentServing();
   CheckpointImportRespectsRamOff();
