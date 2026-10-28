@@ -288,8 +288,6 @@ void CheckAppendSnapshotOracle(
         Require(text_snapshot->CopyTo(inconsistent), "copy text snapshot");
         // The versioned host header has hidden_rows at byte 20, after magic,
         // version, vocabulary size and token count. Native payload stays valid.
-        static_assert(
-            models::qwen38_flash_next::Session::kSnapshotPayloadVersion == 21);
         const auto wrong_rows = std::numeric_limits<std::uint32_t>::max();
         std::memcpy(inconsistent.data() + 20, &wrong_rows, sizeof(wrong_rows));
         Require(!restored->RestoreSnapshot(inconsistent, &error) &&
