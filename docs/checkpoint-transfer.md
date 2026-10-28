@@ -267,4 +267,4 @@ attempts remain NONPASS, and later offline orchestration passes are not
 scientific qualification. GPU restoration, cross-host parity, isolation and
 throughput remain **UNQUALIFIED** on this product. See immutable reports and
 the inherited shared disk-verification risk in
-[the qualification ledger](STRIX-QUALIFICATION.md).
+[the historical qualification ledger](http://git.home.arpa/JCFrags/gufo/src/commit/7b360b41136a4134855659d001051e6f4c8fdc82/docs/STRIX-QUALIFICATION.md).
