@@ -3577,20 +3577,19 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
         try {
           std::vector<pd::Row> observed_rows;
           for (std::uint32_t r = 0; r < rows; ++r)
-            observed_rows.push_back(
-                {n - rows + r, reinterpret_cast<std::uintptr_t>(&session),
-                 std::uint64_t{start_pos} + n - rows + r});
+            observed_rows.push_back({n - rows + r,
+                                     reinterpret_cast<std::uintptr_t>(&session),
+                                     std::uint64_t{start_pos} + n - rows + r});
           const auto model = reinterpret_cast<std::uintptr_t>(model_);
           const std::array tensors{
               pd::Describe(l.ffn_gate_exps, model, il, pd::TensorRole::kGate),
               pd::Describe(l.ffn_up_exps, model, il, pd::TensorRole::kUp),
               pd::Describe(l.ffn_down_exps, model, il, pd::TensorRole::kDown)};
           pd::DeviceRouting routing;
-          routing.execution = WmmaExperts(l, rows)
-                                  ? pd::Execution::kRoutedF16
-                                  : !ExpertMatrixRows(rows)
-                                        ? pd::Execution::kVector
-                                        : pd::Execution::kUnsupported;
+          routing.execution = WmmaExperts(l, rows) ? pd::Execution::kRoutedF16
+                              : !ExpertMatrixRows(rows)
+                                  ? pd::Execution::kVector
+                                  : pd::Execution::kUnsupported;
           routing.used = c.num_experts_used;
           routing.ids = s_.ids;
           if (routing.execution == pd::Execution::kRoutedF16) {
@@ -3603,22 +3602,24 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             routing.gate_tiles = {
                 tiles_host_ + (wide ? routed_pair_offset_ : 0),
                 wide ? routed_pair_tiles_ : routed_n_tiles_};
-            routing.down_tiles = {
-                tiles_host_, wide ? routed_64_tiles_ : routed_n_tiles_};
+            routing.down_tiles = {tiles_host_,
+                                  wide ? routed_64_tiles_ : routed_n_tiles_};
             routing.gate_tile_rows = wide ? 128 : routed_tile_rows_;
             routing.down_tile_rows = wide ? 64 : routed_tile_rows_;
             routing.gate_output_rows = wide ? 64 : 128;
           }
           pd::RecordLayer(
-              tensors, prefill_phase ? pd::ForwardRole::kPrompt
-                                      : pd::ForwardRole::kDecoder,
+              tensors,
+              prefill_phase ? pd::ForwardRole::kPrompt
+                            : pd::ForwardRole::kDecoder,
               observed_rows, routing,
               [&](const std::int32_t* source, std::span<std::int32_t> host) {
-                const auto copy = hipMemcpyAsync(
-                    host.data(), source, host.size_bytes(),
-                    hipMemcpyDeviceToHost, stream_);
+                const auto copy =
+                    hipMemcpyAsync(host.data(), source, host.size_bytes(),
+                                   hipMemcpyDeviceToHost, stream_);
                 // Always join before the temporary host storage is destroyed,
-                // including failed enqueue paths. Diagnostics never own scratch.
+                // including failed enqueue paths. Diagnostics never own
+                // scratch.
                 const auto joined = hipStreamSynchronize(stream_);
                 return copy == hipSuccess && joined == hipSuccess;
               });

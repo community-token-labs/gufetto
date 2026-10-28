@@ -432,7 +432,8 @@ void AddPrefillPrerequisiteOptions(
   parser.AddCustomOption(
       "", "--experimental-prefill-policy", "MODE",
       "Experimental prefill policy: legacy, adaptive, serial-shadow "
-      "(default: legacy; no mixed kernel)", "Scheduling",
+      "(default: legacy; no mixed kernel)",
+      "Scheduling",
       [options](std::string_view, std::string_view value, std::string* error) {
         using Mode = server::detail::PrefillPrerequisiteMode;
         if (value == "legacy")
@@ -448,11 +449,11 @@ void AddPrefillPrerequisiteOptions(
         }
         return true;
       });
-  parser.AddOption(
-      "", "--experimental-prefill-budget", "N",
-      "Experimental policy budget64..4224; prompt rows for adaptive, TOTAL rows "
-      "for serial-shadow (default:0/off; at most8 sessions)", "Scheduling",
-      &options->tokens);
+  parser.AddOption("", "--experimental-prefill-budget", "N",
+                   "Experimental policy budget64..4224; prompt rows for "
+                   "adaptive, TOTAL rows "
+                   "for serial-shadow (default:0/off; at most8 sessions)",
+                   "Scheduling", &options->tokens);
 }
 #endif
 

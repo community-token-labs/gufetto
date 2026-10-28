@@ -221,8 +221,8 @@ struct FakeControl {
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   std::size_t maximum_plan_width{4};
   std::function<void(TextRunnerToken, std::size_t)> advance_callback;
-  std::function<std::optional<std::size_t>(
-      std::span<const TextRunnerToken>, std::size_t, std::size_t)>
+  std::function<std::optional<std::size_t>(std::span<const TextRunnerToken>,
+                                           std::size_t, std::size_t)>
       single_pass_limit;
 #endif
 };
@@ -1470,10 +1470,14 @@ void TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals() {
       }
     };
     control->throw_advance_label = failed_label;
+    // This fixture deliberately queues FIVE anonymous requests while the
+    // first decoder is held. Configure its admission envelope explicitly;
+    // production defaults and the separate queue-limit negatives stay intact.
     TextGenerationScheduler scheduler(
-        pool, {.prerequisites = {
-                   .mode = PrefillPrerequisiteMode::kAdaptive,
-                   .tokens = 64}});
+        pool,
+        {.prerequisites = {.mode = PrefillPrerequisiteMode::kAdaptive,
+                           .tokens = 64}},
+        {.max_pending_requests = 8, .max_pending_requests_per_client = 8});
     auto resuming = scheduler.Submit({7}, 12, 0.0F);
     Expect(captured.try_acquire_for(kTestTimeout), "capture really defers");
     auto first = scheduler.Submit({1}, 12, 0.0F);
@@ -1542,9 +1546,9 @@ void TestSerialShadowPlanFailureOrDeclineKeepsPeersRunnable() {
     auto control = std::make_shared<FakeControl>();
     control->max_context = 4096;
     control->block_advance_label = 1;
-    control->single_pass_limit = [fail](
-        std::span<const TextRunnerToken> prompt, std::size_t offset,
-        std::size_t budget) -> std::optional<std::size_t> {
+    control->single_pass_limit =
+        [fail](std::span<const TextRunnerToken> prompt, std::size_t offset,
+               std::size_t budget) -> std::optional<std::size_t> {
       if (prompt.front() == 2) {
         if (fail)
           throw std::runtime_error("injected read-only planner failure");
@@ -1555,15 +1559,14 @@ void TestSerialShadowPlanFailureOrDeclineKeepsPeersRunnable() {
     auto scheduler = MakeScheduler(
         control, 3,
         {.decode_active_tokens = 2,
-         .prerequisites = {
-             .mode = PrefillPrerequisiteMode::kSerialShadow,
-             .tokens = 64}});
+         .prerequisites = {.mode = PrefillPrerequisiteMode::kSerialShadow,
+                           .tokens = 64}});
     auto decoder = scheduler->Submit({1}, 30, 0.0F);
     control->WaitForAdvance(1);
-    auto declining = scheduler->Submit(std::vector<TextRunnerToken>(35, 2), 2,
-                                       0.0F);
-    auto healthy = scheduler->Submit(std::vector<TextRunnerToken>(35, 3), 2,
-                                     0.0F);
+    auto declining =
+        scheduler->Submit(std::vector<TextRunnerToken>(35, 2), 2, 0.0F);
+    auto healthy =
+        scheduler->Submit(std::vector<TextRunnerToken>(35, 3), 2, 0.0F);
     control->ReleaseAdvance();
     bool failed = false;
     try {

@@ -1118,7 +1118,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
               pd::Describe(l.ffn_down_exps, model, il, pd::TensorRole::kDown)};
           // MoeBatch's Q4 route is explicitly vector; other formats segment
           // into <=8-row vector calls. Internal vector grouping is not exposed,
-          // so only logical packed-address coverage (not tile loads) is claimed.
+          // so only logical packed-address coverage (not tile loads) is
+          // claimed.
           pd::DeviceRouting routing;
           routing.execution = pd::Execution::kVector;
           routing.used = c.num_experts_used;
@@ -1126,9 +1127,9 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
           pd::RecordLayer(
               tensors, pd::ForwardRole::kDecoder, observed_rows, routing,
               [&](const std::int32_t* source, std::span<std::int32_t> host) {
-                const auto copy = hipMemcpyAsync(
-                    host.data(), source, host.size_bytes(),
-                    hipMemcpyDeviceToHost, stream_);
+                const auto copy =
+                    hipMemcpyAsync(host.data(), source, host.size_bytes(),
+                                   hipMemcpyDeviceToHost, stream_);
                 const auto joined = hipStreamSynchronize(stream_);
                 return copy == hipSuccess && joined == hipSuccess;
               });

@@ -1327,9 +1327,10 @@ struct TextGenerationScheduler::Impl {
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
                    bool decoder_runnable, bool peer_waiting = false
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-                   , std::optional<std::size_t> selected_budget = std::nullopt
+                   ,
+                   std::optional<std::size_t> selected_budget = std::nullopt
 #endif
-                   ) {
+  ) {
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -2036,9 +2037,9 @@ struct TextGenerationScheduler::Impl {
       if (IsTerminal(request) || request->runner_request.SnapshotPending())
         continue;
       ids[ready] = request->id;
-      remaining[ready++] =
-          request->token_limit - request->result.tokens.size() +
-          (request->preview_token.has_value() ? 1 : 0);
+      remaining[ready++] = request->token_limit -
+                           request->result.tokens.size() +
+                           (request->preview_token.has_value() ? 1 : 0);
     }
     if (config.mode == detail::PrefillPrerequisiteMode::kAdaptive &&
         !prerequisite_prefill_next && ready != 0) {
@@ -2059,9 +2060,11 @@ struct TextGenerationScheduler::Impl {
     prerequisite_association.cohort = sequence;
     prerequisite_association.plan = sequence;
     prerequisite_association.scheduler_frozen = ready;
-    // No numerical starting-state certificate exists: leave starting_state null.
+    // No numerical starting-state certificate exists: leave starting_state
+    // null.
 #endif
-    if (config.mode == detail::PrefillPrerequisiteMode::kSerialShadow && ready) {
+    if (config.mode == detail::PrefillPrerequisiteMode::kSerialShadow &&
+        ready) {
       // This serial study does NOT enable a mixed target or component commit.
       // The production component route is explicitly unsupported for mixing.
       ++request->result.serial_shadow_unsupported;

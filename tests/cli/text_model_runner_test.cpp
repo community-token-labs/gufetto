@@ -593,12 +593,18 @@ public:
     for (const auto& penalty : sampler.penalties())
       penalties.push_back(
           {penalty.token, penalty.generated_count, penalty.repeated});
-    observations.push_back({
-        fake.position, fake.decode_count, *fake.frontier, token,
-        before.rng, after.rng, before.pending, after.pending,
-        {sampler.history().begin(), sampler.history().end()},
-        std::move(penalties),
-        active_sampler == nullptr || active_sampler == &sampler});
+    observations.push_back(
+        {fake.position,
+         fake.decode_count,
+         *fake.frontier,
+         token,
+         before.rng,
+         after.rng,
+         before.pending,
+         after.pending,
+         {sampler.history().begin(), sampler.history().end()},
+         std::move(penalties),
+         active_sampler == nullptr || active_sampler == &sampler});
     return {.token = token, .piece = std::to_string(token)};
   }
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -695,9 +701,9 @@ std::vector<TextRunnerToken> CheckSeededContinuation(
     const auto begin = runner.observations.size();
     const auto step = request.DecodeStep(cap);
     const bool copied = runner.copied_decode && cap != 1;
-    Expect(step.selections.size() ==
-               (copied ? std::min(cap, std::size_t{2}) : 1),
-           "the available runner interface retains its chosen decode route");
+    Expect(
+        step.selections.size() == (copied ? std::min(cap, std::size_t{2}) : 1),
+        "the available runner interface retains its chosen decode route");
     for (std::size_t i = 0; i < step.selections.size(); ++i) {
       const auto& selection = step.selections[i];
       ExpectSeededSelection(runner.observations.at(begin + i), reference,
@@ -776,19 +782,19 @@ void TestPoolSeededDirectAndCopiedSamplerOwnership() {
   Expect(runner->copied_steps == 0 && runner->direct_steps == 6,
          "a physical batch plan cannot invent a copied-sampler generic route");
   (void)first.SelectNext();
-  ExpectSeededSelection(runner->observations.back(), a, fa,
-                        prompt.size() + 3, 3, true);
+  ExpectSeededSelection(runner->observations.back(), a, fa, prompt.size() + 3,
+                        3, true);
   (void)second.SelectNext();
-  ExpectSeededSelection(runner->observations.back(), b, fb,
-                        other.size() + 3, 3, true);
+  ExpectSeededSelection(runner->observations.back(), b, fb, other.size() + 3, 3,
+                        true);
   first.Invalidate();
   second.Invalidate();
 }
 
 void TestPreparedRaggedCutsRestoreExactSeededContinuation() {
   const std::vector<TextRunnerToken> prefix{2, 7, 1};
-  const std::vector<TextRunnerToken> prompt{
-      2, 7, 1, 6, 3, 5, 2, 1, 4, 7, 6, 3, 2, 5, 1, 4, 6, 7};
+  const std::vector<TextRunnerToken> prompt{2, 7, 1, 6, 3, 5, 2, 1, 4,
+                                            7, 6, 3, 2, 5, 1, 4, 6, 7};
   // Restored p=3, stable b=11: proposals end b-1, b, b+1. No fake
   // alignment grid may round these positive ragged cuts down to zero.
   for (const std::size_t budget : {7U, 8U, 9U}) {
@@ -859,8 +865,8 @@ void TestPreparedRaggedCutsRestoreExactSeededContinuation() {
     branch.Invalidate();
     pin.Invalidate();
 
-    auto cold_runner = std::make_shared<SampledSnapshotRunner>(
-        std::make_shared<FakeStats>());
+    auto cold_runner =
+        std::make_shared<SampledSnapshotRunner>(std::make_shared<FakeStats>());
     TextRunnerPool cold_pool(cold_runner, 1);
     auto cold = cold_pool.Acquire(branch_prompt, SeededSampling());
     Expect(cold.Prefill(64).decode_ready,

@@ -1498,8 +1498,8 @@ void TextRunnerPool::Request::PrepareBatchExecution() {
 }
 
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-std::optional<std::size_t>
-TextRunnerPool::Request::PrepareSinglePassPrefill(std::size_t budget) {
+std::optional<std::size_t> TextRunnerPool::Request::PrepareSinglePassPrefill(
+    std::size_t budget) {
   if (!*this || impl_->stopped || impl_->pending_selection || budget == 0 ||
       impl_->decode_ready)
     return std::nullopt;
@@ -1562,9 +1562,8 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   const auto prepared = impl_->prepared_single_pass;
   impl_->prepared_single_pass.reset();
-  if (prepared &&
-      (prepared->offset != impl_->prefill_offset ||
-       prepared->tokens != max_input_tokens))
+  if (prepared && (prepared->offset != impl_->prefill_offset ||
+                   prepared->tokens != max_input_tokens))
     throw std::logic_error("prepared single-pass range changed");
 #endif
   // Stop exactly on the next shared-prefix boundary so it can be persisted.
@@ -1617,9 +1616,9 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   if (impl_->cancelled && impl_->cancelled())
     throw std::runtime_error("generation cancelled");
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-  if (prepared && (in_pass || max_input_tokens != prepared->tokens ||
-                   impl_->runner->CheckpointPosition(state) !=
-                       prepared->offset))
+  if (prepared &&
+      (in_pass || max_input_tokens != prepared->tokens ||
+       impl_->runner->CheckpointPosition(state) != prepared->offset))
     throw std::logic_error("prepared single-pass boundary changed");
 #endif
   impl_->state_reusable = false;

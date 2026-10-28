@@ -38,8 +38,9 @@ struct Association {
   bool operator==(const Association&) const = default;
 };
 inline thread_local Association current_association;
-// The scheduler/model owner may supply exact plan association. Absent association
-// stays null: adjacent forwards, session pointers, or expert sets cannot fill it.
+// The scheduler/model owner may supply exact plan association. Absent
+// association stays null: adjacent forwards, session pointers, or expert sets
+// cannot fill it.
 class AssociationScope {
 public:
   explicit AssociationScope(Association association)
@@ -98,7 +99,8 @@ struct Map {
   std::vector<Row> rows;
   std::vector<Assignment> assignments;
   std::vector<Tile> tiles;
-  std::uint64_t payload_bytes{0}, expected_assignments{0}, mapped_assignments{0};
+  std::uint64_t payload_bytes{0}, expected_assignments{0},
+      mapped_assignments{0};
   std::optional<std::uint64_t> requested_unique_bytes, requested_packed_blocks;
   bool addresses_complete{false}, tiles_complete{false};
   const char* missing{"not_collected"};
@@ -186,8 +188,8 @@ inline Map BuildMap(const Tensor& tensor, ForwardRole role,
     if (e < 0 || static_cast<std::uint32_t>(e) >= tensor.experts)
       return Missing(std::move(m), "invalid_expert_id");
     ++counts[e];
-    m.assignments.push_back({i / r.used, i % r.used,
-                              static_cast<std::uint32_t>(e), std::nullopt});
+    m.assignments.push_back(
+        {i / r.used, i % r.used, static_cast<std::uint32_t>(e), std::nullopt});
   }
   const auto append = [&](std::uint32_t expert, std::uint32_t tile,
                           std::uint32_t height, std::uint32_t first,
@@ -200,7 +202,8 @@ inline Map BuildMap(const Tensor& tensor, ForwardRole role,
   if (r.execution == Execution::kVector) {
     // Exact logical requested packed-address set for each expert and all its
     // row/slot users. mmq's private grouped-vector tiles are not exposed here;
-    // neither their physical multiplicity nor physical tile coverage is claimed.
+    // neither their physical multiplicity nor physical tile coverage is
+    // claimed.
     for (std::uint32_t e = 0; e < tensor.experts; ++e) {
       std::vector<std::uint32_t> members;
       for (std::uint32_t i = 0; i < r.ids.size(); ++i)
@@ -236,8 +239,9 @@ inline Map BuildMap(const Tensor& tensor, ForwardRole role,
           continue;
         }
         if (slot < 0 || static_cast<std::size_t>(slot) >= r.ids.size() ||
-            token < 0 || static_cast<std::uint32_t>(token) !=
-                             static_cast<std::uint32_t>(slot) / r.used ||
+            token < 0 ||
+            static_cast<std::uint32_t>(token) !=
+                static_cast<std::uint32_t>(slot) / r.used ||
             r.ids[slot] != static_cast<std::int32_t>(e) || seen[slot])
           return Missing(std::move(m), "aliased_or_invalid_compaction");
         seen[slot] = true;
@@ -268,8 +272,9 @@ inline Map BuildMap(const Tensor& tensor, ForwardRole role,
       for (std::uint64_t first = 0; first < tensor.rows;
            first += r.output_tile_rows)
         append(e, tile, r.tile_rows, static_cast<std::uint32_t>(first),
-                static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                    tensor.rows, first + r.output_tile_rows)), members);
+               static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                   tensor.rows, first + r.output_tile_rows)),
+               members);
     }
     if (observed_tiles.size() != expected_tiles)
       return Missing(std::move(m), "uncovered_tile");
@@ -292,9 +297,9 @@ inline Map BuildMap(const Tensor& tensor, ForwardRole role,
 inline std::optional<std::uint64_t> RequestedOverlap(const Map& a,
                                                      const Map& b) {
   if (!a.addresses_complete || !b.addresses_complete ||
-      !a.association.iteration || !a.association.cohort || !a.association.plan ||
-      !a.association.route || !a.association.starting_state ||
-      a.association != b.association ||
+      !a.association.iteration || !a.association.cohort ||
+      !a.association.plan || !a.association.route ||
+      !a.association.starting_state || a.association != b.association ||
       a.role == b.role || a.identity.run != b.identity.run ||
       a.identity.pid != b.identity.pid || a.tensor.model != b.tensor.model)
     return std::nullopt;
@@ -352,7 +357,7 @@ inline void Optional(std::ostream& o, const std::optional<T>& value) {
     o << "null";
 }
 inline void SerializeIdentity(std::ostream& o, const Identity& i,
-                               const Association& a) {
+                              const Association& a) {
   o << "\"schema\":\"pd-profile-v1\",\"run_id\":" << i.run
     << ",\"pid\":" << i.pid << ",\"work_start_ns\":" << i.work_start
     << ",\"thread_id\":" << i.thread << ",\"forward\":" << i.forward
@@ -392,23 +397,22 @@ inline std::string Serialize(const Map& m) {
     << "\",\"layer\":" << m.tensor.layer << ",\"tensor\":\""
     << (m.tensor.tensor == TensorRole::kGate ? "gate"
         : m.tensor.tensor == TensorRole::kUp ? "up"
-                                            : "down")
+                                             : "down")
     << "\",\"packing\":\"" << core::ToString(m.tensor.packing)
     << "\",\"model_instance\":" << m.tensor.model
     << ",\"allocation\":" << m.tensor.allocation
-    << ",\"weight_rows\":" << m.tensor.rows << ",\"weight_cols\":"
-    << m.tensor.cols << ",\"experts\":" << m.tensor.experts
-    << ",\"payload_bytes\":" << m.payload_bytes
-    << ",\"execution\":\""
+    << ",\"weight_rows\":" << m.tensor.rows
+    << ",\"weight_cols\":" << m.tensor.cols
+    << ",\"experts\":" << m.tensor.experts
+    << ",\"payload_bytes\":" << m.payload_bytes << ",\"execution\":\""
     << (m.execution == Execution::kRoutedF16 ? "routed_f16"
-        : m.execution == Execution::kVector ? "q8_vector_logical_addresses"
+        : m.execution == Execution::kVector  ? "q8_vector_logical_addresses"
                                              : "unobserved")
-    << "\",\"coverage\":{\"expected_assignments\":"
-    << m.expected_assignments << ",\"mapped_assignments\":"
-    << m.mapped_assignments << ",\"addresses_complete\":"
-    << (m.addresses_complete ? "true" : "false")
-    << ",\"physical_tiles_complete\":"
-    << (m.tiles_complete ? "true" : "false") << ",\"missing\":";
+    << "\",\"coverage\":{\"expected_assignments\":" << m.expected_assignments
+    << ",\"mapped_assignments\":" << m.mapped_assignments
+    << ",\"addresses_complete\":" << (m.addresses_complete ? "true" : "false")
+    << ",\"physical_tiles_complete\":" << (m.tiles_complete ? "true" : "false")
+    << ",\"missing\":";
   if (m.missing)
     o << '"' << m.missing << '"';
   else
@@ -443,13 +447,12 @@ inline std::string Serialize(const Map& m) {
   o << "],\"tiles\":[";
   sep = "";
   for (const auto& t : m.tiles) {
-    o << sep << "{\"expert\":" << t.expert
-      << ",\"input_tile\":" << t.input_tile
+    o << sep << "{\"expert\":" << t.expert << ",\"input_tile\":" << t.input_tile
       << ",\"input_tile_rows\":" << t.input_tile_rows
       << ",\"weight_row_begin\":" << t.weight_row_begin
       << ",\"weight_row_end\":" << t.weight_row_end
-      << ",\"byte_begin\":" << t.byte_begin << ",\"byte_end\":"
-      << t.byte_end << ",\"logical_assignment_uses\":" << t.assignments.size()
+      << ",\"byte_begin\":" << t.byte_begin << ",\"byte_end\":" << t.byte_end
+      << ",\"logical_assignment_uses\":" << t.assignments.size()
       << ",\"dispatch_request_multiplicity\":";
     if (m.tiles_complete)
       o << 1;  // One packed matrix tile request per recorded F16 dispatch tile.
@@ -473,8 +476,8 @@ inline std::string Serialize(const Map& m) {
 
 inline Identity CurrentIdentity() {
   return {perf::Sink().run_id, perf::Sink().process_id,
-           perf::current ? perf::current->start_ns : 0,
-           perf::current ? perf::current->thread_id : 0, perf::forward_id};
+          perf::current ? perf::current->start_ns : 0,
+          perf::current ? perf::current->thread_id : 0, perf::forward_id};
 }
 inline void Publish(Map map) noexcept {
   try {
@@ -518,9 +521,9 @@ public:
         << "\",\"placement\":\"" << placement_ << "\",\"layer\":";
       Optional(o, layer_);
       o << ",\"role\":\"" << (prompt_ ? "prompt" : "decoder")
-        << "\",\"start_ns\":" << start << ",\"end_ns\":"
-        << end << ",\"clock\":\"host_steady_ns\",\"critical_path\":null,"
-                   "\"gpu_busy_ns\":null,\"L_ns\":null,\"H_upper_ns\":null}";
+        << "\",\"start_ns\":" << start << ",\"end_ns\":" << end
+        << ",\"clock\":\"host_steady_ns\",\"critical_path\":null,"
+           "\"gpu_busy_ns\":null,\"L_ns\":null,\"H_upper_ns\":null}";
       perf::Sink().Append(o.str());
     } catch (...) {
     }
@@ -540,9 +543,11 @@ private:
 
 template<typename DeviceTensor>
 inline Tensor Describe(const DeviceTensor& t, std::uintptr_t model,
-                         std::uint32_t layer, TensorRole role) {
-  return {model, reinterpret_cast<std::uintptr_t>(t.data), layer, role,
-           t.type, t.rows, t.cols, t.experts};
+                       std::uint32_t layer, TensorRole role) {
+  return {model,  reinterpret_cast<std::uintptr_t>(t.data),
+          layer,  role,
+          t.type, t.rows,
+          t.cols, t.experts};
 }
 struct DeviceRouting {
   Execution execution{Execution::kUnsupported};
@@ -584,10 +589,15 @@ inline std::array<Map, 3> CollectLayer(const std::array<Tensor, 3>& tensors,
   }
   std::array<Map, 3> maps;
   for (std::size_t i = 0; i < tensors.size(); ++i) {
-    Routing r{d.execution, d.used, ids, bounds, tokens, slots,
-                i == 2 ? d.down_tiles : d.gate_tiles,
-                i == 2 ? d.down_tile_rows : d.gate_tile_rows,
-                i == 2 ? 128 : d.gate_output_rows};
+    Routing r{d.execution,
+              d.used,
+              ids,
+              bounds,
+              tokens,
+              slots,
+              i == 2 ? d.down_tiles : d.gate_tiles,
+              i == 2 ? d.down_tile_rows : d.gate_tile_rows,
+              i == 2 ? 128 : d.gate_output_rows};
     auto map = BuildMap(tensors[i], role, rows, r);
     maps[i] = missing ? Missing(std::move(map), missing) : std::move(map);
   }
@@ -598,16 +608,16 @@ inline std::array<Map, 3> CollectLayer(const std::array<Tensor, 3>& tensors,
 // disables target graph capture, never called for predictor/capture replays.
 // No device allocation, kernel, arithmetic, scratch mutation, or route changes.
 template<typename Download>
-inline void RecordLayer(const std::array<Tensor, 3>& tensors,
-                          ForwardRole role, std::span<const Row> rows,
-                          const DeviceRouting& d, Download&& download) noexcept {
+inline void RecordLayer(const std::array<Tensor, 3>& tensors, ForwardRole role,
+                        std::span<const Row> rows, const DeviceRouting& d,
+                        Download&& download) noexcept {
   if (!perf::sample_moe || perf::current == nullptr || perf::forward_id == 0)
     return;
   try {
     HostSpan observation("packed_map_observation", "perturbing_d2h_and_host",
                          true, true);
-    for (auto& map : CollectLayer(tensors, role, rows, d,
-                                   std::forward<Download>(download)))
+    for (auto& map :
+         CollectLayer(tensors, role, rows, d, std::forward<Download>(download)))
       Publish(std::move(map));
   } catch (...) {
     // No fabricated empty-success map if host memory/serialization fails.

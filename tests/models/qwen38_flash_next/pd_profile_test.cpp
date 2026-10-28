@@ -13,15 +13,15 @@ namespace pd = gufo::models::qwen38_flash_next::pd;
 using gufo::core::GgmlType;
 namespace {
 const pd::Association paired{11, 22, 33, pd::LegacyRoute::kBackendMtpBatch,
-                             4, 3, 2, 44};
+                             4,  3,  2,  44};
 const std::array<pd::Row, 3> rows{{{0, 91, 100}, {1, 91, 101}, {2, 92, 900}}};
 const std::array<std::int32_t, 6> ids{1, 0, 1, 2, 0, 1};
 // Independently specified atomic scatter order, NOT the order of the IDs.
 const std::array<std::int32_t, 4> bounds{0, 16, 32, 48};
 const std::array<std::int32_t, 3> tiles{0, 1, 2};
 struct Fixture {
-  pd::Tensor tensor{70, 0x100000, 7, pd::TensorRole::kGate,
-                    GgmlType::kQ4_K, 130, 256, 3};
+  pd::Tensor tensor{70,  0x100000, 7, pd::TensorRole::kGate, GgmlType::kQ4_K,
+                    130, 256,      3};
   std::vector<std::int32_t> tokens = std::vector<std::int32_t>(48, -1);
   std::vector<std::int32_t> slots = std::vector<std::int32_t>(48, -1);
   Fixture() {
@@ -39,8 +39,15 @@ struct Fixture {
     slots[32] = 3;
   }
   pd::Routing routing() const {
-    return {pd::Execution::kRoutedF16, 2, ids, bounds, tokens, slots, tiles,
-            16, 128};
+    return {pd::Execution::kRoutedF16,
+            2,
+            ids,
+            bounds,
+            tokens,
+            slots,
+            tiles,
+            16,
+            128};
   }
   pd::Map map() const {
     return pd::BuildMap(tensor, pd::ForwardRole::kPrompt, rows, routing(),
@@ -83,7 +90,7 @@ void CheckVectorAndOverlap() {
   const std::array<std::int32_t, 2> decoder_ids{1, 2};
   const pd::Routing vector{pd::Execution::kVector, 2, decoder_ids};
   auto decode = pd::BuildMap(f.tensor, pd::ForwardRole::kDecoder, decoder,
-                              vector, paired);
+                             vector, paired);
   assert(decode.addresses_complete && !decode.tiles_complete);
   assert(decode.tiles.size() == 2 && decode.mapped_assignments == 2);
   assert(decode.tiles[0].byte_begin == 18720);
@@ -165,10 +172,10 @@ void CheckTileHeightsAndFormats() {
   const std::array<std::int32_t, 2> b{0, 144};
   const std::array<std::int32_t, 3> t64{0, 1 << 16, 2 << 16};
   const std::array<std::int32_t, 2> t128{0, 1 << 16};
-  pd::Tensor tensor{70, 0x100000, 1, pd::TensorRole::kDown,
-                     GgmlType::kQ5_1, 3, 64, 1};
-  pd::Routing r{pd::Execution::kRoutedF16, 1, many_ids, b, token, slot,
-                 t64, 64, 128};
+  pd::Tensor tensor{70, 0x100000, 1, pd::TensorRole::kDown, GgmlType::kQ5_1,
+                    3,  64,       1};
+  pd::Routing r{
+      pd::Execution::kRoutedF16, 1, many_ids, b, token, slot, t64, 64, 128};
   auto m = pd::BuildMap(tensor, pd::ForwardRole::kPrompt, many_rows, r, paired);
   assert(m.addresses_complete && m.tiles.size() == 3);
   assert(m.tiles[0].byte_end == 144);  // 3 rows * 2 K32 blocks * 24B.
@@ -202,36 +209,42 @@ void CheckDownloadCoverage() {
   std::array tensors{f.tensor, f.tensor, f.tensor};
   tensors[1].tensor = pd::TensorRole::kUp;
   tensors[2].tensor = pd::TensorRole::kDown;
-  pd::DeviceRouting d{pd::Execution::kRoutedF16, 2, ids.data(), bounds.data(),
-                       f.tokens.data(), f.slots.data(), 48, tiles, tiles,
-                       16, 16, 128};
+  pd::DeviceRouting d{pd::Execution::kRoutedF16,
+                      2,
+                      ids.data(),
+                      bounds.data(),
+                      f.tokens.data(),
+                      f.slots.data(),
+                      48,
+                      tiles,
+                      tiles,
+                      16,
+                      16,
+                      128};
   std::size_t copies = 0;
   const auto download = [&](const std::int32_t* source,
-                             std::span<std::int32_t> destination) {
+                            std::span<std::int32_t> destination) {
     ++copies;
     std::copy_n(source, destination.size(), destination.begin());
     return true;
   };
-  auto maps = pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d,
-                                download);
+  auto maps =
+      pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d, download);
   assert(copies == 4 && maps[0].addresses_complete);
-  assert(maps[0].tiles[2].assignments ==
-         (std::vector<std::uint32_t>{5, 0, 2}));
+  assert(maps[0].tiles[2].assignments == (std::vector<std::uint32_t>{5, 0, 2}));
   assert(maps[1].tensor.tensor == pd::TensorRole::kUp);
   copies = 0;
   d.compact_capacity = 47;  // Downloaded bound must not exceed owned capacity.
-  maps = pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d,
-                           download);
+  maps = pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d, download);
   assert(copies == 2 && !maps[0].addresses_complete);
   assert(std::string(maps[0].missing) == "bounds_download_failed_or_invalid");
   d.compact_capacity = 48;
   maps = pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d,
-                           [](const auto*, auto) { return false; });
+                          [](const auto*, auto) { return false; });
   assert(!maps[0].addresses_complete && maps[0].tiles.empty());
   copies = 0;
   d.execution = pd::Execution::kUnsupported;
-  maps = pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d,
-                           download);
+  maps = pd::CollectLayer(tensors, pd::ForwardRole::kPrompt, rows, d, download);
   assert(copies == 0 && !maps[0].addresses_complete);
 }
 
@@ -276,14 +289,16 @@ void CheckAssociationScope() {
   {
     pd::AssociationScope scope(singleton);
     Fixture f;
-    auto map = pd::BuildMap(f.tensor, pd::ForwardRole::kDecoder, rows,
-                             f.routing());
+    auto map =
+        pd::BuildMap(f.tensor, pd::ForwardRole::kDecoder, rows, f.routing());
     assert(map.association.route == pd::LegacyRoute::kBackendMtpBatch);
-    assert(pd::Serialize(map).find("\"model_filtered\":1") != std::string::npos);
+    assert(pd::Serialize(map).find("\"model_filtered\":1") !=
+           std::string::npos);
     assert(pd::Serialize(map).find("\"legacy_route\":\"backend_mtp_batch\"") !=
            std::string::npos);
     map.association.route = pd::LegacyRoute::kGeneric;
-    assert(pd::Serialize(map).find("generic_direct_sampler") != std::string::npos);
+    assert(pd::Serialize(map).find("generic_direct_sampler") !=
+           std::string::npos);
   }
 }
 }  // namespace

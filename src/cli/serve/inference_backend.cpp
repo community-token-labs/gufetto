@@ -1,11 +1,4 @@
 #include "src/cli/serve/inference_backend.hpp"
-#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-#include "src/cli/serve/prefill_prerequisites.hpp"
-#endif
-#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
-#include "src/models/qwen38_flash_next/pd_profile.hpp"
-namespace qfn_pd = gufo::models::qwen38_flash_next::pd;
-#endif
 
 #include <algorithm>
 #include <array>
@@ -2359,6 +2352,9 @@ bool FingerprintArtifactFile(std::string_view label,
 constexpr std::string_view kQwenFlashNextStateAbi =
     "qwen38-flash-next-rocm-session-v1";
 
+#if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
+namespace qfn_pd = models::qwen38_flash_next::pd;
+#endif
 using QwenFlashNextModel = models::qwen38_flash_next::Model;
 using QwenFlashNextSession = models::qwen38_flash_next::Session;
 

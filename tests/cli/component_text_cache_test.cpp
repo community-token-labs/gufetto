@@ -3620,8 +3620,8 @@ void PreparedSerialCutKeepsRealComponentBoundaries() {
   runner->in_pass = true;
   TextRunnerPool pool(runner, 1);
   const std::vector<TextRunnerToken> prompt(40, 7);
-  auto request = pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {},
-                              true, 16);
+  auto request =
+      pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {}, true, 16);
   // B1/B2: a large proposed range is clipped to the actual stable boundary,
   // not published at the proposed end or through an interior capture.
   auto cut = request.PrepareSinglePassPrefill(31);
@@ -3631,6 +3631,13 @@ void PreparedSerialCutKeepsRealComponentBoundaries() {
   assert(request.prefill_position() == 16 && runner->through_calls == 0);
   while (!request.prefill_complete()) {
     cut = request.PrepareSinglePassPrefill(7);
+    if (!cut) {
+      // A real asynchronous component capture is a dependency, not a model
+      // decline. Join that exact copy once; no sleeping/retry-until-green.
+      assert(request.SnapshotPending());
+      request.CapturePromptSnapshot();
+      cut = request.PrepareSinglePassPrefill(7);
+    }
     assert(cut && *cut > 0 && *cut <= 7);
     assert(request.Prefill(*cut).consumed_tokens == *cut);
   }
@@ -3672,14 +3679,15 @@ void AdaptiveSchedulingUsesRealComponentCache() {
       cuts.emplace_back(prompt.front(), budget);
       return Runner::Prefill(state, prompt, offset, budget);
     }
-    TextDecodeSelection SelectNext(TextRunnerState& state,
-                                   sampling::SamplerState& sampler)
-        const override {
+    TextDecodeSelection SelectNext(
+        TextRunnerState& state,
+        sampling::SamplerState& sampler) const override {
       if (!blocked) {
         blocked = true;
         entered.release();
         if (!resume.try_acquire_for(std::chrono::seconds(5)))
-          throw std::runtime_error("adaptive component fixture barrier timeout");
+          throw std::runtime_error(
+              "adaptive component fixture barrier timeout");
       }
       return Runner::SelectNext(state, sampler);
     }
@@ -3687,7 +3695,8 @@ void AdaptiveSchedulingUsesRealComponentCache() {
   auto runner = std::make_shared<AdaptiveRunner>();
   assert(runner->UsesComponentCache());  // CreateState throws on wrong path.
   auto pool = std::make_shared<TextRunnerPool>(runner, 2);
-  TextGenerationScheduler scheduler(pool,
+  TextGenerationScheduler scheduler(
+      pool,
       {.decode_active_tokens = 512,
        .prerequisites = {.mode = detail::PrefillPrerequisiteMode::kAdaptive,
                          .tokens = 64}});
@@ -3700,9 +3709,9 @@ void AdaptiveSchedulingUsesRealComponentCache() {
   const auto second = prefill.Wait();
   assert(first.tokens.size() == 4 && second.tokens.size() == 1);
   assert(second.prefill_tokens == prompt.size());
-  const auto first_long = std::find_if(
-      runner->cuts.begin(), runner->cuts.end(),
-      [](const auto& cut) { return cut.first == 22; });
+  const auto first_long =
+      std::find_if(runner->cuts.begin(), runner->cuts.end(),
+                   [](const auto& cut) { return cut.first == 22; });
   assert(first_long != runner->cuts.end() && first_long->second == 64);
   // Independent cold component pool: altered cuts preserve exact state/output.
   auto cold_runner = std::make_shared<Runner>();

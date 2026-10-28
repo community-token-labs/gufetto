@@ -14,8 +14,8 @@ int main() {
   for (const auto offset : {std::size_t{999}, std::size_t{1601}}) {
     for (const auto budget : {std::size_t{1}, std::size_t{98}, std::size_t{99},
                               std::size_t{100}, std::size_t{101}}) {
-      const auto cut = ClipSinglePass(offset, offset + 200, budget, 4096,
-                                       offset + 100);
+      const auto cut =
+          ClipSinglePass(offset, offset + 200, budget, 4096, offset + 100);
       assert(cut == std::min(budget, std::size_t{100}));
     }
     assert(ClipSinglePass(offset, offset + 1, 4096, 4096, 0) == 1);
@@ -45,8 +45,8 @@ int main() {
   const std::array<std::size_t, 7> full{8, 8, 8, 8, 8, 8, 8};
   const auto minimum = SelectPrerequisiteBudget(config, 7, full);
   assert(minimum.verifier_rows_upper == 56 && minimum.prompt_tokens == 8);
-  for (const auto invalid : {std::size_t{0}, std::size_t{63},
-                             std::size_t{4225}}) {
+  for (const auto invalid :
+       {std::size_t{0}, std::size_t{63}, std::size_t{4225}}) {
     config.tokens = invalid;
     bool rejected = false;
     try {
