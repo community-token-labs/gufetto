@@ -357,8 +357,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The CPU reference also reads Q6_K, but the production embedding, dense
-  // and routed kernels do not. Reject it before allocating device weights.
+  // Q6_K is supported only for the explicitly bound MTP dense/HC roles.
+  // Embeddings, vocabulary heads and routed experts still cannot decode it;
+  // reject those before allocating device weights.
   const auto supported = [&](const TensorRef& t) {
     if (t.type != core::GgmlType::kQ6_K)
       return true;

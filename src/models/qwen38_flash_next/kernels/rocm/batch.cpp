@@ -45,6 +45,12 @@ WeightType EmbeddingType(core::GgmlType type) {
       return WeightType::kF16;
     case core::GgmlType::kQ8_0:
       return WeightType::kQ8_0;
+    case core::GgmlType::kQ4_K:
+      return WeightType::kQ4_K;
+    case core::GgmlType::kQ5_0:
+      return WeightType::kQ5_0;
+    case core::GgmlType::kQ6_K:
+      return WeightType::kQ6_K;
     case core::GgmlType::kF32:
       return WeightType::kF32;
     default:
@@ -505,6 +511,10 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
+      const bool subset =
+          UseDraftSubset(*item.session, item.output.draft_subset);
+      perf::TraceMtpHead(1, subset, subset, model_->draft_output().rows,
+                         model_->output().rows, kMtpDraftExtraRows);
       if (item.output.token != nullptr)
         *item.output.token = *mtp_token_host_;
       if (item.output.candidates != nullptr)
@@ -541,6 +551,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::uint32_t i = 0; i < n; ++i)
     subset_rows +=
         UseDraftSubset(*items[i].session, items[i].output.draft_subset);
+  const auto logical_subset_rows = subset_rows;
   // The prefix projection lands in the buffer's tail, then moves to its rows.
   if (subset_rows != 0 &&
       subset_rows * (kSmall + prefix) + (n - subset_rows) * vocab >
@@ -612,6 +623,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     if (subset_rows == 0 &&
         !DenseBatch(full_head, base.mixed, batch_logits_, n, error))
       return false;
+    perf::TraceMtpHead(n, logical_subset_rows, subset_rows, prefix, vocab,
+                       kMtpDraftExtraRows);
     for (std::uint32_t i = 0; i < n; ++i) {
       if (!items[i].session->CheckCancellation(nullptr))
         continue;

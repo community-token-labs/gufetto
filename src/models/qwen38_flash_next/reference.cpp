@@ -46,16 +46,18 @@ std::vector<float> QuantizedInput(std::span<const float> input) {
 }
 }  // namespace
 
-void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
-                            std::span<const float> x, std::span<float> out,
-                            bool narrow_weights) {
-  if (storage_ == Storage::kFloat32) {
-    cpu::MatVec(weight, expert, x, out);
-    return;
-  }
-  const auto quantized = weight.type == core::GgmlType::kQ8_0
-                             ? QuantizedInput(x)
-                             : std::vector<float>{};
+void reference::DecodeMatVec(const TensorRef& weight, std::uint64_t expert,
+                             std::span<const float> x, std::span<float> out,
+                             Projection projection, bool narrow_weights) {
+  // The scalar/grouped routed Q4 vector dot uses stored d8 * integer codes
+  // for BOTH the scale and min terms. It does not read Q8_1's stored sum.
+  // Thus original GGUF dequantization times reconstructed Q8_1 values is
+  // the same formula (up to reduction rounding), independently of packing.
+  // Wide MMQ uses a separately rounded sum; it is NOT this oracle's route.
+  const bool q8_input = weight.type == core::GgmlType::kQ8_0 ||
+                        (projection == Projection::kRoutedVector &&
+                         weight.type == core::GgmlType::kQ4_K);
+  const auto quantized = q8_input ? QuantizedInput(x) : std::vector<float>{};
   if (!quantized.empty())
     x = quantized;
   std::vector<float> row(weight.cols);
@@ -66,6 +68,17 @@ void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
       sum += double(narrow_weights ? Half(row[j]) : row[j]) * x[j];
     out[r] = static_cast<float>(sum);
   }
+}
+
+void ReferenceModel::MatVec(const TensorRef& weight, std::uint64_t expert,
+                            std::span<const float> x, std::span<float> out,
+                            bool narrow_weights,
+                            reference::Projection projection) {
+  if (storage_ == Storage::kFloat32) {
+    cpu::MatVec(weight, expert, x, out);
+    return;
+  }
+  reference::DecodeMatVec(weight, expert, x, out, projection, narrow_weights);
 }
 
 void ReferenceModel::Reset() {
@@ -533,8 +546,10 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
     const std::uint32_t e = order[i];
     const float weight = logits[e] / sum;
-    MatVec(l.ffn_gate_exps, e, x, gate);
-    MatVec(l.ffn_up_exps, e, x, up);
+    MatVec(l.ffn_gate_exps, e, x, gate, false,
+           reference::Projection::kRoutedVector);
+    MatVec(l.ffn_up_exps, e, x, up, false,
+           reference::Projection::kRoutedVector);
     for (std::uint32_t j = 0; j < c_.expert_ff; ++j) {
       gate[j] = Silu(gate[j]) * up[j];
     }

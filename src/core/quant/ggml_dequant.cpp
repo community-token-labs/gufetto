@@ -392,6 +392,21 @@ float DotProductQ8_K(const void* row_data, std::span<const float> vec,
   return sum;
 }
 
+void DequantizeQ5_0(const void* src, float* dst, std::size_t k) {
+  const auto* bytes = static_cast<const std::uint8_t*>(src);
+  for (std::size_t b = 0; b < k / 32; ++b) {
+    block_q5_0 block;
+    std::memcpy(&block, bytes + b * sizeof(block), sizeof(block));
+    const float d = Fp16ToFloat(block.d);
+    for (std::size_t i = 0; i < 32; ++i) {
+      const unsigned low = (block.qs[i % 16] >> (4 * (i / 16))) & 15U;
+      const unsigned high = (block.qh[i / 8] >> (i % 8)) & 1U;
+      dst[b * 32 + i] =
+          d * static_cast<float>(static_cast<int>(low | (high << 4)) - 16);
+    }
+  }
+}
+
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_q8_0*>(src);
   const std::size_t nb = k / 32;

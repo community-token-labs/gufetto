@@ -13,6 +13,7 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_cache gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_rotation gufo_qwen38_flash_next "cpu")
@@ -57,6 +58,9 @@ if (ENGINE_ENABLE_HIP)
     LABELS "qwen38_flash_next;hip;gpu;gfx1151" TIMEOUT 60)
   add_dependencies(qwen38_flash_next_tests qwen38_flash_next_kv_q8_load_test)
 
+  # Packed MTP projections use the independent CPU GGUF decoders.
+  target_link_libraries(qwen38_flash_next_projection_ops_test PRIVATE gufo_core)
+  target_link_libraries(qwen38_flash_next_hc_mix_ops_test PRIVATE gufo_core)
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)

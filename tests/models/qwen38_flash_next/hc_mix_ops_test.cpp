@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "tests/models/qwen38_flash_next/packed_mtp_reference.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -515,6 +516,9 @@ int main() {
                       kRows * sizeof(__half)) != 0)
         throw std::runtime_error("HC prefill depends on chunk width");
     }
+    for (unsigned rows :
+         {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 17U, 32U, 33U})
+      packed_mtp_test::Hc(rows);
     std::cout << "HC mixed outputs and short prefill chunks passed\n";
     return 0;
   } catch (const std::exception& error) {

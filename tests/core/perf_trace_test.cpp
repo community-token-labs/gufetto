@@ -7,6 +7,90 @@
 #include <thread>
 
 #include "src/core/json.hpp"
+#include "src/core/platform/env.hpp"
+
+namespace {
+std::filesystem::path trace_path;
+void RemoveTrace() {
+  std::error_code ec;
+  std::filesystem::remove(trace_path, ec);
+}
+void TestMtpCounters() {
+  using namespace gufo;
+  perf::Record record{};
+  record.kind = "decode_batch";
+  record.sessions.push_back({3, 42, 4096});
+  const auto empty = perf::Serialize(record, 1);
+  assert(empty.find("mtp_heads") == std::string::npos);
+  assert(empty.find("mtp_cycles") == std::string::npos);
+  assert(empty.find("draft_tables") == std::string::npos);
+  auto* previous = std::exchange(perf::current, &record);
+  perf::TraceMtpHead(1, 1, 1, 98304, 248320, 1024);
+  perf::TraceMtpHead(1, 0, 0, 98304, 248320, 1024);
+  perf::TraceMtpHead(4, 4, 4, 98304, 248320, 1024);
+  perf::TraceMtpHead(4, 3, 3, 98304, 248320, 1024);
+  perf::TraceMtpHead(4, 0, 0, 98304, 248320, 1024);
+  perf::TraceMtpHead(4, 3, 0, 98304, 248320, 1024);
+  // Two neural proposals, then three lookup copies. Anchor is never a draft.
+  perf::TraceMtpCycle(4096, 5, 1, 3, 2);
+  perf::TraceMtpCycle(4098, 5, 4, 3, 5);
+  perf::TraceMtpCycle(4103, 3, 3, 3, 4);  // lookup-only
+  perf::TraceMtpCycle(4107, 0, 0, 0, 1);  // AR anchor
+  perf::TraceMtpCycle(4108, 2, 2, 0, 3);  // neural-only
+  record.draft_tables.push_back({4096, 17, 1024});
+  perf::current = previous;
+  const auto serialized = perf::Serialize(record, 2);
+  const auto value = json::parse(serialized);
+  const auto& heads = value.find("mtp_heads")->items();
+  assert(heads.size() == 6);
+  constexpr const char* modes[] = {"scalar_subset", "scalar_full",
+                                   "all_subset",    "mixed_full_gather",
+                                   "full",          "full"};
+  for (std::size_t i = 0; i < heads.size(); ++i)
+    assert(heads[i].member_str("mode") == modes[i]);
+  assert(heads[2].member_size("logical_subset_rows") == 4);
+  const auto& subset = heads[2].find("projections")->items();
+  assert(subset.size() == 5);
+  assert(subset[0].member_str("kind") == "prefix");
+  assert(subset[0].member_size("vocabulary_rows") == 98304);
+  assert(subset[0].member_size("activation_rows") == 4);
+  assert(subset[0].member_size("logit_values") == 393216);
+  for (std::size_t i = 1; i < subset.size(); ++i) {
+    assert(subset[i].member_str("kind") == "table");
+    assert(subset[i].member_size("vocabulary_rows") == 1024);
+    assert(subset[i].member_size("activation_rows") == 1);
+  }
+  for (const auto i : {3, 4, 5}) {
+    const auto& ops = heads[i].find("projections")->items();
+    assert(ops.size() == 1);
+    assert(ops[0].member_str("kind") == "full");
+    assert(ops[0].member_size("vocabulary_rows") == 248320);
+    assert(ops[0].member_size("activation_rows") == 4);
+    assert(ops[0].member_size("logit_values") == 993280);
+  }
+  assert(heads[3].member_str("fallback") == "mixed");
+  assert(heads[5].member_str("fallback") == "scratch");
+  assert(heads[5].member_size("logical_subset_rows") == 3);
+  assert(heads[5].member_size("subset_rows") == 0);
+  const auto& cycles = value.find("mtp_cycles")->items();
+  assert(cycles[0].member_size("neural_proposed") == 2);
+  assert(cycles[0].member_size("neural_accepted") == 1);
+  assert(cycles[0].member_size("lookup_accepted") == 0);
+  assert(cycles[0].member_size("committed") == 2);
+  assert(cycles[1].member_size("neural_accepted") == 2);
+  assert(cycles[1].member_size("lookup_accepted") == 2);
+  assert(cycles[2].member_size("neural_proposed") == 0);
+  assert(cycles[2].member_size("lookup_accepted") == 3);
+  assert(cycles[3].member_size("committed") == 1);
+  assert(cycles[3].member_size("neural_proposed") == 0);
+  assert(cycles[4].member_size("neural_accepted") == 2);
+  assert(cycles[4].member_size("lookup_proposed") == 0);
+  assert(value.find("draft_tables")->items()[0].member_size("used_rows") == 17);
+  assert(value.find("sessions")->items()[0].member_size("request_id") == 42);
+  assert(serialized.find("\"tokens\"") == std::string::npos);
+  assert(serialized.find("prompt_text") == std::string::npos);
+}
+}  // namespace
 
 int main(int argc, char**) {
   using namespace gufo;
@@ -21,6 +105,9 @@ int main(int argc, char**) {
     assert(perf::current == nullptr);
     assert(perf::forward_counter == 0);
     assert(!perf::sample_moe);
+    perf::TraceMtpHead(4, 4, 4, 98304, 248320, 1024);
+    perf::TraceMtpCycle(4096, 5, 4, 3, 5);
+    assert(perf::current == nullptr);
     return 0;
   }
   const auto path = std::filesystem::temp_directory_path() /
@@ -29,6 +116,7 @@ int main(int argc, char**) {
   setenv("GUFO_PERF_TRACE", path.c_str(), 1);
   setenv("GUFO_PERF_TRACE_MOE", "2", 1);
   assert(perf::Enabled());
+  TestMtpCounters();
   {
     perf::Work work("prefill");
     auto* record = work.get();
