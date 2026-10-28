@@ -40,6 +40,34 @@ sampling and policy observers remain the literal legacy operation on this
 unsupported path. Generic remaining-one/MTP-off routes still directly sample
 the pool sampler; MTP backend batches retain their route after model filtering.
 
+## Historical Phase 2 result: retain relief, reject fixed smaller grants
+
+The registered 18-run replay sweep used immutable candidate023 (`1b781e89`),
+one due-decoder cohort, not this unmeasured prerequisite build. Original gates
+required both candidate repeats to clear the descriptive control floor AND the
+median to reach the control mean. Both fixed smaller grants are
+`REJECT_THROUGHPUT` for every S; no post-data tolerance change or cross-S pooling.
+
+| Separate replay group | 2048 median rate vs control | 1024 median rate vs control |
+|---|---:|---:|
+| S2 / nimo-1 | -1.6871% | -6.2984% |
+| S3 / nimo-1 | -2.1269% | -7.4094% |
+| S4 / nimo-2 | -1.8976% | -7.6564% |
+
+The partial decode benefit is real **client-payload proxy** evidence, not native
+GPU/token timing: worst-candidate versus best-control peer-overlap gap-p95 relief
+was 43.2% / 41.9% for 2048 in S2 / S3, and 64.6% / 64.4% for 1024. Integrated
+excess-stall relief after 0.5 s was only 6.8% / 8.5% and 19.2% / 30.3%
+respectively. Pauses became more frequent and native whole-request mean selection-
+publication ITL worsened. Native token p50/p95 and per-chunk GPU timing were not
+recorded. Full-32K responsiveness, Pareto, numerical quality and adoption remain
+unqualified; no S4 decode-relief percentile is inferred from the other groups.
+Natural EOS shortfalls and the S4 1024/r1 +29-prefill/-29-cached difference are
+retained, not normalized. Scalar evidence and methods are in the private
+`JCFrags/gufo-agent-concurrency` repository under
+`docs/pd-interference-live-r1/{s2,s3,s4}-block-r1/` and
+`docs/pd-interference-live-r1/decode-side-method-r1.md`.
+
 ## Diagnostics
 
 `-DGUFO_ENABLE_PD_PROFILING=ON` separately compiles perturbing diagnostics, OFF by
@@ -81,4 +109,11 @@ explicit accepted E1 correction). Completed outgoing-code Opus review, full CPU
 compile/link/format checks and actual native OFF proof are still pending at this
 WIP revision. Native quality, performance, profiler/runtime qualification,
 immutable execution packet and explicit host/time release remain separate.
-Do not merge/push fork main or infer GPU/production authority from these flags.
+Owner integration policy retains correct, safe partial experiments on fork
+main, default OFF. Landing requires a green immutable prerequisite preflight
+(three links, 5/5 focused CPU tests, formatting and six strict OFF-object matches)
+and the one focused outgoing-code Opus review. The coordinator performs that
+landing under the maintainer lease; this branch worker does not push fork main.
+Integration is not release, deployment, activation, native quality, GPU execution
+or a mixed-step feasibility certificate. Keep experimental and inconclusive
+labels until their separate gates are actually met.

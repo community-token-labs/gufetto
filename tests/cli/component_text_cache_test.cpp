@@ -6,12 +6,14 @@
 #include <barrier>
 #include <cassert>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
@@ -52,6 +54,8 @@ public:
   bool in_pass{};
   bool partial{};
   std::size_t private_blocks{128};
+  std::size_t row_blocks{2048};
+  std::uint32_t max_context{4096};
   cache::Rows rows_per_chunk{4};
   mutable std::size_t through_calls{};
   std::function<void(std::string_view)> barrier;
@@ -60,7 +64,7 @@ public:
   TextRunnerDescriptor Descriptor() const override {
     return {.model_id = "component-fake",
             .state_abi = "component-fake-v1",
-            .max_context = 4096,
+            .max_context = max_context,
             .capabilities = {.incremental_prefill = true,
                              .snapshot = true,
                              .fork = true,
@@ -105,11 +109,12 @@ public:
     auto blocks = std::make_shared<std::vector<Block>>();
     // Physical backing commits once, before any request; assigned owner tokens
     // account for the entire block including unused bytes.
-    auto data = std::make_shared<std::vector<std::byte>>(2048 * 16 +
+    auto data = std::make_shared<std::vector<std::byte>>(row_blocks * 16 +
                                                          private_blocks * 64);
-    for (std::size_t i = 0; i < 2048 + private_blocks; ++i) {
-      const auto size = i < 2048 ? 16ULL : 64ULL;
-      const auto offset = i < 2048 ? i * 16 : 2048 * 16 + (i - 2048) * 64;
+    for (std::size_t i = 0; i < row_blocks + private_blocks; ++i) {
+      const auto size = i < row_blocks ? 16ULL : 64ULL;
+      const auto offset =
+          i < row_blocks ? i * 16 : row_blocks * 16 + (i - row_blocks) * 64;
       auto reservation =
           ledger.Reserve(cache::ResourceCategory::kBackingFree, size);
       auto bytes = std::span(*data).subspan(offset, size);
@@ -3667,56 +3672,154 @@ void PreparedSerialCutKeepsRealComponentBoundaries() {
   other.Invalidate();
 }
 
-void AdaptiveSchedulingUsesRealComponentCache() {
+void AdaptiveSchedulingUsesRealComponentCache(bool capturing) {
   class AdaptiveRunner final : public Runner {
   public:
+    explicit AdaptiveRunner(bool capturing) : capturing(capturing) {}
+    const bool capturing;
     mutable std::binary_semaphore entered{0};
     mutable std::binary_semaphore resume{0};
-    mutable bool blocked{false};
+    mutable std::atomic<bool> resumed{false}, timed_out{false};
+    mutable std::atomic<bool> arm_capture{false};
+    mutable std::mutex capture_mutex;
+    mutable std::thread::id capture_thread;
+    mutable bool selected{false}, blocked{false};
+    mutable std::size_t advances{};
     mutable std::vector<std::pair<TextRunnerToken, std::size_t>> cuts;
+    void Resume() const {
+      if (!resumed.exchange(true))
+        resume.release();
+    }
+    void Block() const {
+      entered.release();
+      if (!resume.try_acquire_for(std::chrono::seconds(5))) {
+        timed_out = true;
+        throw std::runtime_error("adaptive component fixture barrier timeout");
+      }
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->allocate =
+          [this, allocate = resources->allocate](const auto& request) {
+            auto buffer = allocate(request);
+            if (arm_capture.exchange(false)) {
+              const std::lock_guard lock(capture_mutex);
+              capture_thread = std::this_thread::get_id();
+            }
+            return buffer;
+          };
+      resources->stream = [this, stream = resources->stream] {
+        bool hold;
+        {
+          const std::lock_guard lock(capture_mutex);
+          hold = capture_thread == std::this_thread::get_id();
+          if (hold)
+            capture_thread = {};
+        }
+        // Only the decoder's post-selection capture worker is held. All its
+        // buffers are allocated, and Lease::Capture's transfer factory holds
+        // neither the cache metadata mutex nor this fixture's mutex. Admission
+        // and the peer slot's prefill can proceed while it is pending.
+        if (hold)
+          Block();
+        return stream();
+      };
+      return resources;
+    }
     TextPrefillStep Prefill(TextRunnerState& state,
                             std::span<const TextRunnerToken> prompt,
                             std::size_t offset,
                             std::size_t budget) const override {
+      assert(CheckpointPosition(state) == offset);
       cuts.emplace_back(prompt.front(), budget);
-      return Runner::Prefill(state, prompt, offset, budget);
+      const bool first_long = prompt.front() == 22 && offset == 1;
+      if (first_long) {
+        if (capturing) {
+          // Do not release the capture at Submit: it must stay pending until
+          // the scheduler has granted and the real pool has clipped this cut.
+          assert(!resumed && !timed_out && advances == 0);
+          Resume();
+        } else {
+          assert(resumed && advances != 0);
+        }
+      }
+      const auto step = Runner::Prefill(state, prompt, offset, budget);
+      assert(step.consumed_tokens == std::min(budget, prompt.size() - offset));
+      if (first_long)
+        assert(step.consumed_tokens == budget);  // No hidden frontier clipping.
+      assert(CheckpointPosition(state) == offset + step.consumed_tokens);
+      return step;
     }
     TextDecodeSelection SelectNext(
         TextRunnerState& state,
         sampling::SamplerState& sampler) const override {
-      if (!blocked) {
-        blocked = true;
-        entered.release();
-        if (!resume.try_acquire_for(std::chrono::seconds(5)))
-          throw std::runtime_error(
-              "adaptive component fixture barrier timeout");
-      }
+      if (capturing && !std::exchange(selected, true))
+        arm_capture = true;
       return Runner::SelectNext(state, sampler);
     }
+    void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+      if (!capturing && !std::exchange(blocked, true)) {
+        // Request::Advance is reached only AFTER PreparePromptSnapshot has
+        // completed. Blocking SelectNext instead leaves an async capture and
+        // correctly gives the next prompt the quiet budget, not active 64.
+        Block();
+      }
+      Runner::Advance(state, token);
+      ++advances;
+    }
   };
-  auto runner = std::make_shared<AdaptiveRunner>();
+  auto runner = std::make_shared<AdaptiveRunner>(capturing);
+  runner->row_blocks = 4096;
+  runner->max_context = 8192;
   assert(runner->UsesComponentCache());  // CreateState throws on wrong path.
   auto pool = std::make_shared<TextRunnerPool>(runner, 2);
+  {
+    const std::vector<TextRunnerToken> prefix{22};
+    auto warm = pool->Acquire(prefix);
+    Prefill(warm);
+    (void)warm.Commit();
+  }
+  runner->cuts.clear();
   TextGenerationScheduler scheduler(
       pool,
       {.decode_active_tokens = 512,
        .prerequisites = {.mode = detail::PrefillPrerequisiteMode::kAdaptive,
                          .tokens = 64}});
+  struct ResumeOnExit {
+    const AdaptiveRunner& runner;
+    ~ResumeOnExit() { runner.Resume(); }
+  } cleanup{*runner};  // Release before scheduler joins, including on failure.
   auto decoder = scheduler.Submit({11}, 4, 0.0f);
-  assert(runner->entered.try_acquire_for(std::chrono::seconds(5)));
-  std::vector<TextRunnerToken> prompt(256, 22);
+  if (!runner->entered.try_acquire_for(std::chrono::seconds(5)))
+    throw std::runtime_error(
+        "adaptive component fixture did not enter barrier");
+  // One reused row leaves exactly 4096 new rows. The 2048 grid is less than
+  // 2048 rows from reuse, and 4096 is within the final 128-row tail, so neither
+  // is a planned checkpoint. Both budgets reach the model without clipping;
+  // context and physical row backing also fit the complete prompt plus output.
+  std::vector<TextRunnerToken> prompt(4097, 22);
   auto prefill = scheduler.Submit(prompt, 1, 0.0f);
-  runner->resume.release();
+  if (!capturing)
+    runner->Resume();
   const auto first = decoder.Wait();
   const auto second = prefill.Wait();
+  assert(!runner->timed_out);
   assert(first.tokens.size() == 4 && second.tokens.size() == 1);
-  assert(second.prefill_tokens == prompt.size());
+  assert(second.cached_prompt_tokens == 1);
+  assert(second.prefill_tokens == 4096);
   const auto first_long =
       std::find_if(runner->cuts.begin(), runner->cuts.end(),
                    [](const auto& cut) { return cut.first == 22; });
-  assert(first_long != runner->cuts.end() && first_long->second == 64);
+  assert(first_long != runner->cuts.end());
+  if (capturing)
+    assert(first_long->second == 4096);
+  else
+    assert(first_long->second == 64);
   // Independent cold component pool: altered cuts preserve exact state/output.
   auto cold_runner = std::make_shared<Runner>();
+  cold_runner->row_blocks = 4096;
+  cold_runner->max_context = 8192;
   TextRunnerPool cold(cold_runner, 1);
   auto reference = cold.Acquire(prompt, sampling::SamplingConfig{});
   while (!reference.prefill_complete())
@@ -3741,7 +3844,8 @@ int main() {
   }
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   PreparedSerialCutKeepsRealComponentBoundaries();
-  AdaptiveSchedulingUsesRealComponentCache();
+  AdaptiveSchedulingUsesRealComponentCache(false);
+  AdaptiveSchedulingUsesRealComponentCache(true);
 #endif
   LookupRuntimeDefaultsAndDisabled();
   CheckpointTransferRoundTripAndConcurrentServing();

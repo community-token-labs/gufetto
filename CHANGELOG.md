@@ -54,6 +54,21 @@ Notable user-facing changes are recorded here. Gufo follows
 * **qwen:** keep a stable cache boundary after system instructions ([#773](https://github.com/gufo-org/gufo/issues/773)) ([1b8ad79](https://github.com/gufo-org/gufo/commit/1b8ad798a4bc443393754b6676ae6654a624dd0a))
 * **qwen:** keep a stable cache boundary after system instructions REVERT ([#815](https://github.com/gufo-org/gufo/issues/815)) ([2479613](https://github.com/gufo-org/gufo/commit/2479613924ced6aab9b1411d0ba84fd00a87b9c7))
 
+## Fork experiment: P/D prerequisites
+
+- Add experimental adaptive-decoder (AD) and serial-shadow (SC) measurement
+  prerequisites, plus gated prompt/decode diagnostics. Both build flags are OFF
+  by default; enabled prerequisite builds still default to runtime `legacy` with
+  budget zero. No mixed-step kernel is added, and production mixed-step
+  feasibility remains **INCONCLUSIVE**. See
+  [scope and qualification limits](docs/experimental-prefill-prerequisites.md).
+- Preserve the Phase 2 finding: fixed 2048/1024 prompt grants are rejected for
+  throughput at S2, S3 and S4. They nevertheless reduced peer-overlap payload-gap
+  p95 by about 42–43% / 64–65% respectively in S2/S3; these are client-side proxy
+  gaps, not native token percentiles or a full-32K responsiveness qualification.
+  Native mean publication ITL worsened; the partial tail-relief result is retained,
+  not promoted to a throughput, quality or adoption win.
+
 ## [0.24.0](https://github.com/gufo-org/gufo/compare/v0.23.0...v0.24.0) (2026-10-25)
 
 
