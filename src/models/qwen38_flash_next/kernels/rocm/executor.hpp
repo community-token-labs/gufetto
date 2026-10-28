@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -304,6 +305,8 @@ public:
   /// Packs independent decode chains for shared projections. Every chain
   /// keeps its own recurrent/KV state and the decode arithmetic (<=8 rows).
   /// Logit rows remain in batch order until SelectBatchLogits is called.
+  /// Opt-in paired admission; ordinary scheduler chunks remain 4096.
+  [[nodiscard]] bool NpuPairEnabled() const;
   [[nodiscard]] bool ForwardBatch(std::span<const BatchItem> items,
                                   std::string* error_msg) const;
   [[nodiscard]] bool SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
@@ -846,6 +849,18 @@ private:
     std::uint32_t n{0};
     std::uint32_t k{0};
   };
+  bool NpuWholeProjection(const DeviceTensor& w, const std::vector<int>& weights,
+                          const float* x, float* out, std::uint32_t rows,
+                          std::string* error_msg) const;
+  std::array<int, 2> npu_whole_a_{{-1, -1}};
+  std::array<std::vector<int>, 2> npu_whole_c_;
+  bool npu_whole_enabled_{false};
+  mutable bool shexp_npu_pending_{false};
+  mutable bool npu_used_{false};
+  std::vector<int> npu_a_;
+  std::vector<int> npu_a_lo_;
+  std::vector<int> npu_c_;
+  const std::uint8_t** npu_c_dev_{nullptr};
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
 };

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -15,6 +16,9 @@
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+#endif
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
@@ -186,6 +190,26 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  const char* strix_npu = std::getenv("GUFO_STRIX_NPU");
+  const char* two_bank = std::getenv("GUFO_TWO_BANK");
+  if (strix_npu != nullptr && std::strcmp(strix_npu, "1") == 0 &&
+      two_bank != nullptr && std::strcmp(two_bank, "1") == 0 &&
+      m->device_->npu() != nullptr && options.max_context >= 8192) {
+    const auto* npu = m->device_->npu();
+    bool supported = npu->Healthy() && npu->tokens() == 4096 &&
+                     npu->k() <= m->device_->max_half_cols();
+    for (const auto& l : m->device_->layers()) {
+      const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
+      const auto& ids = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
+      supported = supported && w.type == core::GgmlType::kQ8_0 &&
+                  w.cols == npu->k() && !ids.empty() && ids.size() <= 16 &&
+                  w.rows == ids.size() * npu->n();
+    }
+    if (supported)
+      exec.max_batch = 8192;  // capacity only; ordinary chunks stay 4096
+  }
+#endif
   exec.max_logit_rows =
       m->mtp_weights_
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -747,8 +771,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
-    const auto capacity = remaining <= exec.max_batch()
-                              ? exec.max_batch()
+    const bool pair = prefill && !image_prompt_ && !checkpoint && !consume &&
+                      remaining >= 8192 && exec.NpuPairEnabled();
+    const auto capacity = pair ? 8192U
+                          : remaining <= model_->PrefillThroughCapacity()
+                              ? model_->PrefillThroughCapacity()
                               : model_->PrefillCapacity();
     std::size_t n = std::min<std::size_t>(capacity, remaining);
     // Extended-context attention can fall back from WMMA to the per-token
@@ -785,8 +812,9 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
     const auto next = rest.first(std::min<std::size_t>(
-        rest.size() <= exec.max_batch() ? exec.max_batch()
-                                        : model_->PrefillCapacity(),
+        rest.size() <= model_->PrefillThroughCapacity()
+            ? model_->PrefillThroughCapacity()
+            : model_->PrefillCapacity(),
         rest.size()));
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
                       capture.get(), next)) {

@@ -26,6 +26,11 @@ target_link_libraries(gufo_qwen38_flash_next_reference PUBLIC
 set_source_files_properties(cpu_ops.cpp reference.cpp
   PROPERTIES COMPILE_OPTIONS "-O2")
 
+option(GUFO_ENABLE_NPU "Build experimental XDNA2 projection offload through XRT" OFF)
+if (GUFO_ENABLE_NPU AND NOT ENGINE_ENABLE_HIP)
+  message(FATAL_ERROR "GUFO_ENABLE_NPU requires ENGINE_ENABLE_HIP")
+endif()
+
 if (ENGINE_ENABLE_HIP)
   set(QFN_ROCM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm")
   set(QFN_MMQ_DIR "${QFN_ROCM_DIR}/mmq")
@@ -67,6 +72,27 @@ if (ENGINE_ENABLE_HIP)
     engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
 
+  # No XRT lookup, includes, link libraries or runtime source in the OFF build.
+  if (GUFO_ENABLE_NPU)
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      message(FATAL_ERROR "GUFO_ENABLE_NPU currently supports Linux XDNA2 hosts only")
+    endif()
+    set(GUFO_XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT installation prefix")
+    set(GUFO_XRT_LIB_DIR "" CACHE PATH "Optional XRT library directory")
+    find_path(GUFO_XRT_INCLUDE_DIR NAMES xrt/xrt_bo.h
+      HINTS ${GUFO_XRT_ROOT} ENV XILINX_XRT PATH_SUFFIXES include)
+    find_library(GUFO_XRT_COREUTIL_LIBRARY NAMES xrt_coreutil libxrt_coreutil.so.2
+      HINTS ${GUFO_XRT_LIB_DIR} ${GUFO_XRT_ROOT} ENV XILINX_XRT
+      PATH_SUFFIXES lib lib64)
+    if (NOT GUFO_XRT_INCLUDE_DIR OR NOT GUFO_XRT_COREUTIL_LIBRARY)
+      message(FATAL_ERROR
+        "GUFO_ENABLE_NPU needs XRT headers and libxrt_coreutil; set GUFO_XRT_ROOT or GUFO_XRT_INCLUDE_DIR/GUFO_XRT_COREUTIL_LIBRARY")
+    endif()
+    target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_ROCM_DIR}/npu_gemm.cpp)
+    target_include_directories(gufo_qwen38_flash_next SYSTEM PRIVATE ${GUFO_XRT_INCLUDE_DIR})
+    target_compile_definitions(gufo_qwen38_flash_next PUBLIC GUFO_ENABLE_NPU=1 GUFO_NPU=1)
+    target_link_libraries(gufo_qwen38_flash_next PRIVATE ${GUFO_XRT_COREUTIL_LIBRARY})
+  endif()
   set_source_files_properties(${QFN_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")

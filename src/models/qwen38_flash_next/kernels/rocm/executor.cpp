@@ -18,6 +18,9 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+#endif
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
@@ -30,6 +33,16 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 using core::GgmlType;
+
+[[maybe_unused]] bool StrixNpuEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_NPU");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+  }();
+  return enabled;
+}
+[[maybe_unused]] constexpr std::uint32_t kNpuSlicesMax = 12;
+
 
 void AssignError(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr) {
@@ -912,6 +925,7 @@ Executor::~Executor() {
   if (ple_pending_ || prefetch_.pending) {
     (void)ngram_->WaitRead();
   }
+  (void)hipFree(npu_c_dev_);
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
   for (void* p : allocations_) {
@@ -1250,6 +1264,73 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
                    !model.layers().empty() &&
                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (NpuGemm* npu = model.npu();
+      StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0) {
+    std::string npu_error;
+    constexpr std::uint32_t kMaxGroups = 4;
+    const std::uint32_t groups = std::clamp<std::uint32_t>(
+        e->options_.max_batch / npu->tokens(), 1, kMaxGroups);
+    for (std::uint32_t g = 0; g < groups; ++g) {
+      const int a = npu->NewBuffer(npu->ABytes(), &npu_error);
+      const int a_lo = npu->NewBuffer(npu->ABytes(), &npu_error);
+      bool ok = a >= 0 && a_lo >= 0;
+      std::vector<int> cs;
+      for (std::uint32_t i = 0; i < kNpuSlicesMax && ok; ++i) {
+        const int id = npu->NewBuffer(npu->CBytes(), &npu_error);
+        ok = id >= 0;
+        cs.push_back(id);
+      }
+      if (!ok) {
+        e->npu_a_.clear();
+        e->npu_a_lo_.clear();
+        e->npu_c_.clear();
+        std::fprintf(stderr, "NPU buffers unavailable: %s\n",
+                     npu_error.c_str());
+        break;
+      }
+      e->npu_a_.push_back(a);
+      e->npu_a_lo_.push_back(a_lo);
+      e->npu_c_.insert(e->npu_c_.end(), cs.begin(), cs.end());
+    }
+    const char* two_bank = std::getenv("GUFO_TWO_BANK");
+    if (two_bank != nullptr && std::strcmp(two_bank, "1") == 0 &&
+        e->options_.max_batch >= 8192 && npu->tokens() == 4096 &&
+        npu->k() <= model.max_half_cols()) {
+      bool ok = true;
+      for (std::uint32_t bank = 0; bank < 2 && ok; ++bank) {
+        e->npu_whole_a_[bank] = npu->NewBuffer(npu->ABytes(), &npu_error);
+        ok = e->npu_whole_a_[bank] >= 0;
+        for (std::uint32_t slice = 0; slice < 16 && ok; ++slice) {
+          const int id = npu->NewBuffer(npu->CBytes(), &npu_error);
+          ok = id >= 0;
+          if (ok)
+            e->npu_whole_c_[bank].push_back(id);
+        }
+      }
+      e->npu_whole_enabled_ = ok;
+      if (!ok)
+        std::fprintf(stderr, "NPU whole buffers unavailable: %s\n",
+                     npu_error.c_str());
+    }
+    if (!e->npu_c_.empty()) {
+      std::vector<const std::uint8_t*> table;
+      for (const int id : e->npu_c_) {
+        table.push_back(
+            static_cast<const std::uint8_t*>(npu->Staged(nullptr, id)));
+      }
+      const std::size_t bytes = table.size() * sizeof(table[0]);
+      void* dev = nullptr;
+      if (hipMalloc(&dev, bytes) == hipSuccess &&
+          hipMemcpy(dev, table.data(), bytes, hipMemcpyHostToDevice) ==
+              hipSuccess) {
+        e->npu_c_dev_ = static_cast<const std::uint8_t**>(dev);
+      } else if (dev != nullptr) {
+        (void)hipFree(dev);
+      }
+    }
+  }
+#endif
   if (model.has_mtp()) {
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
@@ -2435,6 +2516,85 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
   return true;
 }
 
+
+bool Executor::NpuPairEnabled() const {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  const char* two_bank = std::getenv("GUFO_TWO_BANK");
+  NpuGemm* npu = model_->npu();
+  if (!StrixNpuEnabled() || two_bank == nullptr ||
+      std::strcmp(two_bank, "1") != 0 || !npu_whole_enabled_ ||
+      npu == nullptr || !npu->Healthy() || npu->tokens() != 4096 ||
+      options_.max_batch < 8192)
+    return false;
+  for (const auto& l : model_->layers()) {
+    const auto& w = l.linear ? l.ssm_in : l.attn_qkv;
+    const auto& ids = l.linear ? l.npu_ssm_all : l.npu_qkv_all;
+    if (w.type != GgmlType::kQ8_0 || w.cols != npu->k() ||
+        ids.empty() || ids.size() > 16 ||
+        w.rows != ids.size() * npu->n())
+      return false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool Executor::NpuWholeProjection(const DeviceTensor& w,
+                                   const std::vector<int>& weights,
+                                   const float* x, float* out,
+                                   std::uint32_t rows,
+                                   std::string* error_msg) const {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  NpuGemm* npu = model_->npu();
+  if (rows != 8192 || !NpuPairEnabled() || w.type != GgmlType::kQ8_0 ||
+      w.cols != npu->k() || weights.empty() || weights.size() > 16 ||
+      w.rows != weights.size() * npu->n()) {
+    AssignError(error_msg, "unsupported whole NPU projection");
+    return false;
+  }
+  PrepareHalfInput(x, rows, w.cols);
+  npu_used_ = true;
+  // Two private staging banks, each retaining a complete 4096-token group
+  // until both submissions have reaped. Residuals and GPU consumers stay F32.
+  for (std::uint32_t bank = 0; bank < 2; ++bank) {
+    NpuEncodeActivations(static_cast<const __half*>(s_.x_half) +
+                            std::size_t(bank) * npu->tokens() * w.cols,
+                        w.cols, npu->tokens(), npu->k(), 0, npu->k(),
+                        npu->Device(npu_whole_a_[bank]), stream_);
+    if (!npu->Submit(stream_, npu_whole_a_[bank], weights.data(),
+                     npu_whole_c_[bank].data(),
+                     static_cast<int>(weights.size()))) {
+      (void)npu->Wait(stream_);
+      AssignError(error_msg, "NPU whole projection submit failed");
+      return false;
+    }
+  }
+  if (!npu->Wait(stream_)) {
+    AssignError(error_msg, "NPU whole projection wait failed");
+    return false;
+  }
+  for (std::uint32_t bank = 0; bank < 2; ++bank) {
+    for (std::size_t slice = 0; slice < weights.size(); ++slice) {
+      NpuDecodeOutput(npu->Staged(stream_, npu_whole_c_[bank][slice]),
+                      out + std::size_t(bank) * npu->tokens() * w.rows,
+                      npu->tokens(), npu->n(), w.rows,
+                      static_cast<std::uint32_t>(slice) * npu->n(),
+                      false, stream_);
+    }
+  }
+  return true;
+#else
+  (void)w;
+  (void)weights;
+  (void)x;
+  (void)out;
+  (void)rows;
+  AssignError(error_msg, "NPU support is not compiled");
+  return false;
+#endif
+}
+
 bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                                const float* x, float* out,
                                std::uint32_t n_tokens, bool speculative,
@@ -2459,12 +2619,85 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         (void)hipStreamWaitEvent(stream, event, 0);
     }
   } z_join{stream_};
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (!projections_ready && !speculative && prefill_phase &&
+      n_tokens == 8192 && NpuPairEnabled()) {
+    if (!NpuWholeProjection(l.ssm_in, l.npu_ssm_all, x, s_.qkvz,
+                             n_tokens, error_msg) ||
+        !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg))
+      return false;
+    projections_ready = true;
+  }
+#endif
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
     if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+      NpuGemm* npu = model_->npu();
+      if (StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0 &&
+          npu->Healthy() && !npu_a_.empty() && l.ssm_in.rows == 16384 && l.ssm_in.cols == 2560 &&
+          channels == 10240 && c.ssm_conv_kernel == 4 && npu->n() == 1024 &&
+          !l.npu_z.empty() && l.npu_z.size() <= kNpuSlicesMax &&
+          l.npu_z.size() * npu->n() <= l.ssm_in.rows && n_tokens % npu->tokens() == 0 &&
+          n_tokens / npu->tokens() <= npu_a_.size() &&
+          l.ssm_in.cols == npu->k()) {
+        // The last rows of the projection run on the NPU while the GPU does
+        // the rest; the NPU output lands in the tail of each qkvz row.
+        const std::uint32_t npu_cols =
+            static_cast<std::uint32_t>(l.npu_z.size()) * npu->n();
+        const std::uint32_t gpu_rows = l.ssm_in.rows - npu_cols;
+        // The NPU kernel is built for npu->tokens() rows: a larger chunk goes
+        // through it as consecutive groups.
+        const std::uint32_t group_tokens = npu->tokens();
+        const std::uint32_t groups = n_tokens / group_tokens;
+        npu_used_ = true;
+        for (std::uint32_t g = 0; g < groups; ++g) {
+          NpuEncodeActivations(
+              static_cast<const __half*>(s_.x_half) +
+                  static_cast<std::size_t>(g) * group_tokens * l.ssm_in.cols,
+              l.ssm_in.cols, group_tokens, npu->k(), 0, npu->k(),
+              npu->Device(npu_a_[g]), stream_);
+          if (!npu->Submit(
+                  stream_, npu_a_[g], l.npu_z.data(),
+                  npu_c_.data() + std::size_t(g) * kNpuSlicesMax,
+                  static_cast<int>(l.npu_z.size()))) {
+            (void)npu->Wait(stream_);
+            AssignError(error_msg, "NPU split SSM submit failed");
+            return false;
+          }
+        }
+        convolved = DenseF16SsmGemm(
+            l.ssm_in.data, static_cast<const __half*>(s_.x_half),
+            l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
+            n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
+            stream_, checkpoint.tokens, false, gpu_rows);
+        if (!convolved) {
+          (void)npu->Wait(stream_);
+          AssignError(error_msg, "NPU split SSM GPU projection failed");
+          return false;
+        }
+        if (!npu->Wait(stream_)) {
+          AssignError(error_msg, "NPU split SSM wait failed");
+          return false;
+        }
+        for (std::uint32_t g = 0; g < groups; ++g) {
+          for (std::size_t i = 0; i < l.npu_z.size(); ++i) {
+            NpuDecodeOutput(npu->Staged(stream_, npu_c_[g * kNpuSlicesMax + i]),
+                s_.qkvz + gpu_rows + std::size_t(g) * group_tokens * l.ssm_in.rows,
+                group_tokens, npu->n(), l.ssm_in.rows,
+                static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
+          }
+        }
+        if (gpu_rows < channels)
+          SsmConvTail(s_.qkvz, l.ssm_conv1d.f32(), s.conv_state,
+                      s_.conv_scratch, n_tokens, channels, l.ssm_in.rows,
+                      gpu_rows, stream_);
+      } else
+#endif
+      {
       // The Z rows feed only the output norm: the side stream computes them
       // beside the convolution boundary, the alpha/beta GEMM and the
       // recurrence; the epilogue waits for them before it reads z. With the
@@ -2483,6 +2716,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         }
         z_ready = side_done_;
         z_join.event = side_done_;
+      }
       }
     }
     if (!projections_ready && !convolved &&
@@ -2624,6 +2858,15 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   const bool rotated = KvIsRotated(options_.kv_cache_type);
   bool prepared = false;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (!projections_ready && prefill_phase && n_tokens == 8192 &&
+      NpuPairEnabled()) {
+    if (!NpuWholeProjection(l.attn_qkv, l.npu_qkv_all, x, s_.qg,
+                             n_tokens, error_msg))
+      return false;
+    projections_ready = true;
+  }
+#endif
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && WidePrefill(n_tokens) &&
@@ -2633,15 +2876,70 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
         c.rotary_dim == 64 && !rotated;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
-      prepared = AttentionF16Gemm(
-          l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
-          l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
-          s.rope, yarn_, options_.kv_cache_type);
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+      std::uint32_t npu_gate_groups = 0;
+      std::uint32_t skip_gate_heads = 0;
+      // The query and gate rows of the first heads run on the NPU while the
+      // GPU does the rest; the attention kernel is their first reader.
+      NpuGemm* npu = model_->npu();
+      if (StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0 &&
+          npu->Healthy() && !npu_a_.empty() && yarn_.enabled == 0 && options_.kv_cache_type == KvCacheType::kF16 &&
+          npu->n() == 1024 && npu_c_dev_ != nullptr && !l.npu_gate.empty() &&
+          l.npu_gate.size() <= kNpuSlicesMax && n_tokens % npu->tokens() == 0 &&
+          n_tokens / npu->tokens() <= npu_a_.size() &&
+          l.attn_qkv.cols == npu->k()) {
+        const std::uint32_t group_tokens = npu->tokens();
+        npu_gate_groups = n_tokens / group_tokens;
+        npu_used_ = true;
+        for (std::uint32_t g = 0; g < npu_gate_groups; ++g) {
+          NpuEncodeActivations(
+              static_cast<const __half*>(s_.x_half) +
+                  static_cast<std::size_t>(g) * group_tokens * l.attn_qkv.cols,
+              l.attn_qkv.cols, group_tokens, npu->k(), 0, npu->k(),
+              npu->Device(npu_a_[g]), stream_);
+          if (!npu->Submit(
+                  stream_, npu_a_[g], l.npu_gate.data(),
+                  npu_c_.data() + std::size_t(g) * kNpuSlicesMax,
+                  static_cast<int>(l.npu_gate.size()))) {
+            (void)npu->Wait(stream_);
+            AssignError(error_msg, "NPU attention submit failed");
+            return false;
+          }
+        }
+        skip_gate_heads = static_cast<std::uint32_t>(l.npu_gate.size()) * 2;
+      }
+      if (skip_gate_heads != 0) {
+        prepared = AttentionF16Gemm(
+            l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
+            l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+            static_cast<__half*>(s.k_cache), static_cast<__half*>(s.v_cache),
+            n_tokens, pos, c.rope_theta, c.rms_eps, stream_, s.rope, false,
+            skip_gate_heads);
+      } else
+#endif
+      {
+        prepared = AttentionF16Gemm(
+            l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
+            l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+            s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
+            s.rope, yarn_, options_.kv_cache_type);
+      }
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
       }
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+      if (npu_gate_groups != 0) {
+        if (!npu->Wait(stream_)) {
+          AssignError(error_msg, "NPU attention wait failed");
+          return false;
+        }
+        PrepareQueryHeadsStreams(npu_c_dev_, kNpuSlicesMax, npu->tokens(),
+            l.attn_q_norm.f32(), s_.q, s_.attn_gate, n_tokens, c.num_heads,
+            c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
+            c.rms_eps, stream_, s.rope, skip_gate_heads);
+      }
+#endif
     } else {
       if (!projections_ready &&
           !Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
@@ -2911,14 +3209,66 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
+  shexp_half_ready_ = false;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  // The gate and up projections can run on the NPU: queued here, finished
+  // after the routed experts, which are the first to need the GPU's time.
+  NpuGemm* npu = model_->npu();
+  std::uint32_t npu_shexp_groups = 0;
+  if (StrixNpuEnabled() && npu != nullptr && npu->tokens() != 0 &&
+      npu->Healthy() && !npu_a_.empty() && l.npu_shexp.size() == 2 && !last_only && n_tokens >= 1024 &&
+      n_tokens <= options_.max_batch && n_tokens % npu->tokens() == 0 &&
+      n_tokens / npu->tokens() <= npu_a_.size() &&
+      l.shexp_up.type == GgmlType::kQ8_0 &&
+      l.shexp_gate.type == GgmlType::kQ8_0 &&
+      l.shexp_up.cols == npu->k() && l.shexp_up.rows <= npu->n() &&
+      l.shexp_gate.rows == l.shexp_up.rows &&
+      l.shexp_gate.cols == l.shexp_up.cols &&
+      l.shexp_down.cols == l.shexp_up.rows &&
+      DenseF16Route(l.shexp_down, n_tokens)) {
+    PrepareHalfInput(x, n_tokens, l.shexp_up.cols);
+    const std::uint32_t group_tokens = npu->tokens();
+    npu_shexp_groups = n_tokens / group_tokens;
+    npu_used_ = true;
+    for (std::uint32_t g = 0; g < npu_shexp_groups; ++g) {
+      NpuEncodeActivations(
+          static_cast<const __half*>(s_.x_half) +
+              static_cast<std::size_t>(g) * group_tokens * l.shexp_up.cols,
+          l.shexp_up.cols, group_tokens, npu->k(), 0, npu->k(),
+          npu->Device(npu_a_[g]), stream_);
+      if (!npu->Submit(
+              stream_, npu_a_[g], l.npu_shexp.data(),
+              npu_c_.data() + std::size_t(g) * kNpuSlicesMax, 2)) {
+        (void)npu->Wait(stream_);
+        AssignError(error_msg, "NPU shared expert submit failed");
+        return false;
+      }
+      // The residual of the first encoding runs as a second pass.
+      NpuEncodeActivations(
+          static_cast<const __half*>(s_.x_half) +
+              static_cast<std::size_t>(g) * group_tokens * l.shexp_up.cols,
+          l.shexp_up.cols, group_tokens, npu->k(), 0, npu->k(),
+          npu->Device(npu_a_lo_[g]), stream_, true);
+      if (!npu->Submit(
+              stream_, npu_a_lo_[g], l.npu_shexp.data(),
+              npu_c_.data() + std::size_t(g) * kNpuSlicesMax + 2, 2)) {
+        (void)npu->Wait(stream_);
+        AssignError(error_msg, "NPU shared expert residual submit failed");
+        return false;
+      }
+    }
+  }
+#endif
   // A wide batch runs them on the side stream beside the routed experts,
   // which leave compute idle while they stream expert weights. The shared
   // expert writes its own scratch and may quantize x into s_.x_q8t, so no
   // main-stream work may use s_.x_q8t before JoinSide.
-  // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
-  // the BF16, F16 and F32 routes go through BLAS handles bound to the main
-  // stream.
-  const bool overlap = ExpertMatrixRows(n_tokens) && !last_only &&
+  // Shared experts on NPU must not also launch the GPU overlap route.
+  const bool overlap =
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+      npu_shexp_groups == 0 &&
+#endif
+      ExpertMatrixRows(n_tokens) && !last_only &&
                        l.shexp_gate.type == GgmlType::kQ8_0 &&
                        l.shexp_up.type == GgmlType::kQ8_0 &&
                        l.shexp_down.type == GgmlType::kQ8_0;
@@ -2933,6 +3283,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     stream_ = side_stream_;
   }
   const auto shared_expert = [&] {
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+    if (npu_shexp_groups != 0)
+      return true;
+#endif
     shexp_half_ready_ = false;
     if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                     &l.shexp_down, error_msg)) {
@@ -2990,7 +3344,58 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       throw;
     }
   }
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (npu_shexp_groups == 0) {
+    return MoeExperts(l, x, out, n_tokens, error_msg) && JoinSide(error_msg);
+  }
+  struct SharedPending {
+    bool& pending;
+    ~SharedPending() { pending = false; }
+  } shared_pending{shexp_npu_pending_};
+  shexp_npu_pending_ = true;
+  if (!MoeExperts(l, x, out, n_tokens, error_msg)) {
+    (void)npu->Wait(stream_);
+    return false;
+  }
+  if (!npu->Wait(stream_)) {
+    AssignError(error_msg, "NPU shared expert wait failed");
+    return false;
+  }
+  const std::uint32_t group_tokens = npu->tokens();
+  const std::uint32_t ff = l.shexp_up.rows;
+  for (std::uint32_t g = 0; g < npu_shexp_groups; ++g) {
+    const std::size_t base = static_cast<std::size_t>(g) * group_tokens * ff;
+    const std::size_t c0 = static_cast<std::size_t>(g) * kNpuSlicesMax;
+    NpuSwiglu(npu->Staged(stream_, npu_c_[c0]),
+              npu->Staged(stream_, npu_c_[c0 + 1]),
+              npu->Staged(stream_, npu_c_[c0 + 2]),
+              npu->Staged(stream_, npu_c_[c0 + 3]), s_.shexp_half + base,
+              group_tokens, npu->n(), ff, stream_);
+
+  }
+  if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
+                    l.shexp_down.rows, l.shexp_down.cols, stream_)) {
+    AssignError(error_msg, "shared expert F16 GEMM failed");
+    return false;
+  }
+  // The original routed consumer is unchanged; only postpone its epilogue
+  // until the shared rows exist (including the non-WMMA routed fallback).
+  if (WmmaExperts(l, n_tokens)) {
+    moe_pending_ = out == s_.block_out;
+    if (!moe_pending_)
+      MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e),
+          s_.weights, s_.shexp_out, s_.router + c.num_experts,
+          c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
+  } else {
+    MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
+        s_.router + c.num_experts, c.num_experts + 1, out, n_tokens, used,
+        c.hidden_size, stream_);
+  }
+  return true;
+#else
   return MoeExperts(l, x, out, n_tokens, error_msg) && JoinSide(error_msg);
+#endif
+
 }
 
 bool Executor::JoinSide(std::string* error_msg) const {
@@ -3101,6 +3506,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // The epilogue reads the shared expert's output.
   if (!JoinSide(error_msg))
     return false;
+  if (shexp_npu_pending_)
+    return true;
   if (wmma_experts) {
     // The combine that follows folds this epilogue into its own pass when
     // it takes the F16 route (Combine); otherwise it runs here.
@@ -3274,6 +3681,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const bool speculative = mode == ForwardMode::kVerify;
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
+  npu_used_ = false;
   DropReadyQ8();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
@@ -3418,6 +3826,13 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (npu_used_ && model_->npu() != nullptr &&
+      !model_->npu()->Healthy()) {
+    AssignError(error_msg, "NPU run failed; batch result discarded");
+    return false;
+  }
+#endif
   perf_target.Finish();
   perf_trunk.Finish();
   perf_forward.Finish();
