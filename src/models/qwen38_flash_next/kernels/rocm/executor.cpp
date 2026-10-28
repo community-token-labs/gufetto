@@ -3689,6 +3689,12 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
   npu_used_ = false;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (model_->npu() != nullptr && !model_->npu()->Healthy()) {
+    AssignError(error_msg, "NPU runtime failed; restart the process before reuse");
+    return false;
+  }
+#endif
   DropReadyQ8();
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());

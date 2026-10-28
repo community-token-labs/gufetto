@@ -28,6 +28,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 
 namespace {
 
+std::atomic<bool> process_failed{false};
 constexpr std::uint64_t kOpcode = 3;
 constexpr unsigned kDefaultRunTimeoutMs = 8000;  // a dispatch takes 1-15 ms
 constexpr std::size_t kBytesPer8 = 9;
@@ -296,6 +297,7 @@ struct NpuGemm::Impl {
   }
 
   void Fail(const std::exception& e) {
+    process_failed = true;
     failed = true;
     last_error = e.what();
     std::fprintf(stderr, "NPU: %s\n", last_error.c_str());
@@ -308,6 +310,7 @@ struct NpuGemm::Impl {
     if (state == ERT_CMD_STATE_COMPLETED) {
       return true;
     }
+    process_failed = true;
     failed = true;
     last_error = state == ERT_CMD_STATE_TIMEOUT
                      ? "NPU run timed out after " +
@@ -515,6 +518,7 @@ NpuGemm::~NpuGemm() {
   impl_->StopKeepalive();
   impl_->StopWorker();
   if (impl_->failed) {
+    process_failed = true;
     // Quarantine the entire context, instructions, runs and data until process
     // exit. Abort/destruction is not bounded and is not proof DMA has stopped.
     (void)impl_.release();
@@ -529,6 +533,9 @@ std::unique_ptr<NpuGemm> NpuGemm::Create(const Config& config,
     }
     return nullptr;
   };
+  if (process_failed) {
+    return fail("NPU process is quarantined; restart before further dispatch");
+  }
   if (config.tokens == 0 || config.k == 0 || config.n == 0 ||
       config.tokens % 8 != 0 || config.k % 8 != 0 || config.n % 8 != 0) {
     return fail("NPU dimensions must be nonzero multiples of eight");
@@ -682,7 +689,7 @@ int NpuGemm::NewBuffer(std::size_t bytes, std::string* error) {
 }
 
 bool NpuGemm::Healthy() const noexcept {
-  return !impl_->failed;
+  return !process_failed && !impl_->failed;
 }
 
 void* NpuGemm::Host(int id) const {

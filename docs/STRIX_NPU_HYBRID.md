@@ -44,14 +44,15 @@ Never enable this flag in production merely because a build succeeded.
   of 4096 cannot enter the optional 8192-row pair; slice/shared-expert work
   can still run on eligible 4096-row chunks. No global-chunk shrink or
   enlargement is required.
-- Model-owned weights and one executor-owned scratch allocation are reused
-  across sessions. Whole weights share slice IDs instead of duplicating
+- Model-owned weights and one executor scratch set allocated in the runtime
+  are reused across sessions. Whole weights share slice IDs instead of duplicating
   their BOs. GPU and NPU backing compete for the same UMA capacity; actual
   peak/high-water stability still needs measurement.
 - Submit/Wait order work on the HIP stream; synchronization and Healthy()
   are checked before accepting a batch. Failed selected NPU work is not
   silently retried on GPU. Uncertain runtime resources are quarantined;
-  discard the failed request and reload the model before further NPU use.
+  discard the failed request and restart the process before further NPU use.
+  A model reload cannot clear process-wide quarantine.
   Stream callbacks are drained before executor scratch/stream destruction.
 
 ## First qualification
