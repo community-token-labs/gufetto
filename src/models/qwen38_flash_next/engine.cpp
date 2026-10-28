@@ -777,6 +777,9 @@ std::optional<std::size_t> Session::SinglePassPrefillLimit(
     std::size_t remaining, std::size_t budget) const noexcept {
   if (!valid_ || image_prompt_ || remaining == 0 || budget == 0)
     return std::nullopt;
+  if (remaining >= 8192 && budget >= 8192 &&
+      model_->executor_->CanForwardPair(*session_))
+    return 8192;
   return std::min<std::size_t>({budget, remaining,
                                 remaining <= model_->PrefillThroughCapacity()
                                     ? model_->PrefillThroughCapacity()
