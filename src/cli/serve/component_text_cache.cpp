@@ -1433,6 +1433,14 @@ void ComponentTextCache::InitializePins(
   for (const auto& registration : registrations) {
     const auto& tokens = registration.tokens;
     const auto existing = registration.existing;
+    if (existing.value &&
+        PackedKvIngress(impl_->runner->Descriptor(),
+                        impl_->resources->adapter->Components())) {
+      // Both eager and lazy existing pins are external input. Preserve the
+      // explicit-repair policy for a bad pinned root: refuse readiness rather
+      // than silently replace the operator's registered publication.
+      impl_->PreflightDiskAppendRows(disk, existing);
+    }
     auto& pin = impl_->pins.emplace_back();
     pin.durable = existing;
     if (existing.value && options.lazy) {
@@ -2499,6 +2507,13 @@ std::shared_ptr<CheckpointTransferBlob> ComponentTextCache::Import(
       return captured;
     } catch (const CheckpointTransferError&) {
       transfer_failure = std::current_exception();
+      throw;
+    } catch (const std::invalid_argument&) {
+      // Retention turns generic capture exceptions into refusal. Preserve the
+      // packed model's semantic cause instead of reporting a false budget507;
+      // the factory has not returned a publishable checkpoint at this point.
+      if (PackedKvIngress(impl_->runner->Descriptor(), descriptors))
+        transfer_failure = std::current_exception();
       throw;
     }
   });
