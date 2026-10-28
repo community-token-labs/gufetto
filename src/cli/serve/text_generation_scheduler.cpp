@@ -173,8 +173,7 @@ void TraceRequest(const std::shared_ptr<ScheduledRequest>& request,
                                request->result.tokens.size() -
                                (request->preview_token.has_value() ? 1 : 0) -
                                (request->advance_pending ? 1 : 0);
-  perf::current->sessions.push_back(
-      {request->session, request->id, depth});
+  perf::current->sessions.push_back({request->session, request->id, depth});
 }
 
 struct PendingClient {
@@ -1208,9 +1207,9 @@ struct TextGenerationScheduler::Impl {
       perf::Work perf_admit("admit");
       if (auto* trace = perf_admit.get()) {
         trace->prefilling_waiting = prefilling.size();
-        trace->decoders_due = static_cast<std::size_t>(std::count_if(
-            decoding.begin(), decoding.end(),
-            [](const auto& r) { return r->decode_due; }));
+        trace->decoders_due = static_cast<std::size_t>(
+            std::count_if(decoding.begin(), decoding.end(),
+                          [](const auto& r) { return r->decode_due; }));
         trace->capturing = capturing.size();
         trace->waiting = waiting.size();
         // The runner lease is not acquired yet; admission may restore it.
@@ -1965,9 +1964,9 @@ struct TextGenerationScheduler::Impl {
     const auto trace_queue = [&](perf::Work& work) {
       if (auto* trace = work.get()) {
         trace->prefilling_waiting = prefilling.size();
-        trace->decoders_due = static_cast<std::size_t>(std::count_if(
-            decoding.begin(), decoding.end(),
-            [](const auto& r) { return r->decode_due; }));
+        trace->decoders_due = static_cast<std::size_t>(
+            std::count_if(decoding.begin(), decoding.end(),
+                          [](const auto& r) { return r->decode_due; }));
         trace->capturing = capturing.size();
         trace->waiting = waiting.size();
       }
@@ -2101,7 +2100,8 @@ struct TextGenerationScheduler::Impl {
             plan.kind == TextExecutionPlanKind::kBatched
                 ? std::min(candidate_count, plan.physical_width)
                 : 1;
-        perf::Work perf_decode(batch_size == 1 ? "decode_single" : "decode_batch");
+        perf::Work perf_decode(batch_size == 1 ? "decode_single"
+                                               : "decode_batch");
         trace_queue(perf_decode);
         std::vector<std::shared_ptr<ScheduledRequest>> batch;
         batch.reserve(batch_size);

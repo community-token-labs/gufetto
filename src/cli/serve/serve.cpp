@@ -439,7 +439,8 @@ void AddPinnedPrefixOptions(ArgParser& parser,
                             server::TextRunnerPinnedPrefixOptions* options) {
   parser.AddCustomOption(
       "", "--pin-prefix-file", "FILE",
-      "Flash-Next: already-rendered UTF-8 system/tools prefix text "
+      "Experimental Flash-Next: already-rendered UTF-8 system/tools prefix "
+      "text "
       "(repeatable, at most 64; requires --pin-prefix-dir)",
       "Cache",
       [options](std::string_view, std::string_view value, std::string* error) {
@@ -772,7 +773,8 @@ void PrintServeHelp(std::string_view program_name,
     bool cache_lookup_api = false;
     bool cache_transfer_api = false;
     parser.AddFlag("", "--cache-transfer-api",
-                   "Enable trusted-LAN checkpoint export/import (default: off)",
+                   "Enable experimental trusted-LAN checkpoint export/import "
+                   "(default: off)",
                    "Cache", &cache_transfer_api);
     parser.AddFlag("", "--cache-lookup-api",
                    "Enable read-only POST /v1/cache/lookup (default: off)",
@@ -1404,10 +1406,10 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
-    llm_parser.AddFlag(
-        "", "--cache-transfer-api",
-        "Enable trusted-LAN checkpoint export/import (default: off)", "Cache",
-        &cache_transfer_api);
+    llm_parser.AddFlag("", "--cache-transfer-api",
+                       "Enable experimental trusted-LAN checkpoint "
+                       "export/import (default: off)",
+                       "Cache", &cache_transfer_api);
     llm_parser.AddFlag("", "--cache-lookup-api",
                        "Enable read-only POST /v1/cache/lookup (default: off)",
                        "Cache", &cache_lookup_api);

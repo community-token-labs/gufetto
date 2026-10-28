@@ -995,7 +995,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Optional pinned readback, reused by sampled scalar/batched routes.
     (void)e->host_allocations_.Allocate(
         &e->perf_ids_host_, std::size_t{e->options_.max_batch} *
-                               c.num_experts_used * sizeof(std::int32_t));
+                                c.num_experts_used * sizeof(std::int32_t));
   }
   const std::size_t T = e->options_.max_batch;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
@@ -1876,9 +1876,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
-  const auto wait_start = perf::current != nullptr && perf::forward_id != 0
-                              ? perf::Now()
-                              : 0;
+  const auto wait_start =
+      perf::current != nullptr && perf::forward_id != 0 ? perf::Now() : 0;
   const auto wait_status = hipEventSynchronize(counts_ready_);
   if (wait_start != 0)
     perf::RouteWait(perf::Now() - wait_start);
@@ -3366,7 +3365,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
   // Sampled eager calls observe actual ids; never capture host readbacks or
-  // reuse stale routing from a graph replay. Unsampled calls keep the fast path.
+  // reuse stale routing from a graph replay. Unsampled calls keep the fast
+  // path.
   perf::Forward perf_forward(mode == ForwardMode::kPrefill);
   perf_forward.Rows(start_pos, n);
   perf::HostPhase perf_trunk(mode == ForwardMode::kPrefill

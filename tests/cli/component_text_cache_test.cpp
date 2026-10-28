@@ -2511,8 +2511,10 @@ struct PinFixture {
   TextRunnerPinnedPrefixOptions options;
   std::vector<TextRunnerToken> tokens{10, 11, 12, 13, 14, 15, 16, 17};
   PinFixture() {
-    char pattern[] = "/tmp/gufo-pinned-prefix-test-XXXXXX";
-    root = mkdtemp(pattern);
+    auto pattern = (std::filesystem::temp_directory_path() /
+                    "gufo-pinned-prefix-test-XXXXXX")
+                       .string();
+    root = mkdtemp(pattern.data());
     options.files = {root / "rendered.txt"};
     options.directory = root / "pins";
     options.capacity_bytes = 1 << 20;

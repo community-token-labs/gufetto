@@ -36,7 +36,6 @@ using gufo::server::LogLevel;
 using gufo::server::LogLevelFromName;
 using gufo::server::LogLevelName;
 
-
 void TestAuthorization() {
   RunningServer secured({.api_key = "test-secret"});
   for (const std::string path :

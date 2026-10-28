@@ -134,7 +134,8 @@ public:
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
   }
-  std::atomic<std::shared_ptr<gufo::server::CheckpointTransferBlob>> transfer_blob;
+  std::atomic<std::shared_ptr<gufo::server::CheckpointTransferBlob>>
+      transfer_blob;
   std::shared_ptr<gufo::server::CheckpointTransferBlob> cache_export(
       const gufo::server::ChatRequest&) const override {
     return transfer_blob.load();
