@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
 #include <initializer_list>
 #include <utility>
 
@@ -11,6 +14,9 @@
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#ifdef GUFO_ENABLE_NPU
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+#endif
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -21,6 +27,28 @@ namespace {
 /// over-read stays inside the allocation (the extra bytes meet zeroed
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
+
+#ifdef GUFO_ENABLE_NPU
+bool NpuFlag(const char* name, bool fallback = false) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? fallback : std::string_view(value) == "1";
+}
+
+std::uint32_t NpuCount(const char* name, std::uint32_t fallback,
+                       std::uint32_t maximum) {
+  const char* value = std::getenv(name);
+  if (value == nullptr)
+    return fallback;
+  char* end = nullptr;
+  const long long count = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0')
+    return fallback;
+  if (count <= 0)
+    return 0;
+  return static_cast<std::uint32_t>(
+      std::min(count, static_cast<long long>(maximum)));
+}
+#endif
 
 struct Conversion {
   void* source;
@@ -324,6 +352,11 @@ struct Uploader {
 }  // namespace
 
 DeviceModel::~DeviceModel() {
+#ifdef GUFO_ENABLE_NPU
+  // Drain NPU callbacks before releasing GPU weights. The executor must keep
+  // registered streams alive until the runtime has released/drained them.
+  npu_.reset();
+#endif
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -378,6 +411,33 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
+#ifdef GUFO_ENABLE_NPU
+  // Wake the NPU before heavy GPU work: resume touches shared SMU/PSP state.
+  // A directory alone never opts in. Only GUFO_STRIX_NPU=1 enables offload.
+  std::unique_ptr<NpuGemm> early_npu;
+  if (NpuFlag("GUFO_STRIX_NPU")) {
+    const char* dir = std::getenv("GUFO_NPU_DIR");
+    if (dir == nullptr || dir[0] == '\0') {
+      if (error_msg != nullptr)
+        *error_msg = "GUFO_STRIX_NPU=1 requires GUFO_NPU_DIR";
+      return nullptr;
+    }
+    NpuGemm::Config cfg;
+    cfg.xclbin = std::string(dir) + "/final_4096x2560x1024_128x64x128.xclbin";
+    cfg.insts = std::string(dir) + "/insts_4096x2560x1024_128x64x128.txt";
+    early_npu = NpuGemm::Create(cfg, error_msg);
+    if (early_npu == nullptr)
+      return nullptr;
+    if (!early_npu->Healthy() || early_npu->k() != 2560 ||
+        early_npu->n() != 1024 || early_npu->tokens() != 4096) {
+      if (error_msg != nullptr)
+        *error_msg = "NPU runtime unhealthy or fixed projection geometry mismatch";
+      return nullptr;
+    }
+    // Buffer isolation is a runtime policy: leave its default-on private BO
+    // mode intact; only an explicit GUFO_NPU_ISOLATE=0 opts into import.
+  }
+#endif
   const auto regions = reader.GetMappedRegions();
   std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
   const auto shard_count = static_cast<std::uint32_t>(shards.size());
@@ -444,6 +504,124 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
   }
+#ifdef GUFO_ENABLE_NPU
+  if (early_npu != nullptr) {
+    auto npu = std::move(early_npu);
+    std::size_t staged = 0;
+    std::uint32_t z_layers = 0, gate_layers = 0, shexp_layers = 0;
+    std::uint32_t whole_layers = 0;
+    const auto z_slices = NpuCount("GUFO_NPU_SLICES", 6, 12);
+    const auto gate_slices = NpuCount("GUFO_NPU_GATE_SLICES", 12, 12);
+    const auto layer_limit = NpuCount("GUFO_NPU_LAYERS", UINT32_MAX, UINT32_MAX);
+    const bool whole = NpuFlag("GUFO_NPU_WHOLE");
+    const bool shexp = NpuFlag("GUFO_NPU_SHEXP", true);
+    const auto eligible = [&](const DeviceTensor& t, std::uint32_t rows) {
+      return !t.empty() && t.type == core::GgmlType::kQ8_0 &&
+             t.experts == 1 && t.cols == npu->k() && t.rows == rows;
+    };
+    const auto fail = [&](const std::string& message) {
+      if (error_msg != nullptr)
+        *error_msg = "NPU weight staging failed: " + message;
+      return false;
+    };
+    // Keep GPU originals immutable. Only the encoded private NPU copies and
+    // their ids are additional storage, deliberately excluded from bytes_.
+    const auto stage = [&](const DeviceTensor& t, std::uint32_t row0,
+                           std::uint32_t slices, std::uint32_t rows_per_slice,
+                           std::vector<int>& ids) {
+      std::string error;
+      hipError_t launch_status = hipSuccess;
+      for (std::uint32_t i = 0; i < slices; ++i) {
+        const int id = npu->NewBuffer(npu->BBytes(), &error);
+        if (id < 0)
+          break;
+        NpuEncodeWeights(t.data, t.cols, row0 + i * npu->n(), rows_per_slice,
+                         npu->k(), 0, npu->k(), npu->Device(id), nullptr);
+        ids.push_back(id);
+        staged += npu->BBytes();
+        launch_status = hipGetLastError();
+        if (launch_status != hipSuccess)
+          break;
+      }
+      // Also drain partial uploads on allocation/launch failure before BOs
+      // can be destroyed. Never turn a runtime failure into GPU fallback.
+      const auto status = hipDeviceSynchronize();
+      if (launch_status != hipSuccess)
+        return fail(hipGetErrorString(launch_status));
+      if (status != hipSuccess)
+        return fail(hipGetErrorString(status));
+      if (ids.size() != slices)
+        return fail(error.empty() ? "buffer allocation failed" : error);
+      for (const int id : ids) {
+        npu->FinalizeWeights(id);
+        if (!npu->Healthy())
+          return fail("FinalizeWeights left runtime unhealthy");
+      }
+      return true;
+    };
+    for (auto& l : m->layers_) {
+      if (l.linear && eligible(l.ssm_in, 16384)) {
+        // Stage the whole matrix first, then alias its tail for z. This avoids
+        // duplicate private backing when whole-projection execution is on.
+        if (whole) {
+          if (!stage(l.ssm_in, 0, 16, npu->n(), l.npu_ssm_all))
+            return nullptr;
+          ++whole_layers;
+        }
+        if (z_slices != 0 && z_layers < layer_limit) {
+          if (!l.npu_ssm_all.empty()) {
+            l.npu_z.assign(l.npu_ssm_all.end() - z_slices,
+                           l.npu_ssm_all.end());
+          } else if (!stage(l.ssm_in, (16 - z_slices) * npu->n(), z_slices,
+                            npu->n(), l.npu_z)) {
+            return nullptr;
+          }
+          ++z_layers;
+        }
+      }
+      if (!l.linear && eligible(l.attn_qkv, 13312)) {
+        if (whole) {
+          if (!stage(l.attn_qkv, 0, 13, npu->n(), l.npu_qkv_all))
+            return nullptr;
+          ++whole_layers;
+        }
+        if (gate_slices != 0) {
+          if (!l.npu_qkv_all.empty()) {
+            l.npu_gate.assign(l.npu_qkv_all.begin(),
+                              l.npu_qkv_all.begin() + gate_slices);
+          } else if (!stage(l.attn_qkv, 0, gate_slices, npu->n(), l.npu_gate)) {
+            return nullptr;
+          }
+          ++gate_layers;
+        }
+      }
+      // Only the expected 640-row Q8_0 shared expert is supported; Q4 and
+      // other nightly formats stay on their original GPU paths unchanged.
+      if (shexp && eligible(l.shexp_gate, 640) && eligible(l.shexp_up, 640)) {
+        std::vector<int> up_ids;
+        if (!stage(l.shexp_gate, 0, 1, 640, l.npu_shexp) ||
+            !stage(l.shexp_up, 0, 1, 640, up_ids))
+          return nullptr;
+        l.npu_shexp.push_back(up_ids.front());
+        ++shexp_layers;
+      }
+    }
+    if (!npu->Healthy()) {
+      fail("runtime unhealthy after staging");
+      return nullptr;
+    }
+    std::fprintf(stderr,
+                 "NPU: z %u, attention query/gate %u, shared expert %u, "
+                 "whole %u layers; %.2f GiB encoded weights staged "
+                 "(separate from GPU resident bytes)\n",
+                 z_layers, gate_layers, shexp_layers, whole_layers,
+                 static_cast<double>(staged) / (1024.0 * 1024.0 * 1024.0));
+    // Shared-expert-only and attention-only staging must retain the engine.
+    if (z_layers != 0 || gate_layers != 0 || shexp_layers != 0 ||
+        whole_layers != 0)
+      m->npu_ = std::move(npu);
+  }
+#endif
   return m;
 }
 

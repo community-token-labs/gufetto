@@ -13,6 +13,8 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+class NpuGemm;
+
 /// One weight resident in device memory, still in its GGUF encoding.
 struct DeviceTensor {
   void* data{nullptr};
@@ -43,6 +45,13 @@ struct DeviceLayer {
   /// qkv and gate rows stacked ([hidden -> conv channels + value dim]) when
   /// both are Q8_0; then ssm_qkv/ssm_gate are empty.
   DeviceTensor ssm_in;
+  /// NPU weight-buffer ids; empty for unsupported projections or NPU off.
+  /// Partial projections alias whole-projection ids when those are staged.
+  std::vector<int> npu_z;        // Last six 1024-row SSM slices by default.
+  std::vector<int> npu_gate;     // First twelve 1024-row attention slices.
+  std::vector<int> npu_shexp;    // Shared-expert gate and up, in that order.
+  std::vector<int> npu_ssm_all;  // All sixteen SSM slices (GUFO_NPU_WHOLE).
+  std::vector<int> npu_qkv_all;  // All thirteen attention slices (ditto).
   /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F16.
   DeviceTensor ssm_alpha_beta;
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,
@@ -103,6 +112,15 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  /// Null unless explicitly enabled and at least one projection was staged.
+  /// Streams used by this engine must remain valid until it has drained.
+  NpuGemm* npu() const noexcept {
+#ifdef GUFO_ENABLE_NPU
+    return npu_.get();
+#else
+    return nullptr;
+#endif
+  }
   /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
     return max_half_cols_;
@@ -125,6 +143,9 @@ private:
   std::vector<DeviceLayer> layers_;
   DeviceLayer mtp_;
   bool has_mtp_{false};
+#ifdef GUFO_ENABLE_NPU
+  std::unique_ptr<NpuGemm> npu_;
+#endif
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
   std::size_t max_half_cols_{1};
