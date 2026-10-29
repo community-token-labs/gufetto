@@ -1888,6 +1888,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   checkpoint.resize(position);
   if (capabilities.snapshot && capabilities.fork) {
     CommitMetrics metrics = impl_->snapshot_metrics;
+    metrics.committed_tokens = position;
     metrics.snapshot_bytes += impl_->lease.Commit(
         std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
         std::move(checkpoint));
@@ -1902,6 +1903,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
 
   std::unique_ptr<TextRunnerSnapshot> snapshot;
   CommitMetrics metrics;
+  metrics.committed_tokens = position;
   metrics.snapshot_bytes =
       impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
   impl_.reset();
@@ -1925,6 +1927,7 @@ TextRunnerPool::Request::Cancel() noexcept {
       return {};
     }
     std::vector<ContinuationToken> checkpoint;
+    std::optional<std::size_t> committed_tokens;
     if (impl_->state_reusable &&
         (impl_->decode_ready ||
          impl_->prefill_offset == impl_->snapshot_tokens.size() ||
@@ -1944,10 +1947,12 @@ TextRunnerPool::Request::Cancel() noexcept {
         throw std::runtime_error(
             "cancelled checkpoint is outside completed work");
       checkpoint.resize(position);
+      committed_tokens = position;
     } else {
       state.Invalidate();
     }
     CommitMetrics metrics = impl_->snapshot_metrics;
+    metrics.committed_tokens = committed_tokens;
     if (capabilities.snapshot && capabilities.fork) {
       metrics.snapshot_bytes += impl_->lease.Commit(
           std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),

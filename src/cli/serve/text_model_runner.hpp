@@ -577,6 +577,9 @@ public:
   public:
     struct CommitMetrics {
       std::optional<ComponentCacheMetrics> component_cache;
+      /// Exact committed prompt+generated prefix, not sampled-token count.
+      /// Unknown when state was invalidated or prefix reuse is unsupported.
+      std::optional<std::size_t> committed_tokens;
       std::size_t snapshot_bytes{0};
       double snapshot_ms{0.0};
       std::size_t disk_queued_bytes{0};

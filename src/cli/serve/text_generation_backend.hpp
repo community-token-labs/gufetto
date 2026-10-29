@@ -218,6 +218,8 @@ public:
     std::optional<ComponentCacheMetrics> component_cache;
     std::string text;
     std::vector<tokenization::TokenId> tokens;
+    /// Internal trace evidence: exact committed prefix, if retention succeeded.
+    std::optional<std::size_t> committed_tokens;
     std::size_t prompt_tokens{0};
     std::size_t cached_prompt_tokens{0};
     std::size_t cache_restore_bytes{0};
