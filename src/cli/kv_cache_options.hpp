@@ -13,8 +13,9 @@ inline void RegisterKvCacheTypeOption(
     ArgParser& parser, models::qwen38_flash_next::KvCacheType* type) {
   parser.AddCustomOption(
       "", "--kv-cache-type", "TYPE",
-      "Ordinary K/V storage: f16 (default), q8_0 or q8_0-rotated "
-      "(q8 experimental and lossy; Flash-Next only)",
+      "Ordinary K/V storage: f16 (default), q8_0, q4_0, q8_0/q4_0 "
+      "(quantized modes also accept -rotated; experimental, lossy; Flash-Next "
+      "only)",
       "Model",
       [type](std::string_view, std::string_view value, std::string* error) {
         using models::qwen38_flash_next::KvCacheType;
@@ -24,9 +25,19 @@ inline void RegisterKvCacheTypeOption(
           *type = KvCacheType::kQ8_0;
         else if (value == "q8_0-rotated")
           *type = KvCacheType::kQ8_0Rotated;
+        else if (value == "q4_0")
+          *type = KvCacheType::kQ4_0;
+        else if (value == "q8_0/q4_0")
+          *type = KvCacheType::kQ8_0Q4_0;
+        else if (value == "q4_0-rotated")
+          *type = KvCacheType::kQ4_0Rotated;
+        else if (value == "q8_0/q4_0-rotated")
+          *type = KvCacheType::kQ8_0Q4_0Rotated;
         else {
           if (error)
-            *error = "--kv-cache-type must be f16, q8_0 or q8_0-rotated";
+            *error =
+                "--kv-cache-type must be f16, q8_0, q4_0, q8_0/q4_0, "
+                "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated";
           return false;
         }
         return true;
@@ -44,7 +55,7 @@ inline bool ValidateKvCacheTypeForArchitecture(
     return true;
   if (error)
     *error =
-        "--kv-cache-type q8_0 or q8_0-rotated requires Qwen3.8-Flash-Next "
+        "quantized --kv-cache-type requires Qwen3.8-Flash-Next "
         "(GGUF architecture qwen4exp)";
   return false;
 }

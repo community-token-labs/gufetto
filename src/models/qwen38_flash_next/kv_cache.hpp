@@ -13,7 +13,11 @@ namespace gufo::models::qwen38_flash_next {
 enum class KvCacheType : std::uint32_t {
   kF16 = 0,
   kQ8_0 = 1,
-  kQ8_0Rotated = 2
+  kQ8_0Rotated = 2,
+  kQ4_0 = 3,
+  kQ8_0Q4_0 = 4,
+  kQ4_0Rotated = 5,
+  kQ8_0Q4_0Rotated = 6
 };
 
 // Snapshot and persistence arithmetic versions. Version 18 predates packed KV;
@@ -24,11 +28,16 @@ inline constexpr std::uint32_t kKvQ8BlockElements = 32;
 // Equal row widths do not make rotated and unrotated state interchangeable.
 inline constexpr std::uint32_t kKvRotatedNumericsEpoch = 20;
 static_assert(kKvRotatedNumericsEpoch > kKvCacheNumericsEpoch);
+inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
 [[nodiscard]] constexpr bool IsKnownKvCacheType(KvCacheType type) noexcept {
   switch (type) {
     case KvCacheType::kF16:
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ8_0Rotated:
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ8_0Q4_0:
+    case KvCacheType::kQ4_0Rotated:
+    case KvCacheType::kQ8_0Q4_0Rotated:
       return true;
   }
   return false;
@@ -37,20 +46,29 @@ static_assert(kKvRotatedNumericsEpoch > kKvCacheNumericsEpoch);
 [[nodiscard]] constexpr bool KvUsesQ8Codec(KvCacheType type) {
   switch (type) {
     case KvCacheType::kF16:
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ4_0Rotated:
       return false;
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ8_0Rotated:
       return true;
+    case KvCacheType::kQ8_0Q4_0:
+    case KvCacheType::kQ8_0Q4_0Rotated:
+      break;  // Mixed policies require an explicit K/V side.
   }
-  throw std::invalid_argument("unsupported Flash-Next KV cache type");
+  throw std::invalid_argument("unsupported Flash-Next KV row codec");
 }
 
 [[nodiscard]] constexpr bool KvIsRotated(KvCacheType type) {
   switch (type) {
     case KvCacheType::kF16:
     case KvCacheType::kQ8_0:
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ8_0Q4_0:
       return false;
     case KvCacheType::kQ8_0Rotated:
+    case KvCacheType::kQ4_0Rotated:
+    case KvCacheType::kQ8_0Q4_0Rotated:
       return true;
   }
   throw std::invalid_argument("unsupported Flash-Next KV cache type");
@@ -64,9 +82,56 @@ static_assert(kKvRotatedNumericsEpoch > kKvCacheNumericsEpoch);
       return kKvCacheNumericsEpoch;
     case KvCacheType::kQ8_0Rotated:
       return kKvRotatedNumericsEpoch;
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ8_0Q4_0:
+    case KvCacheType::kQ4_0Rotated:
+    case KvCacheType::kQ8_0Q4_0Rotated:
+      return kKvQ4NumericsEpoch;
   }
   throw std::invalid_argument("unsupported Flash-Next KV cache type");
 }
+
+// Resolve a session policy to a storage-only row codec. Rotation is owned by
+// the producer, never by the codec or restore path.
+[[nodiscard]] constexpr KvCacheType KvKeyType(KvCacheType type) {
+  switch (type) {
+    case KvCacheType::kF16:
+      return KvCacheType::kF16;
+    case KvCacheType::kQ8_0:
+    case KvCacheType::kQ8_0Rotated:
+    case KvCacheType::kQ8_0Q4_0:
+    case KvCacheType::kQ8_0Q4_0Rotated:
+      return KvCacheType::kQ8_0;
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ4_0Rotated:
+      return KvCacheType::kQ4_0;
+  }
+  throw std::invalid_argument("unsupported Flash-Next KV cache type");
+}
+[[nodiscard]] constexpr KvCacheType KvValueType(KvCacheType type) {
+  if (type == KvCacheType::kQ8_0Q4_0 || type == KvCacheType::kQ8_0Q4_0Rotated)
+    return KvCacheType::kQ4_0;
+  return KvKeyType(type);
+}
+[[nodiscard]] constexpr bool KvIsPacked(KvCacheType type) {
+  return KvKeyType(type) != KvCacheType::kF16;
+}
+[[nodiscard]] constexpr std::uint32_t KvComponentLayoutVersion(
+    KvCacheType type) {
+  if (!IsKnownKvCacheType(type))
+    throw std::invalid_argument("unsupported Flash-Next KV cache type");
+  return static_cast<std::uint32_t>(type) + 1;
+}
+
+// Standard q4_0: signed F16 scale, low nibbles for coordinates 0..15,
+// high nibbles for 16..31. Nibbles represent signed codes offset by eight.
+struct KvBlockQ4_0 {
+  std::uint16_t scale;
+  std::uint8_t values[16];
+};
+static_assert(sizeof(KvBlockQ4_0) == 18);
+static_assert(offsetof(KvBlockQ4_0, values) == 2);
+static_assert(std::is_trivially_copyable_v<KvBlockQ4_0>);
 
 // Standard q8_0: IEEE F16 scale followed by 32 signed quantized values.
 // There is no inter-block padding. Serialized scales (also F16 rows) are
@@ -93,6 +158,14 @@ static_assert(std::is_trivially_copyable_v<KvBlockQ8_0>);
       return elements % kKvQ8BlockElements == 0 &&
              elements / kKvQ8BlockElements <=
                  std::numeric_limits<std::size_t>::max() / sizeof(KvBlockQ8_0);
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ4_0Rotated:
+      return elements % 32 == 0 &&
+             elements / 32 <=
+                 std::numeric_limits<std::size_t>::max() / sizeof(KvBlockQ4_0);
+    case KvCacheType::kQ8_0Q4_0:
+    case KvCacheType::kQ8_0Q4_0Rotated:
+      return false;  // No single row stride for a mixed policy.
   }
   return false;
 }
@@ -103,7 +176,9 @@ static_assert(std::is_trivially_copyable_v<KvBlockQ8_0>);
     throw std::invalid_argument("invalid Flash-Next KV row geometry");
   return type == KvCacheType::kF16
              ? std::size_t{elements} * 2
-             : std::size_t{elements / kKvQ8BlockElements} * sizeof(KvBlockQ8_0);
+             : std::size_t{elements / kKvQ8BlockElements} *
+                   (KvUsesQ8Codec(type) ? sizeof(KvBlockQ8_0)
+                                        : sizeof(KvBlockQ4_0));
 }
 
 [[nodiscard]] constexpr const char* KvCacheTypeName(KvCacheType type) {
@@ -114,6 +189,14 @@ static_assert(std::is_trivially_copyable_v<KvBlockQ8_0>);
       return "q8_0";
     case KvCacheType::kQ8_0Rotated:
       return "q8_0-rotated";
+    case KvCacheType::kQ4_0:
+      return "q4_0";
+    case KvCacheType::kQ8_0Q4_0:
+      return "q8_0/q4_0";
+    case KvCacheType::kQ4_0Rotated:
+      return "q4_0-rotated";
+    case KvCacheType::kQ8_0Q4_0Rotated:
+      return "q8_0/q4_0-rotated";
   }
   return "unknown";
 }
@@ -138,6 +221,10 @@ static_assert(std::is_trivially_copyable_v<KvBlockQ8_0>);
 // Decode rounds q * stored_scale to F16 before promoting to float. GPU scalar
 // attention/WMMA operands require IEEE value equality, with +0/-0 equivalent;
 // nonzero reconstructed values and packed bytes are not relaxed.
+//
+// q4 uses signed first-absmax / -8, F32 reciprocal, product then +8.5,
+// truncation/clamp[0,15]. Signed scales (including -0) are valid for q4.
+// Mixed session policies must be resolved with KvKeyType/KvValueType first.
 //
 // Exact buffer lengths are required. All APIs throw invalid_argument for
 // invalid geometry, nonfinite input/payload, negative scales (including -0),

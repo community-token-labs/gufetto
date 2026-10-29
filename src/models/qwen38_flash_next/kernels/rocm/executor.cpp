@@ -9,9 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -1063,8 +1063,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     AssignError(error_msg, "unsupported rotated Flash-Next KV geometry");
     return nullptr;
   }
-  if (!IsValidKvRow(c.AttentionKvDim(), options.kv_cache_type) ||
-      (options.kv_cache_type == KvCacheType::kQ8_0 && c.head_dim % 32 != 0)) {
+  if (!IsValidKvRow(c.AttentionKvDim(), KvKeyType(options.kv_cache_type)) ||
+      !IsValidKvRow(c.AttentionKvDim(), KvValueType(options.kv_cache_type)) ||
+      (KvIsPacked(options.kv_cache_type) && c.head_dim % 32 != 0)) {
     AssignError(error_msg,
                 "invalid Flash-Next KV cache type or block geometry");
     return nullptr;
@@ -1111,8 +1112,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   auto& a = e->allocations_;
   const auto view_limit = WmmaCausalAttentionContextLimit(
       c.num_heads, c.num_kv_heads, c.head_dim, c.compress_ratio);
-  if (options.kv_cache_type == KvCacheType::kQ8_0 && T >= 256 &&
-      MatrixRows(T) && view_limit != 0) {
+  if (KvIsPacked(options.kv_cache_type) &&
+      !KvIsRotated(options.kv_cache_type) && T >= 256 && MatrixRows(T) &&
+      view_limit != 0) {
     e->q8_prefill_capacity_ = detail::Q8PrefillViewCapacity(
         options.max_context, e->context_capacity_, view_limit);
     const std::size_t rows = e->q8_prefill_capacity_;
@@ -1495,8 +1497,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
-  const std::size_t kv_row =
-      KvRowBytes(c.AttentionKvDim(), options_.kv_cache_type);
+  const std::size_t key_row =
+      KvRowBytes(c.AttentionKvDim(), KvKeyType(options_.kv_cache_type));
+  const std::size_t value_row =
+      KvRowBytes(c.AttentionKvDim(), KvValueType(options_.kv_cache_type));
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
@@ -1509,12 +1513,12 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache =
-          Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
-                              error_msg, &s->allocated_bytes_);
-      at.v_cache =
-          Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
-                              error_msg, &s->allocated_bytes_);
+      at.k_cache = Alloc<std::uint8_t>(
+          a, static_cast<std::size_t>(max_context) * key_row, error_msg,
+          &s->allocated_bytes_);
+      at.v_cache = Alloc<std::uint8_t>(
+          a, static_cast<std::size_t>(max_context) * value_row, error_msg,
+          &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
@@ -1536,11 +1540,11 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
-        Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
+        Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * key_row,
                             error_msg, &s->allocated_bytes_);
-    s->mtp_.v_cache =
-        Alloc<std::uint8_t>(a, static_cast<std::size_t>(max_context) * kv_row,
-                            error_msg, &s->allocated_bytes_);
+    s->mtp_.v_cache = Alloc<std::uint8_t>(
+        a, static_cast<std::size_t>(max_context) * value_row, error_msg,
+        &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
@@ -1701,8 +1705,10 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const std::size_t kv = 2 * std::size_t{max_context} *
-                         KvRowBytes(c.AttentionKvDim(), options_.kv_cache_type);
+  const std::size_t kv =
+      std::size_t{max_context} *
+      (KvRowBytes(c.AttentionKvDim(), KvKeyType(options_.kv_cache_type)) +
+       KvRowBytes(c.AttentionKvDim(), KvValueType(options_.kv_cache_type)));
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
           c.indexer_head_dim * sizeof(float) +
@@ -2822,24 +2828,24 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       } else
 #endif
       {
-      // The Z rows feed only the output norm: the side stream computes them
-      // beside the convolution boundary, the alpha/beta GEMM and the
-      // recurrence; the epilogue waits for them before it reads z. With the
-      // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
-      // pp2048 and pp4096 within 1 %.
-      convolved = DenseF16SsmGemm(
-          l.ssm_in.data, static_cast<const __half*>(s_.x_half),
-          l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
-          l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_,
-          checkpoint.tokens, side_stream_, side_start_);
-      if (convolved) {
-        if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
-                   error_msg)) {
-          (void)hipStreamSynchronize(side_stream_);
-          return false;
-        }
-        z_ready = side_done_;
-        z_join.event = side_done_;
+        // The Z rows feed only the output norm: the side stream computes them
+        // beside the convolution boundary, the alpha/beta GEMM and the
+        // recurrence; the epilogue waits for them before it reads z. With the
+        // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
+        // pp2048 and pp4096 within 1 %.
+        convolved = DenseF16SsmGemm(
+            l.ssm_in.data, static_cast<const __half*>(s_.x_half),
+            l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
+            n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
+            stream_, checkpoint.tokens, side_stream_, side_start_);
+        if (convolved) {
+          if (!Check(hipEventRecord(side_done_, side_stream_),
+                     "side stream join", error_msg)) {
+            (void)hipStreamSynchronize(side_stream_);
+            return false;
+          }
+          z_ready = side_done_;
+          z_join.event = side_done_;
         }
       }
     }
@@ -2947,7 +2953,8 @@ bool Executor::ProduceCacheOnlyKv(const DeviceLayer& l, float* key,
       [&](bool is_value) {
         StoreKv(is_value ? value : key, is_value ? value_cache : key_cache,
                 rows, c.AttentionKvDim(), position, stream_,
-                options_.kv_cache_type);
+                is_value ? KvValueType(options_.kv_cache_type)
+                         : KvKeyType(options_.kv_cache_type));
       });
   if (!ok)
     AssignError(error_msg, "rotated cache-only producer geometry failed");
@@ -2966,7 +2973,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          bool qkv_only_precomputed) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
-  const bool view_eligible = options_.kv_cache_type == KvCacheType::kQ8_0 &&
+  const bool view_eligible = KvIsPacked(options_.kv_cache_type) &&
+                             !KvIsRotated(options_.kv_cache_type) &&
                              n_tokens >= 256 && MatrixRows(n_tokens) &&
                              !last_only && (!has_mtp() || &l != &model_->mtp());
   if (view_eligible &&
@@ -3108,9 +3116,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       return false;
     }
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_,
-            options_.kv_cache_type);
+            KvKeyType(options_.kv_cache_type));
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_,
-            options_.kv_cache_type);
+            KvValueType(options_.kv_cache_type));
   }
 
   // Raw keys survive only until pooling. The ring holds the initial
@@ -3209,7 +3217,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     if (q8_prefill_k_f16_ == nullptr || q8_prefill_v_f16_ == nullptr ||
         !DequantizeQ8Kv(s.k_cache, s.v_cache, q8_prefill_k_f16_,
                         q8_prefill_v_f16_, start_pos + n_tokens, kv_row,
-                        stream_)) {
+                        stream_, options_.kv_cache_type)) {
       AssignError(error_msg, "q8 prefill F16 view reconstruction failed");
       return false;
     }
@@ -3411,9 +3419,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       npu_shexp_groups == 0 &&
 #endif
       ExpertMatrixRows(n_tokens) && !last_only &&
-                       l.shexp_gate.type == GgmlType::kQ8_0 &&
-                       l.shexp_up.type == GgmlType::kQ8_0 &&
-                       l.shexp_down.type == GgmlType::kQ8_0;
+      l.shexp_gate.type == GgmlType::kQ8_0 &&
+      l.shexp_up.type == GgmlType::kQ8_0 &&
+      l.shexp_down.type == GgmlType::kQ8_0;
   const hipStream_t main = stream_;
   if (overlap) {
     if (!Check(hipEventRecord(side_start_, main), "side stream fork",
@@ -4791,9 +4799,9 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
               std::uint64_t{h.ple_elems} * sizeof(float), "PLE history")) {
     return 0;
   }
-  const auto kv_row_bytes =
-      KvRowBytes(h.kv_row, static_cast<KvCacheType>(h.kv_cache_type));
-  const std::uint64_t kv_bytes = std::uint64_t{h.position} * kv_row_bytes;
+  const auto policy = static_cast<KvCacheType>(h.kv_cache_type);
+  const auto key_row_bytes = KvRowBytes(h.kv_row, KvKeyType(policy));
+  const auto value_row_bytes = KvRowBytes(h.kv_row, KvValueType(policy));
   const std::uint64_t index_row_bytes =
       std::uint64_t{h.indexer_head_dim} * sizeof(float);
   const std::uint32_t index_begin = h.blocks * h.compress_ratio;
@@ -4803,10 +4811,12 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache",
-                  kv_row_bytes, false, false, true) ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache",
-                  kv_row_bytes, false, false, true)) {
+      if (!region(at != nullptr ? at->k_cache : nullptr,
+                  std::uint64_t{h.position} * key_row_bytes, "K cache",
+                  key_row_bytes, false, false, true) ||
+          !region(at != nullptr ? at->v_cache : nullptr,
+                  std::uint64_t{h.position} * value_row_bytes, "V cache",
+                  value_row_bytes, false, false, true)) {
         return 0;
       }
       // Serialize only unpooled rows, in chronological order. The physical
@@ -4853,12 +4863,12 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
             "draft pooled keys",
             std::uint64_t{h.indexer_head_dim} * sizeof(__half), true, true))
       return 0;
-    const std::uint64_t mtp_kv_bytes =
-        std::uint64_t{h.mtp_position} * kv_row_bytes;
-    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
-                "draft K cache", kv_row_bytes, true, false, true) ||
-        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
-                "draft V cache", kv_row_bytes, true, false, true) ||
+    if (!region(mtp != nullptr ? mtp->k_cache : nullptr,
+                std::uint64_t{h.mtp_position} * key_row_bytes, "draft K cache",
+                key_row_bytes, true, false, true) ||
+        !region(mtp != nullptr ? mtp->v_cache : nullptr,
+                std::uint64_t{h.mtp_position} * value_row_bytes,
+                "draft V cache", value_row_bytes, true, false, true) ||
         !region(
             mtp != nullptr ? mtp->h : nullptr,
             h.mtp_residual_valid ? std::uint64_t{h.hc_dim} * sizeof(float) : 0,
@@ -5116,7 +5126,7 @@ bool Executor::RestoreSnapshot(Session& session,
   // Untrusted byte payloads are validated completely before changing any
   // session state. A deferred in-process snapshot borrows canonical live
   // storage, not these as-yet-unmaterialized host rows.
-  if (KvUsesQ8Codec(session.kv_cache_type_) && deferred == nullptr) {
+  if (KvIsPacked(session.kv_cache_type_) && deferred == nullptr) {
     try {
       WalkSnapshot(
           h, nullptr,
@@ -5126,7 +5136,11 @@ bool Executor::RestoreSnapshot(Session& session,
               for (std::uint64_t row = 0; row < bytes; row += row_bytes)
                 ValidateKvRow(
                     std::as_bytes(payload.subspan(offset + row, row_bytes)),
-                    h.kv_row, KvCacheType::kQ8_0);
+                    h.kv_row,
+                    row_bytes == KvRowBytes(h.kv_row,
+                                            KvValueType(session.kv_cache_type_))
+                        ? KvValueType(session.kv_cache_type_)
+                        : KvKeyType(session.kv_cache_type_));
             }
             return true;
           });

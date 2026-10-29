@@ -22,8 +22,8 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/os_info.hpp"
-#include "src/models/qwen38_flash_next/kv_cache.hpp"
 #include "src/core/platform/runtime_fingerprint.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::server {
 namespace {
@@ -66,7 +66,8 @@ bool PackedKvIngress(const TextRunnerDescriptor& descriptor,
   // Inspect the registered append layout even without a durable fingerprint.
   if (std::ranges::any_of(components, [](const auto& c) {
         return c.kind == cache::ComponentKind::kAppendRows &&
-               c.layout_version == 2;
+               (c.layout_version == 2 ||
+                (c.layout_version >= 4 && c.layout_version <= 7));
       }))
     return true;
   return RotatedPackedIngress(descriptor, components);

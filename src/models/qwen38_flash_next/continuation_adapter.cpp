@@ -787,11 +787,14 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
     if (!row || first > end || end > state.expected[id.value - 1].valid_rows ||
         bytes.size() != (end - first) * row)
       throw std::invalid_argument("invalid Flash-Next row restore");
-    if (KvUsesQ8Codec(model_->CacheType()) && OrdinaryKv(component.part)) {
+    if (KvIsPacked(model_->CacheType()) && OrdinaryKv(component.part)) {
       // Validate the canonical packed payload; restoration never re-encodes it.
       // Check every row before submitting any device copy for this piece.
       ValidatePackedRows(bytes, model_->config().AttentionKvDim(), row,
-                         model_->CacheType());
+                         component.part == ContinuationPart::kValue ||
+                                 component.part == ContinuationPart::kDraftValue
+                             ? KvValueType(model_->CacheType())
+                             : KvKeyType(model_->CacheType()));
     }
     auto* destination =
         bytes.empty()
