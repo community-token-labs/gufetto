@@ -2744,6 +2744,144 @@ void UnbackedDeepRowsSurviveDiskRestart() {
   }
   std::filesystem::remove_all(directory);
 }
+// Reproduces staging starvation, not the still-unproven native R61 substage.
+// Capacity changes can use the protected case as a gate: its current outcome is
+// explicit refusal, whereas the same budget with a reclaimable grid publishes.
+void PinnedWriterAndProtectedGridRefuseDurableCapture() {
+  struct Gate {
+    std::atomic<bool> entered{false};
+    std::binary_semaphore reading{0}, release{0};
+  };
+  struct HeldRunner final : Runner {
+    std::shared_ptr<Gate> gate = std::make_shared<Gate>();
+    mutable bool refuse_plan{};
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->can_capture = [this](auto) { return !refuse_plan; };
+      resources->copy_observed_rows =
+          [gate = gate, copy = resources->copy_observed_rows](
+              auto source, auto destination, cache::Stream& stream) {
+            if (!gate->entered.exchange(true)) {
+              gate->reading.release();
+              gate->release.acquire();
+            }
+            return copy(source, destination, stream);
+          };
+      return resources;
+    }
+  };
+  struct ReleaseWriter {
+    std::shared_ptr<Gate> gate;
+    bool released{};
+    void Release() {
+      if (!released) {
+        released = true;
+        gate->release.release();
+      }
+    }
+    ~ReleaseWriter() { Release(); }
+  };
+  for (const int mode : {0, 1, 2}) {
+    const bool protect = mode != 0;
+    const TemporaryDirectory temp("gufo-component-pinned-grid-refusal");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                          .capacity_bytes = 1 << 20,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<HeldRunner>();
+    runner->private_blocks = 2;
+    const std::vector<TextRunnerToken> other{90, 91, 92, 93};
+    const std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
+    std::uint64_t hash{};
+    const auto previous_level = Logger::Level();
+    Logger::SetLevel(LogLevel::kInfo);
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+    {
+      ComponentTextCache cache(runner, 2, 1 << 22, disk);
+      const auto append = [&](auto& lease, auto tokens) {
+        auto& state = dynamic_cast<State&>(lease->state());
+        runner->adapter->Append(state.slot, tokens, tokens);
+      };
+      const auto capture = [](auto& lease, auto tokens,
+                              SnapshotPurpose purpose) {
+        assert(lease->TryReserveSnapshot(lease->CaptureBytes(), tokens.size(),
+                                         false, purpose, tokens));
+        return lease->PublishSnapshot({tokens.begin(), tokens.end()},
+                                      lease->Capture(), false);
+      };
+      auto pinned = cache.Acquire(other, {}, {}, true, 0, true);
+      ReleaseWriter release_writer{runner->gate};
+      append(pinned, std::span(other));
+      assert(capture(pinned, std::span(other), SnapshotPurpose::kContinuation));
+      assert(runner->gate->reading.try_acquire_for(std::chrono::seconds(5)));
+      const auto queued = *pinned->Metrics().persistence;
+      assert(queued.pending == 1 && queued.pinned_bytes > 0);
+      // Keep this slot busy, so the controlled second slot is reassigned.
+      if (!protect) {
+        const std::vector<TextRunnerToken> old{70, 71};
+        auto grid = cache.Acquire(old, {}, {}, true, 0, true);
+        append(grid, std::span(old));
+        assert(capture(grid, std::span(old), SnapshotPurpose::kHistory));
+        (void)grid->Commit(old, {}, old);
+      }
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      if (protect) {
+        append(lease, std::span(prompt).first(2));
+        assert(capture(lease, std::span(prompt).first(2),
+                       SnapshotPurpose::kHistory));
+        append(lease, std::span(prompt).subspan(2));
+      } else {
+        append(lease, std::span(prompt));
+      }
+      auto& state = dynamic_cast<State&>(lease->state());
+      hash = runner->adapter->RecurrentHash(state.slot);
+      runner->refuse_plan = mode == 2;
+      bool refused{};
+      try {
+        assert(
+            capture(lease, std::span(prompt), SnapshotPurpose::kContinuation));
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      assert(refused == protect);
+      assert((lease->Metrics().disk_queued_bytes == 0) == protect);
+      // The held write remains intact; a refusal never claims D durable.
+      assert(lease->Metrics().persistence->completed == 0);
+      release_writer.Release();
+      (void)lease->Commit(prompt, {}, prompt);
+      (void)pinned->Commit(other, {}, other);
+      for (int i = 0; i < 500 && lease->Metrics().persistence->pending; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      const auto settled = *lease->Metrics().persistence;
+      assert(settled.pending == 0 && settled.failed == 0);
+      assert(settled.completed == (protect ? 1U : 2U));
+    }
+    std::clog.rdbuf(previous_sink);
+    Logger::SetLevel(previous_level);
+    const auto log = output.str();
+    if (protect) {
+      assert(log.find(mode == 2 ? "route=durable stage=can_capture"
+                                : "route=durable stage=allocate") !=
+             std::string::npos);
+      assert(log.find("protected_count=1") != std::string::npos);
+      assert(log.find("backing_free_bytes=") != std::string::npos);
+    } else {
+      assert(log.find("event=capture_refused") == std::string::npos);
+    }
+    auto restored_runner = std::make_shared<Runner>();
+    ComponentTextCache restarted(restored_runner, 1, 1 << 22, disk);
+    auto warm = restarted.Acquire(prompt, {}, {}, true, 0, true);
+    assert(warm->restored_from_disk() == !protect);
+    assert(warm->cached_tokens() == (protect ? 0U : prompt.size()));
+    if (!protect) {
+      auto& state = dynamic_cast<State&>(warm->state());
+      assert(restored_runner->adapter->RecurrentHash(state.slot) == hash);
+    }
+    warm->Invalidate();
+  }
+}
+
 void RamRefusalDiskDirectRestartContract() {
   enum class Case {
     kRamOnly,
@@ -4501,6 +4639,7 @@ int main(int argc, char* argv[]) {
     NearTailDiskBranchSurvivesRestart();
     UnbackedDeepRowsSurviveDiskRestart();
     RamRefusalDiskDirectRestartContract();
+    PinnedWriterAndProtectedGridRefuseDurableCapture();
   });
   run("ram", [] {
     OverRamCaptureStagesPrivateStateUnderPressure(false);
