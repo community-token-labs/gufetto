@@ -48,11 +48,11 @@ an `end_ns`: the scope also closes on handled failures/cancellation.
 | `schema` | Integer `1`. |
 | `run_id`, `pid`, `thread_id` | Process-start trace monotonic timestamp, OS PID and process-local scheduler thread number. Partition all analyses by this tuple; counters/slots can repeat across runs or workers. |
 | `start_ns`, `end_ns` | Inclusive host scope boundaries, before serialization. Sorted units and their gaps reconstruct the scheduler timeline. |
-| `kind` | `prefill`, `decode_batch`, `decode_single`, `capture`, `admit`, or `idle-wait`. Decode kind is the scheduler-selected physical cohort, not a guarantee all selected lanes survive preparation. |
+| `kind` | `prefill`, `decode_batch`, `decode_single`, `capture`, `admit`, `idle-wait`, `request_submit`, or `request_terminal`. Decode kind is the scheduler-selected physical cohort, not a guarantee all selected lanes survive preparation. |
 | `queue.prefilling_waiting` | Runnable prefill deque size immediately before selection (includes the selected prefiller). |
 | `queue.decoders_due` | Number with `decode_due` set before selection; not all resident decoders necessarily have that flag set. |
 | `queue.capturing`, `queue.waiting` | Capture-parked and cold shared-prefix/publication-waiting counts. These are not incoming HTTP queue lengths. Admission samples these after popping the arrival. |
-| `sessions[]` | Selected/reserved `{slot, request_id, context_depth, rows, accepted_tokens}`. Numeric slot IDs can be reused; use request ID too. Admission depth is zero before restoring state. Capture depth is the retained prompt frontier. Decode depth is the logical committed context at dispatch, excluding a published-but-not-evaluated preview/pending advance. |
+| `sessions[]` | Selected/reserved `{slot, request_id, context_depth, rows, accepted_tokens, attribution_request_id}`. The last field explicitly joins the process/run-unique trace identity even when cancellation precedes execution. Numeric slot IDs can be reused; use request ID too. Admission depth is zero before restoring state. Capture depth is the retained prompt frontier. Decode depth is the logical committed context at dispatch, excluding a published-but-not-evaluated preview/pending advance. |
 | `sessions[].rows` | On successful decode, anchor + proposed verifier rows (including prompt-lookup proposals), summed on serial fallback. Zero means no successful decode result; for non-decode units it is zero. |
 | `sessions[].accepted_tokens` | Engine/pool committed selections returned by the decode, including anchor, before transport/stop-sequence publication. It is not necessarily the number of newly streamed tokens (first-token preview can have been streamed already). |
 | `tokens_budget` | Scheduler prefill budget, before checkpoint/native capacity clipping. |
@@ -60,8 +60,8 @@ an `end_ns`: the scope also closes on handled failures/cancellation.
 | `tokens_processed` | Actual successful prefill consumption; zero on early exit/failure. |
 | `through` | Pool chose the in-pass `PrefillThrough` route. |
 | `checkpoint` | Engine requested a native in-pass checkpoint within `Feed`. Not a claim that an async capture has finished, and not a census of ordinary boundary snapshots. |
-| `forwards[]` | Actual target-forward attempts: `{forward, prefill, sessions:[{context_depth,rows}]}`. Depths/row widths come directly from native session state and input spans. Ordered packed lanes may be a subset of the scheduler cohort after cancellation/fallback. These native shapes are authoritative for timing aggregation; they intentionally contain no native pointers or token IDs. |
-| `phases[]` | `{name,start_ns,end_ns}` host intervals. Repeated names are separate calls. Some intervals nest: do not sum all phases into one total. |
+| `forwards[]` | Actual target-forward attempts: `{forward, prefill, sessions:[{context_depth,rows,request_id,native_session}]}`. Depths/row widths come from native state/input spans. Packed lanes may be a subset after cancellation/fallback. `request_id` is the attribution identity, not the legacy scheduler ID; unknown bindings are null. `native_session` is a process-local address used only to join existing diagnostic maps, never a stable identity or state proof. No token IDs are recorded. |
+| `phases[]` | `{name,start_ns,end_ns,request_id,forward}` host intervals. Zero request/forward means unbound. Repeated names are separate calls. Some intervals nest: do not sum all phases into one total. |
 | `gpu[]` | `{forward,host_start_ns,host_end_ns,stream_elapsed_ns}` for completed target forwards. Two timing-enabled HIP events, allocated once per executor, surround compute-stream target work outside graph capture. The end event is queued before the existing stream synchronization; querying elapsed time adds no extra synchronization. Missing entries mean unsuccessful/unavailable measurements, not zero GPU work. |
 | `route_waits[]` | `{forward,layer,count,ns}` summed host wait at the existing `RouteHints` expert-count event synchronization. Present without MoE sampling. Layers are zero-based trunk layers. This measures the **unhidden host wait**, not the copy's device duration or the whole RouteHints tile-map construction. Predictor waits are excluded. |
 | `moe[]` | Sampled `{forward,layer,rows,group,experts}`; group is `prompt` or `decoder`. `experts` is exactly 128 lowercase hex digits, a 512-bit integer: bit e means expert e was touched. Expert 0 is the low bit/rightmost digit; expert 511 is the high bit/leftmost digit. Decoder set is the union of all packed decoder rows, including speculative rows ultimately rejected. Predictor MoE is excluded. |
@@ -72,8 +72,56 @@ multiple native forwards, so join layer/wait/GPU entries using that counter.
 For a shortened final prefill layer, `moe[].rows` describes only the rows actually
 routed by the existing final-layer optimization, not imaginary skipped rows.
 
+### Attribution version 1
+
+`attribution` extends the same schema-1 sink and host clock used by persistence
+transfer phases; it does not add a second writer or copy the persistence worker's
+hooks. Transfer enqueue/event/drain records can coexist with these records. Do not
+sum parent/child phases or mistake transfer-stream waits for foreground GPU idle.
+
+- `work_id`: process/run-unique diagnostic ID, not a contiguous sequence.
+- `ready[]`: frozen identities of the decode-ready queue before a scheduler work
+  selection. For prefill this is the candidate roster, not a reservation or proof
+  that these requests survive cancellation, capture preparation or model filtering.
+- `execution[]`: distinct identities entering actual runner calls; native bindings
+  are filled before model filtering. A failed call still appears here. Forward rows,
+  not roster length, describe actual attempted target geometry.
+- `events[]`: `submit`, first `admit`, native `token`, and `terminal`, with integer
+  `time_ns`, one-based token `ordinal` (terminal carries total count) and `burst_id`.
+  Each preview/scalar selection and each returned multi-token selection group has
+  its own burst; lifecycle events use zero. Submit carries the request's original
+  `request_start` clock (the same origin as TTFT), not the later trace-write time.
+  A terminal is not an invented last token and does not certify success.
+  Native publication precedes SSE delivery and can include empty decoded text or
+  text suppressed by stop filtering. It is not a transport timestamp.
+- Each identity contains `request_id` (process/run-unique trace generation),
+  `native_request_id` (legacy scheduler ID), `slot`, `slot_generation` (unique
+  trace generation when bound), and `logical_agent` (opaque ID for the supplied
+  client label, including the shared `anonymous` label). Slot/generation zero at
+  submit is unbound. Do not infer distinct real agents from anonymous requests.
+  The content trace's `attribution_request_id` supplies an explicit HTTP join when
+  that separately sensitive trace is enabled; the performance trace records no
+  raw client labels or HTTP identifiers.
+- `dropped`: new collection overflow/allocation failure count. Each attribution
+  vector and phase vector is capped at 4096 entries per work; the runner binding
+  roster is capped at 64. The logical-agent dictionary retains at most 4096 labels
+  of at most 256 bytes each. Missing labels/overflow invalidate qualification.
+  These bounds do not retroactively bound the older detailed MoE collector.
+
+Nested terminal records can flush before the enclosing decode record. Sort by
+native timestamps, not file order. Work IDs, request IDs, native addresses and
+context depth are not numerical starting-state certificates. The model hooks
+only bind existing sessions and forward rows: no kernel, HIP event, dispatch,
+checkpoint, sampler or scheduling change. Generic paths without a native binding
+stay null instead of borrowing another lane's identity.
+
 ### Host phase names and owners
 
+- `admission_acquire`: scheduler's pool acquisition, including any lookup/restore;
+  not an isolated restore or GPU duration.
+- `prefill_service`: scheduler's actual pool prefill call, after budget selection.
+- `snapshot_prepare`: first-snapshot preparation or pending advance snapshot join;
+  request-tagged even inside a shared scheduler work unit.
 - `draft_catchup`, `draft_catchup_batch`: `Session::DraftCatchUp{,Batch}`. Scalar
   catch-up can also compute the first proposal head when requested by the caller.
 - `mtp_proposal_round`: scalar `PrepareDecode` proposal loop and
@@ -124,6 +172,27 @@ maintains `bench/perf_trace_report.py`; it is not a Gufo runtime dependency.
 Partition by run/thread/forward, distinguish selected scheduler cohorts from
 successful native forwards, and keep incomplete/failed work visible. Expert
 set overlap is observational, not predicted weight reuse or concurrency.
+
+For native publication exposure and explicit burst metrics:
+
+```sh
+python3 tools/prof/pd_attribution.py trace.jsonl > attribution.json
+```
+
+The CPU reader requires an explicit prefiller identity join and exactly one
+correctly ordered admission for every token-producing request. A new prefill
+before the next decode invalidates the earlier candidate association rather than
+claiming one target twice. It joins completed decoder gaps to the union of peer prefill scopes,
+including gaps ending after prefill. It reports nearest-rank quantiles,
+intersection-weighted p95, stall area above 500 ms, inter-burst versus inter-work
+gaps, and terminal censored-silence lower bounds. Missing/dropped/ambiguous data
+stays INCONCLUSIVE; at least 20 completed exposed gaps per request and burst
+series are needed even for sample sufficiency. `SUFFICIENT_SAMPLES` is **not** a
+performance PASS. The reader preserves first-target candidate joins but does not
+compute U/L/H, certify same-cut/state equivalence, compare arms or authorize an
+operator prototype. Host duration is not routed-kernel removal. `pd-profile-v1`
+sidecars are recognized but remain separate diagnostic evidence. Whole-record
+loss without a completeness manifest remains undetectable.
 
 CPU tests cover disabled collection, scope restoration, integer/bitset
 serialization and concurrent whole-line append. The integrated GPU event path,
