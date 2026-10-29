@@ -13,6 +13,7 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(npu_contracts gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 # Host-only production serialization slices with explicit Model/executor proxies.
