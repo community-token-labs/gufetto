@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -18,14 +19,14 @@
 namespace gufo::platform {
 namespace {
 
-#if defined(_WIN32)
 using Handler = ShutdownSignalGuard::Handler;
-// Read by the console-handler thread; the atomic plus the local-copy
-// pattern below keep an in-flight callback racing teardown well-defined:
+// Read by programmatic requesters and the console-handler thread. The atomic
+// local-copy pattern keeps an in-flight callback racing teardown well-defined:
 // a callback that loaded the pointer before teardown completes its single
 // atomic-store side effect on process-lifetime state, and one that loads
-// after the null store returns without calling.
+// after the null store never calls the stale target.
 std::atomic<Handler> g_active_handler{nullptr};
+#if defined(_WIN32)
 std::atomic<bool> g_cleanup_complete{false};
 
 BOOL WINAPI ConsoleEventRouter(DWORD event) noexcept {
@@ -95,14 +96,16 @@ ShutdownSignalGuard::ShutdownSignalGuard(Handler handler) {
     throw std::system_error(error, std::generic_category(),
                             "install SIGTERM handler");
   }
+  g_active_handler.store(handler, std::memory_order_release);
   installed_ = true;
 #endif
 }
 
 ShutdownSignalGuard::~ShutdownSignalGuard() {
+  if (installed_)
+    g_active_handler.store(nullptr, std::memory_order_release);
 #if defined(_WIN32)
   if (installed_) {
-    g_active_handler.store(nullptr, std::memory_order_release);
     SetConsoleCtrlHandler(ConsoleEventRouter, FALSE);
   }
 #else
@@ -111,6 +114,23 @@ ShutdownSignalGuard::~ShutdownSignalGuard() {
     (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
   }
 #endif
+}
+
+[[noreturn]] void ExitAfterDeviceLoss() noexcept {
+  std::_Exit(75);
+}
+
+void RequestDeviceLossShutdown() noexcept {
+  const auto handler = g_active_handler.load(std::memory_order_acquire);
+  if (!handler)
+    ExitAfterDeviceLoss();
+  // Like the Windows console router: a loaded handler may finish after guard
+  // teardown, so its atomic-only target must have process lifetime.
+  try {
+    handler(SIGTERM);
+  } catch (...) {
+    ExitAfterDeviceLoss();
+  }
 }
 
 void NotifyShutdownHandled() noexcept {

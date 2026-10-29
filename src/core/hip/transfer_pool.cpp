@@ -8,44 +8,72 @@
 #include <vector>
 
 #include "src/core/perf_trace.hpp"
+#include "src/core/platform/shutdown_signal.hpp"
 
 namespace gufo::hip {
 namespace {
+std::atomic<FatalCopyHandler> fatal_handler{};
+std::atomic<bool> fault_unsettled{};
+void CheckTransfer(hipError_t status, const char* operation,
+                   FatalCopyInfo info = {}) noexcept {
+  if (status != hipSuccess && !fault_unsettled.exchange(true)) {
+    info.operation = operation;
+    info.error = static_cast<int>(status);
+    try {
+      if (const auto handler = fatal_handler.load())
+        handler(info);
+    } catch (...) {
+    }
+    // Missing, throwing or returning notification cannot release any owners.
+    platform::ExitAfterDeviceLoss();
+  }
+  // A different transfer already faulted. Retain this caller's owners too;
+  // only the serving watchdog/process exit may end this wait, not HIP success.
+  while (fault_unsettled.load())
+    fault_unsettled.wait(true);
+}
 void Check(hipError_t status) {
   if (status != hipSuccess)
     throw std::runtime_error(hipGetErrorString(status));
 }
 }  // namespace
+void SetFatalCopyHandler(FatalCopyHandler handler) noexcept {
+  fatal_handler.store(handler);
+}
 namespace detail {
 struct TransferPoolState {
   struct Slot {
     hipStream_t stream{};
     hipEvent_t event{};
     bool busy{};
-    bool failed{};
   };
   std::mutex mutex;
   std::vector<Slot> slots;
   ~TransferPoolState() {
+    CheckTransfer(hipSuccess, "hipStreamSynchronize");
     for (auto& slot : slots) {
       if (slot.stream) {
-        (void)hipStreamSynchronize(slot.stream);
-        (void)hipStreamDestroy(slot.stream);
+        CheckTransfer(hipStreamSynchronize(slot.stream),
+                      "hipStreamSynchronize");
+        CheckTransfer(hipStreamDestroy(slot.stream), "hipStreamDestroy");
       }
       if (slot.event)
-        (void)hipEventDestroy(slot.event);
+        CheckTransfer(hipEventDestroy(slot.event), "hipEventDestroy");
     }
   }
 };
 struct TransferLease {
   std::shared_ptr<TransferPoolState> state;
   std::size_t index;
-  std::atomic<bool> failed{false};
   bool sealed{};
   bool claimed{};
   bool native_used{};
   hipStream_t bound_stream{};
   std::shared_ptr<void> bound_owner;
+  FatalCopyInfo context{};
+  void Check(hipError_t status, const char* operation) const noexcept {
+    CheckTransfer(status, operation, context);
+  }
   TransferLease(std::shared_ptr<TransferPoolState> state, std::size_t index)
       : state(std::move(state)), index(index) {}
   auto& Slot() const { return state->slots[index]; }
@@ -53,14 +81,13 @@ struct TransferLease {
     return bound_stream ? bound_stream : Slot().stream;
   }
   cache::TransferResult Drain(const char* phase_name) noexcept {
+    Check(hipSuccess, "hipStreamSynchronize");
     const auto status = [&] {
       perf::HostPhase phase(phase_name);
       return hipStreamSynchronize(Stream());
     }();
-    if (status != hipSuccess)
-      failed = true;
-    return failed ? cache::TransferResult::kFailed
-                  : cache::TransferResult::kSucceeded;
+    Check(status, "hipStreamSynchronize");
+    return cache::TransferResult::kSucceeded;
   }
   ~TransferLease() {
     // Metadata allocation may fail before any slot is claimed. Such a lease
@@ -70,7 +97,6 @@ struct TransferLease {
     (void)Drain(bound_stream ? "hip_transfer_bound_lease_destructor_drain"
                              : "hip_transfer_owned_lease_destructor_drain");
     const std::lock_guard lock(state->mutex);
-    Slot().failed = failed;
     Slot().busy = false;
   }
 };
@@ -81,22 +107,22 @@ public:
   explicit TransferSignal(std::shared_ptr<detail::TransferLease> lease)
       : lease_(std::move(lease)) {}
   bool Ready() const noexcept override {
+    lease_->Check(hipSuccess, "hipEventQuery");
     const auto status = hipEventQuery(lease_->Slot().event);
-    if (status != hipSuccess && status != hipErrorNotReady)
-      lease_->failed = true;
-    // A query error is not proof that buffer access has stopped.
+    lease_->Check(status == hipErrorNotReady ? hipSuccess : status,
+                  "hipEventQuery");
     return status == hipSuccess;
   }
   cache::TransferResult Wait() noexcept override {
+    lease_->Check(hipSuccess, "hipEventSynchronize");
     const auto status = [&] {
       perf::HostPhase phase(lease_->bound_stream
                                 ? "hip_transfer_bound_event_wait"
                                 : "hip_transfer_owned_event_wait");
       return hipEventSynchronize(lease_->Slot().event);
     }();
-    if (status != hipSuccess)
-      lease_->failed = true;
-    // Drain also on error; adapters may have submitted work through Native.
+    lease_->Check(status, "hipEventSynchronize");
+    // Healthy event paths retain the existing drain for external Native work.
     return lease_->Drain(lease_->bound_stream
                              ? "hip_transfer_bound_wait_drain"
                              : "hip_transfer_owned_wait_drain");
@@ -117,15 +143,21 @@ TransferStream::~TransferStream() {
 void TransferStream::BindTo(hipStream_t stream, std::shared_ptr<void> owner) {
   if (!stream || !owner)
     throw std::invalid_argument("bound transfer requires a stream owner");
-  if (lease_->sealed || lease_->failed || lease_->native_used ||
-      lease_->bound_stream)
+  if (lease_->sealed || lease_->native_used || lease_->bound_stream)
     throw std::logic_error("transfer stream was already used");
   lease_->bound_stream = stream;
   lease_->bound_owner = std::move(owner);
 }
+void TransferStream::SetPersistenceContext(std::uint64_t entry,
+                                           std::uint64_t bytes) noexcept {
+  lease_->context.has_entry_id = true;
+  lease_->context.entry_id = entry;
+  lease_->context.bytes = bytes;
+}
 hipStream_t TransferStream::Native() const {
-  if (lease_->sealed || lease_->failed)
-    throw std::logic_error("transfer stream is sealed or failed");
+  lease_->Check(hipSuccess, "hipStreamSynchronize");
+  if (lease_->sealed)
+    throw std::logic_error("transfer stream is sealed");
   lease_->native_used = true;
   return lease_->Stream();
 }
@@ -135,10 +167,11 @@ cache::TransferResult TransferStream::Synchronize() noexcept {
                            : "hip_transfer_owned_synchronize_drain");
 }
 cache::Completion TransferStream::Complete() {
+  return Finish(std::make_unique<TransferSignal>(lease_));
+}
+cache::Completion TransferStream::Finish(
+    std::unique_ptr<cache::CompletionSignal> signal) {
   const auto stream = Native();
-  // Allocate host metadata before recording; on an allocation failure the
-  // caller still owns the stream and must drain any Native work.
-  auto signal = std::make_unique<TransferSignal>(lease_);
   const auto status = [&] {
     perf::HostPhase phase(lease_->bound_stream
                               ? "hip_transfer_bound_event_record"
@@ -146,22 +179,21 @@ cache::Completion TransferStream::Complete() {
     return hipEventRecord(lease_->Slot().event, stream);
   }();
   lease_->sealed = true;
-  if (status != hipSuccess) {
-    lease_->failed = true;
-    (void)Synchronize();
-    Check(status);
-  }
+  lease_->Check(status, "hipEventRecord");
   return cache::Completion(std::move(signal));
 }
 cache::Completion TransferStream::Copy(void* destination, const void* source,
                                        std::size_t bytes,
                                        CopyDirection direction,
                                        std::size_t piece_bytes) {
-  const auto stream = Native();
   if (!piece_bytes || (bytes && (!destination || !source)) ||
       (direction != CopyDirection::kDeviceToHost &&
        direction != CopyDirection::kHostToDevice))
     throw std::invalid_argument("invalid bounded transfer");
+  // Host bookkeeping failure precedes the first possible DMA submission.
+  auto signal = std::make_unique<TransferSignal>(lease_);
+  const auto stream = Native();
+  lease_->context.bytes = bytes;
   const auto kind = direction == CopyDirection::kDeviceToHost
                         ? hipMemcpyDeviceToHost
                         : hipMemcpyHostToDevice;
@@ -179,12 +211,10 @@ cache::Completion TransferStream::Copy(void* destination, const void* source,
                               static_cast<const std::byte*>(source) + offset,
                               piece, kind, stream);
       }();
-      if (status != hipSuccess)
-        lease_->failed = true;
-      Check(status);
+      lease_->Check(status, "hipMemcpyAsync");
       offset += piece;
     }
-    return Complete();
+    return Finish(std::move(signal));
   } catch (...) {
     // Includes host metadata failure after some copies were already queued.
     (void)Synchronize();
@@ -203,10 +233,11 @@ TransferPool::TransferPool(std::size_t capacity) {
   state_ = std::move(state);
 }
 std::unique_ptr<TransferStream> TransferPool::TryAcquire() {
+  CheckTransfer(hipSuccess, "hipStreamSynchronize");
   const std::lock_guard lock(state_->mutex);
   for (std::size_t i = 0; i < state_->slots.size(); ++i) {
     auto& slot = state_->slots[i];
-    if (slot.busy || slot.failed)
+    if (slot.busy)
       continue;
     auto lease = std::make_shared<detail::TransferLease>(state_, i);
     // An unclaimed lease has no return-to-pool action on allocation failure.
