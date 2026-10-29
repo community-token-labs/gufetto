@@ -2763,6 +2763,179 @@ public:
   }
 };
 
+void PredictionPlannerSharesQuotaAndDeduplicatesPending() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 5, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(16000);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto lease = cache.Acquire(prompt, {}, {}, true, 15000, true);
+  const auto original = lease->PlannedCaptures(15000);
+  assert(original.size() == 4);
+  const auto plan = lease->PlannedCaptures(15000, 3000);
+  assert(plan.size() == original.size());
+  const auto root =
+      std::ranges::find(plan, 3000, &PlannedSnapshotCapture::boundary);
+  assert(root != plan.end() &&
+         root->capture_origin == SnapshotOrigin::kPredicted);
+  assert(plan.front().boundary == original.front().boundary &&
+         plan.front().boundary < 3000);  // earlier fallback is never advanced
+  for (const auto omitted : {0U, 15000U, 16000U, 17000U}) {
+    const auto invalid = lease->PlannedCaptures(15000, omitted);
+    assert(std::ranges::none_of(invalid, [](const auto& capture) {
+      return capture.capture_origin == SnapshotOrigin::kPredicted;
+    }));
+  }
+  std::vector<std::unique_ptr<ComponentTextCache::Lease>> peers;
+  for (const auto point : {100U, 200U, 300U, 400U}) {
+    auto peer = cache.Acquire(prompt, {}, {}, true, 15000, true);
+    assert(peer->TryReserveSnapshot(0, point, true, SnapshotPurpose::kHistory,
+                                    {}, SnapshotOrigin::kPredicted));
+    peers.push_back(std::move(peer));
+  }
+  // Pending points consume the shared four-point allowance even if none is on
+  // this lease's grid. No extra root, no eviction/replacement of a pending
+  // point.
+  assert(lease->PlannedCaptures(15000, 3000).empty());
+  assert(!lease->TryReserveSnapshot(0, 100, true, SnapshotPurpose::kHistory, {},
+                                    SnapshotOrigin::kPredicted));
+  peers.clear();  // invalidation clears all non-owning pending identities
+  assert(lease->TryReserveSnapshot(0, 100, true, SnapshotPurpose::kHistory, {},
+                                   SnapshotOrigin::kPredicted));
+  const auto duplicate = lease->PlannedCaptures(15000, 100);
+  assert(std::ranges::none_of(
+      duplicate, [](const auto& capture) { return capture.boundary == 100; }));
+  // Required demand can supersede a pending predicted reservation exactly.
+  assert(lease->TryReserveSnapshot(0, 100, true, SnapshotPurpose::kContinuation,
+                                   {}));
+}
+
+void SchedulerCarriesStructuralRootMetadata() {
+  auto runner = std::make_shared<PredictionRunner>();
+  runner->max_context = 2048;
+  auto pool = std::make_shared<TextRunnerPool>(runner, 1);
+  TextGenerationScheduler scheduler(pool);
+  std::vector<TextRunnerToken> seed(1000);
+  std::iota(seed.begin(), seed.end(), 10);
+  TextRequestMetadata metadata;
+  metadata.cache_prefix_tokens = 900;
+  metadata.root_prefix_tokens = 600;
+  const auto first =
+      scheduler.Submit(seed, 1, 0.0f, {}, false, metadata).Wait();
+  assert(first.cached_prompt_tokens == 0 &&
+         first.prefill_tokens == seed.size());
+  seed[606] += 10000;
+  const auto next = scheduler.Submit(seed, 1, 0.0f, {}, false, metadata).Wait();
+  assert(next.cached_prompt_tokens == 600 && next.prefill_tokens == 400);
+}
+
+void UnreadyPredictionDoesNotObserveOrTaintFallback() {
+  class UnreadyRunner final : public PredictionRunner {
+  public:
+    bool LookupFullCheckpointReady() const override { return false; }
+    bool HasDecodeFrontier(const TextRunnerState&) const override {
+      return false;
+    }
+  };
+  auto runner = std::make_shared<UnreadyRunner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, {});
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  auto creator = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(creator->state());
+  for (const auto count : {4U, 8U}) {
+    const auto part = std::span(prompt).subspan(count - 4, 4);
+    runner->adapter->Append(state.slot, part, part);
+    assert(creator->TryReserveSnapshot(
+        creator->CaptureBytes(), count, false, SnapshotPurpose::kHistory, {},
+        count == 8 ? SnapshotOrigin::kPredicted : SnapshotOrigin::kOrdinary));
+    assert(creator->PublishSnapshot({prompt.begin(), prompt.begin() + count},
+                                    creator->Capture(), false));
+  }
+  {
+    auto fallback =
+        cache.Acquire(std::span(prompt).first(8), {}, {}, true, 0, true);
+    assert(fallback->cached_tokens() == 4 && !fallback->reused_prediction());
+    assert(fallback->ordinary_cached_tokens() == 4 &&
+           fallback->Metrics().unready_frontiers == 1);
+  }
+  auto actual = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(actual->cached_tokens() == 8 && actual->reused_prediction() &&
+         actual->ordinary_cached_tokens() == 4);
+}
+
+void PredictionPublicationBudgetIsNotMarginalQuota() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(40001);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  const auto ordinary = std::span(prompt).first(prompt.size() - 1);
+  runner->adapter->Append(state.slot, ordinary, ordinary);
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), ordinary.size(),
+                                   false, SnapshotPurpose::kContinuation, {}));
+  assert(lease->PublishSnapshot({ordinary.begin(), ordinary.end()},
+                                lease->Capture(), false));
+  const auto last = std::span(prompt).last(1);
+  runner->adapter->Append(state.slot, last, last);
+  const auto marginal = lease->CaptureBytes();
+  assert(marginal < (1 << 22) / 12);
+  assert(lease->TryReserveSnapshot(marginal, prompt.size(), false,
+                                   SnapshotPurpose::kHistory, {},
+                                   SnapshotOrigin::kPredicted));
+  // Most rows are shared with the ordinary capture, but the prediction cap
+  // charges their full capacities, not this small new-payload estimate.
+  assert(lease->PublishSnapshot(prompt, lease->Capture(), false) == 0);
+  assert(lease->HasSnapshotFor(ordinary) && !lease->HasSnapshotFor(prompt));
+}
+
+void PredictionProducerPreservesNearbyLearnedBoundary() {
+  auto runner = std::make_shared<PredictionRunner>();
+  runner->max_context = 2048;
+  TextRunnerPool pool(runner, 1);
+  std::vector<TextRunnerToken> seed(1000);
+  std::iota(seed.begin(), seed.end(), 10);
+  {
+    auto request = pool.Acquire(seed, sampling::SamplingConfig{}, {}, {}, true,
+                                900, true, true, {}, 600);
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  auto branch = seed;
+  for (std::size_t i = 606; i < branch.size(); ++i)
+    branch[i] += 2000;
+  {
+    auto request = pool.Acquire(branch, sampling::SamplingConfig{}, {}, {},
+                                true, 900, true, true, {}, 600);
+    assert(request.cached_prompt_tokens() == 600);
+    // Learning's 512-token gate must use ordinary coverage (zero), not the
+    // prediction at 600. Coalescing must not replace the actual 606 with 600.
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  auto next = branch;
+  next[606] += 4000;
+  auto restored = pool.Acquire(next, sampling::SamplingConfig{}, {}, {}, true,
+                               900, true, true, {}, 600);
+  assert(restored.cached_prompt_tokens() == 606);
+  Prefill(restored);
+  const auto actual = Generate(restored);
+  auto oracle_runner = std::make_shared<PredictionRunner>();
+  oracle_runner->max_context = 2048;
+  TextRunnerPool oracle_pool(oracle_runner, 1);
+  auto oracle = oracle_pool.Acquire(next);
+  Prefill(oracle);
+  assert(Generate(oracle) == actual);
+
+  auto planned_runner = std::make_shared<PredictionRunner>();
+  planned_runner->max_context = 2048;
+  TextRunnerPool planned_pool(planned_runner, 1);
+  auto planned = planned_pool.Acquire(seed, sampling::SamplingConfig{}, {}, {},
+                                      true, 900, true, true, {}, 600);
+  assert(planned.ShareCheckpoint(606) == 606);  // not the planned root at 600
+}
+
 void PredictionWithdrawalIsPressureOnly() {
   for (const bool pressure : {false, true}) {
     for (const bool external_owner : {false, true}) {
@@ -2950,9 +3123,11 @@ void PredictedSnapshotsRemainRamOnly() {
     auto ordinary = lease->Capture();
     assert(ordinary);
     // Nor may a later prediction downgrade an already ordinary payload.
-    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+    // Use another boundary: exact published predictions are deduplicated.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size() - 1,
                                      false, SnapshotPurpose::kContinuation,
-                                     prompt, SnapshotOrigin::kPredicted));
+                                     std::span(prompt).first(prompt.size() - 1),
+                                     SnapshotOrigin::kPredicted));
     assert(lease->PublishSnapshot(prompt, std::move(ordinary), false) > 0);
     const auto after = lease->Metrics();
     assert(after.disk_queued_bytes > 0 && after.persistence &&
@@ -5836,6 +6011,11 @@ int main(int argc, char* argv[]) {
     UnpinnedRunnersKeepTheirLimit();
     DiskDirectoryHasOneOwner();
     PredictedSnapshotsRemainRamOnly();
+    PredictionPlannerSharesQuotaAndDeduplicatesPending();
+    SchedulerCarriesStructuralRootMetadata();
+    UnreadyPredictionDoesNotObserveOrTaintFallback();
+    PredictionPublicationBudgetIsNotMarginalQuota();
+    PredictionProducerPreservesNearbyLearnedBoundary();
     PredictionWithdrawalIsPressureOnly();
     PredictionNeverReclaimsOrdinaryCapture();
     PredictionObservationFollowsSuccessfulHandoff();
