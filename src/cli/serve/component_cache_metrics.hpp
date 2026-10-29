@@ -1,10 +1,13 @@
 #ifndef GUFO_SERVER_COMPONENT_CACHE_METRICS_HPP_
 #define GUFO_SERVER_COMPONENT_CACHE_METRICS_HPP_
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/cache/ledger.hpp"
@@ -13,8 +16,68 @@
 #include "src/core/json.hpp"
 
 namespace gufo::server {
+// Acquisition outcomes describe observed resident state, not an all-history
+// reuse oracle. An absent indexed prefix does not prove a first-ever prompt.
+enum class CacheReuseReason : std::uint8_t {
+  kNotAcquired,
+  kLive,
+  kRam,
+  kDisk,
+  kDisabled,
+  kUnknownCompatibility,
+  kNoIndexedPrefix,
+  kNoCompatibleBoundary,
+  kInputIdentity,
+  kMissingComponent,
+  kStablePrefixBoundary,
+  kBoundaryGap,
+  kRestoreFailed,
+  kFrontierNotReady,
+  kCancelled,
+  kCount,
+};
+inline constexpr std::array<std::string_view,
+                            static_cast<std::size_t>(CacheReuseReason::kCount)>
+    kCacheReuseReasonNames{"not_acquired",
+                           "live",
+                           "ram",
+                           "disk",
+                           "disabled",
+                           "unknown_compatibility",
+                           "no_indexed_prefix",
+                           "no_compatible_boundary",
+                           "input_identity",
+                           "missing_component",
+                           "stable_prefix_boundary",
+                           "boundary_gap",
+                           "restore_failed",
+                           "frontier_not_ready",
+                           "cancelled"};
+inline std::string_view CacheReuseReasonName(CacheReuseReason reason) {
+  return kCacheReuseReasonNames.at(static_cast<std::size_t>(reason));
+}
+// Process-lifetime acquisition counts, including acquisitions later cancelled.
+// Never increment on metadata-only lookup or repeated metrics serialization.
+inline auto& CacheReuseReasonCounts() {
+  static std::array<std::atomic<std::uint64_t>, kCacheReuseReasonNames.size()>
+      counts{};
+  return counts;
+}
+inline json::Value CacheReuseCountersJson() {
+  auto result = json::Value::object();
+  for (std::size_t i = 1; i < kCacheReuseReasonNames.size(); ++i)
+    result[std::string(kCacheReuseReasonNames[i])] =
+        CacheReuseReasonCounts()[i].load(std::memory_order_relaxed);
+  return result;
+}
 struct ComponentCacheMetrics {
   std::string reuse{"none"};
+  CacheReuseReason reuse_reason{CacheReuseReason::kNotAcquired};
+  // Identity-qualified resident index agreement before retiring the live slot.
+  // Not all-history reusable tokens; evicted and unrecorded state is absent.
+  std::size_t indexed_common_tokens{}, indexed_gap_tokens{};
+  std::size_t unready_frontiers{};
+  std::uint64_t used_entry_id{};
   std::uint32_t selection_reason{};
   std::uint64_t acquisition_id{}, admission_index_version{},
       selected_entry_id{};
@@ -35,6 +98,12 @@ inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
   auto result = json::Value::object();
   result["schema"] = "component-cache-v1";
   result["reuse"] = value.reuse;
+  result["reuse_reason"] =
+      std::string(CacheReuseReasonName(value.reuse_reason));
+  result["indexed_common_tokens"] = value.indexed_common_tokens;
+  result["indexed_gap_tokens"] = value.indexed_gap_tokens;
+  result["unready_frontiers"] = value.unready_frontiers;
+  result["used_entry_id"] = value.used_entry_id;
   result["selection_reason"] = static_cast<std::size_t>(value.selection_reason);
   result["deepest_live_tokens"] = value.deepest_live;
   result["deepest_ram_tokens"] = value.deepest_ram;
