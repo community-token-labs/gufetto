@@ -455,6 +455,8 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
              // failures in HostPhase/Work.
            }
            auto stream = impl_->Lease(timing);
+           stream->SetPersistenceContext(manifest.checkpoint.value,
+                                         piece.size());
            Finally teardown{[&] {
              perf::HostPhase phase("cache_persist_stream_teardown");
              stream.reset();
