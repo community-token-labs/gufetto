@@ -138,8 +138,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   try {
-    m->vision_ = qwen::vision::Encoder::Open(
-        model_path, options.vision_model_path, c.hidden_size);
+    m->vision_ =
+        qwen::vision::Encoder::Open(model_path, options.vision_model_path,
+                                    c.hidden_size, options.enable_vision);
   } catch (const std::exception& e) {
     AssignError(error_msg, e.what());
     return nullptr;

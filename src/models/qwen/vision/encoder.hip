@@ -20,6 +20,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/model_path.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -559,17 +560,9 @@ Encoder::Encoder(const std::filesystem::path& path, std::uint32_t width)
 Encoder::~Encoder() = default;
 std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
                                        const std::filesystem::path& sidecar,
-                                       std::uint32_t width) {
-  if (!sidecar.empty())
-    return std::make_shared<Encoder>(sidecar, width);
-  auto directory = target.parent_path();
-  for (unsigned level = 0; level < 2; ++level) {
-    const auto path = directory / "mmproj-BF16.gguf";
-    if (std::filesystem::is_regular_file(path))
-      return std::make_shared<Encoder>(path, width);
-    directory = directory.parent_path();
-  }
-  return {};
+                                       std::uint32_t width, bool enabled) {
+  const auto path = ResolveModelPath(target, sidecar, enabled);
+  return path.empty() ? nullptr : std::make_shared<Encoder>(path, width);
 }
 const std::string& Encoder::identity() const {
   std::call_once(impl_->identity_once, [&] {

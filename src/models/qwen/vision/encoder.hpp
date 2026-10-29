@@ -42,7 +42,7 @@ public:
   /// sidecar beside the target or its quantization subdirectory.
   [[nodiscard]] static std::shared_ptr<Encoder> Open(
       const std::filesystem::path& target, const std::filesystem::path& sidecar,
-      std::uint32_t output_width);
+      std::uint32_t output_width, bool enabled = true);
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;

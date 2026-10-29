@@ -657,6 +657,7 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "llm") {
     std::string model;
     std::string served_model_name;
+    bool no_vision = false;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -709,6 +710,9 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--mmproj", "PATH",
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
+    parser.AddFlag("", "--no-vision",
+                   "Disable vision loading and image inputs (default: auto)",
+                   "Model", &no_vision);
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API (repeatable; "
                      "the first is primary)",
@@ -1290,6 +1294,7 @@ int RunServe(std::span<const char* const> args) {
     // Default to LLM server
     std::string model;
     std::vector<std::string> served_model_names;
+    bool no_vision = false;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -1342,6 +1347,10 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
+    llm_parser.AddFlag(
+        "", "--no-vision",
+        "Disable vision loading and image inputs (default: auto)", "Model",
+        &no_vision);
     llm_parser.AddCustomOption(
         "", "--served-model-name", "ID",
         "Model identifier exposed by the OpenAI API (repeatable; the first "
@@ -1489,6 +1498,10 @@ int RunServe(std::span<const char* const> args) {
     if (llm_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "llm");
       return 0;
+    }
+    if (no_vision && llm_parser.WasSupplied("--mmproj")) {
+      std::cerr << "Error: --no-vision cannot be combined with --mmproj\n";
+      return 2;
     }
     const bool pin_prefix_supplied =
         llm_parser.WasSupplied("--pin-prefix-file") ||
@@ -1727,7 +1740,7 @@ int RunServe(std::span<const char* const> args) {
             .publish_lookup = cache_lookup_api,
             .transfer_api = cache_transfer_api,
         },
-        enable_yarn, kv_cache_type);
+        enable_yarn, kv_cache_type, !no_vision);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

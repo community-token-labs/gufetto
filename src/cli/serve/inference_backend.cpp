@@ -3149,7 +3149,11 @@ bool InferenceBackend::load(
     const TextDiskCacheConfig& disk_cache_config,
     const std::string& vision_model_path,
     TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
-    models::qwen38_flash_next::KvCacheType kv_cache_type) {
+    models::qwen38_flash_next::KvCacheType kv_cache_type, bool enable_vision) {
+  if (!enable_vision && !vision_model_path.empty()) {
+    SetError(error, "--no-vision cannot be combined with --mmproj");
+    return false;
+  }
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -3161,6 +3165,10 @@ bool InferenceBackend::load(
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
+  if (!enable_vision)
+    Logger::Info("loader", "event=vision_disabled architecture=" +
+                               std::string(architecture) +
+                               " supports_images=false");
   if (ram_cache_config.pinned_prefix.enabled() && architecture != "qwen4exp") {
     SetError(error,
              "Pinned prefixes require Qwen3.8-Flash-Next (GGUF architecture "
@@ -3304,6 +3312,7 @@ bool InferenceBackend::load(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .rope_scaling = rope_scaling,
             .kv_cache_type = kv_cache_type,
+            .enable_vision = enable_vision,
         },
         &load_error);
     if (model == nullptr) {
@@ -3347,8 +3356,8 @@ bool InferenceBackend::load(
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
-      vision = models::qwen::vision::Encoder::Open(model_path,
-                                                   vision_model_path, 5120);
+      vision = models::qwen::vision::Encoder::Open(
+          model_path, vision_model_path, 5120, enable_vision);
     } else if (!vision_model_path.empty()) {
       throw std::invalid_argument(
           "image input supports Qwen3.8-27B and Flash-Next");

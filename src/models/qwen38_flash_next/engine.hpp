@@ -61,6 +61,8 @@ struct ModelOptions {
   /// Ordinary trunk and MTP K/V only; indexer and recurrent state are
   /// unchanged.
   KvCacheType kv_cache_type = KvCacheType::kF16;
+  /// Disable both explicit and automatic vision projector loading.
+  bool enable_vision = true;
 };
 
 class Session;
