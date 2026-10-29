@@ -476,6 +476,23 @@ if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
   add_library(gufo_kernel_bench_support STATIC
     src/cli/bench/kernel_bench.cpp)
   target_include_directories(gufo_kernel_bench_support PUBLIC ${CMAKE_SOURCE_DIR})
+
+  # Independent offline teacher: no Gufo model/core/encoder dependencies.
+  add_library(vision_ref_math STATIC tools/quality/vision_ref_math.cpp)
+  target_include_directories(vision_ref_math PUBLIC tools/quality)
+  if (OpenMP_CXX_FOUND)
+    target_link_libraries(vision_ref_math PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+  if (MSVC)
+    target_compile_options(vision_ref_math PRIVATE /O2 /fp:strict)
+  else()
+    target_compile_options(vision_ref_math PRIVATE -O3 -fno-fast-math -ffp-contract=off)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+      target_compile_options(vision_ref_math PRIVATE -march=native)
+    endif()
+  endif()
+  add_executable(vision_encoder_reference tools/quality/vision_encoder_reference.cpp)
+  target_link_libraries(vision_encoder_reference PRIVATE vision_ref_math)
 endif()
 
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
@@ -955,8 +972,19 @@ if (BUILD_TESTING)
   set_tests_properties(h3_profile_report_test PROPERTIES
     LABELS "cpu;tools;models;minimax-h3;profiling")
 
+  add_executable(vision_ref_math_test tests/tools/vision_ref_math_test.cpp)
+  target_link_libraries(vision_ref_math_test PRIVATE vision_ref_math)
+  add_test(NAME vision_ref_math_test COMMAND vision_ref_math_test)
+  set_tests_properties(vision_ref_math_test PROPERTIES LABELS "cpu;tools;quality")
+  add_test(NAME vision_encoder_reference_test
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/vision_encoder_reference_test.py
+      $<TARGET_FILE:vision_encoder_reference>)
+  set_tests_properties(vision_encoder_reference_test PROPERTIES LABELS "cpu;tools;quality")
+
   foreach(name IN ITEMS scoring_metrics scoring_contract matched_kl
-                        vision_images vision_reference vision_compare vision_downstream)
+                        vision_images vision_reference vision_compare vision_downstream
+                        vision_encoder_capture)
     add_test(NAME ${name}_test
       COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/${name}_test.py)
