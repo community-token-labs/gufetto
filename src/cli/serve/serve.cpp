@@ -657,6 +657,7 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "llm") {
     std::string model;
     std::string served_model_name;
+    std::uint32_t vision_max_tokens_per_slot = 0;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -709,6 +710,10 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--mmproj", "PATH",
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
+    parser.AddOption("", "--vision-max-tokens-per-slot", "N",
+                     "Aggregate image tokens per slot (default: 0 = context; "
+                     "oversized requests are rejected)",
+                     "Model", &vision_max_tokens_per_slot);
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API (repeatable; "
                      "the first is primary)",
@@ -1290,6 +1295,7 @@ int RunServe(std::span<const char* const> args) {
     // Default to LLM server
     std::string model;
     std::vector<std::string> served_model_names;
+    std::uint32_t vision_max_tokens_per_slot = 0;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -1342,6 +1348,11 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
+    llm_parser.AddOption(
+        "", "--vision-max-tokens-per-slot", "N",
+        "Aggregate image tokens per slot (default: 0 = context; "
+        "oversized requests are rejected)",
+        "Model", &vision_max_tokens_per_slot);
     llm_parser.AddCustomOption(
         "", "--served-model-name", "ID",
         "Model identifier exposed by the OpenAI API (repeatable; the first "
@@ -1727,7 +1738,7 @@ int RunServe(std::span<const char* const> args) {
             .publish_lookup = cache_lookup_api,
             .transfer_api = cache_transfer_api,
         },
-        enable_yarn, kv_cache_type);
+        enable_yarn, kv_cache_type, vision_max_tokens_per_slot);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

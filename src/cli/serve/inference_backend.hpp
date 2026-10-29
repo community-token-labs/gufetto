@@ -88,7 +88,8 @@ public:
             TextRunnerRamCacheOptions ram_cache_config = {},
             bool enable_yarn = false,
             models::qwen38_flash_next::KvCacheType kv_cache_type =
-                models::qwen38_flash_next::KvCacheType::kF16);
+                models::qwen38_flash_next::KvCacheType::kF16,
+            std::uint32_t vision_max_tokens_per_slot = 0);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -98,7 +99,8 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            std::uint32_t vision_max_tokens_per_slot = 0);
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,

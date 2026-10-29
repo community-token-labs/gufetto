@@ -61,6 +61,8 @@ struct ModelOptions {
   /// Ordinary trunk and MTP K/V only; indexer and recurrent state are
   /// unchanged.
   KvCacheType kv_cache_type = KvCacheType::kF16;
+  /// Aggregate image rows per session; zero keeps the full-context bound.
+  std::uint32_t vision_max_tokens_per_slot = 0;
 };
 
 class Session;
@@ -93,6 +95,9 @@ public:
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }
+  [[nodiscard]] std::uint32_t VisionMaxTokensPerSlot() const noexcept {
+    return options_.vision_max_tokens_per_slot;
+  }
   [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] KvCacheType CacheType() const noexcept {
     return options_.kv_cache_type;
@@ -108,7 +113,7 @@ public:
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
-                                         std::uint32_t context) const noexcept;
+                                         std::uint32_t context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
