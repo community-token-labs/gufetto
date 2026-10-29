@@ -98,11 +98,16 @@ public:
     [[nodiscard]] ContinuationState& state() const;
     [[nodiscard]] bool cache_hit() const noexcept;
     [[nodiscard]] std::size_t cached_tokens() const noexcept;
+    [[nodiscard]] std::size_t ordinary_cached_tokens() const noexcept;
+    [[nodiscard]] bool reused_prediction() const noexcept;
     [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
     [[nodiscard]] double restore_ms() const noexcept;
     [[nodiscard]] bool restored_from_disk() const noexcept;
     [[nodiscard]] ContinuationLookup lookup() const noexcept;
     [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
+    // Only the actual successful acquisition source can be observed, never a
+    // matching lookup or this lease's own prefill/capture.
+    bool ObserveSnapshotFor(std::span<const ContinuationToken>);
     [[nodiscard]] bool TryReserveSnapshot(
         std::size_t, std::size_t, bool, SnapshotPurpose,
         std::span<const ContinuationToken>,
@@ -191,11 +196,14 @@ public:
   [[nodiscard]] ContinuationState& state() const;
   [[nodiscard]] bool cache_hit() const noexcept;
   [[nodiscard]] std::size_t cached_tokens() const noexcept;
+  [[nodiscard]] std::size_t ordinary_cached_tokens() const noexcept;
+  [[nodiscard]] bool reused_prediction() const noexcept;
   [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
   [[nodiscard]] double restore_ms() const noexcept;
   [[nodiscard]] bool restored_from_disk() const noexcept;
   [[nodiscard]] ContinuationLookup lookup() const noexcept;
   [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
+  bool ObserveSnapshotFor(std::span<const ContinuationToken>);
   void AdoptRestoredPrefix(std::size_t, std::size_t, double);
   [[nodiscard]] bool TryReserveSnapshot(
       std::size_t, std::size_t, bool = false,
