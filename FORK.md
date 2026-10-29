@@ -75,7 +75,23 @@ its changed output histories and draft acceptance do not isolate loader cost.
 The standard depth8192 benchmark measured rotated q4 about42.3 tokens/s and
 rotated K8/V4 about42.2, versus rotated q8 about47.8 and F16 about96.2. Separate
 fixed-ID whole-model AR measurements met the 0.97×q8 floor for all q4 policies,
-with roughly1–2.4% slowdown. Neither result proves attention-only speed parity.
+with roughly1–2.4% slowdown. The HTTP S4 matrix also has decode/prefill/snapshot
+timing flags; neither result proves general speed parity. No speed claim is made.
+
+**More cache per GiB, slower restores until the fast path lands.** At8192 cached
+tokens, S1 AR RAM restores measured303–304ms for rotated q4,184–186ms for rotated
+K8/V4, and67–68ms for rotated q8. The extra235–237ms /116–118ms repeats across
+all three warm/branch runs and is not an MTP-acceptance effect. Packed-row CPU
+validation checks every q4 coordinate's half reconstruction, versus one overflow
+check per q8 block. A validation-only CPU replay confirms approximately linear
+scaling from8192 to16384 rows per component; it is not a full-restore GPU profile.
+
+**Estimate, not a long-restore measurement:** extrapolating that per-token cost,
+a100K-token restore would take about3.7s /2.3s /0.8s for rotated q4 /rotated K8/V4
+/rotated q8; at150K, about5.6s /3.4s /1.2s. That is roughly4.3s /2.1s extra at150K,
+which matters when returning to long conversations. Actual larger-context times
+can differ. The validation fast path is a separate follow-up, not part of this
+landing; the registered timing failures remain failures.
 
 Measured S1 memory at100000-token capacity, actual target frontier99899:
 
