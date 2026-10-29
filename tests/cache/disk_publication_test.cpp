@@ -107,6 +107,48 @@ void CheckPublished(DiskStore& store, const fs::path& root) {
     }
   }
 }
+void WriteAccountingIncludesRollbackAndReuse() {
+  Directory dir;
+  DiskStore store(ledger, dir.path, 100000);
+  Fixture first(1);
+  short_writes = true;
+  store.Publish(Id(100), first.manifest, first.buffers);
+  short_writes = false;
+  const auto initial = store.PublicationStats();
+  assert(initial.shared_write_bytes == 8 && initial.private_write_bytes == 20);
+  assert(initial.manifest_write_bytes == EncodeManifest(first.manifest).size());
+  assert(initial.inherited_bytes == 0 && initial.write_calls > 4);
+  Fixture child(2);
+  store.Publish(Id(101), child.manifest, std::span(child.buffers).subspan(1));
+  const auto inherited = store.PublicationStats();
+  assert(inherited.shared_write_bytes == initial.shared_write_bytes);
+  assert(inherited.private_write_bytes == initial.private_write_bytes + 20);
+  assert(inherited.inherited_bytes == 8);
+  assert(inherited.manifest_write_bytes ==
+         initial.manifest_write_bytes + EncodeManifest(child.manifest).size());
+  const auto retained = Managed(dir.path);
+  Fixture failed(3);
+  short_writes = true;
+  fail_write = 1;  // Accept two private bytes, then fail the next write.
+  Reject([&] {
+    store.Publish(Id(102), failed.manifest,
+                  std::span(failed.buffers).subspan(1));
+  });
+  short_writes = false;
+  fail_write = -1;
+  const auto rolled_back = store.PublicationStats();
+  assert(rolled_back.private_write_bytes == inherited.private_write_bytes + 2);
+  assert(rolled_back.shared_write_bytes == inherited.shared_write_bytes);
+  assert(rolled_back.manifest_write_bytes == inherited.manifest_write_bytes);
+  assert(rolled_back.inherited_bytes == inherited.inherited_bytes + 8);
+  assert(rolled_back.write_calls == inherited.write_calls + 2);
+  assert(Managed(dir.path) == retained + 2 && !store.Open({3}));
+  store.ReclaimOrphans();
+  store.WaitForReclamation();
+  assert(Managed(dir.path) == retained);
+  assert(store.PublicationStats().private_write_bytes ==
+         rolled_back.private_write_bytes);
+}
 void Crashes() {
   for (int step = 0; step <= int(DiskPublicationStep::kIndexed); ++step) {
     // Every repeated per-file hook is a separate crash boundary.
@@ -581,6 +623,7 @@ extern "C" int __wrap_unlinkat(int fd, const char* name, int flags) {
 int main() {
   const rlimit no_core{0, 0};
   assert(setrlimit(RLIMIT_CORE, &no_core) == 0);
+  WriteAccountingIncludesRollbackAndReuse();
   Crashes();
   SharingAndPins();
   WriterEviction();

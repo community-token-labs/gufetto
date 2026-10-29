@@ -67,7 +67,8 @@ bool PackedKvIngress(const TextRunnerDescriptor& descriptor,
   // Inspect the registered append layout even without a durable fingerprint.
   if (std::ranges::any_of(components, [](const auto& c) {
         return c.kind == cache::ComponentKind::kAppendRows &&
-               c.layout_version == 2;
+               (c.layout_version == 2 ||
+                (c.layout_version >= 4 && c.layout_version <= 7));
       }))
     return true;
   return RotatedPackedIngress(descriptor, components);
@@ -247,7 +248,7 @@ struct ComponentTextCache::Impl {
     // The live frontier's prompt, to tell whether any checkpoint covers it.
     std::vector<cache::Token> live_tokens;
     cache::Identity live_input;
-    // Acquisition order; cold assignment replaces the oldest live frontier.
+    // Acquisition order breaks ties between equal recovery-cost victims.
     std::uint64_t used{};
     bool busy{};
     bool decode_ready{};
@@ -346,6 +347,68 @@ struct ComponentTextCache::Impl {
                            const cache::InputIdentity& input,
                            std::size_t stable, bool reuse) const {
     return index.Lookup({identity, prompt, input, stable, reuse});
+  }
+  struct VictimCost {
+    std::uint64_t recovery_ns{};
+    std::size_t covered{};
+    std::string_view tier{"none"};
+    bool preserved{};
+  };
+  VictimCost CostToReplace(const Entry& entry) const {
+    VictimCost cost{.preserved = entry.slot->PreservationComplete()};
+    if (!entry.live)
+      return cost;
+    // Fixed relative work model, not a per-request latency prediction. Source:
+    // gufo-agent-concurrency/docs/cache-persist-native/r61/phase-comparison.csv,
+    // cache_restore_ms: history-0084 baseline RAM 150016 tokens/1354.929ms
+    // (history-0082..0088: 1343..1376ms); return-C disk 150000/1815.627ms.
+    // Rounded rates are 9us RAM, 12us disk; prefill remains ~94s per150K.
+    // Charge the uncaptured generated tail too; a checkpoint is never free.
+    constexpr std::uint64_t kRamNsPerToken = 9000;
+    constexpr std::uint64_t kDiskNsPerToken = 12000;
+    constexpr std::uint64_t kPrefillNsPerToken = 625000;
+    const auto tokens = entry.live_tokens.size();
+    cost.recovery_ns = tokens * kPrefillNsPerToken;
+    cost.tier = "prefill";
+    // Only an equivalent idle execution lineage can replace this live copy
+    // for free. Merely equal tokens from a different execution are not proof.
+    for (const auto& other : entries) {
+      if (other.get() != &entry && !other->busy && other->live &&
+          entry.history && other->history &&
+          other->history->Lineage() == entry.history->Lineage() &&
+          other->live_input == entry.live_input &&
+          other->live_tokens == entry.live_tokens) {
+        cost.recovery_ns = 0;
+        cost.covered = tokens;
+        cost.tier = "live";
+        return cost;
+      }
+    }
+    cache::PrefixLookup alternatives;
+    try {
+      alternatives =
+          index.Lookup({identity, entry.live_tokens,
+                        cache::InputIdentity(tokens, entry.live_input)});
+    } catch (const std::bad_alloc&) {
+      // Ranking is advisory. Under metadata pressure, conservatively charge
+      // full prefill rather than failing an otherwise admitted request.
+      return cost;
+    }
+    for (const auto& candidate : alternatives.candidates) {
+      if (candidate.live)
+        continue;
+      // A mixed restore still needs disk; conservatively charge its complete
+      // prefix at the disk rate. Consider shallower RAM alternatives as well.
+      const auto rate = candidate.durable ? kDiskNsPerToken : kRamNsPerToken;
+      const auto estimate = candidate.boundary * rate +
+                            (tokens - candidate.boundary) * kPrefillNsPerToken;
+      if (estimate < cost.recovery_ns) {
+        cost.recovery_ns = estimate;
+        cost.covered = candidate.boundary;
+        cost.tier = candidate.durable ? "disk" : "ram";
+      }
+    }
+    return cost;
   }
   std::unique_ptr<cache::DiskCatalog> catalog;
   std::unique_ptr<cache::StreamedStore> streaming;
@@ -746,6 +809,28 @@ struct ComponentTextCache::Impl {
           },
           [this](cache::CheckpointId id, bool success,
                  const cache::TransferTiming& timing) {
+            // Record I/O even if optional serving metadata admission fails,
+            // and for failed attempts whose temporary files were rolled back.
+            try {
+              Logger::Info(
+                  "cache",
+                  "schema=component-cache-v1 event=persistence_io "
+                  "checkpoint_id=" +
+                      std::to_string(id.value) + " published=" +
+                      std::to_string(success) + " private_write_bytes=" +
+                      std::to_string(timing.private_write_bytes) +
+                      " shared_write_bytes=" +
+                      std::to_string(timing.shared_write_bytes) +
+                      " manifest_write_bytes=" +
+                      std::to_string(timing.manifest_write_bytes) +
+                      " inherited_bytes=" +
+                      std::to_string(timing.inherited_bytes) +
+                      " write_calls=" + std::to_string(timing.write_calls) +
+                      " fsync_calls=" + std::to_string(timing.fsync_calls));
+            } catch (...) {
+              // Optional diagnostics must not retain pending owners or bypass
+              // catalog admission when formatting/the logging sink fails.
+            }
             const std::lock_guard lock(mutex);
             for (auto& checkpoint : pending)
               if (checkpoint && checkpoint->Id() == id)
@@ -1090,6 +1175,17 @@ struct ComponentTextCache::Lease::Impl {
   std::size_t edit_boundary_count{};
   cache::ResourceCharge edit_metadata;
   SnapshotPurpose purpose{SnapshotPurpose::kContinuation};
+  // Last attempted route/stage, retained across unwinding for refusal logging.
+  // Logical request bytes and ledger free backing are not contiguous/page-fit
+  // promises; only the provider can decide whether its backing can satisfy
+  // them.
+  struct CaptureAttempt {
+    std::string_view route{"ram"}, stage{"plan"};
+    std::size_t requested_bytes{}, request_count{}, failed_bytes{};
+    cache::ComponentId failed_component{};
+    cache::ResourceCategory failed_category{cache::ResourceCategory::kMetadata};
+    std::size_t protected_count{};
+  } capture_attempt;
   std::vector<cache::Token> capture_tokens;
   ContinuationLookup lookup_result;
   ComponentCacheMetrics metrics;
@@ -1134,9 +1230,13 @@ struct ComponentTextCache::Lease::Impl {
 
 std::unique_ptr<TextRunnerSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
+  capture_attempt = {.route = "durable",
+                     .stage = "eligibility",
+                     .protected_count = edit_boundary_count};
   if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
+  capture_attempt.stage = "min_step";
   const auto capture_input = At(input, capture_tokens.size());
   if (purpose != SnapshotPurpose::kBranchPoint &&
       cache->WithinDiskStep(capture_tokens, capture_input))
@@ -1162,13 +1262,15 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   }
   // Admit metadata before vectors/owners. No append payload allocation is
   // admitted for the native rows: observations may be retired at any guard.
-  auto admission = cache->ledger.Reserve(
-      cache::ResourceCategory::kMetadata,
+  capture_attempt.stage = "metadata";
+  capture_attempt.requested_bytes =
       sizeof(DurableCapture) + sizeof(ComponentSnapshot) +
-          capture_tokens.size() * sizeof(cache::Token) + capture_input.size() +
-          descriptors.size() * sizeof(cache::DiskComponent) +
-          pieces * (sizeof(cache::DiskPayload) +
-                    sizeof(cache::PersistenceSource) + sizeof(Copy) + 256));
+      capture_tokens.size() * sizeof(cache::Token) + capture_input.size() +
+      descriptors.size() * sizeof(cache::DiskComponent) +
+      pieces * (sizeof(cache::DiskPayload) + sizeof(cache::PersistenceSource) +
+                sizeof(Copy) + 256);
+  auto admission = cache->ledger.Reserve(cache::ResourceCategory::kMetadata,
+                                         capture_attempt.requested_bytes);
   auto durable = std::make_shared<DurableCapture>();
   durable->metadata = admission.Convert();
   std::shared_ptr<const cache::DiskDescription> ancestor;
@@ -1234,8 +1336,11 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       if (inherited != completed) {
         auto view = cache->resources->adapter->BorrowRowsView(
             slot.Execution(), d.id, inherited, completed);
-        if (!view.empty())
+        if (!view.empty()) {
+          capture_attempt.stage = "observation";
+          capture_attempt.failed_component = d.id;
           rows = slot.Observe(d.id, inherited, completed, view);
+        }
       }
       component.chunks.reserve(completed / d.rows_per_chunk);
     }
@@ -1306,13 +1411,24 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
     protected_checkpoints[protected_count++] = retain.source;
   retain.protected_checkpoints =
       std::span(protected_checkpoints).first(protected_count);
+  capture_attempt.requested_bytes = staged;
+  capture_attempt.request_count = requests.size();
+  capture_attempt.protected_count = protected_count;
   while (!copies.empty()) {
     try {
+      capture_attempt.stage = "can_capture";
+      capture_attempt.failed_component = {};
+      capture_attempt.failed_bytes = 0;
       if (cache->resources->can_capture &&
           !cache->resources->can_capture(requests))
         throw cache::ResourceExhausted();
-      for (const auto i : allocation_order)
+      for (const auto i : allocation_order) {
+        capture_attempt.stage = "allocate";
+        capture_attempt.failed_component = requests[i].component;
+        capture_attempt.failed_category = requests[i].category;
+        capture_attempt.failed_bytes = requests[i].bytes;
         copies[i].buffer = cache->resources->allocate(requests[i]);
+      }
       break;
     } catch (const cache::ResourceExhausted&) {
       for (auto& copy : copies)
@@ -1322,6 +1438,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
         throw;
     }
   }
+  capture_attempt.stage = "transfer";
   TransferBatch transfers(cache->resources->transfer_batch_size);
   for (auto& copy : copies) {
     const auto& r = copy.request;
@@ -1685,29 +1802,30 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       }
     }
     if (!entry) {
-      // A frontier far beyond every checkpoint of its prompt is the only
-      // copy of that work, as for a conversation larger than the RAM budget
-      // whose captures are refused: take it last. Then completed
-      // preservation first: it needs no foreground copy. Among those, a live
-      // frontier holds generated tokens no checkpoint covers, such as the
-      // tool call the next turn replays. Take a slot without one, then a
-      // shallow frontier before a deep one, then the least recently used.
-      // Faster idle preservation must not make short side requests evict a
-      // deep conversation merely because its backing copy finished earlier.
+      // Minimize the work needed if this history returns, rather than treating
+      // RAM and SSD checkpoint coverage as equally free. Preservation and LRU
+      // break equal-cost ties. Unique uncovered histories retain their much
+      // larger re-prefill cost; shorter covered histories can lose first.
       constexpr std::size_t kUncoveredTokens = 4096;
+      std::vector<std::pair<Impl::Entry*, Impl::VictimCost>> costs;
+      costs.reserve(impl_->entries.size());
+      for (const auto& candidate : impl_->entries)
+        if (!candidate->busy)
+          costs.emplace_back(candidate.get(), impl_->CostToReplace(*candidate));
+      const auto cost = [&](const Impl::Entry& e) -> const Impl::VictimCost& {
+        return std::ranges::find(costs, &e, &decltype(costs)::value_type::first)
+            ->second;
+      };
       const auto uncovered = [&](const Impl::Entry& e) {
-        if (!e.live || e.live_tokens.size() <= kUncoveredTokens)
-          return false;
-        return !impl_->index.HasCheckpoint(
-            {impl_->identity, e.live_tokens,
-             cache::InputIdentity(e.live_tokens.size(), e.live_input)},
-            e.live_tokens.size() - kUncoveredTokens);
+        return e.live &&
+               e.live_tokens.size() - cost(e).covered > kUncoveredTokens;
       };
-      using Rank = std::tuple<bool, bool, bool, bool, std::uint64_t>;
+      using Rank = std::tuple<std::uint64_t, bool, bool, std::uint64_t>;
       const auto rank = [&](const Impl::Entry& e) {
-        return Rank{uncovered(e), !e.slot->PreservationComplete(), bool(e.live),
-                    e.live_tokens.size() >= kUncoveredTokens, e.used};
+        return Rank{cost(e).recovery_ns, !cost(e).preserved, bool(e.live),
+                    e.used};
       };
+      std::string_view victim_reason = "minimum_recovery_cost";
       std::optional<Rank> selected_rank;
       for (auto& candidate : impl_->entries) {
         if (candidate->busy)
@@ -1724,9 +1842,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           selected_rank = candidate_rank;
         }
       }
-      // Keep ordinary cold selection unchanged. Only a cancelled executor
-      // with outstanding work needs an alternative; do not query every
-      // stream or look up exact checkpoint coverage on normal admissions.
+      // Only a cancelled executor with outstanding work needs a readiness
+      // override; do not query every execution stream on normal admissions.
       if (entry && !entry->slot->ExecutionComplete()) {
         if (!selected_rank)
           selected_rank = rank(*entry);
@@ -1751,10 +1868,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                             other->live_tokens == candidate->live_tokens;
                    });
           };
-          if (std::tie(std::get<0>(candidate_rank),
-                       std::get<1>(candidate_rank)) >
-                  std::tie(std::get<0>(*selected_rank),
-                           std::get<1>(*selected_rank)) ||
+          if (std::tuple{uncovered(*candidate), !cost(*candidate).preserved} >
+                  std::tuple{uncovered(*entry), !cost(*entry).preserved} ||
               (candidate->live &&
                candidate->live_tokens.size() >= kUncoveredTokens &&
                !impl_->index.HasCheckpoint(
@@ -1769,8 +1884,42 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
             ready_rank = candidate_rank;
           }
         }
-        if (ready)
+        if (ready) {
           entry = ready;
+          victim_reason = "ready_execution_alternative";
+        }
+      }
+      // Static reason/tier names and opaque IDs only, never prompt content.
+      // Diagnostics must not turn a successful victim choice into failure.
+      if (entry && Logger::Enabled(LogLevel::kInfo)) {
+        try {
+          for (std::size_t i = 0; i < impl_->entries.size(); ++i) {
+            const auto& candidate = *impl_->entries[i];
+            std::string message =
+                "schema=component-cache-v1 event=slot_victim_candidate "
+                "acquisition_id=" +
+                std::to_string(acquisition_id) +
+                " slot_id=" + std::to_string(i + 1) +
+                " eligible=" + std::to_string(!candidate.busy) +
+                " live_entry_id=" +
+                std::to_string(candidate.live ? candidate.live->value : 0) +
+                " live_tokens=" + std::to_string(candidate.live_tokens.size()) +
+                " last_acquisition=" + std::to_string(candidate.used) +
+                " chosen=" + std::to_string(&candidate == entry);
+            if (!candidate.busy) {
+              const auto& estimate = cost(candidate);
+              message +=
+                  " recovery_tier=" + std::string(estimate.tier) +
+                  " covered_tokens=" + std::to_string(estimate.covered) +
+                  " recovery_ns=" + std::to_string(estimate.recovery_ns) +
+                  " preservation_complete=" +
+                  std::to_string(estimate.preserved);
+            }
+            message += " reason=" + std::string(victim_reason);
+            Logger::Info("cache", message);
+          }
+        } catch (...) {
+        }
       }
     }
     if (!entry)
@@ -2716,11 +2865,46 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
       cache.resources->adapter->Positions(request.slot.Execution());
   const auto bytes = request.entry->history->NewPayloadBytes(positions);
   const auto retain = request.Retain(request.capture_tokens, bytes);
+  request.capture_attempt = {.requested_bytes = bytes,
+                             .protected_count = request.edit_boundary_count};
   const auto refused = [&] {
-    Logger::Info("cache",
-                 "schema=component-cache-v1 event=capture_refused "
-                 "reason=byte_capacity tokens=" +
-                     std::to_string(request.capture_tokens.size()));
+    const auto& attempt = request.capture_attempt;
+    const auto ledger = cache.ledger.Snapshot();
+    const auto route = std::ranges::find(kCacheCaptureRoutes, attempt.route) -
+                       kCacheCaptureRoutes.begin();
+    const auto stage = std::ranges::find(kCacheCaptureStages, attempt.stage) -
+                       kCacheCaptureStages.begin();
+    ++request.metrics.capture_refusals.at(route).at(stage);
+    request.metrics.last_capture_refusal = {
+        attempt.route, attempt.stage, attempt.requested_bytes,
+        ledger.bytes[static_cast<std::size_t>(
+            cache::ResourceCategory::kBackingFree)]};
+    Logger::Info(
+        "cache",
+        "schema=component-cache-v1 event=capture_refused "
+        "reason=byte_capacity tokens=" +
+            std::to_string(request.capture_tokens.size()) +
+            " route=" + std::string(attempt.route) +
+            " stage=" + std::string(attempt.stage) + " purpose=" +
+            std::to_string(static_cast<unsigned>(request.purpose)) +
+            " requested_bytes=" + std::to_string(attempt.requested_bytes) +
+            " request_count=" + std::to_string(attempt.request_count) +
+            " failed_component=" +
+            std::to_string(attempt.failed_component.value) +
+            " failed_category=" +
+            (attempt.stage == "allocate" ? std::to_string(static_cast<unsigned>(
+                                               attempt.failed_category))
+                                         : "none") +
+            " failed_bytes=" + std::to_string(attempt.failed_bytes) +
+            " backing_free_bytes=" +
+            std::to_string(ledger.bytes[static_cast<std::size_t>(
+                cache::ResourceCategory::kBackingFree)]) +
+            " ram_bytes=" + std::to_string(ledger.ram_bytes) +
+            " ram_budget_bytes=" + std::to_string(cache.budget) +
+            " persistence_pinned_bytes=" +
+            std::to_string(ledger.persistence_pinned_bytes) +
+            " protected_count=" + std::to_string(attempt.protected_count) +
+            " source_checkpoint=" + std::to_string(request.source.value));
   };
   const auto failed = [](const std::exception& error) {
     Logger::Info(
@@ -2754,6 +2938,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
       std::vector<ComponentCaptureBuffer> buffers;
       std::vector<std::span<const std::byte>> borrowed;
       std::size_t next_buffer = 0;
+      request.capture_attempt.stage = "plan";
       checkpoint = request.entry->history->Capture(
           {request.capture_tokens,
            request.input.Through(request.capture_tokens.size()), positions,
@@ -2775,11 +2960,18 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
             return storage;
           },
           [&](std::span<const cache::PayloadRequest> payloads) {
-            buffer_metadata = cache.ledger.Reserve(
-                cache::ResourceCategory::kMetadata,
+            request.capture_attempt.stage = "metadata";
+            request.capture_attempt.request_count = payloads.size();
+            request.capture_attempt.requested_bytes =
                 payloads.size() *
-                    (sizeof(ComponentCaptureBuffer) +
-                     sizeof(std::span<const std::byte>) + sizeof(std::size_t)));
+                (sizeof(ComponentCaptureBuffer) +
+                 sizeof(std::span<const std::byte>) + sizeof(std::size_t));
+            buffer_metadata =
+                cache.ledger.Reserve(cache::ResourceCategory::kMetadata,
+                                     request.capture_attempt.requested_bytes);
+            request.capture_attempt.requested_bytes = 0;
+            for (const auto& payload : payloads)
+              request.capture_attempt.requested_bytes += payload.bytes;
             buffers.reserve(payloads.size());
             borrowed.reserve(payloads.size());
             // Small row/tail allocations must not split the remaining runs
@@ -2794,6 +2986,9 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
             });
             while (true) {
               try {
+                request.capture_attempt.stage = "can_capture";
+                request.capture_attempt.failed_component = {};
+                request.capture_attempt.failed_bytes = 0;
                 if (cache.resources->can_capture &&
                     !cache.resources->can_capture(payloads))
                   throw cache::ResourceExhausted();
@@ -2801,6 +2996,10 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
                 borrowed.resize(payloads.size());
                 for (const auto i : allocation_order) {
                   const auto& payload = payloads[i];
+                  request.capture_attempt.stage = "allocate";
+                  request.capture_attempt.failed_component = payload.component;
+                  request.capture_attempt.failed_category = payload.category;
+                  request.capture_attempt.failed_bytes = payload.bytes;
                   buffers[i] = cache.resources->allocate(payload);
                   borrowed[i] =
                       !request.pin_capture && buffers[i].borrow &&
@@ -2823,6 +3022,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
                   throw;
               }
             }
+            request.capture_attempt.stage = "transfer";
             TransferBatch transfers(cache.resources->transfer_batch_size);
             for (std::size_t i = 0; i < payloads.size();) {
               if (!borrowed[i].empty()) {

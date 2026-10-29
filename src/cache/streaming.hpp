@@ -38,6 +38,11 @@ struct TransferTiming {
   std::uint64_t metadata_lock_ns{}, filesystem_ns{}, fsync_ns{}, checksum_ns{};
   std::uint64_t yield_ns{}, bytes{}, pieces{};
   std::uint64_t staging_wait_ns{}, io_lock_ns{};
+  // Publication attempt counters, including failed/rolled-back writes. See
+  // DiskPublicationStats; bytes above counts source reads, not write syscalls.
+  std::uint64_t private_write_bytes{}, shared_write_bytes{},
+      manifest_write_bytes{};
+  std::uint64_t inherited_bytes{}, write_calls{}, fsync_calls{};
 };
 // Sources retain immutable storage, assigned spill backing or discardable
 // observations. Backed borrowers wait for preservation before disk work

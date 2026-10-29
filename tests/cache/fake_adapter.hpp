@@ -45,7 +45,11 @@ private:
 class FakeAdapter final : public Adapter {
 public:
   // Wider chunks need less capture metadata for the same row bytes.
-  explicit FakeAdapter(Rows rows_per_chunk = 4);
+  explicit FakeAdapter(Rows rows_per_chunk = 4,
+                       Capabilities capabilities = {true, true});
+  [[nodiscard]] std::size_t RestoreBegins() const noexcept {
+    return restore_begins_;
+  }
   [[nodiscard]] Capabilities GetCapabilities() const override;
   [[nodiscard]] std::span<const ComponentDescriptor> Components()
       const override;
@@ -93,6 +97,11 @@ public:
   [[nodiscard]] std::uint64_t RecurrentHash(const Slot&) const;
   // Isolate host guard overhead and row-range tests without fixture mutation.
   void GuardRows(Slot&, ComponentId, Rows first, Rows end);
+  // Configure before creating slots; other row components stay borrowable.
+  void DisableBorrowRows(ComponentId);
+  // Optional CPU-fixture wrapper; retains ownership of the actual read until
+  // its completion settles. Empty preserves the ordinary fake behavior.
+  std::function<Completion(ComponentId, Completion)> capture_completion;
   void FailNextAllocation() noexcept;
   void FailNextTransfer() noexcept;
   [[nodiscard]] std::size_t Invalidations() const noexcept {
@@ -105,6 +114,9 @@ private:
   [[nodiscard]] Completion SubmitLoad(Slot&, Stream&,
                                       std::function<TransferResult()>);
   std::array<ComponentDescriptor, 3> components_;
+  std::array<bool, 2> borrow_rows_{true, true};
+  Capabilities capabilities_;
+  std::size_t restore_begins_{};
   bool fail_allocation_{false};
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};

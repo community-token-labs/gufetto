@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "tests/cache/fake_adapter.hpp"
+#include "tests/cache/model_capability_records.hpp"
 
 using namespace gufo::cache;
 using namespace gufo::cache::testing;
@@ -139,6 +140,63 @@ struct Fixture {
     return result;
   }
 };
+// Capability failure must occur before destination mutation or any payload I/O.
+// Pattern only: SGLang #46972 (8044ed4e), no upstream implementation copied.
+void CapabilityRejectionsAreObservable() {
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 35, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  StreamedStore streams(ledger, disk, 35, Allocate, Lease);
+  Fixture fixture(ledger);
+  auto sources = fixture.Sources();
+  TransferTiming written;
+  streams.Write(Id(100), fixture.manifest, sources, written);
+  for (const auto& record : kModelCapabilityRecords) {
+    // Use the same family records as the enumeration test; independently
+    // remove each capability to catch either check being silently dropped.
+    for (const auto caps :
+         {record.capabilities,
+          Capabilities{false, record.capabilities.persistent_encoding},
+          Capabilities{record.capabilities.continuation, false}}) {
+      FakeAdapter adapter(4, caps);
+      auto destination = adapter.CreateSlot(fixture.guard);
+      TransferTiming timing;
+      unsigned fallbacks{};
+      const bool accepted =
+          streams.Restore({1}, fixture.manifest.compatibility, adapter,
+                          *destination, timing, {}, [&] { ++fallbacks; });
+      const bool expected = caps.continuation && caps.persistent_encoding;
+      assert(accepted == expected);
+      assert(adapter.RestoreBegins() == (expected ? 1 : 0));
+      assert(adapter.Invalidations() == (expected ? 0 : 1));
+      assert(fallbacks == (expected ? 0 : 1));
+      if (expected) {
+        assert(timing.bytes > 0 && timing.pieces > 0);
+        assert(adapter.Positions(*destination) ==
+               fixture.adapter.Positions(*fixture.source));
+        assert(adapter.RecurrentHash(*destination) == fixture.hash);
+      } else {
+        assert(timing.bytes == 0 && timing.pieces == 0);
+        for (const auto position : adapter.Positions(*destination))
+          assert(position.valid_rows == 0);
+      }
+    }
+    // Even a continuation-capable family cannot reinterpret incompatible
+    // chunk geometry as its own persistent encoding.
+    if (record.capabilities.continuation &&
+        record.capabilities.persistent_encoding) {
+      FakeAdapter incompatible(8, record.capabilities);
+      auto destination = incompatible.CreateSlot(fixture.guard);
+      TransferTiming timing;
+      unsigned fallbacks{};
+      assert(!streams.Restore({1}, fixture.manifest.compatibility, incompatible,
+                              *destination, timing, {}, [&] { ++fallbacks; }));
+      assert(incompatible.RestoreBegins() == 0);
+      assert(incompatible.Invalidations() == 1 && fallbacks == 1);
+      assert(timing.bytes == 0 && timing.pieces == 0);
+    }
+  }
+}
 void PrefetchDoesNotValidateOrAdmitPayload() {
   Directory dir;
   ResourceLedger ledger{{1 << 22, 1 << 21, 35, 4096}};
@@ -242,6 +300,14 @@ void RoundTripAndFailures() {
     assert(timing.bytes == 336 && timing.bytes >= 10 * streams.StagingBytes());
     assert(timing.pieces > fixture.buffers.size());
     assert(timing.filesystem_ns && timing.fsync_ns && timing.stream_wait_ns);
+    std::uint64_t expected_private{}, expected_shared{};
+    for (const auto& buffer : fixture.buffers)
+      (buffer.private_file ? expected_private : expected_shared) +=
+          buffer.owner->size();
+    assert(timing.private_write_bytes == expected_private);
+    assert(timing.shared_write_bytes == expected_shared);
+    assert(timing.manifest_write_bytes > 0 && timing.inherited_bytes == 0);
+    assert(timing.write_calls > 0 && timing.fsync_calls > 0);
   }
   assert(allocations == 1);
   assert(ledger.Snapshot().persistence_pinned_bytes == 0);
@@ -256,6 +322,11 @@ void RoundTripAndFailures() {
     TransferTiming reuse_timing;
     streams.Write(Id(101), reused, {}, reuse_timing);
     assert(reuse_timing.bytes == 0);
+    assert(reuse_timing.private_write_bytes == 0 &&
+           reuse_timing.shared_write_bytes == 0);
+    assert(reuse_timing.inherited_bytes ==
+           reused.components[0].chunks[0].bytes);
+    assert(reuse_timing.manifest_write_bytes == EncodeManifest(reused).size());
   }
   assert(disk.Retire({2}));
   {
@@ -752,6 +823,10 @@ void NewestPendingFrontierSurvives() {
             if (id == CheckpointId{2} && !succeeded) {
               assert(timing.bytes == 0 && timing.pieces == 0 &&
                      timing.yield_ns == 0 && timing.filesystem_ns == 0);
+              assert(timing.private_write_bytes == 0 &&
+                     timing.shared_write_bytes == 0 &&
+                     timing.manifest_write_bytes == 0 &&
+                     timing.write_calls == 0);
               // Replacement callbacks may query the queue and release serving
               // ownership; neither operation may run under the queue lock.
               assert(query->Stats().pending <= 2);
@@ -781,6 +856,14 @@ void NewestPendingFrontierSurvives() {
       idle = true;
       queue.Drain();
       assert(completed_bytes == queue.Stats().timing.bytes);
+      const auto queued_io = queue.Stats().timing;
+      const auto store_io = disk.PublicationStats();
+      assert(queued_io.private_write_bytes == store_io.private_write_bytes);
+      assert(queued_io.shared_write_bytes == store_io.shared_write_bytes);
+      assert(queued_io.manifest_write_bytes == store_io.manifest_write_bytes);
+      assert(queued_io.inherited_bytes == store_io.inherited_bytes);
+      assert(queued_io.write_calls == store_io.write_calls);
+      assert(queued_io.fsync_calls == store_io.fsync_calls);
       assert(disk.Open({1}));
       assert(bool(disk.Open({2})) == learned);
       assert(bool(disk.Open({3})) == (!learned && !pin_failure));
@@ -880,6 +963,45 @@ void AdmissionFailures() {
     assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   }
 }
+void CapacityRetryAccountsRolledBackWrites() {
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 16, 4096}};
+  std::atomic<bool> pressure{};
+  DiskStore disk(ledger, dir.path, 1 << 20,
+                 {1, [&](const auto&) {
+                    return gufo::platform::FilesystemInfo{
+                        1ULL << 30, pressure ? 0ULL : 1ULL << 30, true, true};
+                  }});
+  StreamedStore streams(ledger, disk, 16, Allocate, Lease);
+  Fixture fixture(ledger);
+  std::atomic<unsigned> copies{}, retries{};
+  auto sources = fixture.Sources([&] {
+    // The second source piece is copied, but its write is refused. The first
+    // piece's accepted write must remain counted after rollback and retry.
+    if (++copies == 2)
+      pressure = true;
+  });
+  PersistenceQueue queue(
+      ledger, streams, 1, 4096, [] { return true; }, {},
+      [&](const auto&) {
+        ++retries;
+        assert(disk.Stats().managed_bytes == 0);
+        const auto io = disk.PublicationStats();
+        assert(io.shared_write_bytes + io.private_write_bytes == 16);
+        pressure = false;
+        return true;
+      });
+  assert(queue.TrySubmit(
+      PersistenceJob(ledger, Id(100), fixture.manifest, std::move(sources))));
+  queue.Drain();
+  const auto stats = queue.Stats();
+  assert(retries == 1 && stats.completed == 1 && stats.failed == 0);
+  assert(stats.timing.bytes == 32 + 336);
+  assert(stats.timing.private_write_bytes + stats.timing.shared_write_bytes ==
+         16 + 336);
+  assert(stats.timing.manifest_write_bytes > 0);
+  assert(disk.Open({1}));
+}
 void FailedSubmission() {
   Directory dir;
   ResourceLedger ledger{{1 << 22, 1 << 21, 16, 4096}};
@@ -902,6 +1024,9 @@ void FailedSubmission() {
   }
   assert(failed && disk.Entries().empty());
   assert(costs.filesystem_ns && costs.fsync_ns && costs.bytes == 32);
+  // Failed publication still reports its accepted writes after rollback.
+  assert(costs.shared_write_bytes + costs.private_write_bytes == costs.bytes);
+  assert(costs.manifest_write_bytes == 0 && costs.fsync_calls > 0);
   assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   disk.ReclaimOrphans();
   disk.WaitForReclamation();
@@ -1082,6 +1207,7 @@ void MinimumStagingHoldsWidestRow() {
 }
 }  // namespace
 int main() {
+  CapabilityRejectionsAreObservable();
   MinimumStagingHoldsWidestRow();
   PrefetchDoesNotValidateOrAdmitPayload();
   RestoreGroupsAdjacentFilesWithinStaging();
@@ -1097,6 +1223,7 @@ int main() {
   NewestPendingFrontierSurvives();
   FirstPendingAnchorSurvivesCoalescing();
   AdmissionFailures();
+  CapacityRetryAccountsRolledBackWrites();
   FailedSubmission();
   RestorePreemptsYield();
   CancelledStagingWait();

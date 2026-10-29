@@ -1143,6 +1143,132 @@ void ColdAssignmentKeepsLiveFrontiers() {
     assert(turn(conversation) == frontier);
   }
 }
+void RestorePreservesTheCostlierLiveFrontier(
+    std::size_t b_count = 8192, std::size_t a_count = 4096, bool disk_b = false,
+    bool capture_b = true, bool preserve_b = true, bool keep_b = true) {
+  // The default is persist's older8193-B/newer4097-A reproduction. Changing
+  // only B's tier at closer depths distinguishes cost from depth/LRU.
+  class HeapRunner final : public Runner {
+  public:
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t budget) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, budget);
+      resources->allocate = [&ledger](const cache::PayloadRequest& request) {
+        auto bytes = std::make_shared<std::vector<std::byte>>(request.bytes);
+        auto backing =
+            ledger.Reserve(cache::ResourceCategory::kBackingFree, request.bytes)
+                .Convert();
+        auto reservation = std::make_shared<cache::ResourceReservation>(
+            backing.ReserveBacking(request.category));
+        return ComponentCaptureBuffer{
+            *bytes,
+            [bytes, reservation] {
+              return cache::Payload::Committed(
+                  reservation->Convert(),
+                  std::shared_ptr<const void>(bytes, bytes->data()));
+            },
+            bytes.get(),
+            [bytes, reservation, request](cache::SlotLease& lease,
+                                          auto source) {
+              auto owner = std::shared_ptr<const void>(bytes, bytes->data());
+              return cache::Payload::Borrowed(lease.Borrow(
+                  request.component, request.first, request.end,
+                  std::move(*reservation), std::move(owner), *bytes, source));
+            }};
+      };
+      return resources;
+    }
+  };
+  auto runner = std::make_shared<HeapRunner>();
+  runner->defer_idle = true;
+  runner->max_context = 16384;
+  const TemporaryDirectory temp("gufo-victim-cost");
+  const std::optional<TextRunnerDiskCacheOptions> disk =
+      disk_b ? std::optional<TextRunnerDiskCacheOptions>(
+                   {.directory = temp.path(),
+                    .capacity_bytes = 1 << 22,
+                    .staging_capacity_bytes = 4096})
+             : std::nullopt;
+  const auto capture = [](auto& lease, const auto& prompt) {
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    assert(lease->PublishSnapshot(prompt, lease->Capture(), false));
+  };
+  if (disk_b) {
+    runner->defer_idle = false;
+    // Actual durable-only coverage: the first cache drains publication, then
+    // all RAM ownership is destroyed before the tested cache opens the store.
+    ComponentTextCache prior(runner, 1, 1 << 25, disk);
+    const std::vector<TextRunnerToken> prompt(b_count, 10);
+    auto lease = prior.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    capture(lease, prompt);
+    (void)lease->Commit({}, {}, prompt);
+  }
+  runner->defer_idle = true;
+  ComponentTextCache cache(runner, 2, 1 << 25, disk);
+  std::uint64_t a_prefix_hash{};
+  const auto seed = [&](std::size_t count, TextRunnerToken token, bool b) {
+    std::vector<TextRunnerToken> prompt(count, token);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true, false);
+    auto& state = dynamic_cast<State&>(lease->state());
+    auto* slot = &state.slot;
+    const auto tail = std::span(prompt).subspan(lease->cached_tokens());
+    runner->adapter->Append(state.slot, tail, tail);
+    if (b && disk_b) {
+      assert(lease->cached_tokens() == count && lease->restored_from_disk());
+    } else if (!b || capture_b) {
+      capture(lease, prompt);
+    }
+    if (!b)
+      a_prefix_hash = runner->adapter->RecurrentHash(state.slot);
+    if (!b || preserve_b) {
+      runner->adapter->GuardRows(state.slot, cache::testing::kTarget, 0, count);
+      runner->adapter->GuardRows(state.slot, cache::testing::kDraft, 0, count);
+    }
+    const std::array<TextRunnerToken, 1> reply{token + 1};
+    runner->adapter->Append(state.slot, reply, reply);
+    prompt.push_back(reply.front());
+    (void)lease->Commit({}, {}, prompt);
+    return std::pair{std::move(prompt), slot};
+  };
+  auto [b, b_slot] = seed(b_count, 10, true);
+  auto [a, a_slot] = seed(a_count, 20, false);
+  assert(a_slot != b_slot);
+  auto edited = a;
+  edited.back() = 999;
+  std::ostringstream output;
+  const auto level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  auto* sink = std::clog.rdbuf(output.rdbuf());
+  auto restore = cache.Acquire(edited, {}, {}, true, 0, true, false);
+  std::clog.rdbuf(sink);
+  Logger::SetLevel(level);
+  assert(restore->cached_tokens() == a_count &&
+         restore->restored_snapshot_bytes() > 0);
+  assert(&dynamic_cast<State&>(restore->state()).slot ==
+             (keep_b ? a_slot : b_slot) &&
+         "RAM restore overwrote the more expensive live frontier");
+  assert(runner->adapter->RecurrentHash(
+             dynamic_cast<State&>(restore->state()).slot) == a_prefix_hash);
+  auto returned = cache.Acquire(keep_b ? b : a, {}, {}, true, 0, true, false);
+  assert(returned->cached_tokens() == (keep_b ? b_count : a_count) + 1 &&
+         returned->restored_snapshot_bytes() == 0 &&
+         &dynamic_cast<State&>(returned->state()).slot ==
+             (keep_b ? b_slot : a_slot));
+  const auto log = output.str();
+  assert(log.find("event=slot_victim_candidate acquisition_id=3 slot_id=1") !=
+         std::string::npos);
+  assert(log.find("slot_id=2 eligible=1") != std::string::npos);
+  assert(log.find(!keep_b && disk_b
+                      ? "chosen=1 recovery_tier=disk"
+                      : "chosen=1 recovery_tier=ram") != std::string::npos);
+  assert(log.find("reason=minimum_recovery_cost") != std::string::npos);
+  if (disk_b)
+    assert(log.find("recovery_tier=disk") != std::string::npos);
+}
 void ColdSideRequestsKeepPreservedDeepFrontier() {
   auto runner = std::make_shared<Runner>();
   runner->defer_idle = true;
@@ -2807,6 +2933,476 @@ void UnbackedDeepRowsSurviveDiskRestart() {
   }
   std::filesystem::remove_all(directory);
 }
+// Reproduces staging starvation, not the still-unproven native R61 substage.
+// Capacity changes can use the protected case as a gate: its current outcome is
+// explicit refusal, whereas the same budget with a reclaimable grid publishes.
+void PinnedWriterAndProtectedGridRefuseDurableCapture() {
+  struct Gate {
+    std::atomic<bool> entered{false};
+    std::binary_semaphore reading{0}, release{0};
+  };
+  struct HeldRunner final : Runner {
+    std::shared_ptr<Gate> gate = std::make_shared<Gate>();
+    mutable bool refuse_plan{};
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->can_capture = [this](auto) { return !refuse_plan; };
+      resources->copy_observed_rows =
+          [gate = gate, copy = resources->copy_observed_rows](
+              auto source, auto destination, cache::Stream& stream) {
+            if (!gate->entered.exchange(true)) {
+              gate->reading.release();
+              gate->release.acquire();
+            }
+            return copy(source, destination, stream);
+          };
+      return resources;
+    }
+  };
+  struct ReleaseWriter {
+    std::shared_ptr<Gate> gate;
+    bool released{};
+    void Release() {
+      if (!released) {
+        released = true;
+        gate->release.release();
+      }
+    }
+    ~ReleaseWriter() { Release(); }
+  };
+  for (const int mode : {0, 1, 2}) {
+    const bool protect = mode != 0;
+    const TemporaryDirectory temp("gufo-component-pinned-grid-refusal");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                          .capacity_bytes = 1 << 20,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<HeldRunner>();
+    runner->private_blocks = 2;
+    const std::vector<TextRunnerToken> other{90, 91, 92, 93};
+    const std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
+    std::uint64_t hash{};
+    const auto previous_level = Logger::Level();
+    Logger::SetLevel(LogLevel::kInfo);
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+    {
+      ComponentTextCache cache(runner, 2, 1 << 22, disk);
+      const auto append = [&](auto& lease, auto tokens) {
+        auto& state = dynamic_cast<State&>(lease->state());
+        runner->adapter->Append(state.slot, tokens, tokens);
+      };
+      const auto capture = [](auto& lease, auto tokens,
+                              SnapshotPurpose purpose) {
+        assert(lease->TryReserveSnapshot(lease->CaptureBytes(), tokens.size(),
+                                         false, purpose, tokens));
+        return lease->PublishSnapshot({tokens.begin(), tokens.end()},
+                                      lease->Capture(), false);
+      };
+      auto pinned = cache.Acquire(other, {}, {}, true, 0, true);
+      ReleaseWriter release_writer{runner->gate};
+      append(pinned, std::span(other));
+      assert(capture(pinned, std::span(other), SnapshotPurpose::kContinuation));
+      assert(runner->gate->reading.try_acquire_for(std::chrono::seconds(5)));
+      const auto queued = *pinned->Metrics().persistence;
+      assert(queued.pending == 1 && queued.pinned_bytes > 0);
+      // Keep this slot busy, so the controlled second slot is reassigned.
+      if (!protect) {
+        const std::vector<TextRunnerToken> old{70, 71};
+        auto grid = cache.Acquire(old, {}, {}, true, 0, true);
+        append(grid, std::span(old));
+        assert(capture(grid, std::span(old), SnapshotPurpose::kHistory));
+        (void)grid->Commit(old, {}, old);
+      }
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      if (protect) {
+        append(lease, std::span(prompt).first(2));
+        assert(capture(lease, std::span(prompt).first(2),
+                       SnapshotPurpose::kHistory));
+        append(lease, std::span(prompt).subspan(2));
+      } else {
+        append(lease, std::span(prompt));
+      }
+      auto& state = dynamic_cast<State&>(lease->state());
+      hash = runner->adapter->RecurrentHash(state.slot);
+      runner->refuse_plan = mode == 2;
+      bool refused{};
+      try {
+        assert(
+            capture(lease, std::span(prompt), SnapshotPurpose::kContinuation));
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      assert(refused == protect);
+      assert((lease->Metrics().disk_queued_bytes == 0) == protect);
+      const auto report = ComponentCacheJson(lease->Metrics());
+      const auto* counts = report.find("capture_refusals");
+      const auto* last = report.find("last_capture_refusal");
+      assert(counts && counts->is_object() && last);
+      if (protect) {
+        const auto stage = mode == 2 ? "can_capture" : "allocate";
+        const auto* durable = counts->find("durable");
+        assert(durable && durable->size() == 1);
+        const auto* reasons = durable->find(stage);
+        assert(reasons && reasons->member_size("byte_capacity") == 1);
+        assert(counts->size() == 1);  // no RAM retry double-counting
+        assert(last->member_str("route") == "durable");
+        assert(last->member_str("stage") == stage);
+        assert(last->member_str("reason") == "byte_capacity");
+        assert(last->member_size("requested_bytes") == 32);
+        // Both 64-byte private blocks and four 16-byte row/tail blocks are
+        // retained. Free row bytes do not mean a private allocation can fit.
+        assert(last->member_size("available_bytes") == 32704);
+      } else {
+        assert(counts->empty() && last->is_null());
+      }
+      // Serialization/observation never increments these lease-local counts.
+      const auto repeated = ComponentCacheJson(lease->Metrics());
+      assert(repeated.find("capture_refusals")->dump() == counts->dump());
+      assert(repeated.find("last_capture_refusal")->dump() == last->dump());
+      const auto other_report = ComponentCacheJson(pinned->Metrics());
+      assert(other_report.find("capture_refusals")->empty());
+      assert(other_report.find("last_capture_refusal")->is_null());
+      if (mode == 2) {
+        // A second terminal attempt increments once; it is not a retry inside
+        // the first attempt. The last refusal still describes this failure.
+        bool again{};
+        try {
+          (void)lease->Capture();
+        } catch (const cache::ResourceExhausted&) {
+          again = true;
+        }
+        assert(again);
+        const auto twice = ComponentCacheJson(lease->Metrics());
+        assert(twice.find("capture_refusals")
+                   ->find("durable")
+                   ->find("can_capture")
+                   ->member_size("byte_capacity") == 2);
+        assert(twice.find("last_capture_refusal")->dump() == last->dump());
+      }
+      // The held write remains intact; a refusal never claims D durable.
+      assert(lease->Metrics().persistence->completed == 0);
+      release_writer.Release();
+      (void)lease->Commit(prompt, {}, prompt);
+      (void)pinned->Commit(other, {}, other);
+      for (int i = 0; i < 500 && lease->Metrics().persistence->pending; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      const auto settled = *lease->Metrics().persistence;
+      assert(settled.pending == 0 && settled.failed == 0);
+      assert(settled.completed == (protect ? 1U : 2U));
+    }
+    std::clog.rdbuf(previous_sink);
+    Logger::SetLevel(previous_level);
+    const auto log = output.str();
+    if (protect) {
+      assert(log.find(mode == 2 ? "route=durable stage=can_capture"
+                                : "route=durable stage=allocate") !=
+             std::string::npos);
+      assert(log.find("protected_count=1") != std::string::npos);
+      assert(log.find("backing_free_bytes=") != std::string::npos);
+    } else {
+      assert(log.find("event=capture_refused") == std::string::npos);
+    }
+    auto restored_runner = std::make_shared<Runner>();
+    ComponentTextCache restarted(restored_runner, 1, 1 << 22, disk);
+    auto warm = restarted.Acquire(prompt, {}, {}, true, 0, true);
+    assert(warm->restored_from_disk() == !protect);
+    assert(warm->cached_tokens() == (protect ? 0U : prompt.size()));
+    if (!protect) {
+      auto& state = dynamic_cast<State&>(warm->state());
+      assert(restored_runner->adapter->RecurrentHash(state.slot) == hash);
+    }
+    warm->Invalidate();
+  }
+}
+
+// Synthetic geometry gate, not evidence of the native R61 failure's substage.
+// The backing BYTE budget, protected grid and blocked writer are identical;
+// only the rounded allocation quantum changes. No HIP allocator is linked.
+void RoundedBackingWithPinnedWriterAndProtectedGrid() {
+  static_assert(sizeof(cache::Token) == 4);
+  constexpr std::size_t backing_bytes = 16ULL << 20;
+  constexpr std::size_t ledger_bytes = 64ULL << 20;
+  constexpr std::size_t ram_bytes =
+      ledger_bytes - cache::kDefaultDiskStagingBytes;
+  struct Gate {
+    std::atomic<bool> entered{false};
+    std::binary_semaphore reading{0}, release{0};
+  };
+  struct ReleaseWriter {
+    std::shared_ptr<Gate> gate;
+    bool released{};
+    void Release() {
+      if (!released) {
+        released = true;
+        gate->release.release();
+      }
+    }
+    ~ReleaseWriter() { Release(); }
+  };
+  // Logger emits each complete line through xsputn. Observe the real serving
+  // publication callback (after durable index insertion), not queue admission
+  // or a last-copy signal. Keep reads synchronized and restore logging on
+  // unwind.
+  struct PublicationLog final : std::streambuf {
+    std::mutex mutex;
+    std::string output;
+    std::binary_semaphore b{0}, d{0};
+    LogLevel previous_level = Logger::Level();
+    std::streambuf* previous_sink = std::clog.rdbuf(this);
+    PublicationLog() { Logger::SetLevel(LogLevel::kInfo); }
+    ~PublicationLog() override {
+      std::clog.rdbuf(previous_sink);
+      Logger::SetLevel(previous_level);
+    }
+    std::streamsize xsputn(const char* data, std::streamsize size) override {
+      const std::string_view line(data, static_cast<std::size_t>(size));
+      const std::lock_guard lock(mutex);
+      output.append(line);
+      if (line.find("event=published tokens=256 ") != std::string_view::npos)
+        b.release();
+      if (line.find("event=published tokens=150000 ") != std::string_view::npos)
+        d.release();
+      return size;
+    }
+    std::string Text() {
+      const std::lock_guard lock(mutex);
+      return output;
+    }
+  };
+  struct GeometryRunner final : Runner {
+    std::size_t quantum{};
+    std::shared_ptr<Gate> gate = std::make_shared<Gate>();
+    mutable std::size_t ram_plan_bytes{}, durable_plan_bytes{};
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      adapter->DisableBorrowRows(kTarget);
+      assert(ledger.Limits().total_bytes == ledger_bytes);
+      struct Pool {
+        // Bytes die before their original committed charges; each payload's
+        // aliasing owner retains the entire pool, including those charges.
+        std::vector<cache::ResourceCharge> pages;
+        std::vector<std::byte> data;
+      };
+      auto pool = std::make_shared<Pool>();
+      pool->pages.reserve(backing_bytes / quantum);
+      for (std::size_t i = 0; i < backing_bytes / quantum; ++i)
+        pool->pages.push_back(
+            ledger.Reserve(cache::ResourceCategory::kBackingFree, quantum)
+                .Convert());
+      pool->data.resize(backing_bytes);
+      resources->owner = pool;
+      resources->allocate = [this, pool](const cache::PayloadRequest& request) {
+        // Match CommittedBackingPool::TryAcquire's rounded run length and
+        // private-state direction; the real ledger arbitrates assignments.
+        const auto count =
+            request.bytes ? 1 + (request.bytes - 1) / quantum : 1;
+        const auto first = cache::ResourceCharge::FindFreeBacking(
+            pool->pages, count,
+            request.category == cache::ResourceCategory::kPrivateState);
+        if (first == pool->pages.size())
+          throw cache::ResourceExhausted();
+        auto reservation = std::make_shared<cache::ResourceReservation>(
+            cache::ResourceCharge::ReserveBacking(
+                std::span(pool->pages).subspan(first, count),
+                request.category));
+        auto bytes =
+            std::span(pool->data).subspan(first * quantum, count * quantum);
+        auto owner = std::shared_ptr<const void>(pool, bytes.data());
+        return ComponentCaptureBuffer{
+            bytes,
+            [reservation, owner] {
+              return cache::Payload::Committed(reservation->Convert(), owner);
+            },
+            pool.get(),
+            [reservation, owner, bytes, request](cache::SlotLease& lease,
+                                                 auto source) {
+              return cache::Payload::Borrowed(
+                  lease.Borrow(request.component, request.first, request.end,
+                               std::move(*reservation), owner,
+                               bytes.first(request.bytes), source));
+            }};
+      };
+      resources->can_capture = [this, pool, &ledger](auto payloads) {
+        // Fully committed single-segment form of CommittedBackingPool::CanFit.
+        // Do not inject a refusal: admission uses the rounded physical demand.
+        std::size_t needed = 0;
+        bool draft_rows = false;
+        for (const auto& payload : payloads) {
+          needed += payload.bytes ? 1 + (payload.bytes - 1) / quantum : 1;
+          draft_rows |=
+              payload.component == kDraft &&
+              payload.category == cache::ResourceCategory::kBackingAssigned;
+        }
+        if (payloads.size() > 3)
+          (draft_rows ? ram_plan_bytes : durable_plan_bytes) = needed * quantum;
+        const auto free = ledger.Snapshot().bytes[static_cast<std::size_t>(
+            cache::ResourceCategory::kBackingFree)];
+        return needed <= pool->pages.size() && needed <= free / quantum;
+      };
+      resources->copy_observed_rows =
+          [gate = gate, copy = resources->copy_observed_rows](
+              auto source, auto destination, cache::Stream& stream) {
+            if (!gate->entered.exchange(true)) {
+              gate->reading.release();
+              gate->release.acquire();
+            }
+            return copy(source, destination, stream);
+          };
+      return resources;
+    }
+  };
+  const auto wait = [](std::binary_semaphore& signal) {
+    if (!signal.try_acquire_for(std::chrono::seconds(60)))
+      throw std::runtime_error("geometry fixture writer/publication timed out");
+  };
+  std::vector<TextRunnerToken> other(256), prompt(150000);
+  std::iota(other.begin(), other.end(), 900000);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const auto grid = std::span(prompt).first(256);
+  const std::vector<TextRunnerToken> suffix{9001, 9002, 9003};
+  for (const std::size_t quantum : {64ULL << 10, 16ULL << 10}) {
+    const bool fits = quantum == (16ULL << 10);
+    const TemporaryDirectory temp("gufo-component-rounded-pinned-grid");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                          .capacity_bytes = 16ULL << 20,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<GeometryRunner>();
+    runner->quantum = quantum;
+    runner->row_blocks = runner->private_blocks = 0;
+    runner->rows_per_chunk = 256;
+    runner->max_context = prompt.size() + suffix.size();
+    std::uint64_t b_hash{}, d_hash{};
+    PublicationLog log;
+    {
+      ComponentTextCache cache(runner, 2, ram_bytes, disk);
+      auto pinned = cache.Acquire(other, {}, {}, true, 0, true);
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      // Destroy this guard BEFORE either lease or cache, including on timeout.
+      ReleaseWriter release_writer{runner->gate};
+      const auto append = [&](auto& target, auto tokens) {
+        auto& state = dynamic_cast<State&>(target->state());
+        runner->adapter->Append(state.slot, tokens, tokens);
+        return runner->adapter->RecurrentHash(state.slot);
+      };
+      const auto capture = [](auto& target, auto tokens,
+                              SnapshotPurpose purpose) {
+        assert(target->TryReserveSnapshot(target->CaptureBytes(), tokens.size(),
+                                          false, purpose, tokens));
+        return target->PublishSnapshot({tokens.begin(), tokens.end()},
+                                       target->Capture(), false);
+      };
+      b_hash = append(pinned, std::span(other));
+      assert(capture(pinned, std::span(other), SnapshotPurpose::kContinuation));
+      wait(runner->gate->reading);
+      const auto held = *pinned->Metrics().persistence;
+      assert(held.pending == 1 && held.completed == 0 && held.failed == 0);
+      assert(held.pinned_bytes == 3 * quantum);
+      append(lease, grid);
+      assert(capture(lease, grid, SnapshotPurpose::kHistory));
+      d_hash = append(lease, std::span(prompt).subspan(grid.size()));
+      const auto free_bytes = [&] {
+        return lease->Metrics().ledger.bytes[static_cast<std::size_t>(
+            cache::ResourceCategory::kBackingFree)];
+      };
+      // B holds three pages, and the SAME TURN's protected D grid holds three.
+      assert(free_bytes() == backing_bytes - 6 * quantum);
+      assert(lease->HasSnapshotFor(grid));
+      assert(lease->Metrics().disk_queued_bytes == 0);
+      const auto copied_before = lease->Metrics().copied_payload_bytes;
+      bool refused = false;
+      try {
+        // A successful direct capture queues disk work but retains no full RAM
+        // checkpoint. The ordinary capture must refuse in BOTH geometries.
+        assert(capture(lease, std::span(prompt),
+                       SnapshotPurpose::kContinuation) == 0);
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      assert(refused == !fits);
+      // Ordinary RAM capture shares each grid chunk but needs backing for
+      // both remaining arrays: 585 pieces each, plus recurrent state.
+      assert(runner->ram_plan_bytes == 1171 * quantum);
+      assert(runner->ram_plan_bytes > backing_bytes);
+      // 586 target pieces + one draft tail + one recurrent state. The draft's
+      // 585 full chunks are observed, not allocated in this direct fallback.
+      assert(runner->durable_plan_bytes == 588 * quantum);
+      assert((runner->durable_plan_bytes <= backing_bytes - 6 * quantum) ==
+             fits);
+      assert(lease->HasSnapshotFor(grid));  // Never weaken grid protection.
+      assert(free_bytes() == backing_bytes - (fits ? 594 : 6) * quantum);
+      const auto blocked = *lease->Metrics().persistence;
+      assert(blocked.completed == 0 && blocked.failed == 0);
+      assert(blocked.pending == (fits ? 2U : 1U));
+      assert(blocked.pinned_bytes == (fits ? 591 : 3) * quantum);
+      assert((lease->Metrics().disk_queued_bytes != 0) == fits);
+      if (fits)
+        assert(lease->Metrics().copied_payload_bytes - copied_before ==
+               prompt.size() * sizeof(cache::Token) +
+                   240 * sizeof(cache::Token) + 32);
+      else {
+        const auto text = log.Text();
+        assert(text.find("route=durable stage=can_capture") !=
+               std::string::npos);
+        assert(text.find("protected_count=1") != std::string::npos);
+      }
+      release_writer.Release();
+      wait(log.b);
+      if (fits)
+        wait(log.d);
+      // Publication is observed while BOTH leases and the cache still exist.
+      // No Commit, destructor drain, sleeps or pending-stat polling prove it.
+      assert((log.Text().find("event=published tokens=150000 ") !=
+              std::string::npos) == fits);
+      assert(log.Text().find("event=persistence_incomplete") ==
+             std::string::npos);
+      if (fits)
+        assert(cache.CachedPrefixTokens(prompt, nullptr) == prompt.size());
+    }
+    // Remove capture constraints on restart: a miss cannot be blamed on the
+    // old allocator. Verify B survived in both arms, then D's exact rows/state.
+    auto restored_runner = std::make_shared<Runner>();
+    restored_runner->row_blocks = restored_runner->private_blocks = 0;
+    restored_runner->rows_per_chunk = 256;
+    restored_runner->max_context = prompt.size() + suffix.size();
+    ComponentTextCache restarted(restored_runner, 1, ram_bytes, disk);
+    const auto exact = [&](auto& lease, auto tokens, std::uint64_t hash) {
+      assert(lease->restored_from_disk() &&
+             lease->cached_tokens() == tokens.size());
+      auto& state = dynamic_cast<State&>(lease->state());
+      assert(restored_runner->adapter->RecurrentHash(state.slot) == hash);
+      for (const auto component : {kTarget, kDraft})
+        assert(std::ranges::equal(restored_runner->adapter->BorrowRowsView(
+                                      state.slot, component, 0, tokens.size()),
+                                  std::as_bytes(tokens)));
+    };
+    auto b = restarted.Acquire(other, {}, {}, true, 0, true);
+    exact(b, std::span(other), b_hash);
+    b->Invalidate();
+    auto warm = restarted.Acquire(prompt, {}, {}, true, 0, true);
+    if (fits) {
+      exact(warm, std::span(prompt), d_hash);
+      auto& state = dynamic_cast<State&>(warm->state());
+      restored_runner->adapter->Append(state.slot, suffix, suffix);
+      const auto continued =
+          restored_runner->adapter->RecurrentHash(state.slot);
+      warm->Invalidate();
+      auto cold = restarted.Acquire(prompt, {}, {}, false, 0, true, false);
+      assert(cold->cached_tokens() == 0);
+      auto& cold_state = dynamic_cast<State&>(cold->state());
+      restored_runner->adapter->Append(cold_state.slot, prompt, prompt);
+      restored_runner->adapter->Append(cold_state.slot, suffix, suffix);
+      assert(restored_runner->adapter->RecurrentHash(cold_state.slot) ==
+             continued);
+      cold->Invalidate();
+    } else {
+      assert(!warm->restored_from_disk() && warm->cached_tokens() == 0);
+      warm->Invalidate();
+    }
+  }
+}
+
 void RamRefusalDiskDirectRestartContract() {
   enum class Case {
     kRamOnly,
@@ -2871,6 +3467,24 @@ void RamRefusalDiskDirectRestartContract() {
                                   test == Case::kPrivateBacking;
       assert(refused == capture_denied);
       assert((lease->Metrics().disk_queued_bytes == 0) == capture_denied);
+      const auto report = ComponentCacheJson(lease->Metrics());
+      const auto* counts = report.find("capture_refusals");
+      const auto* last = report.find("last_capture_refusal");
+      assert(counts && last);
+      if (capture_denied) {
+        const auto route = test == Case::kRamOnly ? "ram" : "durable";
+        const auto stage = test == Case::kOptOut ? "eligibility" : "allocate";
+        const auto* routes = counts->find(route);
+        assert(routes && routes->size() == 1 && counts->size() == 1);
+        const auto* reasons = routes->find(stage);
+        assert(reasons && reasons->member_size("byte_capacity") == 1);
+        assert(last->member_str("route") == route);
+        assert(last->member_str("stage") == stage);
+      } else {
+        // Successful durable fallback and later publication failures are not
+        // terminal capture refusals, despite failed RAM allocation attempts.
+        assert(counts->empty() && last->is_null());
+      }
       (void)lease->Commit(prompt, {}, prompt);
       if (!capture_denied) {
         // Submission is not durability. Wait for the actual completion result.
@@ -4313,6 +4927,7 @@ void LookupRuntimeDefaultsAndDisabled() {
     assert(transfer.Lookup(prompt).epoch.empty());
   }
 }
+#include "tests/cli/cache_completion_fanout_checks.hpp"
 #include "tests/cli/cache_lookup_checks.hpp"
 #include "tests/cli/cache_lookup_r3_checks.hpp"
 #include "tests/cli/cache_packed_transfer_checks.hpp"
@@ -4811,6 +5426,7 @@ int main(int argc, char* argv[]) {
 #endif
   });
   run("lifecycle", [] {
+    completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();
     SchedulerSharesAnExactPendingFrontier();
@@ -4834,6 +5450,19 @@ int main(int argc, char* argv[]) {
   run("reuse", [] {
     ColdAssignmentPrefersPreservedSlot();
     ColdAssignmentKeepsLiveFrontiers();
+    RestorePreservesTheCostlierLiveFrontier();
+    RestorePreservesTheCostlierLiveFrontier(8192, 2048);
+    RestorePreservesTheCostlierLiveFrontier(8192, 4096, false, false);
+    RestorePreservesTheCostlierLiveFrontier(8192, 4096, false, true, false);
+    // At 9us RAM / 12us disk, half-depth B is cheaper in either tier.
+    RestorePreservesTheCostlierLiveFrontier(4096, 8192, false, true, true,
+                                            false);
+    RestorePreservesTheCostlierLiveFrontier(4096, 8192, true, true, true,
+                                            false);
+    // B7168: RAM64.512ms < A73.728ms < disk86.016ms, plus equal tail cost.
+    RestorePreservesTheCostlierLiveFrontier(7168, 8192, false, true, true,
+                                            false);
+    RestorePreservesTheCostlierLiveFrontier(7168, 8192, true);
     ColdSideRequestsKeepPreservedDeepFrontier();
     ReuseAndBranches();
     EditBoundariesSurviveActualBackingPressure();
@@ -4863,6 +5492,8 @@ int main(int argc, char* argv[]) {
     NearTailDiskBranchSurvivesRestart();
     UnbackedDeepRowsSurviveDiskRestart();
     RamRefusalDiskDirectRestartContract();
+    PinnedWriterAndProtectedGridRefuseDurableCapture();
+    RoundedBackingWithPinnedWriterAndProtectedGrid();
   });
   run("ram", [] {
     OverRamCaptureStagesPrivateStateUnderPressure(false);

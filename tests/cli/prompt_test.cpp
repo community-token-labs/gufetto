@@ -37,11 +37,39 @@ void TestKvCacheType() {
                                                    ? KvCacheType::kF16
                                                    : KvCacheType::kQ8_0));
   }
-  for (const auto value : {"", "q8", "Q8_0", "bf16", "q4_0"}) {
+  for (const auto type :
+       {KvCacheType::kQ4_0Rotated, KvCacheType::kQ8_0Q4_0Rotated}) {
+    const auto* value = gufo::models::qwen38_flash_next::KvCacheTypeName(type);
+    const auto parsed = gufo::cli::ParsePromptOptions(
+        std::array{"--kv-cache-type", value, "Hello"});
+    assert(parsed && parsed->kv_cache_type == type);
+    assert(!gufo::cli::ParsePromptOptions(
+        std::array{"--kv-cache-type", value, "--cpu"}));
+    assert(gufo::cli::ValidateKvCacheTypeForArchitecture(type, "qwen4exp",
+                                                         nullptr));
+    assert(
+        !gufo::cli::ValidateKvCacheTypeForArchitecture(type, "qwen3", nullptr));
+  }
+  for (const auto type : {KvCacheType::kQ4_0, KvCacheType::kQ8_0Q4_0}) {
+    const auto* value = gufo::models::qwen38_flash_next::KvCacheTypeName(type);
+    std::string error;
+    assert(!gufo::cli::ParsePromptOptions(
+        std::array{"--kv-cache-type", value, "Hello"}, &error));
+    assert(error ==
+           "plain q4 KV modes failed the quality screen; use "
+           "q4_0-rotated or q8_0/q4_0-rotated");
+    error.clear();
+    assert(!gufo::cli::ValidateKvCacheTypeForArchitecture(type, "qwen4exp",
+                                                          &error));
+    assert(error.find("failed the quality screen") != std::string::npos);
+  }
+  for (const auto value : {"", "q8", "Q8_0", "bf16", "q4", "q4_0/q8_0"}) {
     std::string error;
     assert(!gufo::cli::ParsePromptOptions(std::array{"--kv-cache-type", value},
                                           &error));
-    assert(error == "--kv-cache-type must be f16, q8_0 or q8_0-rotated");
+    assert(error ==
+           "--kv-cache-type must be f16, q8_0, "
+           "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated");
   }
   assert(!gufo::cli::ParsePromptOptions(
       std::array{"--kv-cache-type", "q8_0", "--cpu"}));

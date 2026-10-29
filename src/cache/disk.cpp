@@ -39,7 +39,12 @@ DiskPublicationStats Difference(const DiskPublicationStats& after,
           after.filesystem_ns - before.filesystem_ns,
           after.checksum_ns - before.checksum_ns,
           after.metadata_lock_ns - before.metadata_lock_ns,
-          after.io_lock_ns - before.io_lock_ns};
+          after.io_lock_ns - before.io_lock_ns,
+          after.private_write_bytes - before.private_write_bytes,
+          after.shared_write_bytes - before.shared_write_bytes,
+          after.manifest_write_bytes - before.manifest_write_bytes,
+          after.inherited_bytes - before.inherited_bytes,
+          after.write_calls - before.write_calls};
 }
 class CostTimer {
 public:
@@ -817,8 +822,8 @@ struct DiskStore::Impl {
         throw std::runtime_error("cache filesystem is unavailable for writes");
     }
   }
-  void WriteFile(platform::PlatformFile fd,
-                 std::span<const std::uint8_t> bytes) {
+  void WriteFile(platform::PlatformFile fd, std::span<const std::uint8_t> bytes,
+                 std::uint64_t& written_bytes) {
     while (!bytes.empty()) {
       const auto piece =
           bytes.first(std::min(bytes.size(), std::size_t{1} << 20));
@@ -827,7 +832,9 @@ struct DiskStore::Impl {
       {
         CostTimer timer(publication_stats.filesystem_ns);
         std::error_code ec;
+        ++publication_stats.write_calls;
         n = platform::Write(fd, piece.data(), piece.size(), ec);
+        written_bytes += n;
         if (n == 0) {
           if (ec == std::errc::interrupted)
             continue;
@@ -1090,6 +1097,7 @@ struct DiskStore::Impl {
           }
         }
         ValidateInherited(dir, p, access);
+        publication_stats.inherited_bytes += p.bytes;
         continue;
       }
       if (Exists(dir, DiskFileName(p.file)) ||
@@ -1166,8 +1174,10 @@ struct DiskStore::Impl {
               return b.private_file == key.first && b.file == p.file;
             });
         auto fd = Create(payload_name);
+        auto& written_bytes = key.first ? publication_stats.private_write_bytes
+                                        : publication_stats.shared_write_bytes;
         if (it != buffers.end()) {
-          WriteFile(fd.Get(), it->bytes);
+          WriteFile(fd.Get(), it->bytes, written_bytes);
         } else {
           auto source =
               std::find_if(sources.begin(), sources.end(), [&](const auto& s) {
@@ -1190,7 +1200,7 @@ struct DiskStore::Impl {
               CostTimer timer(publication_stats.checksum_ns);
               crc = DiskChecksum(piece, crc);
             }
-            WriteFile(fd.Get(), piece);
+            WriteFile(fd.Get(), piece, written_bytes);
             offset += piece.size();
           }
           if (p.checksum && p.checksum != crc)
@@ -1236,7 +1246,7 @@ struct DiskStore::Impl {
         bytes = EncodeManifest(entries.back().manifest_);
       }
       auto fd = Create(name);
-      WriteFile(fd.Get(), bytes);
+      WriteFile(fd.Get(), bytes, publication_stats.manifest_write_bytes);
       DISK_STEP(kManifestWritten);
       Sync(fd.Get());
       DISK_STEP(kManifestSynced);
