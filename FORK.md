@@ -73,21 +73,30 @@ versus23.256GiB for independently reserved full-context inputs plus the same
 workspace. These are reservation figures, not measured RAM or latency gains.
 
 Flash-Next component serving measures startup memory after creating its resource
-pool, then measures a real first slot and keeps it on success. Host and HIP
+pool, checks that one slot's logical claim plus pending obligations fits, then
+measures a real first slot and keeps it on success. Host and HIP
 capacity are tracked separately; later slots are rechecked using the largest
 observed debit. Pending execution/image obligations and disk staging are counted
 once. The final guard and cache budget use the same post-slot observation, not
 payload bytes as a prediction of allocator overhead.
 
 A measured refusal may suggest `verified to fit: --context X`: the largest
-smaller probe that passed the full staged execution pool and final memory guard,
-**not a maximum** or a guarantee under future pressure. No verified probe yields
+smaller probe that constructed the full staged execution pool and passed an
+equivalent final pending-obligation check, **not a maximum** or a guarantee
+under future pressure. No verified probe yields
 `no fitting context found within the search limits`. Search runs only on refusal,
-uses positive multiples of4096 tokens and at most8 probes, and never changes the
-requested setting. It stops starting work at30s; an in-flight allocation/free
+uses positive multiples of 4096 tokens and at most 8 probes, and never changes the
+requested setting. It stops starting work at 30 s; an in-flight allocation/free
 plus cleanup can overrun that deadline. Logs report elapsed time and limit hits.
 On Windows, HIP's free-memory query is process-only and optimistic; other GPU
-activity during startup can skew observations on any platform.
+activity and allocator history (including the just-freed refused pool) can skew
+observations on any platform.
+
+A verified execution-pool recommendation does not validate cache backing or pin
+warm-up. Very small RAM-cache budgets can still fail later with
+`insufficient component backing budget`. Disable RAM caching with
+`--cache-ram-bytes off`, or free memory/reduce context or sessions; an explicitly
+tiny RAM-cache cap must also be increased if caching is needed.
 
 After slot allocation, cache budgeting protects outstanding lazy execution and
 shared scratch without charging eager state again. AUTO halves the protected
