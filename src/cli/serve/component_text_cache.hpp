@@ -48,6 +48,14 @@ struct ComponentStartupPending {
 // They never bind a second backend or publish cache state.
 struct ComponentStartupAdmission {
   std::size_t context{};
+  // Production uses the monotonic clock; CPU fixtures can advance it without
+  // sleeping to exercise deadlines inside a staged probe.
+  std::function<std::chrono::steady_clock::time_point()> now =
+      std::chrono::steady_clock::now;
+  // Complete logical bytes of ONE not-yet-created slot, including its lazy
+  // obligations. Used only for the provisional first-slot precheck, never as
+  // the measured debit or in addition to that slot's measured pending bytes.
+  std::function<std::size_t(std::size_t)> slot_bytes;
   std::function<core::ExecutionCapacityObservation()> observe;
   std::function<ComponentStartupPending(const cache::Adapter&, std::size_t)>
       pending;

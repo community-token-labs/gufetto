@@ -2792,6 +2792,11 @@ public:
         true);
     auto& startup = *resources->startup_admission;
     startup.context = max_context_;
+    startup.slot_bytes = [model = model_, mtp = use_mtp_](std::size_t context) {
+      return model->SessionBytes(mtp ? core::SessionMode::kSpeculative
+                                     : core::SessionMode::kAutoregressive,
+                                 context);
+    };
     startup.pending = [model = model_](const cache::Adapter& base,
                                        std::size_t context) {
       const auto& adapter =

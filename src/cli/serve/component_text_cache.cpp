@@ -592,16 +592,17 @@ struct ComponentTextCache::Impl {
       cache::Adapter& adapter, std::size_t context, std::size_t count,
       std::size_t permanent_bytes, std::vector<std::unique_ptr<Entry>>& staged,
       Clock::time_point deadline = Clock::time_point::max()) {
-    if (Clock::now() >= deadline)
-      return std::nullopt;
     const auto& startup = *resources->startup_admission;
+    if (startup.now() >= deadline)
+      return std::nullopt;
     auto pending = startup.pending(adapter, context);
     auto capacity = startup.observe();
     core::ExecutionDebit maximum{};
     std::size_t max_slot_execution{}, max_slot_images{};
     const auto fixed =
         core::AddMemoryBytes(ledger.Limits().staging_bytes, permanent_bytes);
-    const auto fits = [&](std::size_t remaining) {
+    const auto fits = [&](std::size_t remaining,
+                          std::size_t first_slot_bytes = 0) {
       // Pending slot counters are independent of the shared counters: shared
       // materialization may lower the latter during construction.
       std::size_t required = core::AddMemoryBytes(
@@ -617,6 +618,8 @@ struct ComponentTextCache::Impl {
         return false;
       required += remaining * per_slot;
       const bool accepted =
+          core::FitsMemoryBudget(capacity.host, first_slot_bytes, required) &&
+          core::FitsMemoryBudget(capacity.device, first_slot_bytes, required) &&
           core::FitsMeasuredExecution(capacity, maximum, remaining, required);
       Logger::Info(
           "cache",
@@ -627,18 +630,22 @@ struct ComponentTextCache::Impl {
               " device_capacity_bytes=" + std::to_string(capacity.device) +
               " max_host_debit_bytes=" + std::to_string(maximum.host) +
               " max_device_debit_bytes=" + std::to_string(maximum.device) +
-              " pending_bytes=" + std::to_string(required) +
+              " required_bytes=" + std::to_string(required) +
+              " first_slot_logical_bytes=" + std::to_string(first_slot_bytes) +
               " fits=" + (accepted ? "1" : "0"));
       return accepted;
     };
-    // Shared obligations alone may already rule out even the first slot.
-    if (!fits(0))
+    // Bypass only the old aggregate gate. Even calibration must not knowingly
+    // spend either lane's reserve: the complete logical size of slot one plus
+    // existing pending/fixed obligations must fit before allocating that slot.
+    // After creation its actual debit and pending counters replace this bound.
+    if (!fits(0, startup.slot_bytes(context)))
       return std::nullopt;
     for (std::size_t i = 0; i < count; ++i) {
-      if (Clock::now() >= deadline)
+      if (startup.now() >= deadline)
         return std::nullopt;
       staged.push_back(CreateStartupEntry(adapter, i));
-      if (Clock::now() >= deadline)
+      if (startup.now() >= deadline)
         return std::nullopt;
       const auto next_pending = startup.pending(adapter, context);
       const auto after = startup.observe();
@@ -653,7 +660,7 @@ struct ComponentTextCache::Impl {
                                                     pending.slot_images));
       pending = next_pending;
       capacity = after;
-      if (Clock::now() >= deadline || !fits(count - i - 1))
+      if (startup.now() >= deadline || !fits(count - i - 1))
         return std::nullopt;
     }
     return StagedExecution{
@@ -665,8 +672,9 @@ struct ComponentTextCache::Impl {
                                          std::size_t permanent_bytes) {
     const auto& startup = *resources->startup_admission;
     if (!count || startup.context != runner->Descriptor().max_context ||
-        !startup.observe || !startup.pending || !startup.make_probe ||
-        !startup.freeze_capacity || !resources->freeze_execution_liability)
+        !startup.now || !startup.slot_bytes || !startup.observe ||
+        !startup.pending || !startup.make_probe || !startup.freeze_capacity ||
+        !resources->freeze_execution_liability)
       throw std::logic_error("incomplete measured startup admission provider");
     if (const auto admitted =
             StageExecution(*resources->adapter, startup.context, count,
@@ -688,7 +696,7 @@ struct ComponentTextCache::Impl {
                                 trial, deadline)
               .has_value();
         },
-        limits);
+        limits, startup.now);
     Logger::Info(
         "cache",
         "event=startup_context_search probes=" + std::to_string(search.probes) +
