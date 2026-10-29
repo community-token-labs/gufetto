@@ -163,7 +163,9 @@ void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
 void DeviceInput::Inject(float* hidden, std::uint32_t position,
                          std::uint32_t count, std::uint32_t width,
                          std::uint32_t hc, hipStream_t stream) {
-  if (!prompt_ || prompt_->images.empty())
+  // Text-only spans need positions, not retained outputs. In particular,
+  // native decode must still work after idle outputs were evicted elsewhere.
+  if (!prompt_ || !prompt_->IntersectsImages(position, count))
     return;
   const auto lease = encoder_->Outputs()->TryAcquire(output_owner_);
   if (!lease)
