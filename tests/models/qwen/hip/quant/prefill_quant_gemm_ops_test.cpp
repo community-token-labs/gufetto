@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <string_view>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -25,6 +26,51 @@
 #include "src/models/qwen/hip/ops.hpp"
 #include "tests/models/qwen/hip/support/bfloat16.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+
+#if defined(GUFO_TEST_Q8_SCRATCH_GUARDS)
+namespace {
+bool guarding_scratch = false;
+void* guarded_scratch = nullptr;
+std::size_t guarded_bytes = 0;
+constexpr std::size_t kGuardBytes = (2u << 20) + 64;
+constexpr unsigned char kGuardValue = 0xA5;
+void CheckScratchGuard() {
+  if (guarded_scratch == nullptr) {
+    std::cerr << "scratch allocation was not intercepted\n";
+    std::abort();
+  }
+  std::vector<unsigned char> guard(kGuardBytes);
+  HIP_CHECK(
+      hipMemcpy(guard.data(),
+                static_cast<unsigned char*>(guarded_scratch) + guarded_bytes,
+                guard.size(), hipMemcpyDeviceToHost));
+  if (!std::all_of(guard.begin(), guard.end(),
+                   [](auto byte) { return byte == kGuardValue; })) {
+    std::cerr << "Q8 scratch sidecar overwrote allocation guard\n";
+    std::abort();
+  }
+  std::cout << "scratch guard intact bytes=" << guarded_bytes << "\n";
+}
+}  // namespace
+extern "C" hipError_t __real_hipMalloc(void**, std::size_t);
+extern "C" hipError_t __real_hipFree(void*);
+extern "C" hipError_t __wrap_hipMalloc(void** ptr, std::size_t bytes) {
+  const auto result =
+      __real_hipMalloc(ptr, bytes + (guarding_scratch ? kGuardBytes : 0));
+  if (result == hipSuccess && guarding_scratch) {
+    guarded_scratch = *ptr;
+    guarded_bytes = bytes;
+    HIP_CHECK(hipMemset(static_cast<unsigned char*>(*ptr) + bytes, kGuardValue,
+                        kGuardBytes));
+  }
+  return result;
+}
+extern "C" hipError_t __wrap_hipFree(void* ptr) {
+  if (ptr == guarded_scratch)
+    guarded_scratch = nullptr;
+  return __real_hipFree(ptr);
+}
+#endif
 
 namespace {
 
@@ -564,17 +610,104 @@ void RunFusedNormQuantizeCase(std::size_t batch, std::size_t dim,
   HIP_CHECK(hipFree(d_got));
 }
 
+// LaunchBatchedQuantGEMM quantizes the BF16 activation into its own scratch and
+// runs the same pre-quantized kernel, so it must be bit-identical to the
+// explicit quantize + LaunchBatchedQuantGEMMPreQuantized chain. The quantizer
+// also writes the activation-sum sidecar after the tiled payload, so the
+// scratch has to hold QuantizedActivationBytes, not just the payload.
+void RunQuantizingGemmCase(std::size_t batch, std::size_t m, std::size_t k) {
+  std::cout << "quantizing Q8_0 GEMM: batch=" << batch << " m=" << m
+            << " k=" << k << "\n";
+  const std::size_t num_blocks = k / 32;
+  Rng rng(0x85EBCA6BU ^
+          static_cast<std::uint32_t>((batch * 131) + (m * 17) + k));
+
+  std::vector<HostQ8_0Block> h_w(m * num_blocks);
+  for (auto& blk : h_w) {
+    blk.d = FloatToFp16(rng.Uniform(-0.05F, 0.05F));
+    for (auto& q : blk.qs) {
+      q = rng.Int8();
+    }
+  }
+  std::vector<std::uint16_t> h_x_bf16(batch * k);
+  for (auto& v : h_x_bf16) {
+    v = gufo::test::FloatToBf16Bits(rng.Uniform(-1.5F, 1.5F));
+  }
+
+  const std::size_t q8_bytes =
+      gufo::hip::QuantizedActivationBytes(batch, k) + 4096;
+  void* d_w = nullptr;
+  void* d_x_bf16 = nullptr;
+  void* d_q8 = nullptr;
+  float* d_ref = nullptr;
+  float* d_got = nullptr;
+  HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(HostQ8_0Block)));
+  HIP_CHECK(hipMalloc(&d_x_bf16, h_x_bf16.size() * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_q8, q8_bytes));
+  HIP_CHECK(hipMalloc(&d_ref, batch * m * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_got, batch * m * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(HostQ8_0Block),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_x_bf16, h_x_bf16.data(),
+                      h_x_bf16.size() * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+
+  gufo::hip::LaunchQuantizeActivationQ8_1(d_x_bf16, d_q8, batch, k);
+  gufo::hip::LaunchBatchedQuantGEMMPreQuantized(gufo::core::GgmlType::kQ8_0,
+                                                d_w, d_q8, d_ref, batch, m, k);
+#if defined(GUFO_TEST_Q8_SCRATCH_GUARDS)
+  guarding_scratch = true;
+#endif
+  gufo::hip::LaunchBatchedQuantGEMM(gufo::core::GgmlType::kQ8_0, d_w, d_x_bf16,
+                                    d_got, batch, m, k);
+#if defined(GUFO_TEST_Q8_SCRATCH_GUARDS)
+  guarding_scratch = false;
+#endif
+  HIP_CHECK(hipDeviceSynchronize());
+#if defined(GUFO_TEST_Q8_SCRATCH_GUARDS)
+  CheckScratchGuard();
+#endif
+
+  std::vector<float> ref(batch * m);
+  std::vector<float> got(batch * m);
+  HIP_CHECK(hipMemcpy(ref.data(), d_ref, ref.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(got.data(), d_got, got.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  if (std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) != 0) {
+    std::cerr << "LaunchBatchedQuantGEMM differs from pre-quantized chain\n";
+    std::abort();
+  }
+
+  HIP_CHECK(hipFree(d_w));
+  HIP_CHECK(hipFree(d_x_bf16));
+  HIP_CHECK(hipFree(d_q8));
+  HIP_CHECK(hipFree(d_ref));
+  HIP_CHECK(hipFree(d_got));
+}
+
 }  // namespace
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-int main() {
+int main(int argc, char** argv) {
+  const bool quantizing_only =
+      argc == 2 && std::string_view(argv[1]) == "--quantizing-only";
+  if (argc != 1 && !quantizing_only)
+    return 2;
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
       gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
                                 "Qwen prefill quant GEMM ops test");
   if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
+  }
+
+  RunQuantizingGemmCase(100, 200, 160);
+  RunQuantizingGemmCase(1024, 64, 16384);
+  if (quantizing_only) {
+    std::cout << "quantizing Q8 GEMM cases passed\n";
+    return 0;
   }
 
   // 128-token throughput configuration, macro-tile aligned.

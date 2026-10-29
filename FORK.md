@@ -112,7 +112,7 @@ limitations are retained in the private `gufo-agent-concurrency` repository,
 
 ## Known limits
 
-Do not combine `--cache-disk` with image inputs while MTP is enabled: a disk-restored image history may continue differently (bug under investigation, owner: cache-persist).
+MTP output can differ slightly from plain decoding; cause not yet identified. SSD restore with images is exact (same-MTP live vs disk matches).
 
 ## Build and process
 
