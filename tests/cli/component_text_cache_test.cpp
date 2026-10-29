@@ -803,9 +803,11 @@ void SchedulerSharesAnExactPendingFrontier() {
       auto resources = Runner::CreateComponentCacheResources(ledger, ram);
       resources->allocate =
           [this, allocate = resources->allocate](const auto& request) {
+            // The inherited fake allocator counts captures non-atomically.
+            // Independent asynchronous captures must serialize that call.
+            const std::lock_guard lock(mutex);
             auto buffer = allocate(request);
             if (first.exchange(false)) {
-              const std::lock_guard lock(mutex);
               capture_thread = std::this_thread::get_id();
             }
             return buffer;
