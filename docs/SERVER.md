@@ -598,6 +598,26 @@ counting its own invalidation would incorrectly excuse every overreport.
 Failures log each attempted entry and a stage code, never exception text.
 `restore_ms=0` is not evidence of zero attempts.
 
+When admission cannot continue an available live slot, `component-cache-v1`
+`slot_victim_candidate` logs every physical slot's eligibility, live entry/depth,
+last acquisition and chosen status. Eligible slots also report `recovery_tier`,
+`covered_tokens`, estimated `recovery_ns` and `preservation_complete`, joined by
+`acquisition_id`. Static `reason` distinguishes minimum recovery cost from the
+safe ready-executor override. IDs/counters do not contain prompt text.
+
+Victim ranking estimates the cheapest compatible checkpoint restore plus
+re-prefill of the uncovered tail: 2 microseconds/token for RAM, 13.333 for disk
+(including mixed restores), and 625 for prefill. These fixed relative costs are
+calibrated to long q8 histories, not measured per-request latency or a promise
+for other models/hardware. An equivalent idle execution lineage or empty slot
+costs zero. Equal costs prefer completed preservation, then no live frontier,
+then oldest acquisition. Checkpoint coverage therefore no longer makes a long
+SSD-backed history free to discard. Retention, disk admission and actual
+restore selection are unchanged; the estimated cheapest alternative may differ
+from the deepest-first restore policy. Metadata pressure falls back to a
+conservative full-prefill estimate. Native victim behavior and admission
+latency still require matched workload measurement.
+
 `retire` logs entry ID, retirement version and reason; retain these logs through
 the whole trial rather than try to recover an expired entry later. `erased` and
 `live_unavailable` denote complete invalidation; `resident_dropped`,
