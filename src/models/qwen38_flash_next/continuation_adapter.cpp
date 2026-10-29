@@ -12,6 +12,7 @@
 
 #include "src/core/hip/snapshot_copy.hpp"
 #include "src/core/memory_budget.hpp"
+#include "src/models/qwen38_flash_next/cache_capabilities.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 
@@ -333,7 +334,7 @@ void ContinuationAdapter::PrefillThrough(cache::Slot& slot,
     throw std::runtime_error("component in-pass prefill failed: " + error);
 }
 cache::Capabilities ContinuationAdapter::GetCapabilities() const {
-  return {.continuation = true, .persistent_encoding = true};
+  return kCacheCapabilities;
 }
 std::span<const cache::ComponentDescriptor> ContinuationAdapter::Components()
     const {

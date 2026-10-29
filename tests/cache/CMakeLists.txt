@@ -1,3 +1,9 @@
+add_executable(cache_model_capabilities_test model_capabilities_test.cpp)
+target_link_libraries(cache_model_capabilities_test PRIVATE gufo_cache)
+add_test(NAME cache_model_capabilities_test
+  COMMAND cache_model_capabilities_test ${PROJECT_SOURCE_DIR}/src/models)
+set_tests_properties(cache_model_capabilities_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
 add_library(gufo_cache_fake STATIC fake_adapter.cpp)
 if (ENGINE_ENABLE_HIP)
   add_executable(cache_backing_test backing_test.cpp)
@@ -91,9 +97,15 @@ if (NOT WIN32)
   add_test(NAME cache_slot_test COMMAND cache_slot_test)
   set_tests_properties(cache_slot_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 
+  add_executable(cache_disk_policy_test disk_policy_test.cpp)
+  target_link_libraries(cache_disk_policy_test PRIVATE gufo_cache)
+  add_test(NAME cache_disk_policy_test COMMAND cache_disk_policy_test)
+  set_tests_properties(cache_disk_policy_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
   add_executable(cache_disk_test disk_test.cpp)
   target_link_libraries(cache_disk_test PRIVATE gufo_cache)
-  target_link_options(cache_disk_test PRIVATE -Wl,--wrap=read -Wl,--wrap=pread)
+  target_link_options(cache_disk_test PRIVATE
+    -Wl,--wrap=read -Wl,--wrap=pread -Wl,--wrap=fstat)
   add_test(NAME cache_disk_test COMMAND cache_disk_test)
   set_tests_properties(cache_disk_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 
@@ -114,6 +126,8 @@ if (NOT WIN32)
   add_test(NAME cache_disk_publication_test COMMAND cache_disk_publication_test)
   set_tests_properties(cache_disk_publication_test PROPERTIES LABELS "cpu;cache" TIMEOUT 60)
   if (GUFO_BUILD_TOOLS)
+    add_executable(cache_disk_checksum_bench disk_checksum_bench.cpp)
+    target_link_libraries(cache_disk_checksum_bench PRIVATE gufo_cache)
     add_executable(cache_disk_publication_bench disk_publication_bench.cpp)
     target_link_libraries(cache_disk_publication_bench PRIVATE gufo_cache)
     target_compile_options(cache_disk_publication_bench PRIVATE -UNDEBUG)

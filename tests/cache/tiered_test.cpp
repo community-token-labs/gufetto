@@ -168,6 +168,62 @@ void GlobalLRUAndSharedFiles() {
   assert(f.catalog.EvictOne());
   assert(!fs::exists(path) && f.disk.Stats().managed_bytes == 0);
 }
+void CoveredIntermediateEviction() {
+  for (bool restart : {false, true}) {
+    for (unsigned protection = 0; protection < 7; ++protection) {
+      TieredFixture f;
+      const auto publish = [&](std::vector<Token> tokens,
+                               CheckpointPurpose purpose =
+                                   CheckpointPurpose::kPrompt) {
+        f.slot = f.adapter.CreateSlot(f.guard);
+        auto history =
+            ExecutionHistory::Cold(f.ledger, f.adapter.Components(),
+                                   f.adapter.CompatibilityIdentity());
+        f.tokens = std::move(tokens);
+        f.adapter.Append(*f.slot, f.tokens, {});
+        return f.Publish(*f.Capture(purpose, &history));
+      };
+      auto unrelated = publish({900, 901});
+      auto root = publish({protection == 6 ? 40 : 10});
+      auto middle =
+          publish({10, 11}, protection == 1 ? CheckpointPurpose::kLearned
+                                            : CheckpointPurpose::kGrid);
+      if (protection == 2)
+        f.digest[0] ^= 1;  // An incompatible descendant cannot cover this root.
+      auto deep = publish({10, 11, 12});
+      if (protection == 2)
+        f.digest[0] ^= 1;
+      if (protection == 3)
+        (void)publish({10, 11, 99});  // Two continuations protect the branch.
+      const auto check = [&](DiskCatalog& catalog, DiskStore& store) {
+        if (protection == 4)
+          catalog.Invalidate(true, deep->Manifest().components[0].tail->file);
+        auto pin = protection == 5
+                       ? store.Describe(middle->Manifest().checkpoint)->Pin()
+                       : DiskReadPin{};
+        assert(catalog.EvictOne());
+        const bool covered = protection == 0;
+        assert(bool(store.Open(unrelated->Manifest().checkpoint)) == covered);
+        assert(bool(store.Open(middle->Manifest().checkpoint)) == !covered);
+        assert(store.Open(root->Manifest().checkpoint));
+      };
+      if (restart) {
+        // Reopen a quiescent durable directory snapshot with a fresh store and
+        // catalog, exercising discovery and startup's checkpoint-ID order.
+        TieredDirectory reopened;
+        fs::copy(
+            f.directory.path, reopened.path,
+            fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+        DiskStore store(f.ledger, reopened.path, 1 << 24);
+        PrefixIndex index(f.ledger);
+        DiskCatalog catalog(f.ledger, store, index);
+        check(catalog, store);
+      } else {
+        check(f.catalog, f.disk);
+      }
+    }
+  }
+}
 void MixedSourcesAndCompatibility() {
   TieredFixture f;
   f.Append(40, 36);
@@ -211,7 +267,7 @@ void MixedSourcesAndCompatibility() {
   }
   assert(rejected);
 }
-void PublicationCorruptionQuarantinesImmediately() {
+void InheritedPublicationCorruptionQuarantinesOnRead() {
   for (bool queued : {false, true}) {
     TieredFixture f;
     f.Append(16, 12);
@@ -250,12 +306,20 @@ void PublicationCorruptionQuarantinesImmediately() {
       assert(queue.TrySubmit(
           PersistenceJob(f.ledger, TieredFile(4, 999), manifest, {})));
       queue.Drain();
-      assert(queue.Stats().failed == 1);
+      assert(queue.Stats().failed == 0 && queue.Stats().completed == 1);
     } else {
       TransferTiming timing;
+      f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
+    }
+    f.catalog.Track({999});
+    {
+      auto snapshot = f.disk.Open({999});
+      assert(snapshot);
+      std::array<std::uint8_t, 16> staging{};
       bool failed{};
       try {
-        f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
+        (void)f.disk.ReadPayload(*snapshot, false, chunk, staging,
+                                 [](auto, auto) {});
       } catch (const DiskDependencyError& error) {
         failed = !error.private_file && error.file == chunk.file;
       }
@@ -270,7 +334,7 @@ void PublicationCorruptionQuarantinesImmediately() {
     // No worker mutates the caller-serialized prefix index/catalog. Cleanup
     // reconciles retained descriptions even after disk-layer invalidation.
     f.catalog.Reconcile();
-    assert(f.catalog.ReclaimInvalid() == 2);
+    assert(f.catalog.ReclaimInvalid() == 3);
     assert(f.disk.Stats().managed_bytes == 0);
     assert(description->Quarantined());
   }
@@ -294,13 +358,21 @@ void RepublishedQuarantineCannotRehabilitateOldRAM() {
       file.put('\xff');
     }
     TransferTiming timing;
-    bool failed{};
-    try {
-      f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
-    } catch (const DiskDependencyError&) {
-      failed = true;
+    f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
+    {
+      auto snapshot = f.disk.Open({999});
+      assert(snapshot);
+      std::array<std::uint8_t, 16> staging{};
+      bool failed{};
+      try {
+        (void)f.disk.ReadPayload(*snapshot, false, chunk, staging,
+                                 [](auto, auto) {});
+      } catch (const DiskDependencyError&) {
+        failed = true;
+      }
+      assert(failed && old->Quarantined());
     }
-    assert(failed && old->Quarantined());
+    assert(f.disk.Retire({999}));
     assert(!f.index.Lookup(f.Query()).selected);
     // Direct retirement/republication may precede caller reconciliation. Track
     // must erase the poisoned RAM record before dropping its old marker.
@@ -537,8 +609,9 @@ int main() {
   DeeperDiskAndRAMEviction();
   CorruptionInvalidatesAllDependents();
   GlobalLRUAndSharedFiles();
+  CoveredIntermediateEviction();
   MixedSourcesAndCompatibility();
-  PublicationCorruptionQuarantinesImmediately();
+  InheritedPublicationCorruptionQuarantinesOnRead();
   RepublishedQuarantineCannotRehabilitateOldRAM();
   InvalidUnusedRAMComponentStillSelectsMixed();
   DurableAvailabilityAdmissionOrder();

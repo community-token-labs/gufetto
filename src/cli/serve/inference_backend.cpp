@@ -46,12 +46,15 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/host_allocations.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/deepseek_v4_flash/cache_capabilities.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/qwen/cache_capabilities.hpp"
 #include "src/models/qwen/continuation_adapter.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen38_flash_next/cache_capabilities.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/models/qwen38_flash_next/target_probe.hpp"
@@ -1161,7 +1164,8 @@ public:
         vision_max_tokens_per_slot_(vision_max_tokens_per_slot),
         speculative_options_(speculative_options),
         execution_policy_(hip::QwenExecutionPolicy::Production()) {
-    if (!artifact_fingerprint.empty()) {
+    if (models::qwen::kCacheCapabilities.persistent_encoding &&
+        !artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenCompatibilityIdentity(
@@ -1261,7 +1265,7 @@ public:
                     speculative_enabled && MaximumDecodeBatchWidth() > 1,
                 .batched_multi_token_decode_max_width =
                     speculative_enabled ? MaximumDecodeBatchWidth() : 0,
-                .prefix_reuse = true,
+                .prefix_reuse = models::qwen::kCacheCapabilities.continuation,
                 .partial_prefill_retention = true,
                 .prefill_rollback = true,
             },
@@ -1793,7 +1797,8 @@ public:
         max_context_(max_context),
         use_dspark_(use_dspark),
         max_draft_tokens_(std::max(max_draft_tokens, 1u)) {
-    if (!artifact_fingerprint.empty()) {
+    if (models::deepseek_v4_flash::kCacheCapabilities.persistent_encoding &&
+        !artifact_fingerprint.empty()) {
       if (use_dspark_ && !IsSha256Hex(support_fingerprint)) {
         throw std::invalid_argument(
             "DSpark disk cache requires a support SHA-256 fingerprint");
@@ -1824,7 +1829,8 @@ public:
                 .multi_token_decode = dspark,
                 .batched_multi_token_decode = dspark,
                 .batched_multi_token_decode_max_width = 8u,
-                .prefix_reuse = true,
+                .prefix_reuse =
+                    models::deepseek_v4_flash::kCacheCapabilities.continuation,
             },
         .persistence = persistence_,
     };
@@ -2575,7 +2581,8 @@ public:
     // supply file fingerprints when disk caching and prefix pins are disabled.
     // Its model lifetime is an exact process-local identity; durable caches
     // still require the validated full artifact fingerprints below.
-    if (!artifact_fingerprint.empty()) {
+    if (models::qwen38_flash_next::kCacheCapabilities.persistent_encoding &&
+        !artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
@@ -2655,7 +2662,8 @@ public:
                 .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = use_mtp_,
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
-                .prefix_reuse = true,
+                .prefix_reuse =
+                    models::qwen38_flash_next::kCacheCapabilities.continuation,
                 .in_pass_checkpoint = true,
                 .partial_prefill_retention = true,
             },
@@ -3233,7 +3241,8 @@ struct InferenceBackend::Impl {
       std::shared_ptr<const TextPromptContext> context = {},
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
-      InitialOutputState initial = InitialOutputState::kContent) const {
+      InitialOutputState initial = InitialOutputState::kContent,
+      bool cache_persist = true) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -3254,6 +3263,7 @@ struct InferenceBackend::Impl {
             .request_start = request_start,
             .prompt_context = std::move(context),
             .cache_prompt = cache_prompt,
+            .cache_persist = cache_persist,
             .cache_prefix_tokens = cache_prefix_tokens,
             .stop_sequences = stop_sequences,
         });
@@ -3678,6 +3688,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .space_policy = disk_cache_config.space_policy,
       };
     }
     Logger::Info("loader",
@@ -3775,6 +3786,7 @@ bool InferenceBackend::load(
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .space_policy = disk_cache_config.space_policy,
       };
     }
     auto& runner_pool = new_state->runner_pool;
@@ -3874,6 +3886,7 @@ bool InferenceBackend::load(
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .space_policy = disk_cache_config.space_policy,
       };
     }
     auto& runner_pool = new_state->runner_pool;
@@ -4090,7 +4103,7 @@ InferenceBackend::Result InferenceBackend::complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool cache_prompt) {
+    bool cache_prompt, bool cache_persist) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
@@ -4101,9 +4114,11 @@ InferenceBackend::Result InferenceBackend::complete(
   return impl_->GenerateScheduled(
       state, std::move(prompt_tokens), request_start, max_tokens,
       sampling_config, is_cancelled, on_token, std::string(client_id), {},
-      cache_prompt, 0, stop_sequences);
+      cache_prompt, 0, stop_sequences, InitialOutputState::kContent,
+      cache_persist);
 #else
   (void)cache_prompt;
+  (void)cache_persist;
   (void)client_id;
   (void)stop_sequences;
   (void)prompt;
@@ -4144,7 +4159,8 @@ InferenceBackend::Result InferenceBackend::chat(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens, request.stop_sequences, initial);
+      prompt->cache_prefix_tokens, request.stop_sequences, initial,
+      request.cache_persist);
 #else
   (void)request;
   (void)max_tokens;
@@ -4161,14 +4177,15 @@ InferenceBackend::start_complete(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, bool stream_output, bool ignore_eos,
     std::string_view client_id, const std::vector<std::string>& stop_sequences,
-    bool return_progress, bool cache_prompt) {
+    bool return_progress, bool cache_prompt, bool cache_persist) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
     return TextGenerationBackend::start_complete(
         prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
+        ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
+        cache_persist);
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   auto scheduled_request = state->scheduler->Submit(
@@ -4180,6 +4197,7 @@ InferenceBackend::start_complete(
           .request_start = request_start,
           .prompt_context = {},
           .cache_prompt = cache_prompt,
+          .cache_persist = cache_persist,
           .cache_prefix_tokens = 0,
           .stop_at_eos = !ignore_eos,
           .stop_sequences = stop_sequences,
@@ -4190,7 +4208,8 @@ InferenceBackend::start_complete(
 #else
   return TextGenerationBackend::start_complete(
       prompt, max_tokens, sampling_config, is_cancelled, stream_output,
-      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt);
+      ignore_eos, client_id, stop_sequences, return_progress, cache_prompt,
+      cache_persist);
 #endif
 }
 
@@ -4236,6 +4255,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .request_start = request_start,
           .prompt_context = std::move(prompt->context),
           .cache_prompt = request.cache_prompt,
+          .cache_persist = request.cache_persist,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,

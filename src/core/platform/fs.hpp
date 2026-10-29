@@ -88,6 +88,7 @@ private:
                      std::error_code&) noexcept;
   friend bool MakeDirectoryAt(const Directory&, std::string_view,
                               std::error_code&) noexcept;
+  friend struct FilesystemProbe;
   friend bool SyncDirectory(const Directory&, std::error_code&) noexcept;
   friend bool SyncAncestors(const Directory&, std::error_code&) noexcept;
   friend bool ListDirectory(
@@ -199,6 +200,15 @@ bool ListDirectory(
     const Directory& dir,
     const std::function<void(std::string_view, const FileInfo&)>& visit,
     std::error_code& ec);
+
+/// Conservative durable-local-filesystem admission and bytes available to this
+/// user (not privileged free blocks). Unknown/error is unsupported and
+/// unwritable.
+struct FilesystemInfo {
+  std::uint64_t capacity_bytes{}, available_bytes{};
+  bool supported{}, writable{};
+};
+FilesystemInfo InspectFilesystem(const Directory&) noexcept;
 
 /// Base directory for per-user caches: XDG_CACHE_HOME, then $HOME/.cache,
 /// then Windows %LOCALAPPDATA%. Returns an empty path when the platform

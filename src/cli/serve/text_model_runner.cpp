@@ -743,6 +743,7 @@ struct TextRunnerPool::Impl {
                   disk_cache_options->staging_capacity_bytes,
               .min_checkpoint_step_tokens =
                   disk_cache_options->min_checkpoint_step_tokens,
+              .space_policy = disk_cache_options->space_policy,
           },
           EmitDiskEvent);
       Logger::Info("cache",
@@ -1454,11 +1455,14 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   // last prefill position instead so peers can start sooner.
   const auto target = std::min(common_tokens, impl_->prompt.size() - 1);
   const auto offset = impl_->prefill_offset;
-  if (target <= offset)
+  if (target < offset)
     return 0;
   // A peer can arrive while the stable-boundary copy is pending, or just
   // after it was published. Reuse that nearby frontier instead of inserting
   // another pass a few tokens later (for example, splitting framing 6 + 1).
+  // That includes a frontier at the target itself: a peer whose prompt ends
+  // one token past the leader's stable boundary arrives while the leader
+  // waits there for the copy.
   if (offset && impl_->lease.component() &&
       target - offset <= kSharedCheckpointSlack) {
     const bool capturing =
@@ -1471,6 +1475,8 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
     if (capturing || published)
       return offset;
   }
+  if (target == offset)
+    return 0;
   // Prefill already publishes the fallback, this turn's stable boundary and
   // intermediate checkpoints before advancing past them.
   std::size_t planned = 0;
@@ -1894,6 +1900,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   checkpoint.resize(position);
   if (capabilities.snapshot && capabilities.fork) {
     CommitMetrics metrics = impl_->snapshot_metrics;
+    metrics.committed_tokens = position;
     metrics.snapshot_bytes += impl_->lease.Commit(
         std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
         std::move(checkpoint));
@@ -1908,6 +1915,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
 
   std::unique_ptr<TextRunnerSnapshot> snapshot;
   CommitMetrics metrics;
+  metrics.committed_tokens = position;
   metrics.snapshot_bytes =
       impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
   impl_.reset();
@@ -1931,6 +1939,7 @@ TextRunnerPool::Request::Cancel() noexcept {
       return {};
     }
     std::vector<ContinuationToken> checkpoint;
+    std::optional<std::size_t> committed_tokens;
     if (impl_->state_reusable &&
         (impl_->decode_ready ||
          impl_->prefill_offset == impl_->snapshot_tokens.size() ||
@@ -1950,10 +1959,12 @@ TextRunnerPool::Request::Cancel() noexcept {
         throw std::runtime_error(
             "cancelled checkpoint is outside completed work");
       checkpoint.resize(position);
+      committed_tokens = position;
     } else {
       state.Invalidate();
     }
     CommitMetrics metrics = impl_->snapshot_metrics;
+    metrics.committed_tokens = committed_tokens;
     if (capabilities.snapshot && capabilities.fork) {
       metrics.snapshot_bytes += impl_->lease.Commit(
           std::move(impl_->snapshot_tokens), std::move(impl_->prompt_snapshot),
@@ -2177,7 +2188,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos,
+    std::size_t cache_prefix_tokens, bool stop_at_eos, bool persist,
     std::optional<TextPromptAdmission> reserved_resources) {
   sampling_config.Validate();
   if (prompt.empty()) {
@@ -2214,7 +2225,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   if (impl_->component_cache) {
     auto lease = impl_->component_cache->Acquire(
         prompt, is_cancelled, context, reuse_prompt, cache_prefix_tokens,
-        stop_at_eos);
+        stop_at_eos, persist);
     if (!lease)
       return {};
     Request request(std::make_unique<Request::Impl>(
@@ -2300,7 +2311,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
                            prefix.size());
       }
       if (snapshot) {
-        if (impl_->disk_store) {
+        if (impl_->disk_store && persist) {
           try {
             const auto prefix_identity =
                 PrefixInputIdentity(identity, input_prefixes, prefix.size());
@@ -2350,8 +2361,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       impl_->validated.runner->SetPromptContext(state, context);
     }
   }
+  // A request that must stay off disk may still restore from it above, but
+  // neither plans nor writes any disk checkpoint of its own.
   std::vector<std::size_t> boundaries;
-  if (reuse_prompt && impl_->disk_store != nullptr &&
+  if (reuse_prompt && persist && impl_->disk_store != nullptr &&
       !(is_cancelled && is_cancelled())) {
     try {
       boundaries = impl_->disk_store->SharedPrefixBoundaries(
@@ -2365,9 +2378,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     });
   }
   Request request(std::make_unique<Request::Impl>(
-      impl_->validated.runner, impl_->disk_store, std::move(lease),
-      std::move(prompt), std::move(boundaries), sampling_config,
-      std::move(context), cache_prefix_tokens, impl_->cache->capacity() > 1));
+      impl_->validated.runner, persist ? impl_->disk_store : nullptr,
+      std::move(lease), std::move(prompt), std::move(boundaries),
+      sampling_config, std::move(context), cache_prefix_tokens,
+      impl_->cache->capacity() > 1));
   request.impl_->prompt_resources = std::move(resources.lease);
   request.impl_->cancelled = is_cancelled;
   request.impl_->lookup_timings = impl_->lookup_timings;

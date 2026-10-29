@@ -259,6 +259,17 @@ and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities
 must match the retained prefix.
 
+`cache_persist: false` on the same endpoints keeps the request's own
+checkpoints off [`--cache-disk`](KV-CACHE.md#the-disk-tier): they stay in RAM
+and leave with RAM eviction or a restart. The request can still restore disk
+checkpoints that other requests wrote, and a later request without the flag
+that sends the same prefix can write its own. `null` keeps the default, `true`.
+Each response echoes the value it applied as a top-level `cache_persist`
+boolean, `true` by default, so a client can confirm that the server honoured
+the flag. Streams carry it on the finishing chunk and the usage chunk (Chat and
+text completions) or on the final `response` object (Responses), never on a
+content delta.
+
 Qwen image identity is checked only for images consumed before each checkpoint.
 Appending an image reuses the preceding text/image state in RAM or on disk;
 changing, removing or moving an earlier image invalidates checkpoints after it.
@@ -1558,7 +1569,14 @@ Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   miss detail the completion log also reports, `generated_tokens`, `finish`,
   `error` when generation failed, the `prompt` decoded from its tokens with
   special tokens spelled out, and the raw `output` before reasoning and
-  tool-call parsing.
+  tool-call parsing. It also includes native `prompt_token_ids`, published
+  `generated_token_ids`, executed `prefill_tokens`, and `committed_tokens`:
+  the exact prompt-plus-generated prefix retained at completion, or JSON null
+  if unavailable. IDs include hidden framing, not retokenized visible text;
+  terminal stop IDs are excluded from generated IDs, while historical stop
+  and framing IDs remain in native prompt IDs. A sampled final token need not have advanced
+  state, so do not equate generated count with committed length. The existing
+  `component_cache` object distinguishes actual live/RAM/disk reuse.
 - `response`: `status`, `outcome`, whether the reply was a `stream`, and the
   `body` the client received. For a stream this is the event stream as
   written, `: ping` keepalives included, so a difference between streaming and
@@ -1576,7 +1594,20 @@ pipe, stops tracing with `event=trace_disabled`. To read one request:
 jq 'select(.request == "r12")' trace.jsonl
 ```
 
-The file holds prompts, tool results and generated text in full: treat it
+For sequential, successful text-only reuse measurements, join by `request` and
+use the native prompt plus only the executed generated prefix established by
+`committed_tokens`. Reject missing counts or a frontier outside the recorded
+IDs rather than silently clamping it. Cancellation, speculative stop-sequence
+publication, unsupported retention and failures can leave incomplete execution
+evidence; a retained frontier is not proof that no work beyond it was executed.
+Token IDs alone do not establish supplemental-input identity for images/audio.
+The all-history client-prefix oracle must retain earlier processed prefixes even
+after eviction; `component_cache.indexed_common_tokens` is a separate resident
+lookup diagnostic, never the historical reuse denominator. Tracing is sensitive
+and adds I/O/allocation overhead; keep trace-on evidence separate from trace-off
+performance comparisons.
+
+The file holds prompts, token IDs, tool results and generated text in full: treat it
 like the conversations themselves and delete it when done. It is never
 rotated or truncated.
 

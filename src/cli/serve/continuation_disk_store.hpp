@@ -66,6 +66,7 @@ struct ContinuationDiskStoreOptions {
   /// Minimum token advance over the longest stored prefix that is still a
   /// prefix of the checkpoint before writing it. Zero disables the gate.
   std::size_t min_checkpoint_step_tokens{0};
+  cache::DiskSpacePolicy space_policy;
 };
 
 /// Restart-safe, provider-neutral exact-prefix snapshot store.

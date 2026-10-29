@@ -11,6 +11,7 @@
 
 #include "src/core/hip/snapshot_copy.hpp"
 #include "src/core/memory_budget.hpp"
+#include "src/models/qwen/cache_capabilities.hpp"
 
 namespace gufo::models::qwen {
 namespace {
@@ -390,7 +391,7 @@ void ContinuationAdapter::RollbackPrefill(cache::Slot& slot) {
   FinishPrefill(slot);
 }
 cache::Capabilities ContinuationAdapter::GetCapabilities() const {
-  return {.continuation = true, .persistent_encoding = true};
+  return kCacheCapabilities;
 }
 std::span<const cache::ComponentDescriptor> ContinuationAdapter::Components()
     const {

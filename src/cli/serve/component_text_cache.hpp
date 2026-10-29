@@ -123,7 +123,8 @@ public:
   [[nodiscard]] std::unique_ptr<Lease> Acquire(
       std::span<const ContinuationToken>,
       const ContinuationCache::CancellationCheck&,
-      std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool);
+      std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
+      bool persist = true);
   [[nodiscard]] std::optional<ContinuationReuse> Lookup(
       std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
       std::size_t stable) const;

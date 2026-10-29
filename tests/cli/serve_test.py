@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def main():
@@ -293,13 +294,33 @@ def main():
               "sampling and scheduling limits are invalid")
     for staging in (None, "0", "8589934592"):
         args = ["serve", "llm", "--model", "missing.gguf",
-                "--cache-disk", "/unused-cache"]
+                "--cache-disk", "off"]
         if staging is not None:
             args += ["--cache-disk-staging-bytes", staging]
         check(args, 1, "Error loading model")
     check(["serve", "llm", "--cache-disk", "/unused-cache",
            "--cache-disk-bytes", "0"], 2,
           "sampling and scheduling limits are invalid")
+
+    previous_cache = env.get("XDG_CACHE_HOME")
+    env["XDG_CACHE_HOME"] = "relative-cache-is-not-admitted"
+    try:
+        check(["serve", "llm", "--model", "missing.gguf", "--cache-disk", "auto"],
+              1, "reason=no_absolute_user_cache")
+    finally:
+        if previous_cache is None:
+            env.pop("XDG_CACHE_HOME")
+        else:
+            env["XDG_CACHE_HOME"] = previous_cache
+
+    assert "auto|off|DIR" in help_text
+    assert "--cache-disk-free-bytes" in help_text
+    with tempfile.TemporaryDirectory() as cache_root:
+        not_directory = Path(cache_root) / "file"
+        not_directory.write_text("not a directory")
+        check(["serve", "llm", "--model", "missing.gguf",
+               "--cache-disk", str(not_directory)], 2,
+              "cache disk unavailable: inaccessible_path")
 
     assert "repeatable, at most 64" in help_text
     assert "Total pinned-prefix registry byte budget" in help_text

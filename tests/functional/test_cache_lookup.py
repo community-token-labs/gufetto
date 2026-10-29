@@ -725,28 +725,28 @@ class HttpTests(unittest.TestCase):
             self.assertNotIn("PRIVATE", json.dumps(report))
 
     def test_own_unfinished_body_correlation_measures_underreport_not_tier_cause(self):
-        class WarmBusyEngine(Engine):
-            def post(self, endpoint, body):
-                if endpoint == "/v1/chat/completions":
-                    # Controlled fake: reuse exists before a slow generation;
-                    # lookups under-report it while the same request is active.
-                    delay = self.generation_delay
-                    self.generation_delay = 0
-                    try:
-                        super().post(endpoint, body)
-                    finally:
-                        self.generation_delay = delay
-                return super().post(endpoint, body)
+        class WarmBusyHarness(Harness):
+            def pair(self, label, body, strict=True):
+                # Establish the fixture's warm-cache precondition BEFORE pair
+                # records the HTTP generation interval. Handler-side warmup is
+                # too late: an in-flight lookup can legitimately still see cold.
+                delay = engine.generation_delay
+                engine.generation_delay = 0
+                try:
+                    engine.post("/v1/chat/completions", body)
+                finally:
+                    engine.generation_delay = delay
+                return super().pair(label, body, strict)
 
         # One generation thread avoids mutable fake timing races; the harness's
         # 4/8 production configuration remains covered by the existing tests.
-        engine = WarmBusyEngine()
+        engine = Engine()
         engine.generation_delay = .12
         engine.lookup_delta = 2
         config = Config("fixture", clients=1, latency_lookups=40,
                         lookup_interval_ms=10, system_lines=1, load_timeout=3)
         with fake_http(engine) as url:
-            runner = Harness(Client(url, timeout=2), config)
+            runner = WarmBusyHarness(Client(url, timeout=2), config)
             report = runner.run("load")
         stats = report["load"]["own_unfinished_conversation_observations"]
         self.assertGreater(stats["fully_in_flight_samples"], 0)

@@ -15,6 +15,20 @@ endfunction()
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
+# Host-only production serialization slices with explicit Model/executor proxies.
+set(identity_body "${CMAKE_CURRENT_BINARY_DIR}/continuation_identity_body.inc")
+add_custom_command(OUTPUT "${identity_body}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_continuation_identity.py"
+    --source-root "${PROJECT_SOURCE_DIR}" --output "${identity_body}"
+  DEPENDS extract_continuation_identity.py
+    "${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/continuation_adapter.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/engine.cpp"
+  VERBATIM)
+add_qwen38_flash_next_test(continuation_identity gufo_qwen38_flash_next "cpu")
+target_sources(qwen38_flash_next_continuation_identity_test PRIVATE "${identity_body}")
+target_include_directories(qwen38_flash_next_continuation_identity_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}")
 add_qwen38_flash_next_test(kv_cache gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_rotation gufo_qwen38_flash_next "cpu")
 target_compile_options(qwen38_flash_next_kv_rotation_test PRIVATE

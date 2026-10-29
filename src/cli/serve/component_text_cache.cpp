@@ -559,7 +559,8 @@ struct ComponentTextCache::Impl {
       // Take directory ownership before slots and backing commit, so a
       // second server fails without claiming its RAM budget first.
       disk = std::make_unique<cache::DiskStore>(ledger, options->directory,
-                                                options->capacity_bytes);
+                                                options->capacity_bytes,
+                                                options->space_policy);
     }
     if (pins.enabled()) {
       if (pins.files.empty() ||
@@ -712,13 +713,15 @@ struct ComponentTextCache::Impl {
       disk_capacity = options->capacity_bytes;
       disk_step = options->min_checkpoint_step_tokens;
       disk->ReclaimOrphans();
-      if (disk->Stats().managed_bytes > disk_capacity) {
+      if (disk->Stats().managed_bytes > disk_capacity ||
+          disk->SpacePressure()) {
         // A lowered --cache-disk-bytes keeps its meaning: reclaim orphans and
         // temporaries first, then evict the oldest checkpoints by creation
         // (startup has no use history) to fit.
         disk->WaitForReclamation();
         std::size_t evicted{};
-        while (disk->Stats().managed_bytes > disk_capacity &&
+        while ((disk->Stats().managed_bytes > disk_capacity ||
+                disk->SpacePressure()) &&
                catalog->EvictOne())
           ++evicted;
         const auto managed = disk->Stats().managed_bytes;
@@ -727,9 +730,9 @@ struct ComponentTextCache::Impl {
         if (evicted)
           Logger::Info("cache",
                        "schema=component-cache-v1 event=disk_evicted "
-                       "reason=budget entries=" +
+                       "reason=budget_or_free_space entries=" +
                            std::to_string(evicted) + fields);
-        if (managed > disk_capacity)
+        if (managed > disk_capacity || disk->SpacePressure())
           Logger::Warn(
               "cache",
               "schema=component-cache-v1 event=disk_over_budget" + fields);
@@ -741,7 +744,8 @@ struct ComponentTextCache::Impl {
             return std::ranges::none_of(
                 entries, [](const auto& entry) { return entry->busy; });
           },
-          [this](cache::CheckpointId id, bool success) {
+          [this](cache::CheckpointId id, bool success,
+                 const cache::TransferTiming& timing) {
             const std::lock_guard lock(mutex);
             for (auto& checkpoint : pending)
               if (checkpoint && checkpoint->Id() == id)
@@ -788,7 +792,16 @@ struct ComponentTextCache::Impl {
                       std::to_string(description->Manifest().tokens.size()) +
                       " checkpoint_id=" + std::to_string(id.value) +
                       " payload_bytes=" +
-                      std::to_string(PayloadBytes(description->Manifest())));
+                      std::to_string(PayloadBytes(description->Manifest())) +
+                      " yield_ms=" + std::to_string(timing.yield_ns / 1e6) +
+                      " stream_wait_ms=" +
+                      std::to_string(timing.stream_wait_ns / 1e6) +
+                      " filesystem_ms=" +
+                      std::to_string(timing.filesystem_ns / 1e6) +
+                      " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6) +
+                      " checksum_ms=" +
+                      std::to_string(timing.checksum_ns / 1e6) +
+                      " fsync_ms=" + std::to_string(timing.fsync_ns / 1e6));
             }
           },
           [this](const cache::DiskManifest& manifest) {
@@ -1057,6 +1070,8 @@ struct ComponentTextCache::Lease::Impl {
   double restore_time{};
   bool disk_hit{}, active{true}, preserve_source{}, pin_capture{};
   ComponentTextCache::Impl::Pin* pin_hit{};
+  // False keeps every checkpoint this lease captures in RAM only.
+  bool persist{true};
   cache::CheckpointId source{};
   std::array<cache::CheckpointId, cache::RetentionPolicy::kRecordLimit>
       edit_boundaries{};
@@ -1107,7 +1122,7 @@ struct ComponentTextCache::Lease::Impl {
 
 std::unique_ptr<TextRunnerSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
-  if (!cache->queue || !cache->resources->copy_observed_rows ||
+  if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
   const auto capture_input = At(input, capture_tokens.size());
@@ -1581,7 +1596,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     std::span<const ContinuationToken> prompt,
     const ContinuationCache::CancellationCheck& cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse,
-    std::size_t stable, bool stop_at_eos) {
+    std::size_t stable, bool stop_at_eos, bool persist) {
   if (cancelled && cancelled())
     return {};
   if (impl_->resources->test_barrier)
@@ -1602,11 +1617,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (impl_->catalog)
       impl_->catalog->Reconcile();
     found = impl_->Plan(prompt, input, stable, reuse);
-    // A miss reports how far a stored prompt agreed, so an empty cache can
-    // be told apart from one holding only incompatible boundaries.
-    if (reuse && !found.selected)
-      common =
-          impl_->index.CommonPrefixTokens({impl_->identity, prompt, input});
+    // Capture resident agreement before retiring a live frontier. Partial hits
+    // need the same diagnostic as full misses; this is not an all-history LCP.
+    if (reuse)
+      common = found.selected && found.selected->boundary == prompt.size()
+                   ? prompt.size()
+                   : impl_->index.CommonPrefixTokens(
+                         {impl_->identity, prompt, input});
     if (found.selected && found.selected->live) {
       const auto location = *found.selected->live;
       auto& selected_entry = *impl_->entries.at(location.slot.value - 1);
@@ -1724,6 +1741,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     lease = std::make_unique<Lease>(std::make_unique<Lease::Impl>(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
     auto& request = *lease->impl_;
+    request.persist = persist;
     request.metrics.acquisition_id = acquisition_id;
     request.metrics.admission_index_version = admission_version;
     request.metrics.selected_entry_id =
@@ -1744,17 +1762,25 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
              impl_->runner->HasDecodeFrontier(*request.state);
     };
     if (live && !decodable(found.selected->boundary)) {
+      ++request.metrics.unready_frontiers;
       live.reset();
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
     }
     bool restored = bool(live);
-    if (live)
+    if (live) {
       request.cached = found.selected->boundary;
+      request.metrics.used_entry_id = found.selected->entry.value;
+    }
+    bool restore_cancelled = false;
     for (const auto& candidate : found.candidates) {
-      if (restored || (cancelled && cancelled()))
+      if (restored)
         break;
+      if (cancelled && cancelled()) {
+        restore_cancelled = true;
+        break;
+      }
       if (candidate.live)
         continue;
       ++request.metrics.restore_attempts;
@@ -1961,6 +1987,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           }
         }
         if (restored && !decodable(candidate.boundary)) {
+          ++request.metrics.unready_frontiers;
           // Intentional conservative full-boundary fallback, not a failed
           // transfer/restore. Lookup omits the same unready boundary.
           if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
@@ -1975,6 +2002,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         }
         if (restored) {
           request.cached = candidate.boundary;
+          request.metrics.used_entry_id = candidate.entry.value;
           const std::lock_guard lock(impl_->mutex);
           entry->durable = candidate.durable;
         }
@@ -2068,6 +2096,46 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                                : "none";
     request.metrics.selection_reason = static_cast<std::uint32_t>(found.reason);
     request.metrics.selected = request.cached;
+    request.metrics.indexed_common_tokens = std::max(common, request.cached);
+    request.metrics.indexed_gap_tokens =
+        request.metrics.indexed_common_tokens - request.cached;
+    auto& reason = request.metrics.reuse_reason;
+    if (!reuse) {
+      reason = CacheReuseReason::kDisabled;
+    } else if (restore_cancelled) {
+      reason = CacheReuseReason::kCancelled;
+    } else if (request.metrics.restore_failures) {
+      reason = CacheReuseReason::kRestoreFailed;
+    } else if (request.metrics.unready_frontiers) {
+      reason = CacheReuseReason::kFrontierNotReady;
+    } else if (request.cached) {
+      reason = request.metrics.indexed_gap_tokens
+                   ? CacheReuseReason::kBoundaryGap
+               : live             ? CacheReuseReason::kLive
+               : request.disk_hit ? CacheReuseReason::kDisk
+                                  : CacheReuseReason::kRam;
+    } else {
+      switch (found.reason) {
+        case cache::SelectionReason::kUnknownCompatibility:
+          reason = CacheReuseReason::kUnknownCompatibility;
+          break;
+        case cache::SelectionReason::kInputIdentity:
+          reason = CacheReuseReason::kInputIdentity;
+          break;
+        case cache::SelectionReason::kMissingComponent:
+          reason = CacheReuseReason::kMissingComponent;
+          break;
+        case cache::SelectionReason::kStablePrefixBoundary:
+          reason = CacheReuseReason::kStablePrefixBoundary;
+          break;
+        default:
+          reason = common ? CacheReuseReason::kNoCompatibleBoundary
+                          : CacheReuseReason::kNoIndexedPrefix;
+          break;
+      }
+    }
+    CacheReuseReasonCounts()[static_cast<std::size_t>(reason)].fetch_add(
+        1, std::memory_order_relaxed);
     request.metrics.restored_bytes = request.restored;
     for (const auto& candidate : found.candidates) {
       auto& deepest = candidate.live         ? request.metrics.deepest_live
@@ -2084,24 +2152,33 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                                  : "no_checkpoint",
                              request.cached ? 0 : common,
                              request.cached ? request.cached : nearest};
-    Logger::Info("cache",
-                 "schema=component-cache-v1 event=acquire reuse=" +
-                     std::string(live               ? "live"
-                                 : request.disk_hit ? "disk"
-                                 : request.cached   ? "ram"
-                                                    : "none") +
-                     " selected_tokens=" + std::to_string(request.cached) +
-                     " restored_bytes=" + std::to_string(request.restored) +
-                     " acquisition_id=" + std::to_string(acquisition_id) +
-                     " admission_index_version=" +
-                     std::to_string(admission_version) + " selected_entry_id=" +
-                     std::to_string(request.metrics.selected_entry_id) +
-                     " restore_attempts=" +
-                     std::to_string(request.metrics.restore_attempts) +
-                     " restore_failures=" +
-                     std::to_string(request.metrics.restore_failures) +
-                     " restore_failure_reason=" +
-                     request.metrics.restore_failure_reason);
+    Logger::Info(
+        "cache",
+        "schema=component-cache-v1 event=acquire reuse=" +
+            std::string(live               ? "live"
+                        : request.disk_hit ? "disk"
+                        : request.cached   ? "ram"
+                                           : "none") +
+            " selected_tokens=" + std::to_string(request.cached) +
+            " restored_bytes=" + std::to_string(request.restored) +
+            " acquisition_id=" + std::to_string(acquisition_id) +
+            " admission_index_version=" + std::to_string(admission_version) +
+            " selected_entry_id=" +
+            std::to_string(request.metrics.selected_entry_id) +
+            " restore_attempts=" +
+            std::to_string(request.metrics.restore_attempts) +
+            " restore_failures=" +
+            std::to_string(request.metrics.restore_failures) +
+            " restore_failure_reason=" +
+            request.metrics.restore_failure_reason +
+            " reuse_reason=" + std::string(CacheReuseReasonName(reason)) +
+            " indexed_common_tokens=" +
+            std::to_string(request.metrics.indexed_common_tokens) +
+            " indexed_gap_tokens=" +
+            std::to_string(request.metrics.indexed_gap_tokens) +
+            " unready_frontiers=" +
+            std::to_string(request.metrics.unready_frontiers) +
+            " used_entry_id=" + std::to_string(request.metrics.used_entry_id));
     return lease;
   } catch (...) {
     if (lease)
@@ -2802,6 +2879,8 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     impl_->edit_boundaries[impl_->edit_boundary_count++] =
         component->checkpoint->Id();
   }
+  if (!impl_->persist)
+    return component->bytes;
   try {
     const auto started = Clock::now();
     impl_->metrics.disk_queued_bytes +=
