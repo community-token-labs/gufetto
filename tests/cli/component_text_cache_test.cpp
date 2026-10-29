@@ -2716,6 +2716,204 @@ void DiskDirectoryHasOneOwner() {
   }
   std::filesystem::remove_all(directory);
 }
+// Independent direct owners make safe creator withdrawal observable. The
+// ordinary fake pool shares one allocation and correctly refuses withdrawal.
+class PredictionRunner : public Runner {
+public:
+  std::size_t private_limit{1 << 20};
+  mutable std::size_t allocation_refusals{};
+  mutable bool fail_reconcile{};
+  PredictionRunner() {
+    row_blocks = private_blocks = 0;
+    rows_per_chunk = 64;
+  }
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t budget) const override {
+    auto resources = Runner::CreateComponentCacheResources(ledger, budget);
+    resources->allocate = [this,
+                           &ledger](const cache::PayloadRequest& request) {
+      if (request.category == cache::ResourceCategory::kPrivateState &&
+          ledger.Snapshot().bytes[static_cast<std::size_t>(
+              cache::ResourceCategory::kPrivateState)] +
+                  request.bytes >
+              private_limit) {
+        ++allocation_refusals;
+        throw cache::ResourceExhausted();
+      }
+      auto bytes = std::make_shared<std::vector<std::byte>>(request.bytes);
+      auto backing =
+          ledger.Reserve(cache::ResourceCategory::kBackingFree, request.bytes)
+              .Convert();
+      auto reservation = std::make_shared<cache::ResourceReservation>(
+          backing.ReserveBacking(request.category));
+      return ComponentCaptureBuffer{
+          *bytes, [bytes, reservation] {
+            return cache::Payload::Committed(
+                reservation->Convert(),
+                std::shared_ptr<const void>(bytes, bytes->data()));
+          }};
+    };
+    return resources;
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    Runner::ReconcileComponentState(state, position);
+    if (fail_reconcile)
+      throw std::runtime_error("test later handoff failure");
+  }
+};
+
+void PredictionWithdrawalIsPressureOnly() {
+  for (const bool pressure : {false, true}) {
+    for (const bool external_owner : {false, true}) {
+      auto runner = std::make_shared<PredictionRunner>();
+      runner->private_limit = pressure ? 32 : 64;
+      ComponentTextCache cache(runner, 1, 1 << 22, {});
+      std::vector<TextRunnerToken> prompt(20);
+      std::iota(prompt.begin(), prompt.end(), 10);
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, std::span(prompt).first(8),
+                              std::span(prompt).first(8));
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 8, true,
+                                       SnapshotPurpose::kHistory, {},
+                                       SnapshotOrigin::kPredicted));
+      std::shared_ptr<const TextRunnerSnapshot> root = lease->Capture();
+      assert(lease->PublishSnapshot({prompt.begin(), prompt.begin() + 8}, root,
+                                    true));
+      // The creator finishing prefill is never an actual reuse observation.
+      assert(!lease->ObserveSnapshotFor(std::span(prompt).first(8)));
+      if (!external_owner)
+        root.reset();
+      runner->adapter->Append(state.slot, std::span(prompt).subspan(8),
+                              std::span(prompt).subspan(8));
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                       true, SnapshotPurpose::kContinuation,
+                                       {}));
+      bool refused = false;
+      try {
+        auto full = lease->Capture();
+        assert(lease->PublishSnapshot(prompt, std::move(full), true));
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      assert(refused == (pressure && external_owner));
+      const auto metrics = lease->Metrics();
+      const auto private_bytes = metrics.ledger.bytes[static_cast<std::size_t>(
+          cache::ResourceCategory::kPrivateState)];
+      if (!pressure) {
+        assert(lease->HasSnapshotFor(std::span(prompt).first(8)));
+        assert(lease->HasSnapshotFor(prompt));
+        assert(private_bytes == 64 && runner->allocation_refusals == 0);
+      } else {
+        assert(runner->allocation_refusals > 0);
+        // Even logical removal cannot spend the escaped payload's bytes.
+        assert(private_bytes == 32);
+        assert(lease->HasSnapshotFor(prompt) == !external_owner);
+        assert(metrics.captures == (external_owner ? 1 : 2));
+      }
+    }
+  }
+}
+
+void PredictionNeverReclaimsOrdinaryCapture() {
+  auto runner = std::make_shared<PredictionRunner>();
+  runner->private_limit = 32;
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(20, 10);
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  runner->adapter->Append(state.slot, std::span(prompt).first(8),
+                          std::span(prompt).first(8));
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 8, false,
+                                   SnapshotPurpose::kContinuation, {}));
+  assert(lease->PublishSnapshot({prompt.begin(), prompt.begin() + 8},
+                                lease->Capture(), false));
+  runner->adapter->Append(state.slot, std::span(prompt).subspan(8),
+                          std::span(prompt).subspan(8));
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 20, false,
+                                   SnapshotPurpose::kHistory, {},
+                                   SnapshotOrigin::kPredicted));
+  bool refused = false;
+  try {
+    (void)lease->Capture();
+  } catch (const cache::ResourceExhausted&) {
+    refused = true;
+  }
+  assert(refused && runner->allocation_refusals);
+  assert(lease->HasSnapshotFor(std::span(prompt).first(8)));
+  assert(lease->Metrics().captures == 1);
+}
+
+void PredictionObservationFollowsSuccessfulHandoff() {
+  enum class Attempt {
+    kSuccess,
+    kFailedRestore,
+    kLaterException,
+    kDisabled,
+    kCancelled
+  };
+  for (const auto attempt :
+       {Attempt::kSuccess, Attempt::kFailedRestore, Attempt::kLaterException,
+        Attempt::kDisabled, Attempt::kCancelled}) {
+    auto runner = std::make_shared<PredictionRunner>();
+    ComponentTextCache cache(runner, 2, 1 << 22, {});
+    std::vector<TextRunnerToken> prompt(20);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto creator = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(creator->state());
+    // Ordinary fallback at four, predicted source at eight.
+    for (const auto count : {4U, 8U}) {
+      const auto start = count == 4 ? 0 : 4;
+      const auto part = std::span(prompt).subspan(start, 4);
+      runner->adapter->Append(state.slot, part, part);
+      assert(creator->TryReserveSnapshot(
+          creator->CaptureBytes(), count, false, SnapshotPurpose::kHistory, {},
+          count == 8 ? SnapshotOrigin::kPredicted : SnapshotOrigin::kOrdinary));
+      assert(creator->PublishSnapshot({prompt.begin(), prompt.begin() + count},
+                                      creator->Capture(), false));
+    }
+    assert(cache.Lookup(prompt, nullptr, true, 0)->matched_tokens == 8);
+    if (attempt == Attempt::kFailedRestore)
+      runner->adapter->FailNextTransfer();
+    runner->fail_reconcile = attempt == Attempt::kLaterException;
+    bool threw = false;
+    std::unique_ptr<ComponentTextCache::Lease> reuse;
+    try {
+      reuse = cache.Acquire(
+          prompt, [attempt] { return attempt == Attempt::kCancelled; }, {},
+          attempt != Attempt::kDisabled, 0, true);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    assert(threw == (attempt == Attempt::kLaterException));
+    if (attempt == Attempt::kCancelled)
+      assert(!reuse);
+    if (reuse) {
+      assert(reuse->cached_tokens() == (attempt == Attempt::kSuccess ? 8
+                                        : attempt == Attempt::kFailedRestore
+                                            ? 4
+                                            : 0));
+      assert(reuse->reused_prediction() == (attempt == Attempt::kSuccess));
+      assert(reuse->ordinary_cached_tokens() ==
+             (attempt == Attempt::kDisabled ? 0 : 4));
+      reuse->Invalidate();
+      reuse.reset();
+    }
+    runner->fail_reconcile = false;
+    // Only success upgraded logical provenance. A later successful reader of
+    // an unobserved source still reports prediction, despite a previous lookup
+    // or exception after restore.
+    if (attempt != Attempt::kFailedRestore) {
+      auto next = cache.Acquire(prompt, {}, {}, true, 0, true);
+      assert(next->cached_tokens() == 8);
+      assert(next->reused_prediction() == (attempt != Attempt::kSuccess));
+      assert(next->ordinary_cached_tokens() ==
+             (attempt == Attempt::kSuccess ? 8 : 4));
+    }
+  }
+}
+
 void PredictedSnapshotsRemainRamOnly() {
   const TemporaryDirectory temp("gufo-predicted-ram-only");
   const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
@@ -5638,6 +5836,9 @@ int main(int argc, char* argv[]) {
     UnpinnedRunnersKeepTheirLimit();
     DiskDirectoryHasOneOwner();
     PredictedSnapshotsRemainRamOnly();
+    PredictionWithdrawalIsPressureOnly();
+    PredictionNeverReclaimsOrdinaryCapture();
+    PredictionObservationFollowsSuccessfulHandoff();
     PredictedCaptureRefusesBothDurableFallbacks();
     GridDoesNotSuppressFirstDiskPrompt();
     NearTailDiskBranchSurvivesRestart();
