@@ -43,6 +43,15 @@ not met the original strict quality gates. Shared-Q4 MTP requires an explicit
 compatible model and speculative selection. Our standard development profile
 explicitly enables **shared-Q8 MTP at C1–C4** (`--speculative mtp --mtp-model …`);
 the generic CLI defaults to speculation off, not implicit Q8 draft loading.
+Vision-enabled startup charges one shared encoder workspace in addition to
+per-slot input storage. After allocating slots, cache budgeting protects their
+still-unallocated execution storage and deferred shared scratch; resident
+weights and eager state are not charged twice. AUTO halves the remaining
+protected headroom, so correcting formerly unprotected promises can reduce the
+cache budget. Explicit and disk-only backing retain execution/OS reserves too.
+The frozen growth guard is conservative after lazy buffers materialize. CPU
+image preprocessing, other processes and runtime overhead remain separate
+pressure sources; this is not an unconditional OOM guarantee.
 RAM caching defaults to AUTO (`--cache-ram-bytes 0`); `off` disables retention.
 Disk caching, pins, `--cache-lookup-api`, `--cache-transfer-api` and `--trace`
 require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and
