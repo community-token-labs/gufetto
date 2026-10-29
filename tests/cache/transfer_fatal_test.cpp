@@ -357,41 +357,47 @@ void StreamedBoundaryAndRestart(const char* api, unsigned skip = 0,
     assert(output.find("entry=2 bytes=4") != std::string::npos);
   }
   assert(output.find("RETURNED") == std::string::npos);
-  // Fresh DiskStore after the child process is gone: no partial child
-  // visibility.
-  DiskStore recovered(ledger, dir.path, 1 << 20);
-  assert(!recovered.Open({2}));
-  auto parent = recovered.Open({1});
-  assert(parent && recovered.Entries().size() == 1);
-  std::array<std::uint8_t, 4> staging{};
-  std::vector<std::uint8_t> restored;
-  const auto payload = parent->Manifest().components[0].chunks[0];
-  (void)recovered.ReadPayload(
-      *parent, false, payload, staging, [&](auto, auto bytes) {
-        restored.insert(restored.end(), bytes.begin(), bytes.end());
-      });
-  assert(std::equal(original.begin(), original.end(), restored.begin(),
-                    restored.end()));
-  recovered.ReclaimOrphans();
-  recovered.WaitForReclamation();
-  assert(!fs::exists(dir.path / "v2/chunks" / DiskFileName(Id(2))));
-  assert(fs::is_empty(dir.path / "v2/tmp"));
-  // Inherited parent bytes are still content-checked, even with restored mtime.
-  const auto path = dir.path / "v2/chunks" / DiskFileName(Id(1));
-  const auto time = fs::last_write_time(path);
-  {
-    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
-    file.put('x');
-  }
-  fs::last_write_time(path, time);
-  bool rejected{};
-  try {
-    (void)recovered.ReadPayload(*parent, false, payload, staging,
-                                [](auto, auto) {});
-  } catch (const std::exception&) {
-    rejected = true;
-  }
-  assert(rejected);
+  // A new reader process after writer death: no partial child visibility or
+  // writer-process metadata can survive the restart.
+  Child(
+      [&] {
+        DiskStore recovered(ledger, dir.path, 1 << 20);
+        assert(!recovered.Open({2}));
+        auto parent = recovered.Open({1});
+        assert(parent && recovered.Entries().size() == 1);
+        std::array<std::uint8_t, 4> staging{};
+        std::vector<std::uint8_t> restored;
+        const auto payload = parent->Manifest().components[0].chunks[0];
+        (void)recovered.ReadPayload(
+            *parent, false, payload, staging, [&](auto, auto bytes) {
+              restored.insert(restored.end(), bytes.begin(), bytes.end());
+            });
+        assert(std::equal(original.begin(), original.end(), restored.begin(),
+                          restored.end()));
+        recovered.ReclaimOrphans();
+        recovered.WaitForReclamation();
+        assert(!fs::exists(dir.path / "v2/chunks" / DiskFileName(Id(2))));
+        assert(fs::is_empty(dir.path / "v2/tmp"));
+        // Inherited parent bytes are still content-checked, even with restored
+        // mtime.
+        const auto path = dir.path / "v2/chunks" / DiskFileName(Id(1));
+        const auto time = fs::last_write_time(path);
+        {
+          std::fstream file(path,
+                            std::ios::binary | std::ios::in | std::ios::out);
+          file.put('x');
+        }
+        fs::last_write_time(path, time);
+        bool rejected{};
+        try {
+          (void)recovered.ReadPayload(*parent, false, payload, staging,
+                                      [](auto, auto) {});
+        } catch (const std::exception&) {
+          rejected = true;
+        }
+        assert(rejected);
+      },
+      0);
 }
 std::atomic<int> requested{};
 std::atomic<bool> entered{}, release_handler{};
