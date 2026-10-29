@@ -793,6 +793,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
                    double* capture_ms, std::span<const std::int32_t> after,
                    const PrefillCapture& consume) {
+  if (perf::current && perf::execution_roster.size() == 1)
+    perf::BindNative(0, reinterpret_cast<std::uintptr_t>(session_.get()));
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
@@ -1427,6 +1429,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
   pd::AssociationScope association(provenance);
 #endif
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  if (perf::current && perf::execution_roster.size() == 1)
+    perf::BindNative(0, reinterpret_cast<std::uintptr_t>(session_.get()));
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
                      occupancy)) {
@@ -1460,6 +1464,12 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
     AssignError(error_msg, "batch must contain 1..8 sessions");
     return false;
   }
+  // Bind BEFORE model filtering: a filtered singleton is not roster index 0.
+  if (perf::current && perf::execution_roster.size() == requests.size())
+    for (std::size_t i = 0; i < requests.size(); ++i)
+      if (requests[i].session)
+        perf::BindNative(i, reinterpret_cast<std::uintptr_t>(
+                                requests[i].session->session_.get()));
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};
