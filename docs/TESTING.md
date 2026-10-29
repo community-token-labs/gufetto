@@ -61,6 +61,13 @@ nix build .#checks.x86_64-linux.h3-quality
 nix build .#checks.x86_64-linux.h3-ml-quality
 ```
 
+The component-cache fixture is registered as `component_text_cache_test_*`
+suites so each hosted test retains the 60-second limit. Select the whole family
+with `ctest --preset cpu-test -R '^component_text_cache_test_'`; the executable
+still runs every case without arguments, or one suite with `--suite NAME`.
+The transfer suites cover both packed dtypes with and without fingerprints;
+layout, foreign-ABI and F16 controls run in the separate layout suite.
+
 Full CPU builds need Python NumPy for the offline tool tests. GPU model oracles
 need the documented local weights; use focused targets and CTest labels before
 running the complete tree. H3 development normally needs an analytic primitive,
