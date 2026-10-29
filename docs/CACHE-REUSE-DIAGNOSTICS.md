@@ -35,6 +35,19 @@ hybrid recurrent checkpoint exists at every token. Evicted state is absent,
 and complete supplemental-input identity gates agreement. Neither field is an
 all-history reusable-token oracle or permission to truncate recurrent state.
 
+Reliability reports must show **client-history reusable tokens R** and
+**resident indexed agreement I** separately. The **99.9% target uses R**: the
+longest token-exact prefix previously processed for a compatible client history,
+including matching histories across chats. Eviction or a never-captured recurrent
+boundary does not reduce R; it can cause a miss. I is `indexed_common_tokens` at
+lookup and is only a resident-state diagnostic. If either value is unavailable,
+report unknown (or a labelled bound), not zero or a substituted denominator.
+The HTTP diagnostics alone cannot establish R after historical state is lost.
+
+Same-boundary restore, split-invariance, numerical quality and per-request timing
+are separate gates. Token-prefix agreement and other engines' cached/fresh
+bit-equality disclaimers do not relax any of them.
+
 `unready_frontiers`, `restore_attempts`, `restore_failures`, and the existing
 static `restore_failure_reason` separate readiness from transfer/validation
 failures. Exception text and prompt/token contents are not logged. The restore
