@@ -1023,10 +1023,12 @@ void FailedSubmission() {
     failed = true;
   }
   assert(failed && disk.Entries().empty());
-  assert(costs.filesystem_ns && costs.fsync_ns && costs.bytes == 32);
-  // Failed publication still reports its accepted writes after rollback.
+  assert(costs.filesystem_ns && costs.bytes == 32);
+  // This source fails before the first bounded payload batch is complete:
+  // accepted writes remain counted, but no data sync or manifest commit runs.
   assert(costs.shared_write_bytes + costs.private_write_bytes == costs.bytes);
-  assert(costs.manifest_write_bytes == 0 && costs.fsync_calls > 0);
+  assert(costs.manifest_write_bytes == 0 && costs.fsync_calls == 0);
+  assert(costs.fsync_ns == 0);
   assert(ledger.Snapshot().persistence_pinned_bytes == 0);
   disk.ReclaimOrphans();
   disk.WaitForReclamation();

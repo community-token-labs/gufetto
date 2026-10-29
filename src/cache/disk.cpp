@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include "src/core/platform/fs.hpp"
@@ -1163,7 +1164,71 @@ struct DiskStore::Impl {
       index_guard.unlock();
       // Candidate is invisible to pinned snapshots until committed. Reuse from
       // filesystem existence after validating claims, never from this
-      // candidate.
+      // candidate. Keep only a bounded group of fully written, CRC-checked
+      // payloads open; no worker touches staging, the index or statistics.
+      struct PendingPayload {
+        Fd fd;
+        const platform::Directory* directory;
+        std::string name;
+      };
+      std::array<std::optional<PendingPayload>, 32> pending;
+      std::size_t pending_count{};
+      auto flush_payloads = [&] {
+        if (!pending_count)
+          return;
+        struct SyncResult {
+          std::error_code error;
+          bool called{}, synced{};
+        };
+        std::array<SyncResult, 32> results{};
+        std::array<std::thread, 4> workers;
+        const auto worker_count = std::min(pending_count, workers.size());
+        {
+          // fsync_ns is wall time blocked launching/settling this batch, not
+          // the sum of overlapping worker times. fsync_calls counts actual
+          // platform sync invocations (including failures); as for serial
+          // Sync, any EINTR retries inside the platform leaf are opaque.
+          CostTimer timer(publication_stats.fsync_ns);
+          Finally settle{[&] {
+            // Also settle every launched worker if thread creation fails,
+            // before closing FDs, rolling back the index or removing files.
+            for (auto& worker : workers)
+              if (worker.joinable())
+                worker.join();
+            for (const auto& result : results)
+              publication_stats.fsync_calls += result.called;
+          }};
+          for (std::size_t i = 0; i < worker_count; ++i)
+            workers[i] = std::thread([&, i] {
+              for (auto j = i; j < pending_count; j += worker_count) {
+                auto& result = results[j];
+                result.synced =
+                    platform::SyncFile(pending[j]->fd.Get(), result.error);
+                result.called = true;
+              }
+            });
+        }
+        for (std::size_t i = 0; i < pending_count; ++i)
+          if (!results[i].synced)
+            IoError("sync cache file/directory", results[i].error);
+        // Every payload in the group is durable before its first rename.
+        // Hooks stay on the writer thread, after all workers have settled.
+        for (std::size_t i = 0; i < pending_count; ++i) {
+          {
+            // Drop clean pages so snapshots don't accumulate in page cache.
+            CostTimer timer(publication_stats.filesystem_ns);
+            platform::Advise(pending[i]->fd.Get(),
+                             platform::AdviseHint::kDontNeed, 0, 0);
+          }
+          DISK_STEP(kPayloadSynced);
+        }
+        for (std::size_t i = 0; i < pending_count; ++i) {
+          Rename(*pending[i]->directory, pending[i]->name);
+          DISK_STEP(kPayloadRenamed);
+          pending[i].reset();
+        }
+        pending_count = 0;
+      };
       for (auto& [key, p] : dependencies) {
         const platform::Directory& dir = key.first ? private_files : chunks;
         auto payload_name = DiskFileName(p.file);
@@ -1173,6 +1238,12 @@ struct DiskStore::Impl {
             std::find_if(buffers.begin(), buffers.end(), [&](const auto& b) {
               return b.private_file == key.first && b.file == p.file;
             });
+        // Shared and private payloads may have the same ID. Their final
+        // namespaces differ, but their temporary names must not overlap.
+        if (std::any_of(
+                pending.begin(), pending.begin() + pending_count,
+                [&](const auto& item) { return item->name == payload_name; }))
+          flush_payloads();
         auto fd = Create(payload_name);
         auto& written_bytes = key.first ? publication_stats.private_write_bytes
                                         : publication_stats.shared_write_bytes;
@@ -1218,18 +1289,13 @@ struct DiskStore::Impl {
             }
           }
         }
+        pending[pending_count++].emplace(
+            PendingPayload{std::move(fd), &dir, std::move(payload_name)});
         DISK_STEP(kPayloadWritten);
-        Sync(fd.Get());
-        {
-          // The payload is durable; drop its clean pages so multi-GB snapshots
-          // don't accumulate in the page cache.
-          CostTimer timer(publication_stats.filesystem_ns);
-          platform::Advise(fd.Get(), platform::AdviseHint::kDontNeed, 0, 0);
-        }
-        DISK_STEP(kPayloadSynced);
-        Rename(dir, payload_name);
-        DISK_STEP(kPayloadRenamed);
+        if (pending_count == pending.size())
+          flush_payloads();
       }
+      flush_payloads();
       Sync(temporary);
       DISK_STEP(kTemporaryDirectorySynced);
       Sync(chunks);
