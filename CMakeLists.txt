@@ -646,7 +646,8 @@ if (BUILD_TESTING)
   target_link_libraries(perf_trace_test PRIVATE gufo_core)
   add_test(NAME perf_trace_test COMMAND perf_trace_test)
   add_test(NAME perf_trace_disabled_test COMMAND perf_trace_test --disabled)
-  set_tests_properties(perf_trace_test perf_trace_disabled_test PROPERTIES
+  add_test(NAME perf_trace_phase_limit_test COMMAND perf_trace_test --phase-limit-high)
+  set_tests_properties(perf_trace_test perf_trace_disabled_test perf_trace_phase_limit_test PROPERTIES
     LABELS "cpu;core")
 
   add_executable(json_test tests/core/json_test.cpp)
