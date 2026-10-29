@@ -103,6 +103,10 @@ CASES = (
     ("dashboard-1536", 1536, 1024,
      "Read the three summary metrics and their values. Which labeled bar "
      "is tallest, and what is the status of batch C?"),
+    ("code-dense-1920", 1920, 1088,
+     "Read the active file name. Explain how BUILD_REPORT handles failed tiles. "
+     "Which two cells failed, what is the pass count, and which report file "
+     "appears in the test panel?"),
 )
 
 
@@ -267,6 +271,96 @@ def _dashboard(width, height):
     return c
 
 
+def _dense_code(width, height):
+    """Text-heavy invented editor: 40 code lines plus a dense test/log pane."""
+    c = _Canvas(width, height, DARK)
+    c.rect(0, 0, width, 56, PANEL)
+    c.text(24, 20, "TILE LAB / REPORT.TOY - SYNTHETIC CODE REVIEW", scale=2)
+    c.rect(0, 56, 240, height - 88, PANEL)
+    for index, line in enumerate((
+            "EXPLORER", "DEMO WORKSPACE", "  SRC/", "> REPORT.TOY",
+            "  GRID.TOY", "  FORMAT.TOY", "  TESTS/", "  REPORT_TEST.TOY",
+            "  GRID_TEST.TOY", "  DATA/", "  TILES.DEMO", "", "OUTLINE",
+            "  BUILD_REPORT", "  FORMAT_REPORT", "  MAIN", "", "CHANGES",
+            "  1 FILE MODIFIED", "  0 CONFLICTS", "", "FIXTURE ONLY",
+            "NO USER CONTENT")):
+        c.text(16, 84 + index * 26, line, MUTED)
+    c.text(264, 76, "REPORT.TOY    GRID.TOY    REPORT_TEST.TOY", YELLOW)
+    lines = (
+        "MODULE TILE_REPORT",
+        "IMPORT GRID, FORMAT, CHECKS",
+        "CONST ROWS = 6",
+        "CONST COLS = 7",
+        "CONST OUTPUT = DEMO-REPORT.TXT",
+        "",
+        "FUNCTION BUILD_REPORT(TILES)",
+        "  LET PASSED = 0",
+        "  LET FAILED = 0",
+        "  LET BAD_CELLS = []",
+        "  FOR EACH TILE IN TILES",
+        "    LET VALID = CHECKS.EDGES(TILE)",
+        "    IF VALID THEN",
+        "      PASSED = PASSED + 1",
+        "    ELSE",
+        "      FAILED = FAILED + 1",
+        "      BAD_CELLS.APPEND(TILE.CELL)",
+        "    END IF",
+        "  END FOR",
+        "  RETURN REPORT(PASSED, FAILED, BAD_CELLS)",
+        "END FUNCTION",
+        "",
+        "FUNCTION FORMAT_REPORT(REPORT)",
+        "  PRINT REPORT.PASSED, REPORT.FAILED",
+        "  FOR EACH CELL IN REPORT.BAD_CELLS",
+        "    PRINT CELL",
+        "  END FOR",
+        "  WRITE OUTPUT, REPORT",
+        "END FUNCTION",
+        "",
+        "FUNCTION MAIN()",
+        "  LET TILES = GRID.LOAD(ROWS, COLS)",
+        "  LET REPORT = BUILD_REPORT(TILES)",
+        "  FORMAT_REPORT(REPORT)",
+        "  ASSERT REPORT.PASSED = 40",
+        "  ASSERT REPORT.FAILED = 2",
+        "  RETURN REPORT",
+        "END FUNCTION",
+        "",
+        "MAIN()",
+    )
+    for index, line in enumerate(lines):
+        c.text(264, 116 + index * 22, f"{index + 1:02d}", MUTED)
+        c.text(312, 116 + index * 22, line, GREEN if line.startswith(
+            ("FUNCTION", "END", "MODULE", "IMPORT", "CONST")) else INK)
+    c.rect(1136, 56, 2, height - 88, BLUE)
+    c.text(1160, 76, "TESTS / DEMO OUTPUT", YELLOW)
+    logs = [
+        "LAB> TILECHECK --GRID 6X7 --MODE DEMO",
+        "BUILD: PAPER-17 / PROFILE: CHECK",
+        "INPUT: INVENTED COLOR TILES",
+        "DISCOVER: 24 TEST CASES",
+    ]
+    for index in range(1, 25):
+        group = ("GRID", "EDGES", "REPORT")[(index - 1) // 8]
+        logs.append(f"PASS {index:02d} / {group}_CASE_{index:02d} ... OK")
+    logs.extend((
+        "TESTS: 24 PASSED / 0 FAILED",
+        "TILES: 42 / PASSED: 40 / FAILED: 2",
+        "FAILED CELL B3: EAST EDGE MISMATCH",
+        "FAILED CELL D5: NORTH EDGE MISMATCH",
+        "OUTPUT: DEMO-REPORT.TXT",
+        "REPORT SAVED / 42 ROWS WRITTEN",
+        "LAB> _",
+    ))
+    for index, line in enumerate(logs):
+        color = RED if line.startswith("FAILED CELL") else GREEN
+        c.text(1160, 116 + index * 24, line, color)
+    c.rect(0, height - 32, width, 32, BLUE)
+    c.text(20, height - 24,
+           "TOY LANGUAGE    UTF-8    LINE 40    24 TESTS PASSED    SYNTHETIC FIXTURE")
+    return c
+
+
 def _chunk(kind, payload):
     return (struct.pack(">I", len(payload)) + kind + payload
             + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
@@ -301,7 +395,7 @@ def _write_png(path, canvas):
 
 
 def generate(out_dir: Path):
-    """Create six PNGs and manifest.json in a new private (0700) directory.
+    """Create seven PNGs and manifest.json in a new private (0700) directory.
 
     Return the JSON-compatible manifest. Refuse every existing output path.
     Provenance hashes this generator's source, not machine-specific paths.
@@ -312,7 +406,7 @@ def generate(out_dir: Path):
     # Also produce exactly 0700 under a restrictive caller umask on POSIX.
     out_dir.chmod(0o700)
     manifest = {"schema": "gufo-vision-images-v1", "cases": []}
-    renderers = (_scene, _scene, _scene, _editor, _terminal, _dashboard)
+    renderers = (_scene, _scene, _scene, _editor, _terminal, _dashboard, _dense_code)
     for (case_id, width, height, prompt), render in zip(CASES, renderers):
         filename = case_id + ".png"
         canvas = render(width, height)
