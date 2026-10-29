@@ -761,7 +761,10 @@ struct ComponentTextCache::Impl {
                       std::to_string(timing.stream_wait_ns / 1e6) +
                       " filesystem_ms=" +
                       std::to_string(timing.filesystem_ns / 1e6) +
-                      " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6));
+                      " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6) +
+                      " checksum_ms=" +
+                      std::to_string(timing.checksum_ns / 1e6) +
+                      " fsync_ms=" + std::to_string(timing.fsync_ns / 1e6));
             }
           },
           [this](const cache::DiskManifest& manifest) {

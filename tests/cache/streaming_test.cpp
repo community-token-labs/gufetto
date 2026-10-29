@@ -741,6 +741,7 @@ void NewestPendingFrontierSurvives() {
       if (learned)
         prior.manifest.purpose = CheckpointPurpose::kLearned;
       std::atomic<bool> idle{}, started{}, discarded{};
+      std::atomic<std::uint64_t> completed_bytes{};
       PersistenceQueue* query{};
       PersistenceQueue queue(
           ledger, streams, 2, 800,
@@ -748,8 +749,14 @@ void NewestPendingFrontierSurvives() {
             started = true;
             return idle.load();
           },
-          [&](CheckpointId id, bool succeeded, const TransferTiming&) {
+          [&](CheckpointId id, bool succeeded, const TransferTiming& timing) {
+            if (succeeded) {
+              assert(timing.bytes > 0 && timing.pieces > 0);
+              completed_bytes += timing.bytes;
+            }
             if (id == CheckpointId{2} && !succeeded) {
+              assert(timing.bytes == 0 && timing.pieces == 0 &&
+                     timing.yield_ns == 0 && timing.filesystem_ns == 0);
               // Replacement callbacks may query the queue and release serving
               // ownership; neither operation may run under the queue lock.
               assert(query->Stats().pending <= 2);
@@ -778,6 +785,7 @@ void NewestPendingFrontierSurvives() {
              (pin_failure ? 780 : 800));
       idle = true;
       queue.Drain();
+      assert(completed_bytes == queue.Stats().timing.bytes);
       assert(disk.Open({1}));
       assert(bool(disk.Open({2})) == learned);
       assert(bool(disk.Open({3})) == (!learned && !pin_failure));
