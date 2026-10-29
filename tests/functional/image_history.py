@@ -57,11 +57,11 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def request(base, path, payload=None):
+def request(base, path, payload=None, *, timeout=600):
     body = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(base + path, body, {"Content-Type": "application/json"})
     start = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=600) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         result = json.load(response)
     return result, (time.perf_counter() - start) * 1000
 

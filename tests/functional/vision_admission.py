@@ -11,6 +11,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import math
 from pathlib import Path
 import threading
 import urllib.error
@@ -27,7 +28,8 @@ def body(urls, text="Describe these screenshots briefly."):
         "cache_prompt": False, "chat_template_kwargs": {"enable_thinking": False}}
 
 
-def exercise(base, fixtures, policy, report, record):
+def exercise(base, fixtures, policy, report, record, *, request_timeout=600,
+             independent_control=False):
     def url(size, index):
         path = fixtures / f"screenshot-{size}x{size}-{index}.png"
         data = path.read_bytes()
@@ -40,7 +42,7 @@ def exercise(base, fixtures, policy, report, record):
         endpoint = "/v1/chat/completions" + ("/input_tokens" if count else "")
         record.case = label
         try:
-            result, elapsed = request(base, endpoint, payload)
+            result, elapsed = request(base, endpoint, payload, timeout=request_timeout)
         except urllib.error.HTTPError as error:
             raw = error.read().decode()
             report["checks"][label] = {"status": error.code, "error": raw}
@@ -94,14 +96,20 @@ def exercise(base, fixtures, policy, report, record):
         large_count = send("max-shape-count", body([large[0]]), count=True)
         assert large_count - small_count == 16384 - 64, (small_count, large_count)
         send("four-max-count", body(large[:4]), count=True)
-        send("five-max-count", body(large[:5]), reject=True, count=True)
-        send("five-max", body(large[:5]), reject=True)
+        send("five-max-count", body(large[:5]), reject=not independent_control, count=True)
+        if not independent_control:
+            send("five-max", body(large[:5]), reject=True)
+        else:
+            report["control_exclusion"] = (
+                "No legacy whole-pool bound: count accepts five; omit the newly-invalid "
+                "generation rather than add unmatched encoder/cache history.")
         send("four-max", body(large[:4]))
         # Four disjoint histories, two max images each; request leases need
         # twice the fixed pool. Native oracle separately proves gate vs slots.
         record.case = "four-concurrent-two-max"
         def peer(index):
-            return request(base, "/v1/chat/completions", body(large[index:index + 2]))
+            return request(base, "/v1/chat/completions", body(large[index:index + 2]),
+                           timeout=request_timeout)
         with ThreadPoolExecutor(max_workers=4) as pool:
             responses = list(pool.map(peer, (0, 2, 4, 6)))
         for result, elapsed in responses:
@@ -125,18 +133,29 @@ def main():
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--policy", choices=("cap64", "pool128", "late", "default"), required=True)
+    parser.add_argument("--request-timeout", type=float, default=600,
+                        help="Bounded client/upstream deadline; does not change timing margins")
+    parser.add_argument("--independent-control", action="store_true",
+                        help="Default-policy legacy control lacks the new whole-pool bound")
     args = parser.parse_args()
+    if not math.isfinite(args.request_timeout) or args.request_timeout <= 0:
+        parser.error("--request-timeout must be finite and positive")
+    if args.independent_control and args.policy != "default":
+        parser.error("--independent-control is only for the default policy")
     args.output.mkdir(parents=True, exist_ok=False)
     wire = args.output / "wire"
     wire.mkdir()
-    recorder = Recorder(args.base_url, wire, request_timeout=600)
+    recorder = Recorder(args.base_url, wire, request_timeout=args.request_timeout)
     thread = threading.Thread(target=recorder.serve_forever)
     thread.start()
     report = {"policy": args.policy, "fixtures": {}, "checks": {}, "status": "running",
+              "request_timeout": args.request_timeout,
+              "independent_control": args.independent_control,
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     try:
         exercise(f"http://127.0.0.1:{recorder.server_port}", args.fixtures,
-                 args.policy, report, recorder)
+                 args.policy, report, recorder, request_timeout=args.request_timeout,
+                 independent_control=args.independent_control)
         report["status"] = "http_checks_passed"
     except BaseException as error:
         report["status"] = "failed"

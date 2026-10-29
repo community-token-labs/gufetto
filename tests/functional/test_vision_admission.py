@@ -1,5 +1,6 @@
 """CPU checks for the focused HTTP harness, not model/admission evidence."""
 
+import base64
 import io
 from pathlib import Path
 import tempfile
@@ -32,7 +33,8 @@ class VisionAdmissionHarnessTests(unittest.TestCase):
             recorder = SimpleNamespace(case="")
             limit = 1 if policy == "cap64" else 2
 
-            def fake_request(base, endpoint, payload):
+            def fake_request(base, endpoint, payload, *, timeout=600):
+                self.assertEqual(timeout, 600)
                 images = sum(part.get("type") == "image_url"
                              for message in payload["messages"]
                              if isinstance(message["content"], list)
@@ -59,6 +61,35 @@ class VisionAdmissionHarnessTests(unittest.TestCase):
                              "alternate-encoding-overflow"):
                     self.assertEqual(checks[case]["status"], 400)
                 self.assertIn("recovery", checks)
+
+    def test_default_control_and_explicit_deadline(self):
+        for control in (False, True):
+            report = {"fixtures": {}, "checks": {}}
+            recorder = SimpleNamespace(case="")
+
+            def fixture(path):
+                return (b"large" if "4096x4096" in path.name else b"small") + path.name.encode()
+
+            def fake_request(base, endpoint, payload, *, timeout):
+                self.assertEqual(timeout, 3600)
+                rows = sum(16384 if base64.b64decode(part["image_url"]["url"].split(",", 1)[1]).startswith(b"large") else 64
+                           for part in payload["messages"][0]["content"]
+                           if part.get("type") == "image_url")
+                if rows > 65536 and not control:
+                    raise urllib.error.HTTPError(base, 400, "bad request", {},
+                                                 io.BytesIO(b"vision budget exceeded"))
+                if endpoint.endswith("/input_tokens"):
+                    return {"object": "response.input_tokens", "input_tokens": rows + 17}, 1.0
+                return {"usage": {"prompt_tokens": rows + 17, "completion_tokens": 1,
+                                  "prompt_tokens_details": {"cached_tokens": 0}},
+                        "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}]}, 1.0
+
+            with patch.object(Path, "read_bytes", fixture), patch("vision_admission.request", fake_request):
+                exercise("http://127.0.0.1", Path("fixtures"), "default", report, recorder,
+                         request_timeout=3600, independent_control=control)
+            self.assertEqual("control_exclusion" in report, control)
+            self.assertEqual("five-max" in report["checks"], not control)
+            self.assertIn("reencode-A-replay", report["checks"])
 
     def test_unexpected_overflow_acceptance_fails(self):
         with self.assertRaisesRegex(AssertionError, "never-fit request accepted"):
