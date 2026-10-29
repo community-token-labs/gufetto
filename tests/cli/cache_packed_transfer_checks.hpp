@@ -438,7 +438,8 @@ void RotatedExistingPinsBeforeReady() {
 }
 #endif
 #endif
-void MalformedImportsAndDisk() {
+void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
+                             bool selected_fingerprint) {
   const std::array types{
       kPlain,
 #if 1  // Both packed modes are unconditional in the cleaned q8 topic.
@@ -447,6 +448,9 @@ void MalformedImportsAndDisk() {
   };
   for (auto type : types) {
     for (bool fingerprint : {true, false}) {
+      // The four hosted suites partition the full dtype/fingerprint matrix.
+      if (type != selected_type || fingerprint != selected_fingerprint)
+        continue;
       const auto valid = Canonical(type);
       const auto valid_wire = Wire(valid);
       auto survivor = valid;
@@ -525,6 +529,9 @@ void MalformedImportsAndDisk() {
       }
     }
   }
+}
+void IncompatibleDiskLayouts() {
+  const std::array types{kPlain, qfn::KvCacheType::kQ8_0Rotated};
   for (auto type : types) {
     // Every registered append descriptor is compared, even zero-row pooled
     // components that the packed KV classifier correctly leaves unwrapped.

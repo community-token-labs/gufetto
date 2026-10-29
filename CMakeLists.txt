@@ -777,8 +777,31 @@ if (BUILD_TESTING)
     set_tests_properties(pd_profile_test PROPERTIES LABELS "cpu;profile;state")
   endif()
   target_link_libraries(component_text_cache_test PRIVATE gufo_checkpoint_transfer gufo_cache_fake gufo_core gufo_logging gufo_qwen38_flash_next)
-  add_test(NAME component_text_cache_test COMMAND component_text_cache_test)
-  set_tests_properties(component_text_cache_test PROPERTIES LABELS "cpu;server;cache;state;lifecycle")
+  # Keep the hosted 60-second per-test cap without dropping fixture cases.
+  # The executable still runs all suites when invoked without arguments.
+  set(gufo_component_text_cache_suites
+    transfer_plain_identity
+    transfer_plain_process_local
+    transfer_rotated_identity
+    transfer_rotated_process_local
+    transfer_layout
+    packed_pins
+    lookup
+    pins
+    lifecycle
+    reuse
+    disk
+    ram)
+  if (GUFO_ENABLE_PREFILL_PREREQUISITES)
+    list(APPEND gufo_component_text_cache_suites prerequisites)
+  endif()
+  set(gufo_component_text_cache_tests)
+  foreach(suite IN LISTS gufo_component_text_cache_suites)
+    set(test_name component_text_cache_test_${suite})
+    add_test(NAME ${test_name} COMMAND component_text_cache_test --suite ${suite})
+    set_tests_properties(${test_name} PROPERTIES LABELS "cpu;server;cache;state;lifecycle")
+    list(APPEND gufo_component_text_cache_tests ${test_name})
+  endforeach()
   add_test(NAME qfn_packed_ingress_publication_test
     COMMAND ${CMAKE_COMMAND} -E env GUFO_TEST_PACKED_INGRESS_ONLY=1
       $<TARGET_FILE:component_text_cache_test>)
