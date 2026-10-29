@@ -227,6 +227,47 @@ void CheckRotated(bool mtp) {
   }
 }
 
+void CheckBf16KControl() {
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  constexpr auto control = qfn::KvCacheType::kBf16KControl;
+  constexpr auto f16 = qfn::KvCacheType::kF16;
+  Require(!qfn::Session::IsCompatibleSnapshotPayload(19, f16, control) &&
+              !qfn::Session::IsCompatibleSnapshotPayload(25, control, f16),
+          "control and F16 snapshots must not mix");
+  const auto identity = qfn::KvCacheCompatibilityIdentity(control);
+  Require(
+      identity != qfn::KvCacheCompatibilityIdentity(f16) &&
+          identity.find("numerical_kernel_epoch=25\n") != std::string::npos &&
+          identity.find("ordinary_kv_scope=all-trunk-and-mtp\n") !=
+              std::string::npos &&
+          identity.find("k-f32-f16-bf16-rne-f16-v1-v-f16-rne-v1") !=
+              std::string::npos,
+      "control numerical identity");
+  for (const bool mtp : {false, true}) {
+    const qfn::ContinuationLayout plain(ProductionGeometry(), mtp, 100000, 8);
+    const qfn::ContinuationLayout perturbed(ProductionGeometry(), mtp, 100000,
+                                            8, control);
+    Require(plain.Components().size() == perturbed.Components().size() &&
+                plain.PrivateBytes() == perturbed.PrivateBytes(),
+            "control changed state inventory or private bytes");
+    for (std::size_t i = 0; i < plain.Components().size(); ++i) {
+      const auto& a = plain.Components()[i];
+      const auto& b = perturbed.Components()[i];
+      const bool ordinary = a.part == qfn::ContinuationPart::kKey ||
+                            a.part == qfn::ContinuationPart::kValue ||
+                            a.part == qfn::ContinuationPart::kDraftKey ||
+                            a.part == qfn::ContinuationPart::kDraftValue;
+      Require(a.part == b.part &&
+                  a.descriptor.row_bytes == b.descriptor.row_bytes &&
+                  a.descriptor.state_bytes == b.descriptor.state_bytes &&
+                  b.descriptor.layout_version ==
+                      (ordinary ? 8U : a.descriptor.layout_version),
+              "control changed bytes or failed to separate ordinary KV layout");
+    }
+  }
+#endif
+}
+
 void CheckIdentity() {
   static_assert(qfn::Session::kSnapshotPayloadVersion == 19);
   Require(qfn::ModelOptions{}.kv_cache_type == qfn::KvCacheType::kF16,
@@ -510,6 +551,7 @@ int main() {
     Check(false);
     Check(true);
     CheckIdentity();
+    CheckBf16KControl();
     CheckQ4();
     for (const auto mtp : {false, true}) {
       CheckQuantized(mtp);

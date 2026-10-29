@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include "src/cli/kv_cache_options.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kv_producer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_q8_prefill_view.hpp"
 #include "tests/models/qwen38_flash_next/checkpoint_memory_test_support.hpp"
 
@@ -105,6 +107,42 @@ bool SameFloats(std::span<const float> a, std::span<const float> b) {
 }
 
 void CheckLayout() {
+  // The selector, enum validity and producer policy must agree in OFF/ON
+  // builds. A diagnostic policy is never accepted as a storage-only codec.
+  KvCacheType selected = KvCacheType::kF16;
+  gufo::cli::ArgParser parser("kv-control-test");
+  gufo::cli::RegisterKvCacheTypeOption(parser, &selected);
+  const std::array args{"--kv-cache-type", "bf16-k-control"};
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  constexpr auto control = KvCacheType::kBf16KControl;
+  static_assert(static_cast<std::uint32_t>(control) == 7);
+  static_assert(qfn::IsKnownKvCacheType(control));
+  static_assert(qfn::KvKeyType(control) == KvCacheType::kF16);
+  static_assert(qfn::KvValueType(control) == KvCacheType::kF16);
+  static_assert(qfn::rocm::detail::KvKeyProducerType(control) == control);
+  static_assert(!qfn::KvIsPacked(control) && !qfn::KvIsRotated(control));
+  static_assert(qfn::KvRowBytes(513, qfn::KvKeyType(control)) == 1026);
+  static_assert(qfn::ExpectedKvPayloadVersion(control) == 25);
+  static_assert(qfn::KvComponentLayoutVersion(control) == 8);
+  Require(parser.Parse(args) && selected == control, "control CLI selector");
+  Require(parser.FormatHelp().find("bf16-k-control") != std::string::npos,
+          "enabled control missing from help");
+  Require(gufo::cli::ValidateKvCacheTypeForArchitecture(control, "qwen4exp",
+                                                        nullptr) &&
+              !gufo::cli::ValidateKvCacheTypeForArchitecture(control, "qwen3",
+                                                             nullptr),
+          "control architecture gate");
+  Reject([&] { (void)qfn::KvRowBytes(32, control); });
+  Reject([&] { (void)qfn::KvUsesQ8Codec(control); });
+#else
+  static_assert(!qfn::IsKnownKvCacheType(static_cast<KvCacheType>(7)));
+  Require(!parser.Parse(args) && selected == KvCacheType::kF16,
+          "disabled control accepted");
+  Require(parser.FormatHelp().find("bf16-k-control") == std::string::npos,
+          "disabled control advertised");
+#endif
+  static_assert(qfn::rocm::detail::KvKeyProducerType(KvCacheType::kF16) ==
+                KvCacheType::kF16);
   static_assert(static_cast<std::uint32_t>(KvCacheType::kF16) == 0);
   static_assert(static_cast<std::uint32_t>(KvCacheType::kQ8_0) == 1);
   static_assert(qfn::KvRowBytes(512, KvCacheType::kF16) == 1024);
