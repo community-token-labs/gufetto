@@ -948,6 +948,13 @@ if (BUILD_TESTING)
   set_tests_properties(h3_profile_report_test PROPERTIES
     LABELS "cpu;tools;models;minimax-h3;profiling")
 
+  foreach(name IN ITEMS scoring_metrics scoring_contract matched_kl)
+    add_test(NAME ${name}_test
+      COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/${name}_test.py)
+    set_tests_properties(${name}_test PROPERTIES LABELS "cpu;tools;quality")
+  endforeach()
+
   add_test(NAME serving_bench_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/serving_bench_test.py)
