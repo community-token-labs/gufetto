@@ -3004,6 +3004,36 @@ void TestServerInstructionsAreFraming() {
   }
 }
 
+void TestContextOverflowDiagnostics() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<FakeRunner>(stats);
+  TextRunnerPool pool(runner, 1);
+  const auto states_before = stats->states_created;
+  const std::vector<TextRunnerToken> oversized(65, 1);
+  for (const bool lookup : {false, true}) {
+    std::string message;
+    try {
+      if (lookup)
+        (void)pool.Lookup(oversized);
+      else
+        (void)pool.Acquire(oversized);
+    } catch (const std::length_error& error) {
+      message = error.what();
+    }
+    Expect(message == "prompt of 65 tokens exceeds the 64-token model context",
+           "acquire and advisory lookup report prompt length and capacity");
+  }
+  Expect(stats->states_created == states_before && stats->prefill_spans.empty(),
+         "oversized prompts fail before state allocation or inference");
+  const std::vector<TextRunnerToken> at_limit(64, 1);
+  Expect(pool.Lookup(at_limit).total_tokens == 64,
+         "lookup accepts a prompt exactly at capacity");
+  auto request = pool.Acquire(at_limit);
+  Expect(request.prompt_tokens() == 64,
+         "acquire accepts a prompt exactly at capacity");
+  request.Invalidate();
+}
+
 void TestLookupRuntimeDefaultsAndDisabled() {
   class IdentityRunner final : public FakeRunner {
   public:
@@ -3032,6 +3062,7 @@ void TestLookupRuntimeDefaultsAndDisabled() {
 }  // namespace
 
 int main() {
+  TestContextOverflowDiagnostics();
   TestLookupRuntimeDefaultsAndDisabled();
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   TestPoolSeededDirectAndCopiedSamplerOwnership();
