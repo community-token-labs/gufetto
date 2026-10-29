@@ -2404,6 +2404,9 @@ template<class F>
 decltype(auto) DispatchKvFormat(KvCacheType type, F&& launch) {
   switch (type) {
     case KvCacheType::kF16:
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+#endif
       return launch.template operator()<0>();
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ8_0Rotated:
@@ -2416,6 +2419,17 @@ decltype(auto) DispatchKvFormat(KvCacheType type, F&& launch) {
       return launch.template operator()<3>();
   }
   throw std::invalid_argument("unsupported Flash-Next KV cache type");
+}
+
+// Producer-only specialization 4 perturbs K, never V or attention readers.
+// Production policies retain their original template specializations.
+template<class F>
+decltype(auto) DispatchKvProducerFormat(KvCacheType type, F&& launch) {
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  if (type == KvCacheType::kBf16KControl)
+    return launch.template operator()<4>();
+#endif
+  return DispatchKvFormat(type, launch);
 }
 
 // Packed cache ABI: one independent F16 scale and 32 signed codes. All
@@ -2546,6 +2560,24 @@ __device__ __forceinline__ uint4 LoadQ8Kv8(const void* cache,
   const auto& block = static_cast<const Q8KvDeviceBlock*>(cache)[index / 32];
   return detail::LoadQ8Kv8Packed(block.values + index % 32, block.scale);
 }
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+// Adapted from DiagnosticBf16Kv / StoreKvProducerLane in Gufo commit
+// 054fd833c98646f1fb8643bf2dedcc0cfa360f5d (JCFrags, Claude Opus 5.5).
+// F32 producer -> F16 -> BF16 RNE -> F16; not a packed BF16 codec.
+// Keep the first F16 boundary opaque under the production fast-math flags.
+__device__ __forceinline__ _Float16 DiagnosticBf16Kv(float value) {
+  const float half =
+      OpaqueQ8KvF32(static_cast<float>(static_cast<_Float16>(value)));
+  unsigned bits = __builtin_bit_cast(unsigned, half);
+  bits = (bits + 0x7fffU + ((bits >> 16) & 1U)) & 0xffff0000U;
+  const float rounded = __builtin_bit_cast(float, bits);
+  const _Float16 result = static_cast<_Float16>(rounded);
+  return __builtin_isfinite(static_cast<float>(result))
+             ? result
+             : static_cast<_Float16>(NAN);
+}
+#endif
+
 // Keep F16-only instantiations independent of the q8 reconstruction helpers.
 template<unsigned kCodec>
 __device__ __forceinline__ void StoreKvLane(void* cache, std::size_t index,
@@ -2554,6 +2586,10 @@ __device__ __forceinline__ void StoreKvLane(void* cache, std::size_t index,
     StoreQ8KvLane(cache, index, value);
   else if constexpr (kCodec == 2)
     StoreQ4KvLane(cache, index, value);
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  else if constexpr (kCodec == 4)
+    static_cast<_Float16*>(cache)[index] = DiagnosticBf16Kv(value);
+#endif
   else
     static_cast<__half*>(cache)[index] = __float2half_rn(value);
 }
@@ -2627,7 +2663,7 @@ __global__ void PrepareAttentionKernel(
         gate[std::size_t(t) * width + head * d + tid] =
             row[head * 2 * d + d + tid];
       else
-        StoreKvLane<kQ8 == 3 ? 2 : kQ8>(
+        StoreKvLane<kQ8 == 4 ? 0 : (kQ8 == 3 ? 2 : kQ8)>(
             value_storage,
             std::size_t(*start_pos + t) * kv_width + head * d + tid,
             row[2 * width + kv_width + head * d + tid]);
@@ -7258,7 +7294,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
                       head * dim + col,
                   v[c]);
             else
-              StoreKvLane<kKvQ8 == 3 ? 2 : kKvQ8>(
+              StoreKvLane<kKvQ8 == 4 ? 0 : (kKvQ8 == 3 ? 2 : kKvQ8)>(
                   attention.values,
                   std::size_t(*attention.position + tok) * kvwidth +
                       head * dim + col,
@@ -7526,7 +7562,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
         nullptr, nullptr, output);
     return true;
   };
-  return DispatchKvFormat(cache_type, launch);
+  return DispatchKvProducerFormat(cache_type, launch);
 }
 
 bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
@@ -8099,7 +8135,7 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
       }
     }
   };
-  DispatchKvFormat(cache_type, launch);
+  DispatchKvProducerFormat(cache_type, launch);
   return true;
 }
 
@@ -8154,6 +8190,17 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
 void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
              hipStream_t stream, KvCacheType cache_type) {
+  // Cache-only K producers pass the diagnostic policy explicitly; V and
+  // all storage/restore callers continue to resolve to the F16 row codec.
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  if (cache_type == KvCacheType::kBf16KControl) {
+    if (!IsValidKvRow(row_dim, KvCacheType::kF16))
+      throw std::invalid_argument("invalid Flash-Next KV store geometry");
+    hipLaunchKernelGGL((StoreKvKernel<4>), dim3(n_tokens), dim3(kThreads), 0,
+                       stream, src, cache, row_dim, start_pos);
+    return;
+  }
+#endif
   // Codec only: callers of rotated mode must supply already-rotated values.
   // The helper rejects unknown representations before any GPU work.
   if (!IsValidKvRow(row_dim, cache_type))

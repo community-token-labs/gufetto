@@ -15,7 +15,11 @@ inline void RegisterKvCacheTypeOption(
       "", "--kv-cache-type", "TYPE",
       "Ordinary K/V storage: f16 (default), q8_0, q4_0, q8_0/q4_0, "
       "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated "
-      "(quantized modes are experimental and lossy; Flash-Next only)",
+      "(quantized modes are experimental and lossy; Flash-Next only)"
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+      "; bf16-k-control (diagnostic K-only perturbation, trunk + MTP)"
+#endif
+      ,
       "Model",
       [type](std::string_view, std::string_view value, std::string* error) {
         using models::qwen38_flash_next::KvCacheType;
@@ -33,6 +37,10 @@ inline void RegisterKvCacheTypeOption(
           *type = KvCacheType::kQ4_0Rotated;
         else if (value == "q8_0/q4_0-rotated")
           *type = KvCacheType::kQ8_0Q4_0Rotated;
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+        else if (value == "bf16-k-control")
+          *type = KvCacheType::kBf16KControl;
+#endif
         else {
           if (error)
             *error =

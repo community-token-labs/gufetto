@@ -2951,10 +2951,11 @@ bool Executor::ProduceCacheOnlyKv(const DeviceLayer& l, float* key,
                             c.head_dim, kind, stream_);
       },
       [&](bool is_value) {
+        const auto type =
+            is_value ? KvValueType(options_.kv_cache_type)
+                     : detail::KvKeyProducerType(options_.kv_cache_type);
         StoreKv(is_value ? value : key, is_value ? value_cache : key_cache,
-                rows, c.AttentionKvDim(), position, stream_,
-                is_value ? KvValueType(options_.kv_cache_type)
-                         : KvKeyType(options_.kv_cache_type));
+                rows, c.AttentionKvDim(), position, stream_, type);
       });
   if (!ok)
     AssignError(error_msg, "rotated cache-only producer geometry failed");
@@ -3116,7 +3117,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       return false;
     }
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_,
-            KvKeyType(options_.kv_cache_type));
+            detail::KvKeyProducerType(options_.kv_cache_type));
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_,
             KvValueType(options_.kv_cache_type));
   }

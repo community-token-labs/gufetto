@@ -17,7 +17,11 @@ enum class KvCacheType : std::uint32_t {
   kQ4_0 = 3,
   kQ8_0Q4_0 = 4,
   kQ4_0Rotated = 5,
-  kQ8_0Q4_0Rotated = 6
+  kQ8_0Q4_0Rotated = 6,
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  // Diagnostic producer perturbation, not a storage codec.
+  kBf16KControl = 7,
+#endif
 };
 
 // Snapshot and persistence arithmetic versions. Version 18 predates packed KV;
@@ -29,6 +33,9 @@ inline constexpr std::uint32_t kKvQ8BlockElements = 32;
 inline constexpr std::uint32_t kKvRotatedNumericsEpoch = 20;
 static_assert(kKvRotatedNumericsEpoch > kKvCacheNumericsEpoch);
 inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+inline constexpr std::uint32_t kKvBf16KControlNumericsEpoch = 25;
+#endif
 [[nodiscard]] constexpr bool IsKnownKvCacheType(KvCacheType type) noexcept {
   switch (type) {
     case KvCacheType::kF16:
@@ -38,6 +45,9 @@ inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
     case KvCacheType::kQ8_0Q4_0:
     case KvCacheType::kQ4_0Rotated:
     case KvCacheType::kQ8_0Q4_0Rotated:
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+#endif
       return true;
   }
   return false;
@@ -54,7 +64,10 @@ inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
       return true;
     case KvCacheType::kQ8_0Q4_0:
     case KvCacheType::kQ8_0Q4_0Rotated:
-      break;  // Mixed policies require an explicit K/V side.
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+#endif
+      break;  // Session policies require an explicit K/V storage side.
   }
   throw std::invalid_argument("unsupported Flash-Next KV row codec");
 }
@@ -65,6 +78,9 @@ inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ4_0:
     case KvCacheType::kQ8_0Q4_0:
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+#endif
       return false;
     case KvCacheType::kQ8_0Rotated:
     case KvCacheType::kQ4_0Rotated:
@@ -87,6 +103,10 @@ inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
     case KvCacheType::kQ4_0Rotated:
     case KvCacheType::kQ8_0Q4_0Rotated:
       return kKvQ4NumericsEpoch;
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+      return kKvBf16KControlNumericsEpoch;
+#endif
   }
   throw std::invalid_argument("unsupported Flash-Next KV cache type");
 }
@@ -96,6 +116,9 @@ inline constexpr std::uint32_t kKvQ4NumericsEpoch = 24;
 [[nodiscard]] constexpr KvCacheType KvKeyType(KvCacheType type) {
   switch (type) {
     case KvCacheType::kF16:
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+#endif
       return KvCacheType::kF16;
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ8_0Rotated:
@@ -165,7 +188,10 @@ static_assert(std::is_trivially_copyable_v<KvBlockQ8_0>);
                  std::numeric_limits<std::size_t>::max() / sizeof(KvBlockQ4_0);
     case KvCacheType::kQ8_0Q4_0:
     case KvCacheType::kQ8_0Q4_0Rotated:
-      return false;  // No single row stride for a mixed policy.
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+#endif
+      return false;  // Resolve session policies to storage codecs first.
   }
   return false;
 }
@@ -197,6 +223,10 @@ static_assert(std::is_trivially_copyable_v<KvBlockQ8_0>);
       return "q4_0-rotated";
     case KvCacheType::kQ8_0Q4_0Rotated:
       return "q8_0/q4_0-rotated";
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+      return "bf16-k-control";
+#endif
   }
   return "unknown";
 }

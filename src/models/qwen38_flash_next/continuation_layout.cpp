@@ -35,6 +35,18 @@ std::string KvCacheCompatibilityIdentity(KvCacheType type) {
           "ordinary_kv_rounding_saturation_revision=f16-rne-v1\n"
           "ordinary_kv_reconstruction=f16-identity-v1\n";
       break;
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+      identity +=
+          "ordinary_kv_layout=row-major-f16-le-v1\n"
+          "ordinary_kv_block_elements=1\n"
+          "ordinary_kv_scale_dtype=none\n"
+          "ordinary_kv_rounding_saturation_revision="
+          "k-f32-f16-bf16-rne-f16-v1-v-f16-rne-v1\n"
+          "ordinary_kv_reconstruction=f16-identity-v1\n"
+          "ordinary_kv_control_nonfinite=nan\n";
+      break;
+#endif
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ8_0Rotated:
       identity +=

@@ -20,6 +20,8 @@ option(BUILD_TESTING "Build correctness tests" OFF)
 option(GUFO_BUILD_TOOLS "Build development benchmarks and tuning tools" OFF)
 option(GUFO_ENABLE_PREFILL_PREREQUISITES
   "Build experimental default-off adaptive/serial-shadow prefill policies" OFF)
+option(GUFO_ENABLE_BF16_K_CONTROL
+  "Build diagnostic Flash-Next BF16-K/F16-V producer control (not a format)" OFF)
 option(GUFO_ENABLE_PD_PROFILING
   "Build perturbing prompt/decode tile diagnostics (not performance evidence)" OFF)
 if (GUFO_ENABLE_PREFILL_PREREQUISITES)

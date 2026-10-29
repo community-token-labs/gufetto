@@ -458,8 +458,9 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           const qwen::vision::DeviceRope* rope = nullptr,
           const YarnRope& yarn = {});
 
-/// Stores f32 rows into the f16 cache at positions start_pos + t:
-/// cache[(start_pos + t)][row_dim].
+/// Stores f32 rows with the selected storage codec at start_pos + t.
+/// Diagnostic builds also accept kBf16KControl for live K insertion only;
+/// V and restore callers must use the resolved storage codec (F16).
 void StoreKv(const float* src, void* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
              hipStream_t stream, KvCacheType cache_type = KvCacheType::kF16);
