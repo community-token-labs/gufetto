@@ -2545,6 +2545,141 @@ void UnbackedDeepRowsSurviveDiskRestart() {
   }
   std::filesystem::remove_all(directory);
 }
+void RamRefusalDiskDirectRestartContract() {
+  enum class Case {
+    kRamOnly,
+    kSuccess,
+    kOptOut,
+    kFloor,
+    kQuota,
+    kPrivateBacking
+  };
+  const std::vector<TextRunnerToken> suffix{9001, 9002, 9003};
+  std::vector<TextRunnerToken> prompt(4096);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  for (const auto test : {Case::kRamOnly, Case::kSuccess, Case::kOptOut,
+                          Case::kFloor, Case::kQuota, Case::kPrivateBacking}) {
+    const TemporaryDirectory temp("gufo-component-direct-contract");
+    auto runner = std::make_shared<Runner>();
+    // Keep RAM caching enabled, but deny append-row backing. A normal RAM
+    // capture must fail; the existing fallback can only borrow live rows.
+    runner->row_blocks = 0;
+    runner->private_blocks = test == Case::kPrivateBacking ? 0 : 2;
+    runner->rows_per_chunk = 256;
+    const auto make_disk = [&] {
+      return TextRunnerDiskCacheOptions{
+          .directory = temp.path(),
+          .capacity_bytes = test == Case::kQuota ? 1U : 1U << 20,
+          .min_checkpoint_step_tokens = 1,
+          .space_policy = {1 << 20, [test](const auto&) {
+                             return platform::FilesystemInfo{
+                                 1ULL << 30,
+                                 test == Case::kFloor ? 0ULL : 1ULL << 30, true,
+                                 true};
+                           }}};
+    };
+    const auto previous_level = Logger::Level();
+    Logger::SetLevel(LogLevel::kInfo);
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+    std::uint64_t cold_hash{};
+    {
+      const std::optional<TextRunnerDiskCacheOptions> disk =
+          test == Case::kRamOnly ? std::nullopt
+                                 : std::make_optional(make_disk());
+      ComponentTextCache cache(runner, 1, 1 << 20, disk);
+      auto lease =
+          cache.Acquire(prompt, {}, {}, true, 0, true, test != Case::kOptOut);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      cold_hash = runner->adapter->RecurrentHash(state.slot);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       prompt));
+      bool refused{};
+      try {
+        auto snapshot = lease->Capture();
+        assert(snapshot);
+        assert(lease->PublishSnapshot(prompt, std::move(snapshot), false) == 0);
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      const bool capture_denied = test == Case::kRamOnly ||
+                                  test == Case::kOptOut ||
+                                  test == Case::kPrivateBacking;
+      assert(refused == capture_denied);
+      assert((lease->Metrics().disk_queued_bytes == 0) == capture_denied);
+      (void)lease->Commit(prompt, {}, prompt);
+      if (!capture_denied) {
+        // Submission is not durability. Wait for the actual completion result.
+        for (int i = 0; i < 500; ++i) {
+          const auto stats = *lease->Metrics().persistence;
+          if (stats.completed + stats.failed)
+            break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const auto stats = *lease->Metrics().persistence;
+        assert(stats.pending == 0);
+        assert(stats.completed == (test == Case::kSuccess ? 1U : 0U));
+        assert(stats.failed == (test == Case::kSuccess ? 0U : 1U));
+      } else if (test != Case::kRamOnly) {
+        const auto stats = *lease->Metrics().persistence;
+        assert(stats.completed == 0 && stats.failed == 0 && stats.pending == 0);
+      }
+    }
+    std::clog.rdbuf(previous_sink);
+    Logger::SetLevel(previous_level);
+    const auto log = output.str();
+    if (test == Case::kSuccess) {
+      assert(log.find("event=published") != std::string::npos);
+      assert(ManagedBytes(temp.path()) > 0);
+    } else {
+      assert(log.find("event=published") == std::string::npos);
+      assert(log.find(test == Case::kFloor || test == Case::kQuota
+                          ? "event=persistence_incomplete"
+                          : "event=capture_refused") != std::string::npos);
+      if (test != Case::kRamOnly)
+        assert(ManagedBytes(temp.path()) == 0);
+    }
+    // Remove the denial on restart: a miss must mean no durable publication,
+    // not an unchanged floor, quota or private-backing limitation.
+    auto restored_runner = std::make_shared<Runner>();
+    restored_runner->row_blocks = 0;
+    restored_runner->private_blocks = 2;
+    restored_runner->rows_per_chunk = 256;
+    const TextRunnerDiskCacheOptions restored_disk{
+        .directory = temp.path(),
+        .capacity_bytes = 1 << 20,
+        .space_policy = {1 << 20, [](const auto&) {
+                           return platform::FilesystemInfo{
+                               1ULL << 30, 1ULL << 30, true, true};
+                         }}};
+    ComponentTextCache restarted(restored_runner, 1, 1 << 20, restored_disk);
+    auto warm = restarted.Acquire(prompt, {}, {}, true, 0, true);
+    assert(warm->restored_from_disk() == (test == Case::kSuccess));
+    assert(warm->cached_tokens() ==
+           (test == Case::kSuccess ? prompt.size() : 0));
+    if (test == Case::kSuccess) {
+      auto& state = dynamic_cast<State&>(warm->state());
+      assert(restored_runner->adapter->RecurrentHash(state.slot) == cold_hash);
+      restored_runner->adapter->Append(state.slot, suffix, suffix);
+      const auto warm_hash =
+          restored_runner->adapter->RecurrentHash(state.slot);
+      warm->Invalidate();
+      auto cold = restarted.Acquire(prompt, {}, {}, false, 0, true, false);
+      assert(cold->cached_tokens() == 0);
+      auto& cold_state = dynamic_cast<State&>(cold->state());
+      restored_runner->adapter->Append(cold_state.slot, prompt, prompt);
+      restored_runner->adapter->Append(cold_state.slot, suffix, suffix);
+      assert(restored_runner->adapter->RecurrentHash(cold_state.slot) ==
+             warm_hash);
+      cold->Invalidate();
+    } else {
+      warm->Invalidate();
+    }
+  }
+}
+
 void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
   // An over-RAM checkpoint is captured for disk only. Its rows are borrowed
   // from the live slot, but its private state is staged in RAM backing, and
@@ -4163,6 +4298,7 @@ int main(int argc, char* argv[]) {
     GridDoesNotSuppressFirstDiskPrompt();
     NearTailDiskBranchSurvivesRestart();
     UnbackedDeepRowsSurviveDiskRestart();
+    RamRefusalDiskDirectRestartContract();
   });
   run("ram", [] {
     OverRamCaptureStagesPrivateStateUnderPressure(false);
