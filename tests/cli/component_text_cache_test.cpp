@@ -1893,6 +1893,87 @@ std::uintmax_t ManagedBytes(const std::filesystem::path& directory) {
       bytes += file.file_size();
   return bytes;
 }
+void UnpersistedRequestStaysOffDisk() {
+  const TemporaryDirectory temp("gufo-component-unpersisted-test");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
+  const auto acquire = [&](TextRunnerPool& pool, bool persist) {
+    return pool.Acquire(prompt, {}, {}, {}, true, 0, true, persist);
+  };
+  TextRunnerToken token;
+  {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto first = acquire(pool, false);
+    Prefill(first);
+    token = Generate(first);
+    assert(first.Commit().disk_queued_bytes == 0);
+    // The RAM cache still serves the prompt within this process.
+    auto again = acquire(pool, false);
+    assert(again.cache_hit() && !again.cache_disk_hit());
+    assert(again.cached_prompt_tokens() == prompt.size());
+    again.Invalidate();
+  }
+  assert(ManagedBytes(directory) == 0);
+  {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto cold = acquire(pool, true);
+    assert(!cold.cache_hit());
+    Prefill(cold);
+    assert(Generate(cold) == token);
+    assert(cold.Commit().disk_queued_bytes > 0);
+  }
+  assert(ManagedBytes(directory) > 0);
+  {
+    // Reading what other requests stored is allowed.
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 1, disk);
+    auto reader = acquire(pool, false);
+    assert(reader.cache_disk_hit());
+    assert(reader.cached_prompt_tokens() == prompt.size());
+    reader.Invalidate();
+  }
+  std::filesystem::remove_all(directory);
+}
+void UnpersistedOverRamCaptureIsRefused() {
+  // A checkpoint larger than the RAM budget would be staged for disk only.
+  // A request that stays off disk refuses it instead.
+  const TemporaryDirectory temp("gufo-component-unpersisted-over-ram-test");
+  const std::filesystem::path directory = temp.path();
+  const TextRunnerDiskCacheOptions disk{.directory = directory.string(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  auto runner = std::make_shared<Runner>();
+  runner->private_blocks = 2;
+  runner->rows_per_chunk = 4096;
+  constexpr std::size_t kRam = 448 << 10;
+  {
+    ComponentTextCache cache(runner, 1, kRam, disk);
+    std::vector<TextRunnerToken> prompt(65536);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true, false);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    const auto bytes = lease->CaptureBytes();
+    assert(bytes > kRam);
+    assert(lease->TryReserveSnapshot(bytes, prompt.size(), false,
+                                     SnapshotPurpose::kContinuation, prompt));
+    bool refused = false;
+    try {
+      (void)lease->Capture();
+    } catch (const cache::ResourceExhausted&) {
+      refused = true;
+    }
+    assert(refused);
+    lease->Invalidate();
+  }
+  assert(ManagedBytes(directory) == 0);
+  std::filesystem::remove_all(directory);
+}
 void LoweredDiskBudgetEvictsOldestAtStartup() {
   const TemporaryDirectory temp("gufo-component-lowered-budget-test");
   const std::filesystem::path directory = temp.path();
@@ -2696,6 +2777,41 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
       }
       assert(fixture.Files() == published);
     }
+  }
+}
+void UnpersistedRequestCanReuseRegisteredPins() {
+  PinFixture fixture;
+  const TextRunnerDiskCacheOptions disk{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  {
+    // Explicit operator registration is independent of request persistence.
+    TextRunnerPool create(std::make_shared<PinRunner>(), 2, disk,
+                          {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  auto prompt = fixture.tokens;
+  prompt.insert(prompt.end(), {100, 101, 102});
+  for (bool lazy : {false, true}) {
+    auto options = fixture.options;
+    options.lazy = lazy;
+    {
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
+      assert(runner->prefilled == 0);
+      auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
+      assert(request.cached_prompt_tokens() == fixture.tokens.size());
+      assert(request.cache_disk_hit() == lazy);
+      Prefill(request);
+      (void)Generate(request);
+      assert(request.Commit().disk_queued_bytes == 0);
+      auto replay = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
+      assert(replay.cached_prompt_tokens() == prompt.size());
+      assert(!replay.cache_disk_hit());
+      replay.Invalidate();
+    }
+    assert(ManagedBytes(disk.directory) == 0);
+    assert(fixture.Files() == published);
   }
 }
 void PinnedPrefixesRespectOffAndAutomaticRam() {
@@ -3986,6 +4102,7 @@ int main(int argc, char* argv[]) {
     MultiplePinsExplicitReplacementAndValidation();
     MultiplePinsLazyCorruptionPreservesOtherRegistrations();
     PinnedPrefixRestartReplayAndNoRewrite();
+    UnpersistedRequestCanReuseRegisteredPins();
     PinnedPrefixesRespectOffAndAutomaticRam();
     PinnedPrefixPressureIdentityAndAccounting();
     PinnedPrefixPressureIdentityAndAccounting(true);
@@ -4029,6 +4146,8 @@ int main(int argc, char* argv[]) {
     FragmentedBackingKeepsCompletePrompt();
   });
   run("disk", [] {
+    UnpersistedRequestStaysOffDisk();
+    UnpersistedOverRamCaptureIsRefused();
     RotatedDiskAdmissionFinishesBeforePublication();
     packed_ingress_cpu::CorruptedDisk();
     packed_ingress_cpu::AdmissionFailuresPreserveDisk();
