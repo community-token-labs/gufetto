@@ -4,6 +4,8 @@
 #include <bit>
 #include <cmath>
 
+#include "src/models/qwen38_flash_next/kv_cache_validation.hpp"
+
 namespace gufo::models::qwen38_flash_next {
 namespace {
 static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
@@ -165,6 +167,29 @@ float KvHalfBitsToFloat(std::uint16_t bits) noexcept {
   return std::bit_cast<float>(sign | magnitude);
 }
 
+// Keep q8 validation beside the half converters so production builds can
+// inline them. A separate translation unit added two calls per packed block.
+void detail::ValidateQ8Rows(std::span<const std::byte> input) {
+  for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ8_0)) {
+    const auto scale_bits = ReadHalf(input.data() + i);
+    if ((scale_bits & 0x8000) != 0 || !IsFiniteHalf(scale_bits))
+      throw std::invalid_argument("invalid Flash-Next KV scale");
+    const float scale = KvHalfBitsToFloat(scale_bits);
+    int largest = 0;
+    for (std::size_t j = 0; j < kKvQ8BlockElements; ++j) {
+      const auto q = std::bit_cast<std::int8_t>(
+          std::to_integer<std::uint8_t>(input[i + 2 + j]));
+      if (q == -128)
+        throw std::invalid_argument("invalid Flash-Next KV reconstruction");
+      largest = std::max(largest, std::abs(static_cast<int>(q)));
+    }
+    // One overflow check per block; finite nonnegative scales make the
+    // maximum code magnitude sufficient for every reconstructed operand.
+    if (!IsFiniteHalf(KvFloatToHalfBits(largest * scale)))
+      throw std::invalid_argument("invalid Flash-Next KV reconstruction");
+  }
+}
+
 void EncodeKvRow(std::span<const float> input, KvCacheType type,
                  std::span<std::byte> output) {
   const auto bytes = KvRowBytes(CheckedElements(input.size()), type);
@@ -214,37 +239,9 @@ void ValidateKvRow(std::span<const std::byte> input, std::uint32_t elements,
         throw std::invalid_argument("nonfinite Flash-Next F16 KV payload");
     }
   } else if (!KvUsesQ8Codec(type)) {
-    for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ4_0)) {
-      const auto bits = ReadHalf(input.data() + i);
-      if (!IsFiniteHalf(bits))
-        throw std::invalid_argument("invalid Flash-Next q4 scale");
-      const float scale = KvHalfBitsToFloat(bits);
-      for (std::size_t j = 0; j < 32; ++j) {
-        const auto byte = std::to_integer<unsigned>(input[i + 2 + j % 16]);
-        const int code = static_cast<int>((byte >> (j / 16 * 4)) & 15) - 8;
-        if (!IsFiniteHalf(KvFloatToHalfBits(code * scale)))
-          throw std::invalid_argument("invalid Flash-Next KV reconstruction");
-      }
-    }
+    detail::ValidateQ4Rows(input);
   } else {
-    for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ8_0)) {
-      const auto scale_bits = ReadHalf(input.data() + i);
-      if ((scale_bits & 0x8000) != 0 || !IsFiniteHalf(scale_bits))
-        throw std::invalid_argument("invalid Flash-Next KV scale");
-      const float scale = KvHalfBitsToFloat(scale_bits);
-      int largest = 0;
-      for (std::size_t j = 0; j < kKvQ8BlockElements; ++j) {
-        const auto q = std::bit_cast<std::int8_t>(
-            std::to_integer<std::uint8_t>(input[i + 2 + j]));
-        if (q == -128)
-          throw std::invalid_argument("invalid Flash-Next KV reconstruction");
-        largest = std::max(largest, std::abs(static_cast<int>(q)));
-      }
-      // One overflow check per block; finite nonnegative scales make the
-      // maximum code magnitude sufficient for every reconstructed operand.
-      if (!IsFiniteHalf(KvFloatToHalfBits(largest * scale)))
-        throw std::invalid_argument("invalid Flash-Next KV reconstruction");
-    }
+    detail::ValidateQ8Rows(input);
   }
 }
 
