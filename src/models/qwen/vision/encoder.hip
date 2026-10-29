@@ -20,6 +20,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/memory_budget.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -362,6 +363,7 @@ struct Encoder::Impl {
   std::uint32_t output_width;
   std::string identity;
   std::once_flag identity_once;
+  SerializedEncoderWorkspace workspace;
   std::atomic<std::size_t> resident_bytes{0};
   std::unordered_map<std::string, Allocation> weights;
   hipStream_t stream{nullptr};
@@ -601,6 +603,7 @@ std::size_t Encoder::ResidentBytes() const noexcept {
   return impl_->resident_bytes.load();
 }
 void Encoder::Upload() {
+  const auto lease = impl_->workspace.Acquire();
   impl_->Upload();
 }
 Encoder::Embedding::~Embedding() {
@@ -611,6 +614,7 @@ Encoder::Embedding::~Embedding() {
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     const core::Image& image, const Observer& observer,
     const CancellationCheck& is_cancelled) {
+  const auto lease = impl_->workspace.Acquire();
   const auto check_cancelled = [&] {
     if (is_cancelled && is_cancelled())
       throw std::runtime_error("vision encoding cancelled");

@@ -62,6 +62,10 @@ struct ComponentCacheResources {
   // pause at lookup_observed, admission, selected, or mutation (owner locked).
   // They must not re-enter this cache from the same thread.
   std::function<void(std::string_view)> test_barrier;
+  // Called once after all native slots exist, before backing/staging commit.
+  // Return genuinely unallocated execution obligations, not resident memory.
+  // The provider freezes the same value for asynchronous backing growth.
+  std::function<std::size_t()> freeze_execution_liability;
 };
 
 class ComponentTextCache {

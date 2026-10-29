@@ -51,7 +51,8 @@ public:
   /// Upload the weights now instead of in the first Encode. Repeated calls
   /// keep the existing upload.
   void Upload();
-  /// Serialized by the owning model scheduler. Pixel grid is already resized.
+  /// Serialized per encoder, including callers outside the model scheduler.
+  /// Pixel grid is already resized.
   /// Uploads the weights if Upload has not; scratch is bounded by image
   /// dimensions.
   [[nodiscard]] std::shared_ptr<const Embedding> Encode(

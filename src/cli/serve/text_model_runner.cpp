@@ -287,11 +287,14 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
 
   auto resources = runner->ResourceClaim();
   const auto per_state_reservation = PerStateReservationBytes(resources);
-  if (resources.state_capacity_bytes.has_value() &&
-      per_state_reservation.has_value()) {
-    const std::size_t per_request = *per_state_reservation;
+  if (resources.state_capacity_bytes.has_value()) {
     const std::size_t capacity = *resources.state_capacity_bytes;
-    if (per_request != 0 && state_count > capacity / per_request) {
+    if (resources.shared_execution_bytes > capacity)
+      throw std::invalid_argument(
+          "text runner shared execution claim exceeds state capacity");
+    const auto remaining = capacity - resources.shared_execution_bytes;
+    if (per_state_reservation && *per_state_reservation != 0 &&
+        state_count > remaining / *per_state_reservation) {
       throw std::invalid_argument(
           "text runner request-state claim exceeds state capacity");
     }

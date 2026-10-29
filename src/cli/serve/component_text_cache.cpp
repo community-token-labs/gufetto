@@ -21,6 +21,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/memory_budget.hpp"
 #include "src/core/platform/os_info.hpp"
 #include "src/core/platform/runtime_fingerprint.hpp"
 #include "src/models/qwen38_flash_next/kv_cache.hpp"
@@ -593,12 +594,42 @@ struct ComponentTextCache::Impl {
                                  resources->reassignment_batch_size});
       entries.push_back(std::move(entry));
     }
+    // Freeze only after every slot allocated, before any backing or staging.
+    // Resident weights/slot bytes already reduced the provider's free sample.
+    const auto pending_execution = resources->freeze_execution_liability
+                                       ? resources->freeze_execution_liability()
+                                       : 0;
+    const auto claim = resources->freeze_execution_liability ||
+                               (ram_enabled && resources->commit_backing)
+                           ? this->runner->ResourceClaim()
+                           : TextRunnerResourceClaim{};
+    const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
+    auto headroom = core::ProtectedCacheHeadroom{
+        measured, claim.retained_snapshot_ceiling_bytes.value_or(measured)};
+    if (resources->freeze_execution_liability) {
+      Logger::Info("cache", "event=execution_liability pending_bytes=" +
+                                std::to_string(pending_execution) +
+                                " unprotected_automatic_bytes=" +
+                                std::to_string(headroom.automatic) +
+                                " unprotected_ceiling_bytes=" +
+                                std::to_string(headroom.ceiling));
+      headroom = core::ProtectCacheHeadroom(
+          headroom.automatic, headroom.ceiling, pending_execution);
+      if (ledger.Limits().staging_bytes > headroom.ceiling)
+        throw std::invalid_argument(
+            "cache staging exceeds capacity after execution reservations");
+    }
     std::size_t automatic_bytes{}, max_bytes{}, slot_pinned_bytes{};
     if (!ram_enabled) {
       // Only disk captures copy through backing, so without a disk cache no
       // pool exists. The ledger admits what the slots already charged, that
       // backing, and request metadata.
       ram = options ? kDiskOnlyBackingBytes : 0;
+      if (resources->freeze_execution_liability &&
+          !core::FitsMemoryBudget(headroom.ceiling, ram,
+                                  ledger.Limits().staging_bytes))
+        throw std::invalid_argument(
+            "disk-only backing exceeds capacity after execution reservations");
       disk_backing = ram;
       slot_pinned_bytes =
           resources->pinned_bytes ? resources->pinned_bytes() : 0;
@@ -621,17 +652,15 @@ struct ComponentTextCache::Impl {
         }
       }
     } else if (resources->commit_backing) {
-      const auto claim = this->runner->ResourceClaim();
       // The claim measures the host after the slots allocated, so bytes they
       // pinned are missing from it. Add them back: in full to the ceiling,
       // and half to the automatic budget, which is half the available RAM.
       // The ledger charges them on top of the cache's own budget.
       const auto pinned =
           resources->pinned_bytes ? resources->pinned_bytes() : 0;
-      const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
-      const auto automatic = measured + pinned / 2;
-      const auto ceiling =
-          claim.retained_snapshot_ceiling_bytes.value_or(measured) + pinned;
+      const auto automatic =
+          core::AddMemoryBytes(headroom.automatic, pinned / 2);
+      const auto ceiling = core::AddMemoryBytes(headroom.ceiling, pinned);
       automatic_bytes =
           std::min(TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
       // Staging is pinned host memory too, so the host keeps its reserve
@@ -653,6 +682,11 @@ struct ComponentTextCache::Impl {
       // Slots allocated under the host ceiling; return to the budget. This
       // ignores pinned_bytes: a runner that pins must commit backing.
       const auto staging = ledger.Limits().staging_bytes;
+      if (resources->freeze_execution_liability) {
+        ram = std::min(ram, headroom.ceiling - staging);
+        if (automatic_ram)
+          ram = std::min(ram, headroom.automatic);
+      }
       ledger.ConstrainLimits({ram + staging, ram, staging, ram});
     }
     budget = ram_enabled ? ram : 0;
