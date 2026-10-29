@@ -79,6 +79,13 @@ def main():
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
+    assert "--vision-max-tokens-per-slot" in help_text
+    for value in ("0", "16384", "65536"):
+        check(["serve", "llm", "--vision-max-tokens-per-slot", value,
+               "--model", "missing.gguf"], 1, "Error loading model")
+    for value in ("-1", "4294967296", "invalid"):
+        check(["serve", "llm", "--vision-max-tokens-per-slot", value], 2,
+              "--vision-max-tokens-per-slot")
     assert "--cache-ram-bytes <N|off>" in help_text
     for value in ("off", "0", "536870912"):
         check(["serve", "llm", "--cache-ram-bytes", value,
