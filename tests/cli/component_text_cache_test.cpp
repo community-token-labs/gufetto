@@ -25,11 +25,9 @@
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
+#include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
-#if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-#include "src/cli/serve/text_generation_scheduler.hpp"
-#endif
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/runtime_fingerprint.hpp"
 #include "tests/cache/fake_adapter.hpp"
@@ -751,14 +749,122 @@ void SharedPeerReusesTheCurrentStableCapture() {
     peer.Invalidate();
     leader.Invalidate();
   }
+  // A peer with the same prompt shares at most the leader's last prefill
+  // position. When that is the stable boundary, the leader stops right there:
+  // the pending or just published copy is the shared checkpoint.
+  for (const bool settled : {false, true}) {
+    auto runner = std::make_shared<Runner>();
+    TextRunnerPool pool(runner, 2);
+    std::vector<TextRunnerToken> prompt(40);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto leader = pool.Acquire(prompt, {}, {}, {}, true, 39);
+    const auto first = leader.Prefill(64);
+    assert(first.consumed_tokens == 39 && !first.decode_ready);
+    if (settled)
+      leader.CapturePromptSnapshot();
+    assert(leader.ShareCheckpoint(prompt.size()) == 39 &&
+           "a peer arriving at the leader's stable boundary was not parked");
+    assert(leader.Prefill(64).consumed_tokens == 1);
+    auto peer = pool.Acquire(prompt, {}, {}, {}, true, 39);
+    assert(peer.cached_prompt_tokens() == 39);
+    assert(peer.Prefill(64).consumed_tokens == 1);
+    assert(Generate(peer) == Generate(leader));
+    peer.Invalidate();
+    leader.Invalidate();
+  }
   auto runner = std::make_shared<Runner>();
   TextRunnerPool pool(runner, 1);
   const std::vector<TextRunnerToken> prompt(40, 9);
   auto leader = pool.Acquire(prompt);
   assert(leader.Prefill(16).consumed_tokens == 16);
+  assert(leader.ShareCheckpoint(16) == 0 &&
+         "an uncaptured equal frontier cannot be offered to a peer");
+  assert(leader.ShareCheckpoint(15) == 0);
   assert(leader.ShareCheckpoint(prompt.size()) > 16 &&
          "an uncaptured partial pass cannot be offered to a peer");
   leader.Invalidate();
+}
+void SchedulerSharesAnExactPendingFrontier() {
+  // Hold the first real component capture after allocation, outside the cache
+  // mutex. An unrelated queued request releases it only after the scheduler
+  // has considered the earlier follower: no arrival sleeps or race lottery.
+  class PendingRunner final : public Runner {
+  public:
+    mutable std::binary_semaphore entered{0}, release{0};
+    mutable std::atomic<bool> first{true}, resumed{false}, timed_out{false};
+    mutable std::mutex mutex;
+    mutable std::thread::id capture_thread;
+    void Resume() const {
+      if (!resumed.exchange(true))
+        release.release();
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->allocate =
+          [this, allocate = resources->allocate](const auto& request) {
+            // The inherited fake allocator counts captures non-atomically.
+            // Independent asynchronous captures must serialize that call.
+            const std::lock_guard lock(mutex);
+            auto buffer = allocate(request);
+            if (first.exchange(false)) {
+              capture_thread = std::this_thread::get_id();
+            }
+            return buffer;
+          };
+      resources->stream = [this, stream = resources->stream] {
+        bool hold;
+        {
+          const std::lock_guard lock(mutex);
+          hold = capture_thread == std::this_thread::get_id();
+          if (hold)
+            capture_thread = {};
+        }
+        if (hold) {
+          entered.release();
+          if (!release.try_acquire_for(std::chrono::seconds(5))) {
+            timed_out = true;
+            throw std::runtime_error("pending component capture timed out");
+          }
+        }
+        return stream();
+      };
+      return resources;
+    }
+    TextPrefillStep Prefill(TextRunnerState& state,
+                            std::span<const TextRunnerToken> prompt,
+                            std::size_t offset,
+                            std::size_t budget) const override {
+      if (prompt.front() == 999)
+        Resume();
+      return Runner::Prefill(state, prompt, offset, budget);
+    }
+  };
+  auto runner = std::make_shared<PendingRunner>();
+  auto pool = std::make_shared<TextRunnerPool>(runner, 3);
+  TextGenerationScheduler scheduler(pool);
+  struct ReleaseOnExit {
+    PendingRunner& runner;
+    ~ReleaseOnExit() { runner.Resume(); }
+  } cleanup{*runner};
+  std::vector<TextRunnerToken> prompt(600);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  TextRequestMetadata metadata;
+  metadata.cache_prefix_tokens = prompt.size() - 1;
+  auto leader = scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata);
+  if (!runner->entered.try_acquire_for(std::chrono::seconds(5)))
+    throw std::runtime_error("leader did not enter pending capture window");
+  auto follower = scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata);
+  auto unrelated = scheduler.Submit({999, 1000}, 1, 0.0f);
+  const auto peer = unrelated.Wait();
+  const auto a = leader.Wait();
+  const auto b = follower.Wait();
+  assert(!runner->timed_out && runner->resumed);
+  assert(peer.tokens.size() == 1 && a.tokens.size() == 1 &&
+         a.tokens == b.tokens);
+  assert(a.prefill_tokens == prompt.size());
+  assert(b.shared_prefix_wait_ms > 0);
+  assert(b.cached_prompt_tokens == prompt.size() - 1 && b.prefill_tokens == 1);
 }
 void PrefillLookaheadReachesTheNextFrontier() {
   class LookaheadRunner final : public Runner {
@@ -4346,6 +4452,7 @@ int main(int argc, char* argv[]) {
   run("lifecycle", [] {
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();
+    SchedulerSharesAnExactPendingFrontier();
     SharedPeerReusesTheCurrentStableCapture();
     BackingPreparationFollowsCaptures();
     PrefillLookaheadReachesTheNextFrontier();
