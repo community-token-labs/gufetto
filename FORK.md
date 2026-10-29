@@ -86,6 +86,32 @@ See [README](README.md), [q8 reproduction](docs/q8-kv-cache/reproduce.md) and
 [testing](docs/TESTING.md): CPU passes and a short smoke are not model-quality,
 performance or public-release qualification.
 
+## Predictive conversation roots
+
+RAM caching can retain an optional checkpoint at a renderer-defined system/tool
+root before conversations diverge. Roots use bounded, no-eviction admission;
+when the budget cannot fit one, prediction is skipped rather than displacing
+required captures. They remain RAM-only even with disk caching enabled. This
+is not a new pinned-prefix or persistence mechanism, and no fixed token offset
+is built into the rule.
+
+**First-visit cost:** creating a root can split prefill into another model call.
+On Flash-Next q8 KV/shared-Q8 MTP, three short root-creating requests added
+130/131/161ms of prefill in the initial run. Alternating matched controls added
+107/115/157ms, then133/134/158ms on those same requests; unchanged-main controls
+did not reproduce the increases. These are individual requests, not an average.
+The capture cost is paid when creating a new root and can recur after eviction;
+ordinary continuations do not recreate a retained root. In the controlled small
+return case, root reuse saved about1.09s TTFT and total request time. A150K-token
+conversation return recovered35,525 cached tokens and saved20.73s TTFT with disk
+off and21.44s with disk on; the adjacent35,531-token ordinary boundary survived.
+The measured root's private state was126.87MiB; shared rows/backing are separate.
+
+Measurements use **host HIP7.2.4 + patched ROCr7.2.3**, not production Nix
+ROCm10.1/HIP-Clang24. The first-visit split is an explicit feature cost, not
+latency parity. Other ordinary-path timing flags require separate attribution;
+these measurements alone are not general performance or release qualification.
+
 ## Rotated q4 capacity options
 
 **F16 remains the default.** For opt-in capacity, prefer
