@@ -2775,6 +2775,15 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   const auto refused = [&] {
     const auto& attempt = request.capture_attempt;
     const auto ledger = cache.ledger.Snapshot();
+    const auto route = std::ranges::find(kCacheCaptureRoutes, attempt.route) -
+                       kCacheCaptureRoutes.begin();
+    const auto stage = std::ranges::find(kCacheCaptureStages, attempt.stage) -
+                       kCacheCaptureStages.begin();
+    ++request.metrics.capture_refusals.at(route).at(stage);
+    request.metrics.last_capture_refusal = {
+        attempt.route, attempt.stage, attempt.requested_bytes,
+        ledger.bytes[static_cast<std::size_t>(
+            cache::ResourceCategory::kBackingFree)]};
     Logger::Info(
         "cache",
         "schema=component-cache-v1 event=capture_refused "

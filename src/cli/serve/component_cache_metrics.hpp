@@ -70,6 +70,19 @@ inline json::Value CacheReuseCountersJson() {
         CacheReuseReasonCounts()[i].load(std::memory_order_relaxed);
   return result;
 }
+// Static capture-attempt labels shared with the refusal log. Counts are
+// lease-local terminal refusals, not allocator/reclaim retries or disk skips.
+inline constexpr std::array<std::string_view, 2> kCacheCaptureRoutes{"ram",
+                                                                     "durable"};
+inline constexpr std::array<std::string_view, 8> kCacheCaptureStages{
+    "plan",        "eligibility", "min_step", "metadata",
+    "observation", "can_capture", "allocate", "transfer"};
+inline constexpr std::string_view kCacheCaptureRefusalReason = "byte_capacity";
+struct CacheCaptureRefusal {
+  // Views refer only to static attempt labels, never error or prompt strings.
+  std::string_view route, stage;
+  std::size_t requested_bytes{}, available_bytes{};
+};
 struct ComponentCacheMetrics {
   std::string reuse{"none"};
   CacheReuseReason reuse_reason{CacheReuseReason::kNotAcquired};
@@ -88,6 +101,11 @@ struct ComponentCacheMetrics {
   std::size_t restored_bytes{}, prefilled{}, captures{}, captured_bytes{};
   std::size_t borrowed_capacity_bytes{}, copied_payload_bytes{};
   std::vector<std::uint64_t> captured_checkpoint_ids;
+  // Fixed storage: recording an allocation refusal must not allocate memory.
+  std::array<std::array<std::size_t, kCacheCaptureStages.size()>,
+             kCacheCaptureRoutes.size()>
+      capture_refusals{};
+  std::optional<CacheCaptureRefusal> last_capture_refusal;
   std::size_t disk_queued_bytes{};
   double disk_enqueue_ms{};
   cache::ResourceSnapshot ledger;
@@ -125,6 +143,25 @@ inline json::Value ComponentCacheJson(const ComponentCacheMetrics& value) {
   for (const auto id : value.captured_checkpoint_ids)
     checkpoints.push_back(id);
   result["captured_checkpoint_ids"] = std::move(checkpoints);
+  auto refusals = json::Value::object();
+  for (std::size_t route = 0; route < kCacheCaptureRoutes.size(); ++route)
+    for (std::size_t stage = 0; stage < kCacheCaptureStages.size(); ++stage)
+      if (const auto count = value.capture_refusals[route][stage])
+        refusals[std::string(kCacheCaptureRoutes[route])]
+                [std::string(kCacheCaptureStages[stage])]
+                [std::string(kCacheCaptureRefusalReason)] = count;
+  result["capture_refusals"] = std::move(refusals);
+  auto last_refusal = json::Value();
+  if (value.last_capture_refusal) {
+    const auto& last = *value.last_capture_refusal;
+    last_refusal["route"] = std::string(last.route);
+    last_refusal["stage"] = std::string(last.stage);
+    last_refusal["reason"] = std::string(kCacheCaptureRefusalReason);
+    last_refusal["requested_bytes"] = last.requested_bytes;
+    // Free backing at refusal, not total headroom or a page/contiguity promise.
+    last_refusal["available_bytes"] = last.available_bytes;
+  }
+  result["last_capture_refusal"] = std::move(last_refusal);
   auto spill = json::Value::object();
   spill["idle_bytes"] = value.spill.idle_bytes;
   spill["foreground_bytes"] = value.spill.foreground_bytes;
