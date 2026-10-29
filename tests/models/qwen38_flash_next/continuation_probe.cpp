@@ -42,6 +42,7 @@ struct Piece {
 int main(int argc, char** argv) {
   try {
     std::string model_path, mtp_path, mode;
+    auto cache_type = qfn::KvCacheType::kF16;
     std::uint32_t context = 0, count = 0;
     std::size_t backing_gib = 4;
     bool round_trip = false;
@@ -65,16 +66,31 @@ int main(int argc, char** argv) {
         count = static_cast<std::uint32_t>(std::stoul(value));
       else if (arg == "--backing-gib")
         backing_gib = std::stoul(value);
-      else
+      else if (arg == "--kv-cache-type") {
+        bool found = false;
+        for (const auto type :
+             {qfn::KvCacheType::kF16, qfn::KvCacheType::kQ8_0,
+              qfn::KvCacheType::kQ8_0Rotated, qfn::KvCacheType::kQ4_0,
+              qfn::KvCacheType::kQ8_0Q4_0, qfn::KvCacheType::kQ4_0Rotated,
+              qfn::KvCacheType::kQ8_0Q4_0Rotated}) {
+          if (value == qfn::KvCacheTypeName(type)) {
+            cache_type = type;
+            found = true;
+            break;
+          }
+        }
+        Require(found, "unknown KV cache type");
+      } else
         throw std::invalid_argument("unknown option");
     }
     Require(!model_path.empty() && !mtp_path.empty() &&
                 (mode == "ar" || mode == "mtp") && context > 0 &&
-                context <= 100000 && count > 0 && count <= 8 &&
+                context <= 200000 && count > 0 && count <= 8 &&
                 backing_gib > 0 && backing_gib <= 16,
             "requires --model PATH --mtp-model PATH --mode ar|mtp --context N "
-            "--sessions N [--backing-gib N] [--round-trip]");
-    Require(count <= 2 || context <= 32768,
+            "--sessions N [--backing-gib N] [--kv-cache-type TYPE] "
+            "[--round-trip]");
+    Require(count <= 4 || context <= 32768,
             "long high-concurrency histories are excluded from the admitted "
             "envelope");
     Require(!round_trip || count >= 2,
@@ -92,9 +108,12 @@ int main(int argc, char** argv) {
         qfn::Model::Load(model_path,
                          {.max_context = slot_context,
                           .mtp_model_path = mode == "mtp" ? mtp_path : "",
-                          .decode_concurrency = count},
+                          .decode_concurrency = count,
+                          .kv_cache_type = cache_type},
                          &error);
     Require(bool(model), error);
+    std::cout << "policy," << qfn::KvCacheTypeName(model->CacheType())
+              << ",vision_loaded," << bool(model->VisionEncoder()) << std::endl;
     const auto session_mode = mode == "mtp"
                                   ? gufo::core::SessionMode::kSpeculative
                                   : gufo::core::SessionMode::kAutoregressive;
@@ -161,6 +180,43 @@ int main(int argc, char** argv) {
     }
     if (!round_trip && mode == "mtp")
       Require(drafted > 0, "capacity qualification executed no MTP drafts");
+    // Record actual live frontiers and borrowed byte spans, separately from
+    // allocated capacity and physical UMA usage. No device pointer is read.
+    const qfn::ContinuationLayout layout(
+        model->config(), mode == "mtp", slot_context,
+        qfn::kMaxMtpDraftTokens + 1, cache_type);
+    for (std::size_t lane = 0; lane < slots.size(); ++lane) {
+      const auto positions = adapter.Positions(*slots[lane]);
+      std::size_t ordinary = 0;
+      for (const auto& component : layout.Components()) {
+        using Part = qfn::ContinuationPart;
+        if (component.part != Part::kKey && component.part != Part::kValue &&
+            component.part != Part::kDraftKey &&
+            component.part != Part::kDraftValue)
+          continue;
+        const auto rows =
+            positions.at(component.descriptor.id.value - 1).valid_rows;
+        const auto bytes =
+            rows ? adapter
+                       .BorrowRowsView(*slots[lane], component.descriptor.id, 0,
+                                       rows)
+                       .size()
+                 : 0;
+        Require(bytes == rows * component.descriptor.row_bytes,
+                "ordinary KV span size mismatch");
+        ordinary += bytes;
+        std::cout << "ordinary_component,lane," << lane << ",id,"
+                  << component.descriptor.id.value << ",part,"
+                  << static_cast<unsigned>(component.part) << ",rows," << rows
+                  << ",row_bytes," << component.descriptor.row_bytes
+                  << ",borrowed_bytes," << bytes << '\n';
+      }
+      const auto& session = adapter.GetSession(*slots[lane]);
+      std::cout << "live_inventory,lane," << lane << ",tokens,"
+                << session.Tokens().size() << ",ordinary_valid_bytes,"
+                << ordinary << ",session_allocated_bytes,"
+                << session.AllocatedBytes() << std::endl;
+    }
     std::size_t free_bytes = 0, total_bytes = 0;
     Check(hipMemGetInfo(&free_bytes, &total_bytes));
     const auto live_claim =
