@@ -141,6 +141,11 @@ public:
   // RAM retention drops only its payload ownership when a durable copy exists.
   // A checkpoint without a usable durable description is erased instead.
   void DropResident(IndexEntryId);
+  // Allocation-free ownership witness under the caller's index lock. Matches
+  // the exact entry, object and shared ownership; does not acquire a new pin,
+  // check selection availability, or prove absence of other external owners.
+  [[nodiscard]] bool OwnsResidentCheckpoint(
+      IndexEntryId, const std::shared_ptr<const Checkpoint>&) const noexcept;
   // Applies to every index entry bound to this publication. Corruption erases
   // RAM candidates too; ordinary disk eviction retains coherent RAM copies.
   void RemoveDurable(const DiskDescription&, bool corrupt = false);

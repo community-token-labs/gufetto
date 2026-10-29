@@ -507,7 +507,8 @@ bool RetentionPolicy::Reclaim(const RetentionRequest& r) {
   return true;
 }
 
-bool RetentionPolicy::ExecutionEligible(std::size_t i) const {
+bool RetentionPolicy::ExecutionEligible(std::size_t i,
+                                        bool exact_owner_witness) const {
   const auto& e = records_[i];
   const auto& checkpoint = e.checkpoint;
   // Normally there are exactly two owners: this record and PrefixIndex's
@@ -555,6 +556,12 @@ bool RetentionPolicy::ExecutionEligible(std::size_t i) const {
   }
   if (checkpoint.use_count() == 1)
     return true;
+  // Withdrawal must work even when publication exhausted all ledger headroom.
+  // The exact witness allocates/pins nothing; the count and payload checks
+  // above still exclude every external owner. Keep ordinary execution reclaim's
+  // historical availability-based path unchanged.
+  if (exact_owner_witness)
+    return index_.OwnsResidentCheckpoint(e.entry, checkpoint);
   // Do not blindly subtract an assumed index owner: corruption/removal may
   // already have erased that entry, leaving one external handle instead.
   // Lookup is owner-serialized (PrefixIndex's contract). Its temporary pins
@@ -621,7 +628,7 @@ bool RetentionPolicy::WithdrawUnprovenPrediction(CheckpointId id,
     return false;
   const auto& e = records_[i];
   if (!e.prediction || e.prediction->owner != owner || e.prediction->observed ||
-      e.forked || Branch(i) || !ExecutionEligible(i))
+      e.forked || Branch(i) || !ExecutionEligible(i, true))
     return false;
   // Execution reclaim deliberately tolerates direct owners that prevent a
   // physical trim. Creator withdrawal is stricter: an escaped direct RowPin
