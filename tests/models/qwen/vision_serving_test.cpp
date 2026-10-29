@@ -27,6 +27,37 @@ void Require(bool condition, std::string_view message) {
     throw std::runtime_error(std::string(message));
 }
 
+void PrintOracleResult(std::string_view label, const Backend::Result& result) {
+  std::cout << "image oracle=" << label << " cache_hit=" << result.cache_hit
+            << " disk_hit=" << result.cache_disk_hit
+            << " restored_bytes=" << result.cache_restore_bytes
+            << " cached=" << result.cached_prompt_tokens
+            << " prefill=" << result.prefill_tokens
+            << " prompt=" << result.prompt_tokens
+            << " drafts=" << result.draft_tokens
+            << " accepted=" << result.draft_accepted_tokens << " IDs:";
+  for (const auto token : result.tokens)
+    std::cout << ' ' << token;
+  std::cout << '\n';
+}
+
+void PrintOracleComparison(std::string_view label, const Backend::Result& left,
+                           const Backend::Result& right) {
+  std::size_t first = 0;
+  while (first < left.tokens.size() && first < right.tokens.size() &&
+         left.tokens[first] == right.tokens[first])
+    ++first;
+  const bool exact = left.tokens == right.tokens;
+  std::cout << "image comparison=" << label << " exact=" << exact
+            << " first_difference=";
+  if (exact)
+    std::cout << "none";
+  else
+    std::cout << first;
+  std::cout << " left_count=" << left.tokens.size()
+            << " right_count=" << right.tokens.size() << '\n';
+}
+
 std::string Lower(std::string value) {
   for (auto& character : value) {
     character =
@@ -770,6 +801,50 @@ int main(int argc, char** argv) {
                 "disk-restored image state or identity differs");
       }
       const auto result = restored->chat(continuation, 16, greedy);
+      PrintOracleResult(use_spec ? "spec-disk-descended" : "ar-disk-descended",
+                        result);
+      PrintOracleComparison(use_spec ? "spec-disk/ar-live" : "ar-disk/ar-live",
+                            result, continued);
+      if (flash && use_spec && disk_only) {
+        // Diagnose the existing cross-backend gate without changing its oracle.
+        // Match the restored backend's red, blue, continuation request order,
+        // but never configure disk on either independent MTP control backend.
+        // Release all restored slots before allocating the fresh controls.
+        restored.reset();
+        auto no_disk = load(true);
+        const auto live_red = no_disk->chat(requests[0], 16, greedy);
+        const auto live_blue = no_disk->chat(requests[1], 16, greedy);
+        const auto live = no_disk->chat(continuation, 16, greedy);
+        no_disk.reset();
+        auto cold_backend = load(true);
+        const auto cold = cold_backend->chat(continuation, 16, greedy);
+        cold_backend.reset();
+        PrintOracleResult("ar-live", continued);
+        PrintOracleResult("ar-cold", cold_continuation);
+        PrintOracleResult("mtp-no-disk-red", live_red);
+        PrintOracleResult("mtp-no-disk-blue", live_blue);
+        PrintOracleResult("mtp-no-disk-live", live);
+        PrintOracleResult("mtp-no-disk-cold", cold);
+        PrintOracleComparison("mtp-red/original-mtp-red", live_red, red);
+        PrintOracleComparison("mtp-blue/original-mtp-blue", live_blue, blue);
+        PrintOracleComparison("mtp-red/ar-red", live_red, references[0]);
+        PrintOracleComparison("mtp-live/disk", live, result);
+        PrintOracleComparison("mtp-cold/disk", cold, result);
+        PrintOracleComparison("mtp-live/cold", live, cold);
+        PrintOracleComparison("mtp-live/ar-live", live, continued);
+        PrintOracleComparison("mtp-cold/ar-cold", cold, cold_continuation);
+        std::cout << std::flush;
+        Require(
+            !live_red.cache_disk_hit && !live_blue.cache_disk_hit &&
+                !live.cache_disk_hit && !cold.cache_disk_hit &&
+                live.cache_hit && live.cache_restore_bytes == 0 &&
+                live.cached_prompt_tokens > live_red.prompt_tokens &&
+                cold.cached_prompt_tokens == 0 &&
+                cold.prefill_tokens == cold.prompt_tokens &&
+                live_red.draft_tokens > 0 && live_blue.draft_tokens > 0 &&
+                live.draft_tokens > 0 && cold.draft_tokens > 0,
+            "MTP image diagnostic controls did not exercise live/cold paths");
+      }
       Require(result.cached_prompt_tokens > red.prompt_tokens,
               "continued image check must reuse generated history");
       if (!flash)

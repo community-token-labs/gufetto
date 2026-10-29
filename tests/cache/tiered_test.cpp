@@ -184,7 +184,7 @@ void CoveredIntermediateEviction() {
         return f.Publish(*f.Capture(purpose, &history));
       };
       auto unrelated = publish({900, 901});
-      auto root = publish({protection == 6 ? 40 : 10});
+      auto root = publish({protection == 6 ? 40U : 10U});
       auto middle =
           publish({10, 11}, protection == 1 ? CheckpointPurpose::kLearned
                                             : CheckpointPurpose::kGrid);
