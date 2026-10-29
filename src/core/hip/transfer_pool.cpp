@@ -7,6 +7,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/perf_trace.hpp"
+
 namespace gufo::hip {
 namespace {
 void Check(hipError_t status) {
@@ -50,8 +52,12 @@ struct TransferLease {
   hipStream_t Stream() const {
     return bound_stream ? bound_stream : Slot().stream;
   }
-  cache::TransferResult Drain() noexcept {
-    if (hipStreamSynchronize(Stream()) != hipSuccess)
+  cache::TransferResult Drain(const char* phase_name) noexcept {
+    const auto status = [&] {
+      perf::HostPhase phase(phase_name);
+      return hipStreamSynchronize(Stream());
+    }();
+    if (status != hipSuccess)
       failed = true;
     return failed ? cache::TransferResult::kFailed
                   : cache::TransferResult::kSucceeded;
@@ -61,7 +67,8 @@ struct TransferLease {
     // must neither synchronize nor release another borrower's stream.
     if (!claimed)
       return;
-    (void)Drain();
+    (void)Drain(bound_stream ? "hip_transfer_bound_lease_destructor_drain"
+                             : "hip_transfer_owned_lease_destructor_drain");
     const std::lock_guard lock(state->mutex);
     Slot().failed = failed;
     Slot().busy = false;
@@ -81,10 +88,18 @@ public:
     return status == hipSuccess;
   }
   cache::TransferResult Wait() noexcept override {
-    if (hipEventSynchronize(lease_->Slot().event) != hipSuccess)
+    const auto status = [&] {
+      perf::HostPhase phase(lease_->bound_stream
+                                ? "hip_transfer_bound_event_wait"
+                                : "hip_transfer_owned_event_wait");
+      return hipEventSynchronize(lease_->Slot().event);
+    }();
+    if (status != hipSuccess)
       lease_->failed = true;
     // Drain also on error; adapters may have submitted work through Native.
-    return lease_->Drain();
+    return lease_->Drain(lease_->bound_stream
+                             ? "hip_transfer_bound_wait_drain"
+                             : "hip_transfer_owned_wait_drain");
   }
 
 private:
@@ -95,7 +110,9 @@ private:
 TransferStream::TransferStream(std::shared_ptr<detail::TransferLease> lease)
     : lease_(std::move(lease)) {}
 TransferStream::~TransferStream() {
-  (void)Synchronize();
+  (void)lease_->Drain(lease_->bound_stream
+                          ? "hip_transfer_bound_stream_destructor_drain"
+                          : "hip_transfer_owned_stream_destructor_drain");
 }
 void TransferStream::BindTo(hipStream_t stream, std::shared_ptr<void> owner) {
   if (!stream || !owner)
@@ -113,14 +130,21 @@ hipStream_t TransferStream::Native() const {
   return lease_->Stream();
 }
 cache::TransferResult TransferStream::Synchronize() noexcept {
-  return lease_->Drain();
+  return lease_->Drain(lease_->bound_stream
+                           ? "hip_transfer_bound_synchronize_drain"
+                           : "hip_transfer_owned_synchronize_drain");
 }
 cache::Completion TransferStream::Complete() {
   const auto stream = Native();
   // Allocate host metadata before recording; on an allocation failure the
   // caller still owns the stream and must drain any Native work.
   auto signal = std::make_unique<TransferSignal>(lease_);
-  const auto status = hipEventRecord(lease_->Slot().event, stream);
+  const auto status = [&] {
+    perf::HostPhase phase(lease_->bound_stream
+                              ? "hip_transfer_bound_event_record"
+                              : "hip_transfer_owned_event_record");
+    return hipEventRecord(lease_->Slot().event, stream);
+  }();
   lease_->sealed = true;
   if (status != hipSuccess) {
     lease_->failed = true;
@@ -144,9 +168,17 @@ cache::Completion TransferStream::Copy(void* destination, const void* source,
   try {
     for (std::size_t offset = 0; offset < bytes;) {
       const auto piece = std::min(piece_bytes, bytes - offset);
-      const auto status = hipMemcpyAsync(
-          static_cast<std::byte*>(destination) + offset,
-          static_cast<const std::byte*>(source) + offset, piece, kind, stream);
+      const auto status = [&] {
+        perf::HostPhase phase(
+            direction == CopyDirection::kDeviceToHost
+                ? (lease_->bound_stream ? "hip_transfer_bound_d2h_enqueue"
+                                        : "hip_transfer_owned_d2h_enqueue")
+                : (lease_->bound_stream ? "hip_transfer_bound_h2d_enqueue"
+                                        : "hip_transfer_owned_h2d_enqueue"));
+        return hipMemcpyAsync(static_cast<std::byte*>(destination) + offset,
+                              static_cast<const std::byte*>(source) + offset,
+                              piece, kind, stream);
+      }();
       if (status != hipSuccess)
         lease_->failed = true;
       Check(status);
