@@ -17,6 +17,7 @@ GUFO_PERF_TRACE="$HOME/.cache/gufo-routes.jsonl" GUFO_PERF_TRACE_MOE=1 \
 - `GUFO_PERF_TRACE`: append destination, read once per process. Unset/empty is
   disabled. An open failure prints a fixed warning and disables instrumentation.
   Parent directories must already exist. Prefer a local filesystem.
+- **Diagnostic only:** `GUFO_PERF_TRACE_PHASE_LIMIT=65536` raises only the per-work phase cap from 4096; every other value (including invalid/empty) retains 4096, read once when tracing starts; each record reports `phase_limit` and `phase_dropped` (also included in `attribution.dropped`); this option alone does not enable tracing and can increase trace memory/overhead.
 - `GUFO_PERF_TRACE_MOE=N`: positive integer, sample every Nth **target forward**
   on the scheduler thread (N, 2N, ...). Unset, zero, invalid or overflowing values
   disable routing-set sampling, not phase/RouteHints timings. This variable alone
@@ -103,7 +104,8 @@ sum parent/child phases or mistake transfer-stream waits for foreground GPU idle
   that separately sensitive trace is enabled; the performance trace records no
   raw client labels or HTTP identifiers.
 - `dropped`: new collection overflow/allocation failure count. Each attribution
-  vector and phase vector is capped at 4096 entries per work; the runner binding
+  vector is capped at 4096 entries per work; phases use the reported `phase_limit`
+  (4096 by default, diagnostic override above). The runner binding
   roster is capped at 64. The logical-agent dictionary retains at most 4096 labels
   of at most 256 bytes each. Missing labels/overflow invalidate qualification.
   These bounds do not retroactively bound the older detailed MoE collector.
