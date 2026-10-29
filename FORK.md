@@ -112,6 +112,8 @@ limitations are retained in the private `gufo-agent-concurrency` repository,
 
 ## Known limits
 
+very large conversations may not be saved to SSD while earlier saves are still being written; they are still served correctly.
+
 MTP output can differ slightly from plain decoding; cause not yet identified. SSD restore with images is exact (same-MTP live vs disk matches).
 
 ## Build and process
