@@ -674,6 +674,25 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
   if (r.new_payload_bytes > limits.total_bytes ||
       r.new_payload_bytes > limits.ram_bytes)
     return refuse(RetentionReason::kByteCapacity);
+  const auto exact_match = [&](const Record& e) {
+    return e.checkpoint && e.checkpoint->Compatibility() == r.compatibility &&
+           e.checkpoint->Input() == r.input &&
+           std::ranges::equal(e.checkpoint->Tokens(), r.tokens);
+  };
+  const auto withdraw_owned = [&] {
+    bool removed = false;
+    if (!predicted && r.prediction_owner)
+      for (const auto id : r.owned_predictions)
+        if (std::ranges::find(r.protected_checkpoints, id) ==
+            r.protected_checkpoints.end())
+          removed |= WithdrawUnprovenPrediction(id, r.prediction_owner);
+    return removed;
+  };
+  // A full table needs a new slot only for a non-replacement. No allocation
+  // forecast is needed; byte pressure is handled at the actual failure below.
+  if (!predicted && size_ == limit_ && !r.owned_predictions.empty() &&
+      std::ranges::none_of(records_, exact_match))
+    withdraw_owned();
   // ReserveSnapshot's optional-role record guard precedes its exact-match
   // search. Republishing an exact boundary cannot bypass that guard and
   // downgrade an inferred continuation branch to history/retry.
@@ -683,9 +702,7 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
   std::size_t exact = limit_;
   for (std::size_t i = 0; i < limit_; ++i) {
     const auto& e = records_[i];
-    if (e.checkpoint && e.checkpoint->Compatibility() == r.compatibility &&
-        e.checkpoint->Input() == r.input &&
-        std::ranges::equal(e.checkpoint->Tokens(), r.tokens)) {
+    if (exact_match(e)) {
       exact = i;
       if (e.purpose == RetentionPurpose::kBranchPoint)
         purpose = RetentionPurpose::kBranchPoint;
@@ -798,6 +815,12 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
     } catch (const ResourceExhausted&) {
       if (predicted)
         return refuse(RetentionReason::kByteCapacity);
+      // Capture/index-publication temporaries from the failed try are gone.
+      // Removal is not physical credit: retry real admission before deciding
+      // whether an ordinary victim is still necessary. Successful withdrawal
+      // is bounded by the finite owned-ID list and can happen only once per ID.
+      if (withdraw_owned())
+        continue;
       auto target = limit_;
       if (exact != limit_ && records_[exact].checkpoint &&
           (records_[exact].checkpoint->Id() != r.source ||
