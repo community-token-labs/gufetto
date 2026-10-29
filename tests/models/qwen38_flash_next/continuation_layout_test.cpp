@@ -1,6 +1,7 @@
 #include "src/models/qwen38_flash_next/continuation_layout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -226,6 +227,47 @@ void CheckRotated(bool mtp) {
   }
 }
 
+void CheckBf16KControl() {
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  constexpr auto control = qfn::KvCacheType::kBf16KControl;
+  constexpr auto f16 = qfn::KvCacheType::kF16;
+  Require(!qfn::Session::IsCompatibleSnapshotPayload(19, f16, control) &&
+              !qfn::Session::IsCompatibleSnapshotPayload(25, control, f16),
+          "control and F16 snapshots must not mix");
+  const auto identity = qfn::KvCacheCompatibilityIdentity(control);
+  Require(
+      identity != qfn::KvCacheCompatibilityIdentity(f16) &&
+          identity.find("numerical_kernel_epoch=25\n") != std::string::npos &&
+          identity.find("ordinary_kv_scope=all-trunk-and-mtp\n") !=
+              std::string::npos &&
+          identity.find("k-f32-f16-bf16-rne-f16-v1-v-f16-rne-v1") !=
+              std::string::npos,
+      "control numerical identity");
+  for (const bool mtp : {false, true}) {
+    const qfn::ContinuationLayout plain(ProductionGeometry(), mtp, 100000, 8);
+    const qfn::ContinuationLayout perturbed(ProductionGeometry(), mtp, 100000,
+                                            8, control);
+    Require(plain.Components().size() == perturbed.Components().size() &&
+                plain.PrivateBytes() == perturbed.PrivateBytes(),
+            "control changed state inventory or private bytes");
+    for (std::size_t i = 0; i < plain.Components().size(); ++i) {
+      const auto& a = plain.Components()[i];
+      const auto& b = perturbed.Components()[i];
+      const bool ordinary = a.part == qfn::ContinuationPart::kKey ||
+                            a.part == qfn::ContinuationPart::kValue ||
+                            a.part == qfn::ContinuationPart::kDraftKey ||
+                            a.part == qfn::ContinuationPart::kDraftValue;
+      Require(a.part == b.part &&
+                  a.descriptor.row_bytes == b.descriptor.row_bytes &&
+                  a.descriptor.state_bytes == b.descriptor.state_bytes &&
+                  b.descriptor.layout_version ==
+                      (ordinary ? 8U : a.descriptor.layout_version),
+              "control changed bytes or failed to separate ordinary KV layout");
+    }
+  }
+#endif
+}
+
 void CheckIdentity() {
   static_assert(qfn::Session::kSnapshotPayloadVersion == 19);
   Require(qfn::ModelOptions{}.kv_cache_type == qfn::KvCacheType::kF16,
@@ -358,6 +400,67 @@ void CheckIdentity() {
   });
 }
 
+void CheckQ4() {
+  using qfn::KvCacheType;
+  const auto config = ProductionGeometry();
+  const std::array types{KvCacheType::kF16,
+                         KvCacheType::kQ8_0,
+                         KvCacheType::kQ8_0Rotated,
+                         KvCacheType::kQ4_0,
+                         KvCacheType::kQ8_0Q4_0,
+                         KvCacheType::kQ4_0Rotated,
+                         KvCacheType::kQ8_0Q4_0Rotated};
+  for (const auto type :
+       {KvCacheType::kQ4_0, KvCacheType::kQ8_0Q4_0, KvCacheType::kQ4_0Rotated,
+        KvCacheType::kQ8_0Q4_0Rotated}) {
+    const bool mixed =
+        type == KvCacheType::kQ8_0Q4_0 || type == KvCacheType::kQ8_0Q4_0Rotated;
+    for (bool mtp : {false, true}) {
+      const qfn::ContinuationLayout layout(config, mtp, 200000, 8, type);
+      Require(layout.PrivateBytes() == (mtp ? 133032096 : 131614880),
+              "q4 changed private state");
+      const std::size_t pair = mixed ? 832 : 576;
+      for (const auto target :
+           {1U, 2U, 3U, 255U, 256U, 257U, 100000U, 200000U}) {
+        const auto draft = mtp ? target - 1 : 0;
+        Require(layout.RowBytes(target, draft, target / 4, draft / 4) ==
+                    std::size_t{target} * (12 * pair + 4) +
+                        std::size_t{target / 4} * 3072 +
+                        std::size_t{draft} * pair +
+                        std::size_t{draft / 4} * 256,
+                "q4/mixed frontier byte count");
+      }
+      unsigned keys = 0, values = 0;
+      for (const auto& c : layout.Components()) {
+        const bool key = c.part == qfn::ContinuationPart::kKey ||
+                         c.part == qfn::ContinuationPart::kDraftKey;
+        const bool value = c.part == qfn::ContinuationPart::kValue ||
+                           c.part == qfn::ContinuationPart::kDraftValue;
+        if (key || value) {
+          Require(c.descriptor.row_bytes == (key && mixed ? 544 : 288),
+                  "q4/mixed component stride");
+          Require(
+              c.descriptor.layout_version == static_cast<unsigned>(type) + 1,
+              "q4/mixed component version");
+          keys += key;
+          values += value;
+        }
+      }
+      Require(keys == (mtp ? 13U : 12U) && values == keys, "q4 scope");
+    }
+    for (const auto stored : types)
+      for (const auto version : {18U, 19U, 20U, 21U, 22U, 23U, 24U, 25U})
+        Require(qfn::Session::IsCompatibleSnapshotPayload(
+                    version, stored, type) == (stored == type && version == 24),
+                "q4 snapshot mismatched policy/version accepted");
+    for (const auto other : types)
+      if (other != type)
+        Require(qfn::KvCacheCompatibilityIdentity(type) !=
+                    qfn::KvCacheCompatibilityIdentity(other),
+                "q4/mixed/basis compatibility collision");
+  }
+}
+
 void CheckExtendedContext(bool mtp, qfn::KvCacheType type) {
   const auto native = ProductionGeometry();
   Reject([&] {
@@ -448,6 +551,8 @@ int main() {
     Check(false);
     Check(true);
     CheckIdentity();
+    CheckBf16KControl();
+    CheckQ4();
     for (const auto mtp : {false, true}) {
       CheckQuantized(mtp);
       CheckRotated(mtp);

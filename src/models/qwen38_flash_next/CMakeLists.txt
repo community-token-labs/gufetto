@@ -8,6 +8,10 @@ add_library(gufo_qwen38_flash_next STATIC
   rope_scaling.cpp
   weights.cpp)
 
+if (GUFO_ENABLE_BF16_K_CONTROL)
+  target_compile_definitions(gufo_qwen38_flash_next PUBLIC GUFO_ENABLE_BF16_K_CONTROL=1)
+endif()
+
 target_sources(gufo_qwen38_flash_next PRIVATE kv_rotation.cpp)
 # The CPU oracle has explicit F32 operation boundaries and strict zero signs.
 set_source_files_properties(kv_rotation.cpp PROPERTIES

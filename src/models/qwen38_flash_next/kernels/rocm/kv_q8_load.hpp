@@ -73,6 +73,25 @@ __device__ __forceinline__ uint4 LoadQ8Kv8Packed(const std::int8_t* codes,
                            __builtin_bit_cast(std::uint16_t, scale));
 }
 
+// Eight consecutive coordinates within a q4 block; offset is 0,8,16 or24.
+// Reuse the value-exact half multiplication primitive after integer unpack.
+__device__ __forceinline__ uint4 LoadQ4Kv8Packed(const std::uint8_t* codes,
+                                                 unsigned offset,
+                                                 std::uint16_t scale_bits) {
+  std::uint64_t unpacked = 0;
+#pragma unroll
+  for (unsigned j = 0; j < 8; ++j) {
+    const unsigned coordinate = offset + j;
+    const int code =
+        static_cast<int>((codes[coordinate % 16] >> (coordinate / 16 * 4)) &
+                         15) -
+        8;
+    unpacked |= std::uint64_t{static_cast<std::uint8_t>(code)} << (j * 8);
+  }
+  // Unlike q8, q4 permits a signed scale. The same exact multiply handles it.
+  return DecodeQ8Kv8Packed(unpacked, scale_bits);
+}
+
 }  // namespace gufo::models::qwen38_flash_next::rocm::detail
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KV_Q8_LOAD_HPP_

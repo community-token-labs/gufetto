@@ -9,12 +9,21 @@
 
 namespace gufo::cli {
 
+inline constexpr std::string_view kPlainQ4QualityError =
+    "plain q4 KV modes failed the quality screen; use q4_0-rotated or "
+    "q8_0/q4_0-rotated";
+
 inline void RegisterKvCacheTypeOption(
     ArgParser& parser, models::qwen38_flash_next::KvCacheType* type) {
   parser.AddCustomOption(
       "", "--kv-cache-type", "TYPE",
-      "Ordinary K/V storage: f16 (default), q8_0 or q8_0-rotated "
-      "(q8 experimental and lossy; Flash-Next only)",
+      "Ordinary K/V storage: f16 (default), q8_0, "
+      "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated "
+      "(quantized modes are experimental and lossy; Flash-Next only)"
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+      "; bf16-k-control (diagnostic K-only perturbation, trunk + MTP)"
+#endif
+      ,
       "Model",
       [type](std::string_view, std::string_view value, std::string* error) {
         using models::qwen38_flash_next::KvCacheType;
@@ -24,9 +33,23 @@ inline void RegisterKvCacheTypeOption(
           *type = KvCacheType::kQ8_0;
         else if (value == "q8_0-rotated")
           *type = KvCacheType::kQ8_0Rotated;
+        else if (value == "q4_0" || value == "q8_0/q4_0") {
+          if (error)
+            *error = kPlainQ4QualityError;
+          return false;
+        } else if (value == "q4_0-rotated")
+          *type = KvCacheType::kQ4_0Rotated;
+        else if (value == "q8_0/q4_0-rotated")
+          *type = KvCacheType::kQ8_0Q4_0Rotated;
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+        else if (value == "bf16-k-control")
+          *type = KvCacheType::kBf16KControl;
+#endif
         else {
           if (error)
-            *error = "--kv-cache-type must be f16, q8_0 or q8_0-rotated";
+            *error =
+                "--kv-cache-type must be f16, q8_0, "
+                "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated";
           return false;
         }
         return true;
@@ -39,12 +62,19 @@ inline bool ValidateKvCacheTypeForArchitecture(
     models::qwen38_flash_next::KvCacheType type, std::string_view architecture,
     std::string* error) {
   using models::qwen38_flash_next::KvCacheType;
+  // The underlying q4 codecs/geometry also serve the rotated implementations;
+  // knowing their storage identity does not admit an unqualified CLI policy.
+  if (type == KvCacheType::kQ4_0 || type == KvCacheType::kQ8_0Q4_0) {
+    if (error)
+      *error = kPlainQ4QualityError;
+    return false;
+  }
   if (models::qwen38_flash_next::IsKnownKvCacheType(type) &&
       (type == KvCacheType::kF16 || architecture == "qwen4exp"))
     return true;
   if (error)
     *error =
-        "--kv-cache-type q8_0 or q8_0-rotated requires Qwen3.8-Flash-Next "
+        "quantized --kv-cache-type requires Qwen3.8-Flash-Next "
         "(GGUF architecture qwen4exp)";
   return false;
 }
