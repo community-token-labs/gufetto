@@ -211,6 +211,10 @@ Directory OpenDirectoryAt(const Directory& dir, std::string_view name,
   return result;
 }
 
+std::string ImmutableFileDigest(PlatformFile) {
+  return {};
+}
+
 bool Stat(PlatformFile file, FileInfo* out, std::error_code& ec) noexcept {
   ec.clear();
   if (!FileValid(file) || !FromHandle(static_cast<HANDLE>(file), out)) {

@@ -1024,6 +1024,7 @@ if (BUILD_TESTING)
   if (NOT WIN32)
   add_executable(gguf_identity_test tests/core/gguf_identity_test.cpp)
   target_link_libraries(gguf_identity_test PRIVATE gufo_core)
+  target_link_options(gguf_identity_test PRIVATE -Wl,--wrap=fstat -Wl,--wrap=pread -Wl,--wrap=ioctl)
 
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
