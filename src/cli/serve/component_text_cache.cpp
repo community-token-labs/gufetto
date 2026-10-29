@@ -3430,7 +3430,7 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
 }
 
 std::vector<PlannedSnapshotCapture> ComponentTextCache::Lease::PlannedCaptures(
-    std::size_t stable, std::optional<std::size_t> root) const {
+    std::size_t stable, std::optional<std::size_t> root) const try {
   // Off with no disk cache keeps no checkpoint, so skip the planning.
   if (!impl_->cache->ram_enabled && !impl_->cache->queue)
     return {};
@@ -3502,6 +3502,12 @@ std::vector<PlannedSnapshotCapture> ComponentTextCache::Lease::PlannedCaptures(
   }
   std::ranges::sort(boundaries, {}, &PlannedSnapshotCapture::boundary);
   return boundaries;
+} catch (const std::bad_alloc&) {
+  // Inventory lookup charges metadata even when there is no optional point.
+  // An already admitted request must not fail because optional planning runs
+  // out of ledger or allocator headroom. Required captures are independent;
+  // decline the entire optional plan rather than bypassing quota/dedup checks.
+  return {};
 }
 std::vector<PlannedSnapshotCapture> ServingCacheLease::PlannedCaptures(
     std::size_t stable, std::optional<std::size_t> root) const {
