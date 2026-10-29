@@ -42,12 +42,13 @@ void TestFormatCapabilities() {
       GgmlType::kQ3_K,   GgmlType::kQ4_K,  GgmlType::kQ5_K,
       GgmlType::kQ6_K,   GgmlType::kQ8_K,  GgmlType::kIQ2_XXS,
       GgmlType::kIQ4_NL, GgmlType::kIQ3_S, GgmlType::kIQ4_XS,
-      GgmlType::kBF16,
+      GgmlType::kBF16,   GgmlType::kI32,
   };
   for (const auto type : all_types) {
     const auto descriptor = DescribeQwenGemmFormat(type);
-    Check(descriptor.dense != descriptor.quantized,
-          "every declared GGML type must classify as dense or quantized");
+    Check(type == GgmlType::kI32 ? !descriptor.dense && !descriptor.quantized
+                                 : descriptor.dense != descriptor.quantized,
+          "non-weight I32 must not acquire a floating or quantized route");
     const std::size_t k =
         descriptor.block_elements == 0 ? 32 : descriptor.block_elements;
     constexpr std::array modes{
@@ -57,17 +58,24 @@ void TestFormatCapabilities() {
         QwenGemmMode::kHipMtp,
     };
     for (const auto mode : modes) {
-      const auto resolution = Resolution(type, 1, k, mode);
       const bool expected = mode == QwenGemmMode::kCpu ? descriptor.cpu_direct
                             : mode == QwenGemmMode::kHipPrefill
                                 ? descriptor.hip_prefill_direct
                                 : descriptor.hip_decode_direct;
-      Check(resolution.accepted() == expected,
-            "route must match the format/mode capability descriptor");
-      Check(expected
-                ? resolution.rejection == QwenGemmRejection::kNone
-                : resolution.rejection == QwenGemmRejection::kUnsupportedFormat,
-            "format/mode route must expose the expected rejection reason");
+      // Check actual backend/format/dtype dispatch at single-token, ragged
+      // and prefill widths; unsupported requests must not fall through to a
+      // different backend or silently lose their explicit rejection reason.
+      for (const auto batch : {1U, 17U, 2048U}) {
+        const auto resolution = Resolution(type, 7, k, mode, batch);
+        Check(resolution.accepted() == expected,
+              "route must match the format/mode capability descriptor");
+        Check((resolution.route != QwenGemmRoute::kRejected) == expected,
+              "unsupported format must have no executable route");
+        Check(expected ? resolution.rejection == QwenGemmRejection::kNone
+                       : resolution.rejection ==
+                             QwenGemmRejection::kUnsupportedFormat,
+              "format/mode route must expose the expected rejection reason");
+      }
     }
   }
 
