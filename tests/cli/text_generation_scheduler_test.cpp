@@ -943,6 +943,8 @@ void TestRunnerCanSkipUnusedFinalAdvance() {
   }
   Expect(advances == 1,
          "runner skips the unused frontier computation after the final token");
+  Expect(result.committed_tokens == 2,
+         "committed prefix excludes the sampled but unadvanced final token");
 }
 
 void TestRunnerCanReuseExactIncrementalText() {
@@ -996,8 +998,30 @@ void TestGenerationTraceRecordsPromptAndOutput() {
       failed = true;
     }
   }
-  Trace::Close();
   Expect(failed, "the injected runner failure reaches the consumer");
+  bool callback_failed = false;
+  {
+    const Trace::RequestScope scope("r44");
+    auto completed = scheduler->Submit({10}, 2, sampling, {}, true);
+    // Let execution commit before consuming its queued output. The callback
+    // failure must not serialize that successful retained frontier.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (completed.phase() != TextRequestPhase::kTerminal) {
+      Expect(std::chrono::steady_clock::now() < deadline,
+             "callback fixture reaches terminal state");
+      std::this_thread::yield();
+    }
+    try {
+      (void)completed.Wait([](std::string_view) -> bool {
+        throw std::runtime_error("injected consumer failure");
+      });
+    } catch (const std::runtime_error&) {
+      callback_failed = true;
+    }
+  }
+  Trace::Close();
+  Expect(callback_failed, "the injected consumer failure reaches the caller");
 
   std::vector<gufo::json::Value> records;
   {
@@ -1007,7 +1031,7 @@ void TestGenerationTraceRecordsPromptAndOutput() {
     }
   }
   fs::remove(path);
-  Expect(records.size() == 2, "one generation record per request");
+  Expect(records.size() == 3, "one generation record per request");
   const auto& record = records.front();
   Expect(record.member_str("event") == "generation" &&
              record.member_str("request") == "r42",
@@ -1020,6 +1044,18 @@ void TestGenerationTraceRecordsPromptAndOutput() {
              record.member_size("prompt_tokens") == 2 &&
              record.member_size("generated_tokens") == result.tokens.size(),
          "the record carries the effective limits and counts");
+  const auto* prompt_ids = record.find("prompt_token_ids");
+  const auto* generated_ids = record.find("generated_token_ids");
+  Expect(prompt_ids && prompt_ids->items().size() == 2 &&
+             prompt_ids->items()[0].as_size() == 7 &&
+             prompt_ids->items()[1].as_size() == 8,
+         "trace records native prompt IDs without retokenizing text");
+  Expect(generated_ids && generated_ids->items().size() == 2 &&
+             generated_ids->items()[0].as_size() == 700 &&
+             generated_ids->items()[1].as_size() == 701 &&
+             record.member_size("committed_tokens") == 4 &&
+             record.member_size("prefill_tokens") == 2,
+         "trace records published IDs and the exact executed commit frontier");
   const auto* recorded_sampling = record.find("sampling");
   Expect(recorded_sampling != nullptr &&
              recorded_sampling->find("temperature")->as_double() == 0.7 &&
@@ -1031,11 +1067,21 @@ void TestGenerationTraceRecordsPromptAndOutput() {
              record.member_str("finish") == "length" &&
              record.find("error") == nullptr,
          "the record carries the cache outcome and finish");
-  const auto& failure = records.back();
+  const auto& failure = records[1];
   Expect(failure.member_str("request") == "r43" &&
              failure.member_str("prompt") == "9" &&
              failure.member_str("error") == "injected scheduler runner failure",
          "a failed request still records its prompt and the failure");
+  Expect(failure.find("committed_tokens") &&
+             failure.find("committed_tokens")->is_null(),
+         "failed retention is unknown, never fabricated as zero tokens");
+  const auto& callback_failure = records.back();
+  Expect(
+      callback_failure.member_str("request") == "r44" &&
+          callback_failure.member_str("error") == "injected consumer failure" &&
+          callback_failure.find("committed_tokens") &&
+          callback_failure.find("committed_tokens")->is_null(),
+      "consumer failure must not attest a successful execution frontier");
 }
 
 void TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse() {

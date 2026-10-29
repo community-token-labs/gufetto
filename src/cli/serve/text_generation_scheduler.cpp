@@ -408,6 +408,10 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
       // template for every model without a per-model hook.
       .prompt = Trace::Text(runner.Decode(request.prompt)),
   };
+  auto prompt_ids = json::Value::array();
+  for (const auto token : request.prompt)
+    prompt_ids.push_back(static_cast<std::size_t>(token));
+  trace.record["prompt_token_ids"] = std::move(prompt_ids);
   trace.record["generation"] = request.id;
   trace.record["max_tokens"] = request.token_limit;
   json::Value sampling = json::Value::object();
@@ -459,7 +463,15 @@ void WriteGenerationTrace(GenerationTrace trace,
     record["common_prefix_tokens"] = result.cache_common_prefix_tokens;
     record["nearest_checkpoint_tokens"] = result.cache_checkpoint_tokens;
   }
+  record["prefill_tokens"] = result.prefill_tokens;
   record["generated_tokens"] = result.tokens.size();
+  auto generated_ids = json::Value::array();
+  for (const auto token : result.tokens)
+    generated_ids.push_back(static_cast<std::size_t>(token));
+  record["generated_token_ids"] = std::move(generated_ids);
+  record["committed_tokens"] = result.committed_tokens && failure == nullptr
+                                   ? json::Value(*result.committed_tokens)
+                                   : json::Value();
   record["finish"] = FinishName(result);
   if (!result.stop_sequence.empty()) {
     record["stop_sequence"] = Trace::Text(result.stop_sequence);
@@ -813,6 +825,7 @@ struct TextGenerationScheduler::Impl {
     try {
       if (request->runner_request) {
         const auto retained = request->runner_request.Cancel();
+        request->result.committed_tokens = retained.committed_tokens;
         request->result.component_cache = retained.component_cache;
         request->result.cache_snapshot_bytes = retained.snapshot_bytes;
         request->result.cache_snapshot_ms = retained.snapshot_ms;
@@ -990,6 +1003,7 @@ struct TextGenerationScheduler::Impl {
         finish_reason == TextGenerationBackend::FinishReason::kStopSequence
             ? request->runner_request.Cancel()
             : request->runner_request.Commit();
+    request->result.committed_tokens = cache_commit.committed_tokens;
     request->result.component_cache = cache_commit.component_cache;
     request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
