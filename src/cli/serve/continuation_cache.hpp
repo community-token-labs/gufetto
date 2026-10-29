@@ -93,6 +93,10 @@ enum class SnapshotPurpose : std::uint8_t {
   kBranchPoint,
 };
 
+/// Capture policy/provenance, never compatibility or token/input identity.
+/// A predicted payload remains RAM-only even after its reuse is observed.
+enum class SnapshotOrigin : std::uint8_t { kOrdinary, kPredicted };
+
 /// Sanitized snapshot-retention event.
 ///
 /// Token values and prompt contents are deliberately absent.

@@ -81,9 +81,10 @@ public:
     [[nodiscard]] bool restored_from_disk() const noexcept;
     [[nodiscard]] ContinuationLookup lookup() const noexcept;
     [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
-    [[nodiscard]] bool TryReserveSnapshot(std::size_t, std::size_t, bool,
-                                          SnapshotPurpose,
-                                          std::span<const ContinuationToken>);
+    [[nodiscard]] bool TryReserveSnapshot(
+        std::size_t, std::size_t, bool, SnapshotPurpose,
+        std::span<const ContinuationToken>,
+        SnapshotOrigin = SnapshotOrigin::kOrdinary);
     void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
     std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                                 std::shared_ptr<const ContinuationSnapshot>,
@@ -177,7 +178,8 @@ public:
   [[nodiscard]] bool TryReserveSnapshot(
       std::size_t, std::size_t, bool = false,
       SnapshotPurpose = SnapshotPurpose::kContinuation,
-      std::span<const ContinuationToken> = {});
+      std::span<const ContinuationToken> = {},
+      SnapshotOrigin = SnapshotOrigin::kOrdinary);
   void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
   std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                               std::shared_ptr<const ContinuationSnapshot>,

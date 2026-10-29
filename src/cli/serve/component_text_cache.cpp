@@ -127,6 +127,8 @@ std::size_t PayloadBytes(const cache::DiskManifest& manifest) {
   return bytes;
 }
 struct DurableCapture {
+  explicit DurableCapture(SnapshotOrigin origin) : capture_origin(origin) {}
+  const SnapshotOrigin capture_origin;
   cache::ResourceCharge metadata;
   std::shared_ptr<const void> branch;
   cache::DiskReadPin ancestor_pin;
@@ -135,6 +137,8 @@ struct DurableCapture {
 };
 class ComponentSnapshot final : public TextRunnerSnapshot {
 public:
+  explicit ComponentSnapshot(SnapshotOrigin origin) : capture_origin(origin) {}
+  const SnapshotOrigin capture_origin;
   std::shared_ptr<const cache::Checkpoint> checkpoint;
   std::shared_ptr<DurableCapture> durable;
   std::size_t bytes{};
@@ -920,7 +924,10 @@ struct ComponentTextCache::Impl {
     return file;
   }
   std::size_t Persist(std::shared_ptr<const cache::Checkpoint> checkpoint,
-                      bool pin = false) {
+                      bool pin = false,
+                      SnapshotOrigin origin = SnapshotOrigin::kOrdinary) {
+    if (origin == SnapshotOrigin::kPredicted)
+      return 0;
     // Grid captures support RAM edits during prefill. Persist semantic prompt
     // and learned boundaries: an early grid must not consume the spacing
     // allowance of the first complete turn.
@@ -1082,7 +1089,8 @@ struct ComponentTextCache::Impl {
     return prior && tokens.size() - prior < disk_step;
   }
   std::size_t Persist(std::shared_ptr<DurableCapture> capture) {
-    if (capture->sources.empty())
+    if (capture->capture_origin == SnapshotOrigin::kPredicted ||
+        capture->sources.empty())
       return 0;
     if (WithinDiskStep(capture->manifest.tokens, capture->manifest.input) &&
         capture->manifest.purpose != cache::CheckpointPurpose::kLearned)
@@ -1129,6 +1137,7 @@ struct ComponentTextCache::Lease::Impl {
   std::size_t edit_boundary_count{};
   cache::ResourceCharge edit_metadata;
   SnapshotPurpose purpose{SnapshotPurpose::kContinuation};
+  SnapshotOrigin capture_origin{SnapshotOrigin::kOrdinary};
   // Last attempted route/stage, retained across unwinding for refusal logging.
   // Logical request bytes and ledger free backing are not contiguous/page-fit
   // promises; only the provider can decide whether its backing can satisfy
@@ -1187,7 +1196,8 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   capture_attempt = {.route = "durable",
                      .stage = "eligibility",
                      .protected_count = edit_boundary_count};
-  if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
+  if (capture_origin == SnapshotOrigin::kPredicted || !persist ||
+      !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
   capture_attempt.stage = "min_step";
@@ -1225,7 +1235,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
                 sizeof(Copy) + 256);
   auto admission = cache->ledger.Reserve(cache::ResourceCategory::kMetadata,
                                          capture_attempt.requested_bytes);
-  auto durable = std::make_shared<DurableCapture>();
+  auto durable = std::make_shared<DurableCapture>(capture_origin);
   durable->metadata = admission.Convert();
   std::shared_ptr<const cache::DiskDescription> ancestor;
   {
@@ -1431,7 +1441,7 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
   }
   ++metrics.captures;
   metrics.captured_checkpoint_ids.push_back(durable->manifest.checkpoint.value);
-  auto snapshot = std::make_unique<ComponentSnapshot>();
+  auto snapshot = std::make_unique<ComponentSnapshot>(capture_origin);
   snapshot->bytes = entry->history->NewPayloadBytes(positions);
   snapshot->durable = std::move(durable);
   return snapshot;
@@ -2460,7 +2470,11 @@ bool ComponentTextCache::Lease::HasSnapshotFor(
 }
 bool ComponentTextCache::Lease::TryReserveSnapshot(
     std::size_t bytes, std::size_t boundary, bool preserve,
-    SnapshotPurpose purpose, std::span<const ContinuationToken> tokens) {
+    SnapshotPurpose purpose, std::span<const ContinuationToken> tokens,
+    SnapshotOrigin capture_origin) {
+  if (capture_origin == SnapshotOrigin::kPredicted &&
+      (!impl_->cache->ram_enabled || bytes > impl_->cache->budget))
+    return false;
   if (!impl_->cache->ram_enabled &&
       (!impl_->cache->queue || purpose == SnapshotPurpose::kHistory))
     return false;
@@ -2479,6 +2493,7 @@ bool ComponentTextCache::Lease::TryReserveSnapshot(
   impl_->capture_tokens.assign(tokens.begin(), tokens.end());
   impl_->preserve_source = preserve;
   impl_->purpose = purpose;
+  impl_->capture_origin = capture_origin;
   return true;
 }
 void ComponentTextCache::Lease::SkipSnapshot(SnapshotEventReason reason,
@@ -2819,6 +2834,8 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   };
   if (!cache.ram_enabled || bytes > cache.budget) {
     try {
+      if (request.capture_origin == SnapshotOrigin::kPredicted)
+        throw cache::ResourceExhausted();
       return request.CaptureDurable();
     } catch (const cache::ResourceExhausted&) {
       refused();
@@ -2974,7 +2991,8 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
       break;
     } catch (const cache::ResourceExhausted&) {
       if (!reclaim()) {
-        if (!request.pin_capture && cache.queue &&
+        if (request.capture_origin != SnapshotOrigin::kPredicted &&
+            !request.pin_capture && cache.queue &&
             request.purpose != SnapshotPurpose::kHistory) {
           try {
             if (auto durable = request.CaptureDurable())
@@ -3008,7 +3026,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
                   [](const auto& r) { return r.checkpoint.expired(); });
     cache.readiness.push_back({checkpoint, ready});
   }
-  auto snapshot = std::make_unique<ComponentSnapshot>();
+  auto snapshot = std::make_unique<ComponentSnapshot>(request.capture_origin);
   snapshot->checkpoint = std::move(checkpoint);
   snapshot->bytes = bytes;
   return snapshot;
@@ -3019,6 +3037,8 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
   const auto* component =
       dynamic_cast<const ComponentSnapshot*>(snapshot.get());
   if (component && component->durable) {
+    if (component->capture_origin == SnapshotOrigin::kPredicted)
+      return 0;
     const auto started = Clock::now();
     impl_->metrics.disk_queued_bytes +=
         impl_->cache->Persist(component->durable);
@@ -3045,12 +3065,13 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     impl_->edit_boundaries[impl_->edit_boundary_count++] =
         component->checkpoint->Id();
   }
-  if (!impl_->persist)
+  if (!impl_->persist ||
+      component->capture_origin == SnapshotOrigin::kPredicted)
     return component->bytes;
   try {
     const auto started = Clock::now();
-    impl_->metrics.disk_queued_bytes +=
-        impl_->cache->Persist(component->checkpoint);
+    impl_->metrics.disk_queued_bytes += impl_->cache->Persist(
+        component->checkpoint, false, component->capture_origin);
     impl_->metrics.disk_enqueue_ms +=
         std::chrono::duration<double, std::milli>(Clock::now() - started)
             .count();
@@ -3174,11 +3195,17 @@ FORWARD_RESULT(bool, restored_from_disk, const noexcept, (), ())
 FORWARD_RESULT(ContinuationLookup, lookup, const noexcept, (), ())
 FORWARD_RESULT(bool, HasSnapshotFor, const,
                (std::span<const ContinuationToken> tokens), (tokens))
-FORWARD_RESULT(bool, TryReserveSnapshot, ,
-               (std::size_t bytes, std::size_t boundary, bool preserve,
-                SnapshotPurpose purpose,
-                std::span<const ContinuationToken> tokens),
-               (bytes, boundary, preserve, purpose, tokens))
+bool ServingCacheLease::TryReserveSnapshot(
+    std::size_t bytes, std::size_t boundary, bool preserve,
+    SnapshotPurpose purpose, std::span<const ContinuationToken> tokens,
+    SnapshotOrigin capture_origin) {
+  if (component_)
+    return component_->TryReserveSnapshot(bytes, boundary, preserve, purpose,
+                                          tokens, capture_origin);
+  if (capture_origin == SnapshotOrigin::kPredicted)
+    return false;
+  return legacy_.TryReserveSnapshot(bytes, boundary, preserve, purpose, tokens);
+}
 FORWARD_RESULT(void, SkipSnapshot, noexcept,
                (SnapshotEventReason reason, std::size_t bytes,
                 std::size_t boundary),
