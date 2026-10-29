@@ -56,6 +56,22 @@ add_qwen_cpu_test(qwen_gemm_route_test
   tests/models/qwen/gemm_route_test.cpp
   "cpu;models;qwen;gemm;dispatch")
 
+# CPU bounds contract for the HIP scratch allocation; native numerics stay in
+# qwen_prefill_quant_gemm_ops_test.
+set(prefill_scratch_body "${CMAKE_CURRENT_BINARY_DIR}/prefill_scratch_body.inc")
+add_custom_command(OUTPUT "${prefill_scratch_body}"
+  COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hip/quant/extract_prefill_scratch.py"
+    --source-root "${PROJECT_SOURCE_DIR}" --output "${prefill_scratch_body}"
+  DEPENDS hip/quant/extract_prefill_scratch.py
+    "${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_gemm.hip"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
+  VERBATIM)
+add_qwen_cpu_test(qwen_prefill_scratch_test
+  tests/models/qwen/hip/quant/prefill_scratch_test.cpp "cpu;models;qwen;quant")
+target_sources(qwen_prefill_scratch_test PRIVATE "${prefill_scratch_body}")
+target_include_directories(qwen_prefill_scratch_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+
 if (ENGINE_ENABLE_HIP)
   function(add_qwen_hip_test target source labels)
     add_executable(${target} ${PROJECT_SOURCE_DIR}/${source})
@@ -116,6 +132,12 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_prefill_quant_gemm_ops_test
     tests/models/qwen/hip/quant/prefill_quant_gemm_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;prefill;q8;opt-c163-blocked-w8a8;opt-c192-swiglu-epilogue")
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(qwen_prefill_quant_gemm_ops_test PRIVATE
+      GUFO_TEST_Q8_SCRATCH_GUARDS=1)
+    target_link_options(qwen_prefill_quant_gemm_ops_test PRIVATE
+      -Wl,--wrap=hipMalloc -Wl,--wrap=hipFree)
+  endif()
   add_qwen_hip_test(qwen_q4kxl_quant_ops_test
     tests/models/qwen/hip/quant/q4kxl_quant_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;gemm;k-quant;iquant;opt-q4kxl")
