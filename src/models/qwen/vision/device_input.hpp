@@ -60,6 +60,11 @@ private:
   std::shared_ptr<Encoder> encoder_;
   std::shared_ptr<OutputPool::Owner> output_owner_;
   std::vector<std::shared_ptr<const Encoder::Embedding>> embeddings_;
+  // The configured budget survives text-only Configure calls. The resident
+  // positions keep their original owner even when a different encoder binds.
+  std::shared_ptr<core::ReclaimableMemory> memory_budget_;
+  std::shared_ptr<core::ReclaimableMemory> positions_budget_;
+  hipError_t ReleasePositions() noexcept;
   DeviceRope* descriptor_{nullptr};
   std::int32_t* positions_{nullptr};
   std::size_t capacity_{0};

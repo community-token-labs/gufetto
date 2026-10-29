@@ -23,6 +23,12 @@ void* CommitZeroedPages(std::size_t bytes) noexcept {
   return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
+bool TryReleaseCommittedPages(void* base, std::size_t bytes) noexcept {
+  if (base == nullptr)
+    return true;
+  return bytes > 0 && VirtualFree(base, 0, MEM_RELEASE) != 0;
+}
+
 void ReleaseCommittedPages(void* base, std::size_t) noexcept {
   if (base != nullptr) {
     VirtualFree(base, 0, MEM_RELEASE);

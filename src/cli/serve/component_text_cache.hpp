@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 
 #include "src/cache/checkpoint.hpp"
 #include "src/cache/streaming.hpp"
@@ -66,6 +67,23 @@ struct ComponentCacheResources {
   // Return genuinely unallocated execution obligations, not resident memory.
   // The provider freezes the same value for asynchronous backing growth.
   std::function<std::size_t()> freeze_execution_liability;
+  // Bind one bounded logical-eviction step after initialization; the provider
+  // physically trims outside the publication lock and remeasures headroom.
+  // Clearing the callback drains it before this cache's state is destroyed.
+  std::function<void(std::function<bool()>)> bind_execution_reclaimer;
+  // Protect the image execution envelope while RAM backing becomes permanent,
+  // including entire shared segments rather than only the pin's payload bytes.
+  // Called outside cache/publication locks and, at startup, before acquiring a
+  // runner. A nonempty ticket must live through allocation and pin publication.
+  // Empty refuses eager readiness or leaves lazy pins disk-backed. A lazy
+  // caller already holds a runner: providers may trim free segments but must
+  // refuse conservatively rather than wait for or evict active sources.
+  std::function<std::shared_ptr<void>()> reserve_permanent_backing;
+  // Optional refusal diagnostic: image envelope bytes needed and currently
+  // available, respectively. Called outside cache/publication locks; it does
+  // not reserve capacity and must not be used to authorize permanent backing.
+  std::function<std::pair<std::size_t, std::size_t>()>
+      permanent_backing_headroom;
 };
 
 class ComponentTextCache {

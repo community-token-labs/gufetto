@@ -13,6 +13,10 @@
 #include "src/models/qwen/vision/output_pool.hpp"
 #include "src/models/qwen/vision/policy.hpp"
 
+namespace gufo::core {
+class ReclaimableMemory;
+}
+
 namespace gufo::models::qwen::vision {
 
 /// Shared Qwen3.8 ViT operator graph. Each model supplies and validates its
@@ -32,6 +36,8 @@ public:
     friend class Encoder;
     Embedding() = default;
     float* data_{nullptr};
+    std::shared_ptr<core::ReclaimableMemory> memory_budget_;
+    std::size_t bytes_{0};
     std::uint32_t rows_{0};
     std::uint32_t width_{0};
   };
@@ -52,6 +58,13 @@ public:
   Encoder& operator=(const Encoder&) = delete;
   [[nodiscard]] const std::string& identity() const;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// Bind only while quiescent, before any image usage. Null preserves the
+  /// native allocation path; serving admits image work before entering it.
+  void SetMemoryBudget(std::shared_ptr<core::ReclaimableMemory> budget);
+  [[nodiscard]] const std::shared_ptr<core::ReclaimableMemory>& MemoryBudget()
+      const noexcept {
+    return memory_budget_;
+  }
   [[nodiscard]] const std::shared_ptr<OutputPool>& Outputs() const noexcept {
     return outputs_;
   }
@@ -71,6 +84,7 @@ public:
 private:
   struct Impl;
   Policy policy_;
+  std::shared_ptr<core::ReclaimableMemory> memory_budget_;
   std::shared_ptr<OutputPool> outputs_;
   std::uint32_t output_width_;
   std::unique_ptr<Impl> impl_;

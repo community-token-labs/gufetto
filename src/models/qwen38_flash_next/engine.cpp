@@ -337,6 +337,30 @@ std::size_t Model::DeferredScratchBytes() const {
                               vision_ ? vision_->OutputBudgetBytes() : 0);
 }
 
+std::shared_ptr<void> Model::BindComponentMemoryBudget(
+    std::shared_ptr<core::ReclaimableMemory> memory) {
+  return core::ReclaimableMemoryBinding::Bind(
+      executor_->ComponentMemoryBudget(), std::move(memory),
+      [model = shared_from_this()](auto budget) noexcept {
+        model->SetComponentMemoryBudget(std::move(budget));
+      });
+}
+
+void Model::SetComponentMemoryBudget(
+    std::shared_ptr<core::ReclaimableMemory> memory) noexcept {
+  executor_->SetComponentMemoryBudget(memory);
+  if (vision_)
+    vision_->SetMemoryBudget(std::move(memory));
+}
+
+std::size_t Model::ComponentDeferredScratchBytes() const {
+  return executor_->DeferredScratchBytes(SnapshotRoute::kComponentServing);
+}
+
+std::size_t Session::AllocatedVisionBytes() const noexcept {
+  return session_->AllocatedVisionBytes();
+}
+
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
 }

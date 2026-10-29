@@ -31,6 +31,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
 #include "src/core/memory_budget.hpp"
+#include "src/core/reclaimable_memory.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
@@ -86,6 +87,22 @@ struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
   std::shared_ptr<models::qwen::vision::OutputPool> pool;
   std::shared_ptr<models::qwen::vision::OutputPool::Owner> owner;
+  std::shared_ptr<core::ReclaimableMemory> memory;
+  mutable std::weak_ptr<core::ReclaimableMemory::ImageLease> image_lease;
+  void CompleteImages(std::size_t position) const noexcept {
+    if (position < prompt->rope.PrefixLength())
+      return;
+    if (const auto lease = image_lease.lock(); lease && lease->Complete()) {
+      try {
+        const auto stats = memory->GetStats();
+        Logger::Debug("vision", "event=image_claim_completed resident_bytes=" +
+                                    std::to_string(stats.resident) +
+                                    " outstanding_bytes=" +
+                                    std::to_string(stats.outstanding));
+      } catch (...) {
+      }
+    }
+  }
   ~QwenImageContext() override {
     // Cumulative completed encode/re-encode counters, after request execution.
     // Diagnostic allocation/formatting failures must not break resource
@@ -109,7 +126,21 @@ struct QwenImageContext final : TextPromptContext {
     if (!pool)
       return {};
     auto lease = pool->TryAcquire(owner);
-    return {lease != nullptr, std::move(lease)};
+    if (!lease || !memory)
+      return {lease != nullptr, std::move(lease)};
+    struct Resources {
+      std::shared_ptr<models::qwen::vision::OutputPool::Lease> outputs;
+      std::shared_ptr<core::ReclaimableMemory::ImageLease> image;
+    };
+    auto resources = std::make_shared<Resources>();
+    resources->outputs = std::move(lease);
+    resources->image = memory->TryAcquireImage();
+    if (!resources->image)
+      return {false, {}};
+    image_lease = resources->image;
+    Logger::Debug("vision", "event=image_claim_admitted outstanding_bytes=" +
+                                std::to_string(memory->GetStats().outstanding));
+    return {true, std::move(resources)};
   }
 };
 
@@ -226,6 +257,7 @@ TextPreparedPrompt PrepareQwenPrompt(
   }
   context->prompt = prompt;
   context->pool = encoder->Outputs();
+  context->memory = encoder->MemoryBudget();
   if (context->pool)
     context->owner =
         context->pool->GetOwner(std::string(prompt->cache_identity.begin(),
@@ -935,13 +967,16 @@ std::size_t ExecutionCapacityBytes() {
 template<typename AdapterType>
 std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
     std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger,
-    std::function<std::size_t()> shared_pending = {}) {
+    std::function<std::size_t()> shared_pending = {},
+    std::shared_ptr<core::ReclaimableMemory> memory = {},
+    std::function<std::size_t(const AdapterType&)> image_pending = {}) {
   const bool protect_execution = static_cast<bool>(shared_pending);
   struct Backing {
     hip::TransferPool streams{64};
     std::unique_ptr<hip::CommittedBackingPool> pool;
     std::map<std::uint32_t, std::size_t> component_classes;
     std::size_t execution_liability{};
+    std::size_t permanent_pin_cushion{};
     bool frozen{};
   };
   auto result = std::make_unique<ComponentCacheResources>();
@@ -950,11 +985,37 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
   if (protect_execution)
     result->freeze_execution_liability =
         [backing, native = static_cast<AdapterType*>(result->adapter.get()),
-         shared_pending = std::move(shared_pending)] {
+         shared_pending = std::move(shared_pending), memory,
+         image_pending = std::move(image_pending), &ledger] {
           if (backing->frozen)
             throw std::logic_error("execution liability already frozen");
           backing->execution_liability = core::AddMemoryBytes(
               native->InitialPendingExecutionBytes(), shared_pending());
+          if (memory) {
+            const auto protected_bytes = core::AddMemoryBytes(
+                backing->execution_liability, ledger.Limits().staging_bytes);
+            const auto headroom = [protected_bytes] {
+              std::size_t free = 0, total = 0;
+              if (hipMemGetInfo(&free, &total) != hipSuccess ||
+                  free < hip::kDispatchReserve)
+                return std::size_t{0};
+              const auto available = std::min(HostSnapshotCeilingBytes(),
+                                              free - hip::kDispatchReserve);
+              return available > protected_bytes ? available - protected_bytes
+                                                 : 0;
+            };
+            const auto images = image_pending(*native);
+            // Pins cannot be reclaimed later. Leave an extra frozen liability
+            // so its eventual materialization cannot strand image admission.
+            backing->permanent_pin_cushion = images ? protected_bytes : 0;
+            // No cache exists yet. A demand that cannot fit even after all
+            // reclaimable backing is gone must refuse startup, not wait
+            // forever later in the request queue.
+            if (images > headroom())
+              throw std::invalid_argument(
+                  "image obligations exceed remaining execution capacity");
+            memory->Configure(images, headroom);
+          }
           backing->frozen = true;
           return backing->execution_liability;
         };
@@ -971,7 +1032,7 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
   // The remainder belongs to index, histories, disk catalog and queue
   // metadata. The pools charge their own per-block allocator headroom.
   result->commit_backing = [backing, &ledger, adapter = result->adapter.get(),
-                            protect_execution](std::size_t budget) {
+                            protect_execution, memory](std::size_t budget) {
     if (protect_execution && !backing->frozen)
       throw std::logic_error("backing requires frozen execution reservations");
     const auto protected_bytes =
@@ -1008,7 +1069,11 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                 allocation.metadata_bytes,
             allocation.block_bytes, allocation.metadata_bytes, segment,
             [limited = std::make_shared<Limited>(), protected_bytes,
-             protect_execution](std::size_t bytes) {
+             protect_execution, memory](std::size_t bytes) {
+              // The transactional ticket below replaces the legacy snapshot
+              // precheck on reclaim-enabled routes.
+              if (memory)
+                return true;
               const std::lock_guard lock(limited->mutex);
               const auto now = std::chrono::steady_clock::now();
               // Pressure retries ask once per capture; recheck at most
@@ -1053,7 +1118,12 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               limited->active = true;
               limited->refused = now;
               return false;
-            }});
+            },
+            memory ? std::function<std::shared_ptr<void>(std::size_t)>(
+                         [memory](std::size_t bytes) {
+                           return memory->TryAcquireGrowth(bytes);
+                         })
+                   : std::function<std::shared_ptr<void>(std::size_t)>{}});
     // Prepare a bounded reserve before readiness. The first shared-prefix
     // capture needs more than one segment; preparing 2 GiB avoids moving
     // registration onto that request's capture or decode path.
@@ -1066,6 +1136,49 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
             " long_term_pinned_bytes=" +
             std::to_string(backing->pool->LongTermPinnedBytes()));
   };
+  if (memory)
+    result->reserve_permanent_backing = [memory,
+                                         backing]() -> std::shared_ptr<void> {
+      // Called outside publication locks. Settle our own preceding startup
+      // growth so a pending commit alone cannot falsely refuse eager pins.
+      if (backing->pool)
+        backing->pool->WaitForGrowth();
+      // Hold the image envelope while segment-rounded backing becomes pinned.
+      // Thus permanent pins can never consume its only reclaimable capacity.
+      return memory->TryAcquireImage(backing->permanent_pin_cushion);
+    };
+  if (memory)
+    result->permanent_backing_headroom = [memory, backing] {
+      return memory->ImageHeadroom(backing->permanent_pin_cushion);
+    };
+  if (memory)
+    result->bind_execution_reclaimer = [memory,
+                                        backing](std::function<bool()> evict) {
+      if (!evict) {
+        memory->SetReclaimer({});
+        return;
+      }
+      memory->SetReclaimer([backing,
+                            evict = std::move(evict)](std::size_t needed) {
+        if (!backing->pool)
+          return false;
+        const auto before = backing->pool->CommittedBytes();
+        const auto rss_before = Logger::MemoryStatus();
+        const auto released = backing->pool->TrimFreeSegments(needed);
+        if (released) {
+          Logger::Info("cache",
+                       "event=image_backing_reclaim_before committed_bytes=" +
+                           std::to_string(before) + " " + rss_before);
+          Logger::Info("cache",
+                       "event=image_backing_reclaim_after released_bytes=" +
+                           std::to_string(released) + " committed_bytes=" +
+                           std::to_string(backing->pool->CommittedBytes()) +
+                           " " + Logger::MemoryStatus());
+          return true;
+        }
+        return evict();
+      });
+    };
   result->prepare_prefill = [backing](std::size_t tokens) {
     // Prepare after any fallback capture, alongside actual prefill work.
     // Short turns need a smaller reserve for private states and row tails.
@@ -2528,9 +2641,18 @@ public:
   }
   [[nodiscard]] cache::Slot& slot() const { return *slot_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
-  void set_position(std::size_t position) noexcept { position_ = position; }
+  void set_position(std::size_t position) noexcept {
+    position_ = position;
+    if (image_context_)
+      image_context_->CompleteImages(position);
+  }
+  void SetImageContext(std::shared_ptr<const TextPromptContext> context) {
+    image_context_ =
+        std::dynamic_pointer_cast<const QwenImageContext>(std::move(context));
+  }
 
 private:
+  std::shared_ptr<const QwenImageContext> image_context_;
   QwenFlashNextSession* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -2617,19 +2739,34 @@ public:
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
     (void)ram;
-    auto resources = CreateHipComponentCacheResources(
+    auto resources = CreateHipComponentCacheResources<
+        models::qwen38_flash_next::ContinuationAdapter>(
         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
             model_,
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_),
-        ledger, [model = model_, context = max_context_] {
-          return core::AddMemoryBytes(
-              model->DeferredScratchBytes(),
-              model->VisionEncoder()
-                  ? models::qwen::vision::EncoderWorkspaceBytes(context)
-                  : 0);
+        ledger,
+        [model = model_] { return model->ComponentDeferredScratchBytes(); },
+        image_memory_,
+        [model = model_, context = max_context_](const auto& adapter) {
+          const auto encoder = model->VisionEncoder();
+          return encoder ? core::AddMemoryBytes(
+                               adapter.InitialPendingImageBytes(),
+                               core::AddMemoryBytes(
+                                   encoder->OutputBudgetBytes(),
+                                   models::qwen::vision::EncoderWorkspaceBytes(
+                                       context)))
+                         : 0;
         });
+    struct BoundResources {
+      std::shared_ptr<void> backing;
+      std::shared_ptr<void> binding;
+    };
+    auto owner = std::make_shared<BoundResources>();
+    owner->backing = resources->owner;
+    owner->binding = model_->BindComponentMemoryBudget(image_memory_);
+    resources->owner = std::move(owner);
     detail::InstallQfnPackedKvIngressValidation(*resources, model_->config(),
                                                 use_mtp_, max_context_,
                                                 model_->CacheType());
@@ -2674,9 +2811,11 @@ public:
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     const auto capacity = ExecutionCapacityBytes();
     const auto shared = core::AddMemoryBytes(
-        model_->DeferredScratchBytes(),
+        model_->ComponentDeferredScratchBytes(),
         model_->VisionEncoder()
-            ? models::qwen::vision::EncoderWorkspaceBytes(max_context_)
+            ? core::AddMemoryBytes(
+                  model_->VisionEncoder()->OutputBudgetBytes(),
+                  models::qwen::vision::EncoderWorkspaceBytes(max_context_))
             : 0);
     // Admission charges complete snapshot payloads. Flash-Next can retain
     // mutable state and protected K/V rows in private device storage.
@@ -2772,8 +2911,9 @@ public:
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
-    RequireQwenFlashNextState(state).session().ConfigureVision(
-        QwenPrompt(context));
+    auto& qfn = RequireQwenFlashNextState(state);
+    qfn.SetImageContext(context);
+    qfn.session().ConfigureVision(QwenPrompt(context));
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -3154,6 +3294,8 @@ public:
 private:
   mutable models::qwen::vision::ImageCache image_cache_;
   std::shared_ptr<QwenFlashNextModel> model_;
+  std::shared_ptr<core::ReclaimableMemory> image_memory_ =
+      std::make_shared<core::ReclaimableMemory>();
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;

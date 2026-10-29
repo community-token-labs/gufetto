@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -32,11 +33,15 @@ public:
     // Kernels built without THP reject this advice with EINVAL; their pages
     // cannot be promoted. All other failures must release the mapping.
     if (madvise(data, bytes, MADV_NOHUGEPAGE) != 0 && errno != EINVAL) {
-      munmap(data, bytes);
+      if (!TryReleaseCommittedPages(data, bytes))
+        std::terminate();
       return nullptr;
     }
     if (!Populate(data, bytes)) {
-      munmap(data, bytes);
+      // A nullptr result lets admission roll back. Never claim that rollback
+      // succeeded while an unowned physical allocation is still resident.
+      if (!TryReleaseCommittedPages(data, bytes))
+        std::terminate();
       return nullptr;
     }
     return data;
@@ -91,6 +96,12 @@ private:
 
 void* CommitZeroedPages(std::size_t bytes) noexcept {
   return CommittedRange::Commit(bytes);
+}
+
+bool TryReleaseCommittedPages(void* base, std::size_t bytes) noexcept {
+  if (base == nullptr)
+    return true;
+  return bytes > 0 && munmap(base, bytes) == 0;
 }
 
 void ReleaseCommittedPages(void* base, std::size_t bytes) noexcept {

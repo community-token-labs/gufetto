@@ -13,20 +13,20 @@ hipError_t HostAllocations::Allocate(void** pointer, std::size_t bytes,
   if (!pointer)
     return hipErrorInvalidValue;
   *pointer = nullptr;
-  void* data{};
-  const auto status = hipHostMalloc(&data, bytes, flags);
-  if (status != hipSuccess)
-    return status;
-  if (!data)
-    return hipSuccess;
-  const int pin = platform::PinHostPages(data, bytes);
+  // Admit bookkeeping before physical allocation. Otherwise a vector failure
+  // needs an unchecked free rollback and can lose a still-resident allocation.
   try {
-    allocations_.push_back({data, bytes, pin});
+    allocations_.push_back({nullptr, 0, -1});
   } catch (const std::bad_alloc&) {
-    platform::UnpinHostPages(pin);
-    (void)hipHostFree(data);
     return hipErrorOutOfMemory;
   }
+  void* data{};
+  const auto status = hipHostMalloc(&data, bytes, flags);
+  if (status != hipSuccess || !data) {
+    allocations_.pop_back();
+    return status;
+  }
+  allocations_.back() = {data, bytes, platform::PinHostPages(data, bytes)};
   *pointer = data;
   return hipSuccess;
 }
@@ -37,6 +37,23 @@ void HostAllocations::Reset() noexcept {
     (void)hipHostFree(allocation.data);
   }
   allocations_.clear();
+}
+
+bool HostAllocations::TryReset() noexcept {
+  std::size_t kept = 0;
+  for (auto allocation : allocations_) {
+    if (platform::TryUnpinHostPages(allocation.pin)) {
+      // If HIP free fails, retry only that remaining stage, never the consumed
+      // pin token (whose descriptor may already have been reused).
+      allocation.pin = -1;
+      if (hipHostFree(allocation.data) == hipSuccess)
+        continue;
+    }
+    allocations_[kept++] = allocation;
+  }
+  // Compact only failed POD records; shrinking cannot allocate or throw.
+  allocations_.resize(kept);
+  return allocations_.empty();
 }
 
 std::size_t HostAllocations::PinnedBytes() const noexcept {

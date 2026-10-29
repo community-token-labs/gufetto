@@ -837,8 +837,20 @@ struct ComponentTextCache::Impl {
                      " slot_pinned_bytes=" + std::to_string(slot_pinned_bytes) +
                      " ram_cache=" + (ram_enabled ? "on" : "off") +
                      " disk_backing_bytes=" + std::to_string(disk_backing));
+    if (resources->bind_execution_reclaimer)
+      resources->bind_execution_reclaimer([this] {
+        const std::lock_guard lock(mutex);
+        // Conservatively keep every active source/edit boundary intact. The
+        // scheduler retries unadmitted images without holding a runner, while
+        // existing leases finish. Free segments may still trim before here.
+        if (std::ranges::any_of(entries, [](const auto& e) { return e->busy; }))
+          return false;
+        return retention.ReclaimForExecution();
+      });
   }
   ~Impl() {
+    if (resources->bind_execution_reclaimer)
+      resources->bind_execution_reclaimer({});
     // Settle immutable-source readers before slots/resources/index unwind.
     if (queue)
       queue->Drain();
@@ -1501,6 +1513,31 @@ void ComponentTextCache::InitializePins(
                        std::to_string(disk.Stats().managed_bytes));
       continue;
     }
+    // Reserve before acquiring a runner so the provider can physically reclaim
+    // idle backing. Keep the envelope protected until the pin and its index
+    // entry own the complete allocation (including segment fragmentation).
+    // Lazy creation only uses a transient capture to publish a durable root;
+    // it must not require or acquire a permanent RAM claim.
+    const std::string capacity_remedy =
+        "; reduce pinned prefixes or use --pin-prefix-lazy for existing disk "
+        "pins, or --no-vision if supported by the model";
+    std::shared_ptr<void> permanent_backing;
+    if (!options.lazy && impl_->resources->reserve_permanent_backing) {
+      permanent_backing = impl_->resources->reserve_permanent_backing();
+      if (!permanent_backing) {
+        std::string headroom = "needed_bytes=unknown available_bytes=unknown";
+        if (impl_->resources->permanent_backing_headroom) {
+          const auto [needed, available] =
+              impl_->resources->permanent_backing_headroom();
+          headroom = "needed_bytes=" + std::to_string(needed) +
+                     " available_bytes=" + std::to_string(available);
+        }
+        throw std::runtime_error(
+            "--pin-prefix-file/--pin-prefix-dir eager RAM warmup conflicts "
+            "with preserving vision capacity: image execution envelope " +
+            headroom + capacity_remedy);
+      }
+    }
     const auto started = Clock::now();
     // Lease a cold destination, then restore this particular pin publication.
     // A general lookup could fall back to an equal/deeper ordinary checkpoint
@@ -1543,15 +1580,30 @@ void ComponentTextCache::InitializePins(
       throw std::runtime_error(
           "pinned prefix checkpoint is not at the exact boundary");
     const auto bytes = lease->CaptureBytes();
+    const auto capacity_error = [&] {
+      return std::runtime_error(
+          "--pin-prefix-file/--pin-prefix-dir cannot fit pinned prefix RAM "
+          "backing: needed_payload_bytes=" +
+          std::to_string(bytes) +
+          " ram_budget_bytes=" + std::to_string(impl_->budget) +
+          (permanent_backing ? "; vision capacity remains protected" : "") +
+          capacity_remedy);
+    };
     if (bytes > impl_->budget ||
         !lease->TryReserveSnapshot(bytes, tokens.size(), true,
                                    SnapshotPurpose::kBranchPoint, tokens))
-      throw std::runtime_error(
-          "pin prefix cannot fit RAM; use lazy mode for an existing pin");
+      throw capacity_error();
     // Required RAM warmth means materialized host backing, not native rows that
     // will need spilling when the temporary startup slot is reassigned.
     lease->impl_->pin_capture = true;
-    auto snapshot = lease->Capture();
+    std::unique_ptr<TextRunnerSnapshot> snapshot;
+    try {
+      snapshot = lease->Capture();
+    } catch (const cache::ResourceExhausted&) {
+      // A ticket protects the envelope, not the remaining capacity needed by
+      // this pin's segment-rounded footprint. Do not relabel I/O/corruption.
+      throw capacity_error();
+    }
     const auto* component =
         dynamic_cast<const ComponentSnapshot*>(snapshot.get());
     if (!component || !component->checkpoint)
@@ -2043,6 +2095,15 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       }
       if (warm) {
         try {
+          // The hook may reclaim physical segments or call back into this
+          // cache: never invoke it under the publication mutex. This request
+          // already owns a runner; refusal leaves the durable pin usable.
+          std::shared_ptr<void> permanent_backing;
+          if (impl_->resources->reserve_permanent_backing) {
+            permanent_backing = impl_->resources->reserve_permanent_backing();
+            if (!permanent_backing)
+              throw cache::ResourceExhausted();
+          }
           const auto bytes = lease->CaptureBytes();
           if (bytes > impl_->budget ||
               !lease->TryReserveSnapshot(bytes, request.cached, true,

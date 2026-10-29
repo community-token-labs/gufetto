@@ -349,10 +349,18 @@ std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
   auto session = model_->CreateSession(mode_, context_, &error);
   if (!session)
     throw std::runtime_error(error);
-  initial_pending_execution_bytes_ = core::AddMemoryBytes(
-      initial_pending_execution_bytes_,
-      core::PendingMemoryBytes(model_->SessionBytes(mode_, context_),
-                               session->AllocatedBytes()));
+  const auto pending = core::PendingMemoryBytes(
+      model_->SessionBytes(mode_, context_), session->AllocatedBytes());
+  const auto image_pending =
+      model_->VisionEncoder()
+          ? core::PendingMemoryBytes(qwen::vision::InputPositionBytes(context_),
+                                     session->AllocatedVisionBytes())
+          : 0;
+  initial_pending_image_bytes_ =
+      core::AddMemoryBytes(initial_pending_image_bytes_, image_pending);
+  initial_pending_execution_bytes_ =
+      core::AddMemoryBytes(initial_pending_execution_bytes_,
+                           core::PendingMemoryBytes(pending, image_pending));
   return std::make_unique<State>(*this, guard, std::move(session));
 }
 std::vector<cache::ComponentPosition> ContinuationAdapter::Positions(

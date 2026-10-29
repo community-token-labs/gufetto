@@ -4,6 +4,7 @@
 #include <mutex>
 #include <stdexcept>
 
+#include "src/core/reclaimable_memory.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::models::qwen::vision {
@@ -83,8 +84,27 @@ __global__ void InjectRows(float* hidden, const float* embedding,
 DeviceInput::~DeviceInput() {
   if (descriptor_ != nullptr)
     (void)hipFree(descriptor_);
-  if (positions_ != nullptr)
-    (void)hipFree(positions_);
+  (void)ReleasePositions();
+}
+
+hipError_t DeviceInput::ReleasePositions() noexcept {
+  if (positions_ == nullptr)
+    return hipSuccess;
+  auto status = hipSuccess;
+  const auto release = [&] {
+    status = hipFree(positions_);
+    return status == hipSuccess;
+  };
+  if (positions_budget_)
+    positions_budget_->RetireImage(capacity_ * 3 * sizeof(std::int32_t), release);
+  else
+    (void)release();
+  if (status == hipSuccess) {
+    positions_ = nullptr;
+    capacity_ = 0;
+    positions_budget_.reset();
+  }
+  return status;
 }
 
 void DeviceInput::PrepareRope(hipStream_t stream) {
@@ -126,6 +146,8 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
   }
   prompt_ = std::move(prompt);
   encoder_ = std::move(encoder);
+  if (encoder_)
+    memory_budget_ = encoder_->MemoryBudget();
   output_owner_ = std::move(owner);
   if (pooled || !reuse)
     embeddings_.clear();
@@ -141,21 +163,33 @@ void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
   if (layout == layout_ && (descriptor_ != nullptr || layout.images.empty()))
     return;
   const auto length = layout.PrefixLength();
+  std::vector<std::array<std::int32_t, 3>> positions;
+  const auto prepare_positions = [&] {
+    positions.resize(length);
+    for (std::uint32_t token = 0; token < length; ++token)
+      positions[token] = layout.Position(token);
+  };
+  // Host allocation/validation failures must not discard a bound old array.
+  if (memory_budget_)
+    prepare_positions();
   if (descriptor_ == nullptr)
     Check(hipMalloc(&descriptor_, sizeof(DeviceRope)));
   if (length > capacity_) {
     Check(hipStreamSynchronize(stream));
-    if (positions_ != nullptr)
-      Check(hipFree(positions_));
-    positions_ = nullptr;
-    capacity_ = 0;
-    Check(
-        hipMalloc(&positions_, std::size_t{length} * 3 * sizeof(std::int32_t)));
+    // Free before growing so the per-slot high-water claim need not cover
+    // two arrays. A failed release retains both the old pointer and charge.
+    Check(ReleasePositions());
+    const auto bytes = std::size_t{length} * 3 * sizeof(std::int32_t);
+    const auto allocate = [&] { Check(hipMalloc(&positions_, bytes)); };
+    if (memory_budget_)
+      memory_budget_->AllocateImage(bytes, allocate);
+    else
+      allocate();
     capacity_ = length;
+    positions_budget_ = memory_budget_;
   }
-  std::vector<std::array<std::int32_t, 3>> positions(length);
-  for (std::uint32_t token = 0; token < length; ++token)
-    positions[token] = layout.Position(token);
+  if (!memory_budget_)
+    prepare_positions();
   if (length != 0) {
     Check(hipMemcpyAsync(positions_, positions.data(),
                          positions.size() * sizeof(positions[0]),

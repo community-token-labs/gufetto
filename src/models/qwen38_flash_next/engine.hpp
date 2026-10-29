@@ -119,12 +119,18 @@ public:
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  // Hard scratch only: no image pool and no unused native snapshot spares.
+  [[nodiscard]] std::size_t ComponentDeferredScratchBytes() const;
+  [[nodiscard]] std::shared_ptr<void> BindComponentMemoryBudget(
+      std::shared_ptr<core::ReclaimableMemory>);
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
   }
 
 private:
+  void SetComponentMemoryBudget(
+      std::shared_ptr<core::ReclaimableMemory>) noexcept;
   Model() = default;
 
   ModelOptions options_;
@@ -236,6 +242,7 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  [[nodiscard]] std::size_t AllocatedVisionBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();

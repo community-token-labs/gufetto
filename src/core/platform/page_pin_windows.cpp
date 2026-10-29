@@ -10,4 +10,10 @@ int PinHostPages(void*, std::size_t) noexcept {
 
 void UnpinHostPages(int) noexcept {}
 
+bool TryUnpinHostPages(int pin) noexcept {
+  // This leaf never issues a nonnegative token. Do not pretend to release a
+  // foreign/invalid token; the ordinary unavailable-pin sentinel is a no-op.
+  return pin < 0;
+}
+
 }  // namespace gufo::platform
