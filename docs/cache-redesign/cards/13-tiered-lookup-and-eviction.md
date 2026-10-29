@@ -96,8 +96,14 @@ mismatches and all catalog reserve/convert fault points fail without leakage.
 
 `DiskCatalog` keeps global LRU across all discovered disk identities, including
 ones not loaded into lookup. New publications become most recent; callers touch
-successful uses. Startup ties use ascending checkpoint ID. Eviction skips reader
-pins and immediately refuses a busy writer. Manifest retirement and directory
+successful uses. Startup ties use ascending checkpoint ID. Eviction first ranks
+covered intermediates: an exact compatible earlier anchor and a single next-token
+continuation must remain. Learned boundaries and durable branch points are not
+preferred victims. This is retention ranking, not permission to truncate hybrid
+state; fallback remains ordinary LRU. Compatibility and supplemental input
+identity must match. The catalog scans existing admitted metadata, allocating no
+secondary prefix tree (worst-case quadratic record comparisons per eviction).
+Eviction skips reader pins and immediately refuses a busy writer. Manifest retirement and directory
 sync still precede dependency deletion; shared files survive another manifest's
 retirement. Only completed durable deletion contributes reusable disk budget.
 
