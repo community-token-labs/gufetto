@@ -118,7 +118,11 @@ public:
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
   /// request-owned sessions, the model's tokenizer, and host-memory
-  /// continuation snapshots.
+  /// continuation snapshots. Only one component-serving backend may be alive
+  /// per Model; finish/release its requests and release it before binding
+  /// another, or load a separate Model. A second binding fails before startup
+  /// allocation and leaves the first backend unchanged. Native use is restored
+  /// when component resources unwind, including after failed initialization.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
             std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,

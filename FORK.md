@@ -146,6 +146,16 @@ limitations are retained in the private `gufo-agent-concurrency` repository,
 
 ## Known limits
 
+- **Development/API:** a Flash-Next `Model` supports one component-serving
+  `InferenceBackend` at a time. A second backend using the same shared Model
+  fails early without disturbing the first. Finish/release its requests and
+  release the first backend before creating another; use separately loaded
+  Models for simultaneous backends. Sequential AR/MTP backends may reuse one
+  Model. Native use is restored after component teardown or failed startup.
+  Shared per-Model multi-backend reservation accounting remains follow-up work
+  (`shared-model-component-authority`); this does not restrict sessions within
+  one server or its MTP sidecar.
+
 very large conversations may not be saved to SSD while earlier saves are still being written; they are still served correctly.
 
 MTP output can differ slightly from plain decoding; cause not yet identified. SSD restore with images is exact (same-MTP live vs disk matches).

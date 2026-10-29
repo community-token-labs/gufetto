@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 
 #include "src/core/memory_budget.hpp"
@@ -38,13 +39,18 @@ void ScopedServingAuthority() {
   {
     auto serving = bind();
     assert(model->executor && model->encoder && model->allocator);
+    const auto original = model->executor;
     bool duplicate = false;
     try {
       (void)bind();
-    } catch (const std::logic_error&) {
-      duplicate = true;
+    } catch (const std::logic_error& error) {
+      duplicate =
+          std::string_view(error.what()) ==
+          "a second component backend on the same Model is not supported "
+          "(one backend per Model); release the first or load a separate Model";
     }
-    assert(duplicate && model->executor);
+    assert(duplicate && model->executor == original &&
+           model->encoder == original && model->allocator == original);
     model->executor->Configure(10, [] { return 10; });
     auto image = model->executor->TryAcquireImage();
     model->NativeImage();

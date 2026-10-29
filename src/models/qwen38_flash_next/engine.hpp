@@ -121,6 +121,7 @@ public:
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   // Hard scratch only: no image pool and no unused native snapshot spares.
   [[nodiscard]] std::size_t ComponentDeferredScratchBytes() const;
+  [[nodiscard]] bool HasComponentBackend() const noexcept;
   [[nodiscard]] std::shared_ptr<void> BindComponentMemoryBudget(
       std::shared_ptr<core::ReclaimableMemory>);
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()

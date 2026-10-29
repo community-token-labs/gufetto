@@ -572,6 +572,19 @@ int main(int argc, char** argv) {
         "Continue counting from one, with commas between the numbers.");
     requests[3].reasoning.enabled = false;
     auto ar = load(false);
+    if (flash) {
+      Backend duplicate;
+      std::string duplicate_error;
+      Require(!duplicate.load(qfn, &duplicate_error, context, 4) &&
+                  duplicate_error ==
+                      "a second component backend on the same Model is not "
+                      "supported "
+                      "(one backend per Model); release the first or load a "
+                      "separate Model" &&
+                  !duplicate.ready() && ar->ready() &&
+                  qfn->HasComponentBackend(),
+              "second component binding did not fail cleanly");
+    }
     sampling::SamplingConfig greedy;
     greedy.temperature = 0;
     sampling::SamplingConfig sampled;
@@ -581,7 +594,37 @@ int main(int argc, char** argv) {
     sampled.min_p = 0.05F;
     sampled.seed = 47;
     std::array<Backend::Result, 4> references;
-    std::unique_ptr<Backend> spec;
+    // Preserve per-mode sampling/cancellation checks with sequential backend
+    // lifetimes on the same Model; saved results remain independent oracles.
+    const auto check_sampled = [&](Backend& backend, bool use_spec) {
+      std::array<Backend::Result, 4> expected;
+      for (std::size_t i = 0; i < requests.size(); ++i) {
+        expected[i] = backend.chat(requests[i], 16, sampled);
+        Require(
+            expected[i].tokens == backend.chat(requests[i], 16, sampled).tokens,
+            "seeded image generation is not reproducible");
+      }
+      CheckConcurrent(backend, requests, expected, sampled, flash && use_spec);
+      auto interrupted = requests[0];
+      interrupted.messages.back().content =
+          "Name the image color, then count from one to one hundred.";
+      for (const auto& sampling : {greedy, sampled}) {
+        const auto expected = backend.chat(interrupted, 8, sampling);
+        std::size_t pieces = 0;
+        const auto cancelled =
+            backend.chat(interrupted, 128, sampling, {},
+                         [&](std::string_view) { return ++pieces < 3; });
+        Require(cancelled.cancelled,
+                "image cancellation fixture did not interrupt generation");
+        const auto resumed = backend.chat(interrupted, 8, sampling);
+        Require(resumed.cache_hit && resumed.prefill_tokens == 0 &&
+                    resumed.tokens == expected.tokens,
+                "cancelled image request lost its exact reusable frontier");
+      }
+      std::cout << "image cancellation/resume exact, speculative=" << use_spec
+                << '\n';
+    };
+
     if (!disk_only) {
       for (std::size_t i = 0; i < requests.size(); ++i) {
         references[i] = ar->chat(requests[i], 16, greedy);
@@ -606,58 +649,7 @@ int main(int argc, char** argv) {
       CheckPoolQueue(*ar, flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
                      flash ? qfn->tokenizer() : qwen->GetTokenizer(), requests,
                      references, greedy);
-      if (!draft.empty()) {
-        spec = load(true);
-        std::array<Backend::Result, 4> speculative_references;
-        for (std::size_t i = 0; i < requests.size(); ++i) {
-          speculative_references[i] = spec->chat(requests[i], 16, greedy);
-          Require(speculative_references[i].tokens == references[i].tokens,
-                  "greedy image speculation differs from autoregression");
-          Require(speculative_references[i].draft_tokens > 0,
-                  "image request bypassed speculative decoding");
-        }
-        spec.reset();
-        spec = load(true);
-        CheckConcurrent(*spec, requests, speculative_references, greedy, flash);
-        CheckPoolQueue(*spec,
-                       flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
-                       flash ? qfn->tokenizer() : qwen->GetTokenizer(),
-                       requests, speculative_references, greedy);
-      }
-      // Sampled replay and per-request RNG independence. Existing sampler
-      // suites cover the distribution itself; this checks image-path
-      // integration.
-      for (auto* backend : {ar.get(), spec.get()}) {
-        if (!backend)
-          continue;
-        std::array<Backend::Result, 4> expected;
-        for (std::size_t i = 0; i < requests.size(); ++i) {
-          expected[i] = backend->chat(requests[i], 16, sampled);
-          Require(expected[i].tokens ==
-                      backend->chat(requests[i], 16, sampled).tokens,
-                  "seeded image generation is not reproducible");
-        }
-        CheckConcurrent(*backend, requests, expected, sampled,
-                        flash && backend == spec.get());
-        auto interrupted = requests[0];
-        interrupted.messages.back().content =
-            "Name the image color, then count from one to one hundred.";
-        for (const auto& sampling : {greedy, sampled}) {
-          const auto expected = backend->chat(interrupted, 8, sampling);
-          std::size_t pieces = 0;
-          const auto cancelled =
-              backend->chat(interrupted, 128, sampling, {},
-                            [&](std::string_view) { return ++pieces < 3; });
-          Require(cancelled.cancelled,
-                  "image cancellation fixture did not interrupt generation");
-          const auto resumed = backend->chat(interrupted, 8, sampling);
-          Require(resumed.cache_hit && resumed.prefill_tokens == 0 &&
-                      resumed.tokens == expected.tokens,
-                  "cancelled image request lost its exact reusable frontier");
-        }
-        std::cout << "image cancellation/resume exact, speculative="
-                  << (backend == spec.get()) << '\n';
-      }
+      check_sampled(*ar, false);
     } else {
       references[0] = ar->chat(requests[0], 16, greedy);
     }
@@ -692,7 +684,6 @@ int main(int argc, char** argv) {
               "multiple image order/content was lost");
     }
     ar.reset();
-    spec.reset();
     // Fresh executors are independent cold oracles for a continued image chat.
     ar = load(false);
     const auto cold_continuation = ar->chat(continuation, 16, greedy);
@@ -714,6 +705,26 @@ int main(int argc, char** argv) {
       CheckQwenIncrementalOracle(qwen, continuation, references[0], continued);
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
+
+    if (!disk_only && !draft.empty()) {
+      auto spec = load(true);
+      std::array<Backend::Result, 4> speculative_references;
+      for (std::size_t i = 0; i < requests.size(); ++i) {
+        speculative_references[i] = spec->chat(requests[i], 16, greedy);
+        Require(speculative_references[i].tokens == references[i].tokens,
+                "greedy image speculation differs from autoregression");
+        Require(speculative_references[i].draft_tokens > 0,
+                "image request bypassed speculative decoding");
+      }
+      spec.reset();
+      spec = load(true);
+      CheckConcurrent(*spec, requests, speculative_references, greedy, flash);
+      CheckPoolQueue(*spec,
+                     flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
+                     flash ? qfn->tokenizer() : qwen->GetTokenizer(), requests,
+                     speculative_references, greedy);
+      check_sampled(*spec, true);
+    }
 
     TemporaryDirectory cache_root("gufo-vision-cache");
     server::TextDiskCacheConfig cache{

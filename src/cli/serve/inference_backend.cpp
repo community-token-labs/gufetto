@@ -3959,6 +3959,12 @@ bool InferenceBackend::load(
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
   }
+  // Refuse before projector preparation, slot allocation or any publication.
+  // The binding factory repeats this check at installation.
+  if (model->HasComponentBackend()) {
+    SetError(error, core::kSecondComponentBackendError);
+    return false;
+  }
   if (max_context == 0)
     max_context = model->MaxContext();
 

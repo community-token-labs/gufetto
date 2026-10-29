@@ -338,6 +338,10 @@ std::size_t Model::DeferredScratchBytes() const {
                               vision_ ? vision_->OutputBudgetBytes() : 0);
 }
 
+bool Model::HasComponentBackend() const noexcept {
+  return static_cast<bool>(executor_->ComponentMemoryBudget());
+}
+
 std::shared_ptr<void> Model::BindComponentMemoryBudget(
     std::shared_ptr<core::ReclaimableMemory> memory) {
   return core::ReclaimableMemoryBinding::Bind(

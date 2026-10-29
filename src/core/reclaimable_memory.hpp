@@ -11,6 +11,10 @@
 
 namespace gufo::core {
 
+inline constexpr char kSecondComponentBackendError[] =
+    "a second component backend on the same Model is not supported "
+    "(one backend per Model); release the first or load a separate Model";
+
 // One authority for lazy image capacity and competing physical cache growth.
 // Headroom is physical free memory AFTER hard execution/staging/OS reserves.
 // A queued demand owns neither a claim nor an execution/source lease. Admission
@@ -218,8 +222,10 @@ public:
   [[nodiscard]] static std::shared_ptr<ReclaimableMemoryBinding> Bind(
       const std::shared_ptr<ReclaimableMemory>& current,
       std::shared_ptr<ReclaimableMemory> next, Install install) {
-    if (current || !next || !install)
-      throw std::logic_error("model already has a component memory authority");
+    if (current)
+      throw std::logic_error(kSecondComponentBackendError);
+    if (!next || !install)
+      throw std::logic_error("invalid component memory authority binding");
     auto result = std::shared_ptr<ReclaimableMemoryBinding>(
         new ReclaimableMemoryBinding(std::move(install)));
     result->install_(std::move(next));
