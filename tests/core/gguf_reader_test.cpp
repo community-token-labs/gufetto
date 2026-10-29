@@ -368,6 +368,14 @@ void TestSplitGgufDiscovery() {
          "Split reader exposes two mapped regions");
   Expect(reader->GetData() == nullptr,
          "Split reader has no single contiguous backing pointer");
+  const auto regions = reader->GetMappedRegions();
+  Expect(regions[0].header_size != regions[1].header_size,
+         "Split shards retain their distinct header extents");
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    const auto* start = static_cast<const std::uint8_t*>(regions[i].data);
+    Expect(reader->GetTensors()[i].data == start + regions[i].header_size,
+           "Each split header ends at its own zero-offset tensor");
+  }
 
   std::filesystem::remove_all(temp_dir);
 }

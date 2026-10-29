@@ -338,6 +338,31 @@ void InPassCapturePreservesBoundaryAndLiveTail() {
     independent.Invalidate();
   }
 }
+void ContextOverflowDiagnostics() {
+  auto runner = std::make_shared<Runner>();
+  runner->max_context = 32;
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> oversized(33, 1);
+  for (const bool lookup : {false, true}) {
+    std::string message;
+    try {
+      if (lookup)
+        (void)pool.Lookup(oversized);
+      else
+        (void)pool.Acquire(oversized);
+    } catch (const std::length_error& error) {
+      message = error.what();
+    }
+    assert(message == "prompt of 33 tokens exceeds the 32-token model context");
+  }
+  assert(runner->captures == 0 && runner->through_calls == 0);
+  const std::vector<TextRunnerToken> at_limit(32, 1);
+  assert(pool.Lookup(at_limit).total_tokens == 32);
+  auto request = pool.Acquire(at_limit);
+  assert(request.prompt_tokens() == 32);
+  request.Invalidate();
+}
+
 void ColdAcquireResetsOnce() {
   auto runner = std::make_shared<Runner>();
   ComponentTextCache cache(runner, 1, 1 << 22, {});
@@ -3898,6 +3923,7 @@ int main(int argc, char* argv[]) {
 #endif
   });
   run("lookup", [] {
+    ContextOverflowDiagnostics();
     LookupRuntimeDefaultsAndDisabled();
     CheckpointTransferRoundTripAndConcurrentServing();
     CheckpointImportRespectsRamOff();

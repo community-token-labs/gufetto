@@ -16,8 +16,8 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
-#include "src/core/platform/os_info.hpp"
 #include "src/core/perf_trace.hpp"
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::server {
 
@@ -2177,7 +2177,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     throw std::invalid_argument("text runner prompt must not be empty");
   }
   if (prompt.size() > impl_->validated.descriptor.max_context) {
-    throw std::length_error("text runner prompt exceeds model context");
+    throw std::length_error(
+        "prompt of " + std::to_string(prompt.size()) + " tokens exceeds the " +
+        std::to_string(impl_->validated.descriptor.max_context) +
+        "-token model context");
   }
   if (cache_prefix_tokens > prompt.size())
     throw std::invalid_argument("cache prefix exceeds prompt length");
@@ -2399,7 +2402,10 @@ TextGenerationBackend::CacheLookupResult TextRunnerPool::Lookup(
   if (prompt.empty())
     throw std::invalid_argument("text runner prompt must not be empty");
   if (prompt.size() > impl_->validated.descriptor.max_context)
-    throw std::length_error("text runner prompt exceeds model context");
+    throw std::length_error(
+        "prompt of " + std::to_string(prompt.size()) + " tokens exceeds the " +
+        std::to_string(impl_->validated.descriptor.max_context) +
+        "-token model context");
   if (cache_prefix_tokens > prompt.size())
     throw std::invalid_argument("cache prefix exceeds prompt length");
   // Admission may hold its mutex across restore/capture GPU work. Lookup is
