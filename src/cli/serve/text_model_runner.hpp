@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/cache/adapter.hpp"
+#include "src/cache/disk_policy.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/pinned_prefix.hpp"
@@ -89,6 +90,7 @@ struct TextRunnerDiskCacheOptions {
   /// checkpoints are cheaper to re-prefill than that write. Zero disables the
   /// gate.
   std::size_t min_checkpoint_step_tokens{2048};
+  cache::DiskSpacePolicy space_policy;
 };
 
 /// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
@@ -697,7 +699,7 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true);
+      bool stop_at_eos = true, bool persist = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Read-only published Acquire inventory. Never waits for admission,

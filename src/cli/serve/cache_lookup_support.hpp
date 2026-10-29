@@ -78,7 +78,8 @@ inline std::string CacheLookupEpoch(
           << ':' << disk->staging_capacity_bytes << ':'
           << disk->shared_prefix_min_tokens << ':'
           << disk->shared_prefix_max_boundaries << ':'
-          << disk->min_checkpoint_step_tokens;
+          << disk->min_checkpoint_step_tokens << ':'
+          << disk->space_policy.minimum_free_bytes;
   add(flags.str());
   std::set<std::string> environment;
   for (const auto& value : platform::CacheIdentityEnvironment()) {

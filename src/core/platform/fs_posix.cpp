@@ -1,9 +1,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fsverity.h>
+#include <linux/magic.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -352,6 +355,28 @@ bool ListDirectory(
     }
     visit(name, FromStat(st));
   }
+}
+
+struct FilesystemProbe {
+  static FilesystemInfo Inspect(const Directory& directory) noexcept {
+    struct statvfs space{};
+    struct statfs kind{};
+    if (::fstatvfs(directory.fd_, &space) || ::fstatfs(directory.fd_, &kind))
+      return {};
+    const auto bytes = [](std::uint64_t blocks, std::uint64_t size) {
+      return size && blocks <= UINT64_MAX / size ? blocks * size : 0;
+    };
+    const bool supported =
+        kind.f_type == EXT4_SUPER_MAGIC || kind.f_type == BTRFS_SUPER_MAGIC ||
+        kind.f_type == XFS_SUPER_MAGIC || kind.f_type == F2FS_SUPER_MAGIC;
+    return {bytes(space.f_blocks, space.f_frsize),
+            bytes(space.f_bavail, space.f_frsize), supported,
+            !(space.f_flag & ST_RDONLY) &&
+                ::faccessat(directory.fd_, ".", W_OK, AT_EACCESS) == 0};
+  }
+};
+FilesystemInfo InspectFilesystem(const Directory& directory) noexcept {
+  return FilesystemProbe::Inspect(directory);
 }
 
 std::filesystem::path UserCacheDirectory() noexcept {

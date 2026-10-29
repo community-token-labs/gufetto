@@ -66,25 +66,29 @@ struct TieredFixture {
     tokens.insert(tokens.end(), suffix.begin(), suffix.end());
     drafts.insert(drafts.end(), draft_suffix.begin(), draft_suffix.end());
   }
-  std::shared_ptr<const Checkpoint> Capture() {
-    return history.Capture(
-        {tokens, InputIdentity(tokens.size()), adapter.Positions(*slot),
-         CheckpointPurpose::kPrompt, 1},
-        [&](const PayloadRequest& request) {
-          auto admission =
-              ledger.Reserve(ResourceCategory::kBackingFree, request.bytes);
-          auto bytes = std::make_shared<std::vector<std::byte>>(request.bytes);
-          auto pool = admission.Convert();
-          auto assigned = pool.ReserveBacking(request.category);
-          auto completion =
-              request.category == ResourceCategory::kPrivateState
-                  ? adapter.CapturePrivate(*slot, request.component, *bytes,
-                                           stream)
-                  : adapter.CopyRowsOut(*slot, request.component, request.first,
-                                        request.end, *bytes, stream);
-          assert(completion.Wait() == TransferResult::kSucceeded);
-          return Payload::Committed(assigned.Convert(), bytes);
-        });
+  std::shared_ptr<const Checkpoint> Capture(
+      CheckpointPurpose purpose = CheckpointPurpose::kPrompt,
+      ExecutionHistory* provenance = nullptr) {
+    return (provenance ? *provenance : history)
+        .Capture({tokens, InputIdentity(tokens.size()),
+                  adapter.Positions(*slot), purpose, 1},
+                 [&](const PayloadRequest& request) {
+                   auto admission = ledger.Reserve(
+                       ResourceCategory::kBackingFree, request.bytes);
+                   auto bytes =
+                       std::make_shared<std::vector<std::byte>>(request.bytes);
+                   auto pool = admission.Convert();
+                   auto assigned = pool.ReserveBacking(request.category);
+                   auto completion =
+                       request.category == ResourceCategory::kPrivateState
+                           ? adapter.CapturePrivate(*slot, request.component,
+                                                    *bytes, stream)
+                           : adapter.CopyRowsOut(*slot, request.component,
+                                                 request.first, request.end,
+                                                 *bytes, stream);
+                   assert(completion.Wait() == TransferResult::kSucceeded);
+                   return Payload::Committed(assigned.Convert(), bytes);
+                 });
   }
   std::shared_ptr<const DiskDescription> Publish(
       const Checkpoint& checkpoint, bool track = true,
@@ -94,6 +98,8 @@ struct TieredFixture {
     manifest.lineage = checkpoint.Lineage();
     manifest.compatibility = digest;
     manifest.input = checkpoint.Input();
+    manifest.purpose = checkpoint.Purpose();
+    manifest.rank = checkpoint.Rank();
     manifest.tokens.assign(checkpoint.Tokens().begin(),
                            checkpoint.Tokens().end());
     std::vector<DiskWriteBuffer> buffers;

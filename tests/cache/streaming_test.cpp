@@ -339,15 +339,14 @@ void RoundTripAndFailures() {
          fixture.adapter.RecurrentHash(*fixture.source));
   assert(ledger.Snapshot().peak_bytes[static_cast<std::size_t>(
              ResourceCategory::kTransferStaging)] == 10);
-  // Verification survives identical identity and is discarded on a changed
-  // inode, size, mtime or ctime. Read all bytes even on a verification hit.
+  // Even identical metadata cannot attest content: every read checks bytes.
   {
     auto snapshot = disk.Open({1});
     const auto& payload = snapshot->Manifest().components[0].chunks[0];
     std::array<std::uint8_t, 5> staging{};
     auto stats =
         disk.ReadPayload(*snapshot, false, payload, staging, [](auto, auto) {});
-    assert(stats.verification_cached && stats.bytes == payload.bytes);
+    assert(!stats.verification_cached && stats.bytes == payload.bytes);
     assert(!disk.Retire({1}));
   }
   const auto path = dir.path / "v2/chunks" / DiskFileName(Id(1));
@@ -357,8 +356,8 @@ void RoundTripAndFailures() {
     file.write(&corrupt, 1);
   }
   {
-    // Resolving an unspecified checksum must still attest the existing file;
-    // a new durable checkpoint cannot hide corruption in a shared chunk.
+    // Publication preserves the expected checksum without rereading inherited
+    // files. The subsequent restore must quarantine all dependent checkpoints.
     auto reused = fixture.manifest;
     reused.checkpoint = {4};
     reused.tokens.resize(4);
@@ -366,13 +365,8 @@ void RoundTripAndFailures() {
     reused.components[0].position.valid_rows = 4;
     reused.components[0].chunks.resize(1);
     auto sources = fixture.Sources();
-    bool rejected{};
-    try {
-      streams.Write(Id(103), reused, std::span(sources).first(1), timing);
-    } catch (const DiskDependencyError&) {
-      rejected = true;
-    }
-    assert(rejected && !disk.Open({4}));
+    streams.Write(Id(103), reused, std::span(sources).first(1), timing);
+    assert(disk.Open({4}));
   }
   bool fallback{};
   assert(!streams.Restore({1}, fixture.manifest.compatibility, fixture.adapter,
@@ -387,7 +381,8 @@ void RoundTripAndFailures() {
   assert(fallback &&
          fixture.adapter.Positions(*destination)[0].valid_rows == 2);
   // No leaked read pin after failure.
-  assert(disk.Retire({1}));
+  assert(!disk.Open({4}));
+  assert(disk.Retire({1}) && disk.Retire({4}));
   {
     auto sources = fixture.Sources();
     streams.Write(Id(100), fixture.manifest, sources, timing);
@@ -741,6 +736,7 @@ void NewestPendingFrontierSurvives() {
       if (learned)
         prior.manifest.purpose = CheckpointPurpose::kLearned;
       std::atomic<bool> idle{}, started{}, discarded{};
+      std::atomic<std::uint64_t> completed_bytes{};
       PersistenceQueue* query{};
       PersistenceQueue queue(
           ledger, streams, 2, 800,
@@ -748,8 +744,14 @@ void NewestPendingFrontierSurvives() {
             started = true;
             return idle.load();
           },
-          [&](CheckpointId id, bool succeeded) {
+          [&](CheckpointId id, bool succeeded, const TransferTiming& timing) {
+            if (succeeded) {
+              assert(timing.bytes > 0 && timing.pieces > 0);
+              completed_bytes += timing.bytes;
+            }
             if (id == CheckpointId{2} && !succeeded) {
+              assert(timing.bytes == 0 && timing.pieces == 0 &&
+                     timing.yield_ns == 0 && timing.filesystem_ns == 0);
               // Replacement callbacks may query the queue and release serving
               // ownership; neither operation may run under the queue lock.
               assert(query->Stats().pending <= 2);
@@ -778,6 +780,7 @@ void NewestPendingFrontierSurvives() {
              (pin_failure ? 780 : 800));
       idle = true;
       queue.Drain();
+      assert(completed_bytes == queue.Stats().timing.bytes);
       assert(disk.Open({1}));
       assert(bool(disk.Open({2})) == learned);
       assert(bool(disk.Open({3})) == (!learned && !pin_failure));
