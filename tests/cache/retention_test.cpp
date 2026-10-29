@@ -9,6 +9,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "src/cache/backing.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/cache/prefix_index_fixture.hpp"
 using namespace gufo::cache;
@@ -1531,8 +1532,440 @@ void RealCapacityAndUniqueAdmission() {
            f.Cached({129}) == 1);
   }
 }
+RetentionRequest Prediction(std::span<const Token> tokens,
+                            std::uint64_t owner = 1) {
+  RetentionRequest request{tokens, {1}, {}, RetentionPurpose::kHistory};
+  request.admission = AdmissionPolicy::kNoEviction;
+  request.prediction_owner = owner;
+  return request;
+}
+CheckpointId AddPrediction(Fixture& f, const std::vector<Token>& tokens,
+                           std::uint64_t owner = 1) {
+  assert(f.policy.Admit(Prediction(tokens, owner),
+                        [&] { return IndexCheckpoint(f.ledger, tokens); }));
+  return f.log.events.back().checkpoint;
+}
+void NoEvictionRecordAndDuplicate() {
+  Fixture full;
+  for (Token token = 1; token <= 128; ++token)
+    full.Add({token});
+  const std::vector<Token> incoming{129};
+  auto request = Prediction(incoming);
+  const auto before = full.ledger.Snapshot();
+  bool called = false;
+  assert(!full.policy.Admit(request, [&] {
+    called = true;
+    return IndexCheckpoint(full.ledger, incoming);
+  }));
+  assert(!called && full.policy.Size() == 128);
+  assert(full.log.events.back().reason == RetentionReason::kRecordCapacity);
+  assert(!full.policy.Reclaim(request));
+  assert(full.ledger.Snapshot().total_bytes == before.total_bytes);
+  for (Token token = 1; token <= 128; ++token)
+    assert(full.Cached({token}) == 1);
+  // The default still evicts and admits the 129th ordinary record.
+  full.Add(incoming);
+  assert(full.Cached({1}) == 0 && full.Cached(incoming) == 1);
+  assert(full.policy.PredictionUsage().records == 0);
+
+  Fixture duplicate;
+  const std::vector<Token> tokens{1, 2, 3};
+  const auto id = duplicate.Add(tokens, RetentionPurpose::kBranchPoint);
+  assert(!duplicate.policy.Admit(Prediction(tokens), [&] {
+    called = true;
+    throw ResourceExhausted();
+    return std::shared_ptr<const Checkpoint>{};
+  }));
+  assert(!called && duplicate.policy.Size() == 1);
+  assert(duplicate.policy.Rank(id) == 3 && duplicate.Cached(tokens) == 3);
+  assert(duplicate.log.events.back().reason == RetentionReason::kDuplicate);
+}
+void PredictionCountQuotaAndObservation() {
+  Fixture f;
+  std::array<CheckpointId, 4> ids;
+  for (std::size_t i = 0; i < ids.size(); ++i)
+    ids[i] = AddPrediction(f, {static_cast<Token>(i + 1)}, i + 10);
+  const auto budget = f.policy.PredictionLimits();
+  assert(budget.bytes == kIndexLimits.ram_bytes / 12 && budget.records == 4);
+  const auto used = f.policy.PredictionUsage();
+  assert(used.records == 4 && used.bytes > 0 && used.bytes <= budget.bytes);
+  const auto rank = f.policy.Rank(ids[0]);
+  assert(!f.policy.ObservePrediction(ids[0], 0));
+  assert(!f.policy.ObservePrediction(ids[0], 10));
+  assert(f.policy.ObservePrediction(ids[0], 99));
+  assert(f.policy.ObservePrediction(ids[0], 99));
+  assert(f.policy.Rank(ids[0]) == rank);
+  assert(!f.policy.WithdrawUnprovenPrediction(ids[0], 10));
+  assert(f.policy.PredictionUsage().bytes == used.bytes);
+  const std::vector<Token> fifth{5};
+  bool called = false;
+  assert(!f.policy.Admit(Prediction(fifth), [&] {
+    called = true;
+    return IndexCheckpoint(f.ledger, fifth);
+  }));
+  assert(!called && f.log.events.back().reason ==
+                        RetentionReason::kPredictionRecordCapacity);
+  f.policy.Remove(ids[0]);
+  assert(f.policy.PredictionUsage().records == 3);
+  AddPrediction(f, fifth);
+  assert(f.policy.PredictionUsage().records == 4);
+  assert(!f.policy.WithdrawUnprovenPrediction(ids[1], 0));
+  assert(!f.policy.WithdrawUnprovenPrediction(ids[1], 999));
+  assert(f.policy.WithdrawUnprovenPrediction(ids[1], 11));
+  assert(f.policy.PredictionUsage().records == 3);
+  // Ordinary exact replacement ends prediction provenance, even if observed.
+  assert(f.policy.ObservePrediction(ids[2], 99));
+  const auto replacement = f.Add({3});
+  assert(f.policy.PredictionUsage().records == 2);
+  assert(!f.policy.WithdrawUnprovenPrediction(replacement, 12));
+  assert(!f.policy.ObservePrediction(replacement, 99));
+}
+void PredictionByteQuota() {
+  constexpr std::array<ComponentDescriptor, 1> components{
+      {{{1}, 1, ComponentKind::kPrivateState, 0, 0, 32768}}};
+  ResourceLedger ledger{{1 << 20, 1 << 20, 0, 0}};
+  PrefixIndex index{ledger};
+  index.Register({1}, components);
+  Log log;
+  RetentionPolicy policy{ledger, index, &log};
+  const auto add = [&](Token token, std::size_t estimate = 0) {
+    const std::vector<Token> tokens{token};
+    auto request = Prediction(tokens);
+    request.new_payload_bytes = estimate;
+    return policy.Admit(request, [&] {
+      return IndexCheckpoint(ledger, tokens, {1}, {}, components);
+    });
+  };
+  assert(add(1));
+  const auto first = log.events.back().checkpoint;
+  assert(add(2));
+  const auto before = policy.PredictionUsage();
+  assert(before.records == 2);
+  // Even an underestimated preflight cannot bypass the actual payload cap.
+  assert(!add(3));
+  assert(log.events.back().reason == RetentionReason::kPredictionByteCapacity);
+  assert(policy.PredictionUsage().bytes == before.bytes);
+  assert(!add(4, policy.PredictionLimits().bytes + 1));
+  assert(log.events.back().reason == RetentionReason::kPredictionByteCapacity);
+  policy.Remove(first);
+  assert(add(3));
+  assert(policy.PredictionUsage().records == 2);
+}
+void PredictionFailureAndCancellation() {
+  for (int failure = 0; failure < 4; ++failure) {
+    Fixture f;
+    const auto anchor = f.Add({1, 2, 3}, RetentionPurpose::kBranchPoint);
+    const auto before = f.ledger.Snapshot().total_bytes;
+    const std::vector<Token> tokens{9, 9};
+    auto request = Prediction(tokens);
+    std::stop_source stop;
+    request.stop = stop.get_token();
+    int calls = 0;
+    assert(!f.policy.Admit(request, [&]() -> std::shared_ptr<const Checkpoint> {
+      ++calls;
+      if (failure == 0)
+        throw ResourceExhausted();
+      if (failure == 1)
+        throw std::bad_alloc();
+      if (failure == 2)
+        throw std::runtime_error("copy failed");
+      auto checkpoint = IndexCheckpoint(f.ledger, tokens);
+      stop.request_stop();
+      return checkpoint;
+    }));
+    assert(calls == 1 && f.policy.Size() == 1 && f.policy.Rank(anchor) == 3);
+    assert(f.Cached({1, 2, 3}) == 3 && f.Cached(tokens) == 0);
+    assert(f.policy.PredictionUsage().records == 0);
+    assert(f.ledger.Snapshot().total_bytes == before);
+  }
+  Fixture f;
+  const std::vector<Token> tokens{1};
+  bool called = false;
+  assert(!f.policy.Admit(Prediction(tokens, 0), [&] {
+    called = true;
+    return IndexCheckpoint(f.ledger, tokens);
+  }));
+  assert(!called && f.log.events.back().reason == RetentionReason::kInvalid);
+}
+void PredictionReaderAndPinProtection() {
+  constexpr std::array<ComponentDescriptor, 2> components{
+      {{{1}, 1, ComponentKind::kAppendRows, 64, 4, 0},
+       {{2}, 1, ComponentKind::kPrivateState, 0, 0, 32}}};
+  for (int kind = 0; kind < 9; ++kind) {
+    ResourceLedger ledger{kIndexLimits};
+    PrefixIndex index{ledger};
+    index.Register({1}, components);
+    Log log;
+    RetentionPolicy policy{ledger, index, &log};
+    const std::vector<Token> tokens(9, 1);
+    assert(policy.Admit(Prediction(tokens), [&] {
+      return IndexCheckpoint(ledger, tokens, {1}, {}, components);
+    }));
+    const auto id = log.events.back().checkpoint;
+    auto lookup = index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+    const auto& c = lookup.selected->checkpoint->Components()[0];
+    std::optional<ChunkReference> chunk;
+    std::optional<CheckpointChunk> escaped;
+    std::shared_ptr<const Checkpoint> checkpoint;
+    std::shared_ptr<const void> owner;
+    PersistencePin persistence;
+    RowPin reader;
+    if (kind == 0)
+      chunk = c.chunks[0].PinReader();
+    else if (kind == 1)
+      chunk = c.chunks[0].PinPersistence();
+    else if (kind == 2)
+      escaped = c.chunks[0];
+    else if (kind == 3)
+      persistence = c.tail->CommittedCharge().PinPersistence();
+    else if (kind == 4)
+      persistence = lookup.selected->checkpoint->Components()[1]
+                        .private_state->CommittedCharge()
+                        .PinPersistence();
+    else if (kind == 5)
+      reader = c.tail->PinRows();
+    else if (kind == 6)
+      owner =
+          lookup.selected->checkpoint->Components()[1].private_state->Owner();
+    else
+      checkpoint = lookup.selected->checkpoint;
+    if (kind == 8)
+      index.DropResident(lookup.selected->entry);
+    lookup = {};
+    if (kind == 8)
+      assert(checkpoint.use_count() == 2);  // policy + external, NOT index
+    assert(!policy.WithdrawUnprovenPrediction(id, 1));
+    assert(policy.Size() == 1 && policy.PredictionUsage().records == 1);
+    chunk.reset();
+    escaped.reset();
+    checkpoint.reset();
+    owner.reset();
+    persistence = {};
+    reader = {};
+    // Lookup/pin acquisition alone did not promote the prediction.
+    assert(policy.WithdrawUnprovenPrediction(id, 1));
+    assert(policy.Size() == 0 && policy.PredictionUsage().bytes == 0);
+  }
+  Fixture fork;
+  const auto root = AddPrediction(fork, {1, 2});
+  fork.Add({1, 2, 3});
+  fork.Add({1, 2, 4});
+  assert(!fork.policy.WithdrawUnprovenPrediction(root, 1));
+  assert(fork.Cached({1, 2, 9}) == 2);
+}
+void PredictionConcurrentReader() {
+  Fixture f;
+  const std::vector<Token> tokens{1, 2, 3};
+  const auto id = AddPrediction(f, tokens);
+  std::mutex publication;
+  std::promise<void> pinned, release;
+  auto ready = pinned.get_future();
+  auto released = release.get_future();
+  std::jthread reader([&] {
+    std::shared_ptr<const Checkpoint> checkpoint;
+    {
+      std::lock_guard lock(publication);
+      checkpoint = f.index.Lookup({{1}, tokens, InputIdentity(tokens.size())})
+                       .selected->checkpoint;
+    }
+    pinned.set_value();
+    released.wait();
+  });
+  assert(ready.wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+  {
+    std::lock_guard lock(publication);
+    assert(!f.policy.WithdrawUnprovenPrediction(id, 1));
+  }
+  release.set_value();
+  reader.join();
+  std::lock_guard lock(publication);
+  assert(f.policy.WithdrawUnprovenPrediction(id, 1));
+}
+void PredictionBorrowedLifecycle() {
+  ResourceLedger ledger{kIndexLimits};
+  FakeAdapter adapter;
+  FakeStream stream{true};
+  std::promise<void> copying, resume;
+  auto started = copying.get_future();
+  auto allowed = resume.get_future();
+  IdleSpillConfig spill{4 * sizeof(Token),
+                        [&]() -> std::unique_ptr<Stream> {
+                          copying.set_value();
+                          allowed.wait();
+                          return std::make_unique<FakeStream>(true);
+                        },
+                        [] { return true; }};
+  LeasedSlot slot{ledger, adapter, stream, {1}, spill};
+  auto lease = slot.Acquire();
+  const auto live = lease.Location();
+  const std::vector<Token> tokens{1, 2, 3, 4};
+  adapter.Append(lease.Execution(), tokens, tokens);
+  const auto descriptors = adapter.Components().first(1);
+  PrefixIndex index{ledger};
+  index.Register(adapter.CompatibilityIdentity(), descriptors);
+  RetentionPolicy policy{ledger, index};
+  auto history = ExecutionHistory::Cold(ledger, descriptors,
+                                        adapter.CompatibilityIdentity());
+  auto request = Prediction(tokens);
+  request.compatibility = adapter.CompatibilityIdentity();
+  assert(policy.Admit(request, [&] {
+    return history.Capture(
+        {tokens,
+         InputIdentity(tokens.size()),
+         {{kTarget, tokens.size()}},
+         CheckpointPurpose::kPrompt,
+         1},
+        [&](const PayloadRequest& r) {
+          auto pool =
+              ledger.Reserve(ResourceCategory::kBackingFree, r.bytes).Convert();
+          auto bytes = std::make_shared<std::vector<std::byte>>(r.bytes);
+          return Payload::Borrowed(lease.Borrow(r.component, r.first, r.end,
+                                                pool.ReserveBacking(r.category),
+                                                bytes, *bytes));
+        });
+  }));
+  auto lookup = index.Lookup(
+      {request.compatibility, tokens, InputIdentity(tokens.size())});
+  const auto id = lookup.selected->checkpoint->Id();
+  auto rows = lookup.selected->checkpoint->Components()[0]
+                  .chunks[0]
+                  .Storage()
+                  .BorrowedStorage();
+  lookup = {};
+  assert(!policy.WithdrawUnprovenPrediction(id, 1));  // still source-backed
+  lease.Commit();
+  assert(started.wait_for(std::chrono::seconds(3)) ==
+         std::future_status::ready);
+  assert(
+      !policy.WithdrawUnprovenPrediction(id, 1));  // active preservation copy
+  auto source_reader = rows->Pin();
+  resume.set_value();
+  lease = slot.Acquire(live);  // drain the copy, but not the old source reader
+  assert(!rows->Location());
+  assert(!policy.WithdrawUnprovenPrediction(id, 1));
+  auto backing_reader = rows->Pin();
+  source_reader = {};
+  assert(!policy.WithdrawUnprovenPrediction(id, 1));
+  auto persistence = rows->PinPersistence();
+  backing_reader = {};
+  assert(!policy.WithdrawUnprovenPrediction(id, 1));
+  persistence = {};
+  rows.reset();
+  assert(policy.WithdrawUnprovenPrediction(id, 1));
+  assert(policy.PredictionUsage().records == 0);
+}
+void PredictionWithdrawalBeforeRequiredCapture() {
+  constexpr std::array<ComponentDescriptor, 1> components{
+      {{{1}, 1, ComponentKind::kPrivateState, 0, 0, 4096}}};
+  ResourceLedger ledger{{65536, 65536, 0, 0}};
+  PrefixIndex index{ledger};
+  index.Register({1}, components);
+  Log log;
+  RetentionPolicy policy{ledger, index, &log};
+  const std::vector<Token> ordinary{1}, predicted{2}, required{3};
+  const auto capture = [&](const auto& tokens) {
+    return IndexCheckpoint(ledger, tokens, {1}, {}, components);
+  };
+  assert(policy.Admit({ordinary, {1}, {}, RetentionPurpose::kBranchPoint},
+                      [&] { return capture(ordinary); }));
+  const auto anchor = log.events.back().checkpoint;
+  assert(policy.Admit(Prediction(predicted, 17),
+                      [&] { return capture(predicted); }));
+  const auto prediction = log.events.back().checkpoint;
+  const auto room = 65536 - ledger.Snapshot().total_bytes;
+  assert(room > 2048);
+  auto pressure =
+      ledger.Reserve(ResourceCategory::kBackingFree, room - 2048).Convert();
+  bool exhausted = false;
+  try {
+    (void)capture(required);
+  } catch (const ResourceExhausted&) {
+    exhausted = true;
+  }
+  assert(exhausted);
+  const auto before = ledger.Snapshot().total_bytes;
+  assert(policy.WithdrawUnprovenPrediction(prediction, 17));
+  assert(ledger.Snapshot().total_bytes + 4096 <= before);
+  assert(policy.Admit({required, {1}, {}}, [&] { return capture(required); }));
+  assert(policy.Rank(anchor) == 3 && policy.Size() == 2);
+  assert(policy.PredictionUsage().records == 0);
+  for (const auto& event : log.events)
+    if (event.action == RetentionAction::kRemoved)
+      assert(event.checkpoint == prediction);
+}
+void NoEvictionBackingFragmentation() {
+  constexpr std::array<ComponentDescriptor, 1> components{
+      {{{1}, 1, ComponentKind::kPrivateState, 0, 0, 8192}}};
+  for (bool fragmented : {false, true}) {
+    ResourceLedger ledger{kIndexLimits};
+    PrefixIndex index{ledger};
+    index.Register({1}, components);
+    Log log;
+    RetentionPolicy policy{ledger, index, &log};
+    CommittedBackingPool pool{
+        ledger,
+        {4 * 4096 + 131072, 4096, 131072},
+        {[](std::size_t bytes) {
+           auto memory = std::make_shared<std::vector<std::byte>>(bytes);
+           return BackingPages{memory->data(), memory};
+         },
+         [](BackingPages& pages, std::size_t) {
+           pages = {};
+           return true;
+         }}};
+    std::array<std::optional<BackingBlock>, 4> occupied;
+    for (auto& block : occupied) {
+      block = pool.TryAcquire(ResourceCategory::kPrivateState, 4096);
+      assert(block);
+    }
+    if (fragmented) {
+      occupied[0].reset();
+      occupied[2].reset();
+    }
+    const std::vector<Token> ordinary{1}, predicted{2};
+    assert(
+        policy.Admit({ordinary, {1}, {}, RetentionPurpose::kBranchPoint}, [&] {
+          return IndexCheckpoint(ledger, ordinary, {1}, {}, components);
+        }));
+    const auto anchor = log.events.back().checkpoint;
+    const std::array demand{
+        PayloadRequest{{1}, ResourceCategory::kPrivateState, 0, 1, 8192}};
+    assert(pool.CanFit(demand) == fragmented);
+    assert(ledger.Snapshot().ram_bytes + 8192 < ledger.Limits().ram_bytes);
+    int attempts = 0;
+    assert(!policy.Admit(Prediction(predicted), [&] {
+      ++attempts;
+      auto history = ExecutionHistory::Cold(ledger, components, {1});
+      return history.Capture({predicted,
+                              InputIdentity(1),
+                              {{{1}, 1}},
+                              CheckpointPurpose::kPrompt,
+                              1},
+                             [&](const PayloadRequest& r) {
+                               auto block =
+                                   pool.TryAcquire(r.category, r.bytes);
+                               if (!block)
+                                 throw ResourceExhausted();
+                               block->Convert();
+                               return std::move(*block).TakePayload();
+                             });
+    }));
+    assert(attempts == 1 && policy.Size() == 1 && policy.Rank(anchor) == 3);
+    assert(log.events.back().reason == RetentionReason::kByteCapacity);
+    assert(policy.PredictionUsage().records == 0);
+  }
+}
 }  // namespace
 int main() {
+  NoEvictionRecordAndDuplicate();
+  PredictionCountQuotaAndObservation();
+  PredictionByteQuota();
+  PredictionFailureAndCancellation();
+  PredictionReaderAndPinProtection();
+  PredictionConcurrentReader();
+  PredictionBorrowedLifecycle();
+  PredictionWithdrawalBeforeRequiredCapture();
+  NoEvictionBackingFragmentation();
   Planning();
   Branches();
   RanksAndSources();
