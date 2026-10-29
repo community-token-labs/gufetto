@@ -1,5 +1,6 @@
 #include "src/cache/disk.hpp"
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +18,9 @@ namespace fs = std::filesystem;
 namespace {
 std::atomic<std::uint64_t> actual_manifest_bytes{}, actual_payload_bytes{};
 std::atomic<bool> interrupt_next_read{}, shorten_reads{};
+// Deterministically model same-tick writes / coarse filesystem timestamps.
+// Only the chosen payload inode is affected; size and other metadata stay real.
+std::optional<struct stat> frozen_times;
 void CountRead(int fd, ssize_t bytes) {
   if (bytes <= 0)
     return;
@@ -33,6 +37,16 @@ void CountRead(int fd, ssize_t bytes) {
     actual_payload_bytes += bytes;
 }
 }  // namespace
+extern "C" int __real_fstat(int, struct stat*);
+extern "C" int __wrap_fstat(int fd, struct stat* st) {
+  const int result = __real_fstat(fd, st);
+  if (result == 0 && frozen_times && st->st_dev == frozen_times->st_dev &&
+      st->st_ino == frozen_times->st_ino) {
+    st->st_mtim = frozen_times->st_mtim;
+    st->st_ctim = frozen_times->st_ctim;
+  }
+  return result;
+}
 extern "C" ssize_t __real_read(int, void*, size_t);
 extern "C" ssize_t __wrap_read(int fd, void* buffer, size_t size) {
   if (interrupt_next_read.exchange(false)) {
@@ -233,6 +247,10 @@ void LargePieceReadAndCorruption() {
   auto snapshot = disk.Open({7});
   assert(snapshot);
   const auto payload = *snapshot->Manifest().components[1].private_state;
+  const auto path = directory.path / "v2/private" / DiskFileName(Id(3));
+  struct stat status{};
+  assert(::stat(path.c_str(), &status) == 0);
+  frozen_times = status;
   std::array<std::uint8_t, 513> staging{};
   std::size_t copied{};
   interrupt_next_read = true;
@@ -262,6 +280,7 @@ void LargePieceReadAndCorruption() {
     invalid = error.private_file && error.file == payload.file;
   }
   assert(invalid);
+  frozen_times.reset();
 }
 void Ownership() {
   Directory d;
@@ -677,17 +696,20 @@ void VerifiedDependencies() {
     assert(store.Entries().empty());
     return ledger.Snapshot().total_bytes;
   };
-  // Inherited chunks are read once after they were written, then their
-  // unchanged identity is trusted by later publications.
+  // Every publication verifies inherited bytes, even with identical metadata.
   assert(publish(7) == 0);
   assert(publish(8) == chunk.size());
-  assert(publish(9) == 0);
+  assert(publish(9) == chunk.size());
   const auto settled = retire();
-  // Removing a file releases its verification record.
+  // Retiring dependencies releases their metadata charges.
   shared = 2;
   assert(publish(7) == 0);
   assert(publish(8) == chunk.size());
-  // A rewritten file changes identity and is verified again.
+  // A same-size corrupt rewrite with unchanged timestamps must be rejected.
+  struct stat status{};
+  const auto path = directory.path / "v2/chunks" / DiskFileName(Id(shared));
+  assert(::stat(path.c_str(), &status) == 0);
+  frozen_times = status;
   chunk[0] ^= 1;
   Write(directory.path / "v2/chunks" / DiskFileName(Id(shared)), chunk);
   chunk[0] ^= 1;
@@ -698,6 +720,7 @@ void VerifiedDependencies() {
     rejected = true;
   }
   assert(rejected);
+  frozen_times.reset();
   assert(retire() == settled);
 }
 }  // namespace

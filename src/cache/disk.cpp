@@ -518,54 +518,6 @@ struct DiskStore::Impl {
   mutable std::timed_mutex mutex;
   mutable std::mutex index_mutex;
   mutable std::mutex stats_mutex;
-  struct FileIdentity {
-    platform::FileInfo info;
-    std::uint64_t checksum;
-    bool operator==(const FileIdentity& b) const = default;
-  };
-  struct VerifiedFile {
-    ResourceCharge charge;
-    FileIdentity identity;
-  };
-  std::mutex verification_mutex;
-  // One entry per payload file whose bytes matched its checksum, until the
-  // file is removed. A matching identity skips the next re-read.
-  std::map<std::pair<bool, DiskFileId>, VerifiedFile> verified;
-  bool VerificationCached(std::pair<bool, DiskFileId> key,
-                          const FileIdentity& identity) {
-    std::lock_guard guard(verification_mutex);
-    auto it = verified.find(key);
-    return it != verified.end() && it->second.identity == identity;
-  }
-  void RememberVerified(std::pair<bool, DiskFileId> key,
-                        const FileIdentity& identity) {
-    std::lock_guard guard(verification_mutex);
-    auto it = verified.find(key);
-    if (it != verified.end()) {
-      it->second.identity = identity;
-      return;
-    }
-    try {
-      auto reservation = ledger->Reserve(ResourceCategory::kMetadata, 256);
-      auto [inserted, added] =
-          verified.emplace(key, VerifiedFile{{}, identity});
-      try {
-        inserted->second.charge = reservation.Convert();
-      } catch (...) {
-        verified.erase(inserted);
-        throw;
-      }
-    } catch (const std::bad_alloc&) {
-      // Verification caching is optional; the completed read remains valid.
-    }
-  }
-  void ForgetVerified(std::pair<bool, DiskFileId> key) {
-    std::unique_lock guard(verification_mutex);
-    auto node = verified.extract(key);
-    guard.unlock();
-    // The charge returns to the ledger outside the verification lock.
-    node = {};
-  }
 #ifdef GUFO_CACHE_TESTING
   std::function<void(DiskPublicationStep)> crash_hook;
 #define DISK_STEP(step)                      \
@@ -668,11 +620,6 @@ struct DiskStore::Impl {
   ~Impl() {
     if (reclamation.valid())
       reclamation.wait();
-    while (!verified.empty()) {
-      auto node = verified.extract(verified.begin());
-      auto charge = std::move(node.mapped().charge);
-      node = {};
-    }
   }
   void ValidateReferences(bool reject = true) {
     if (entries.empty())
@@ -782,9 +729,6 @@ struct DiskStore::Impl {
     }
     if (!Regular(st))
       return;
-    if (&directory == &chunks || &directory == &private_files)
-      if (auto id = ParseName(name))
-        ForgetVerified({&directory == &private_files, *id});
     if (!platform::Unlink(directory, name, ec))
       IoError("remove cache file", ec);
     {
@@ -971,12 +915,8 @@ struct DiskStore::Impl {
     if (!platform::FileValid(fd.Get()) || status < 0 || !Regular(st) ||
         st.size != payload.bytes)
       DependencyFailure(private_file, payload.file);
-    // Each publication inherits the chunks of earlier checkpoints. Re-read
-    // only those whose identity changed since this store last verified them.
-    const auto key = std::make_pair(private_file, payload.file);
-    const FileIdentity identity{st, payload.checksum};
-    if (VerificationCached(key, identity))
-      return;
+    // Metadata is not a content version: same-size writes can retain both
+    // timestamps. Revalidate inherited bytes before publishing a dependent.
     ResourceReservation charge;
     std::vector<std::uint8_t> allocated;
     if (staging.empty()) {
@@ -1018,7 +958,6 @@ struct DiskStore::Impl {
     if (crc != payload.checksum || final_status < 0 || !Regular(after) ||
         !(st == after))
       DependencyFailure(private_file, payload.file);
-    RememberVerified(key, identity);
     {
       // Verified; drop the pages this re-read brought in.
       CostTimer timer(publication_stats.filesystem_ns);
@@ -1616,10 +1555,7 @@ DiskReadStats DiskStore::ReadPayload(
       !platform::Stat(file.Get(), &before, ec) || !Regular(before) ||
       before.size != payload.bytes)
     impl_->DependencyFailure(private_file, payload.file);
-  const Impl::FileIdentity identity{before, payload.checksum};
   stats.filesystem_ns += elapsed(begin);
-  const auto key = std::make_pair(private_file, payload.file);
-  stats.verification_cached = impl_->VerificationCached(key, identity);
   std::uint64_t offset{}, checksum{};
   while (offset < payload.bytes) {
     auto piece = staging.first(
@@ -1636,25 +1572,22 @@ DiskReadStats DiskStore::ReadPayload(
       filled += n;
     }
     stats.filesystem_ns += elapsed(begin);
-    if (!stats.verification_cached) {
-      begin = Clock::now();
-      checksum = DiskChecksum(piece, checksum);
-      stats.checksum_ns += elapsed(begin);
-    }
+    // Always verify the bytes actually delivered, including repeat reads.
+    // File identity/timestamps cannot attest unchanged content.
+    begin = Clock::now();
+    checksum = DiskChecksum(piece, checksum);
+    stats.checksum_ns += elapsed(begin);
     stats.bytes += piece.size();
     consume(offset, piece);
     offset += piece.size();
   }
   begin = Clock::now();
   if (!platform::Stat(file.Get(), &after, ec) || !Regular(after) ||
-      identity.info != after ||
-      (!stats.verification_cached && checksum != payload.checksum))
+      before != after || checksum != payload.checksum)
     impl_->DependencyFailure(private_file, payload.file);
   // The consumer holds the bytes now; drop the page-cache copy.
   platform::Advise(file.Get(), platform::AdviseHint::kDontNeed, 0, 0);
   stats.filesystem_ns += elapsed(begin);
-  if (!stats.verification_cached)
-    impl_->RememberVerified(key, identity);
   return stats;
 }
 DiskReadPin DiskStore::Pin(CheckpointId id, std::uint64_t epoch) const {

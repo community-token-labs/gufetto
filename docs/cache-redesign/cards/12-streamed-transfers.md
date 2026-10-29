@@ -106,10 +106,11 @@ loads and invalidates before fallback; cancellation invalidates without fallback
 The caller supplies the SHA-256 compatibility digest for its current adapter;
 layout checks and independent target/draft positions remain mandatory.
 
-The verification cache includes device, inode, size, nanosecond mtime and ctime,
-and expected CRC. It is bounded to 1,024 admitted metadata nodes; cache admission
-failure skips memoization. A cache hit still reads every byte and checks the file
-identity again after copying. Retirement is blocked by snapshot pins.
+Every restore verifies CRC during its existing streaming read, then checks file
+identity again after copying. Device/inode/size/mtime/ctime are not a content
+version: a same-size write can retain identical timestamps. Inherited publication
+also re-reads and verifies shared files; there is no metadata-only verification
+cache. Retirement is blocked by snapshot pins.
 
 One optional persistence worker bounds active plus pending depth and retained
 allocation capacities. Admission/coalescing precedes pinning; duplicate logical
@@ -134,13 +135,14 @@ attempts retain observations even when a transfer throws.
 
 The fake adapter round-trips 336 bytes with a ten-byte staging allocation, with
 unaligned row-sized pieces and split private state. It verifies target/draft
-positions and continued recurrent hashes, corrupts an already memoized file and
+positions and continued recurrent hashes, corrupts an already verified file and
 checks cold invalidation before fallback, and cancels after partial loads without
 leaking a disk pin. Queue tests prove active/pending depth and 672-byte pin bounds,
 coalescing, skipping, yielding without blocking index/accounting queries, and
 stop cleanup. A concurrent restore completes while an optional writer yields,
 which would deadlock if the writer held staging through its transaction. Admission tests inject every staging reserve/convert and source pin
-failure, and verification-cache admission/commit faults skip memoization; physical staging is freed while its charge is still live. Reused chunks
+failure; physical staging is freed while its charge is still live. Frozen-timestamp
+regressions require corrupt repeat reads and inherited publications to fail. Reused chunks
 also publish with no new sources and no hidden verification buffer.
 
 Normal and ASan/UBSan checks cover the changed common cache contract. The pinned

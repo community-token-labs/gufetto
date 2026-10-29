@@ -339,15 +339,14 @@ void RoundTripAndFailures() {
          fixture.adapter.RecurrentHash(*fixture.source));
   assert(ledger.Snapshot().peak_bytes[static_cast<std::size_t>(
              ResourceCategory::kTransferStaging)] == 10);
-  // Verification survives identical identity and is discarded on a changed
-  // inode, size, mtime or ctime. Read all bytes even on a verification hit.
+  // Even identical metadata cannot attest content: every read checks bytes.
   {
     auto snapshot = disk.Open({1});
     const auto& payload = snapshot->Manifest().components[0].chunks[0];
     std::array<std::uint8_t, 5> staging{};
     auto stats =
         disk.ReadPayload(*snapshot, false, payload, staging, [](auto, auto) {});
-    assert(stats.verification_cached && stats.bytes == payload.bytes);
+    assert(!stats.verification_cached && stats.bytes == payload.bytes);
     assert(!disk.Retire({1}));
   }
   const auto path = dir.path / "v2/chunks" / DiskFileName(Id(1));

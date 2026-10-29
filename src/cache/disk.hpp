@@ -111,6 +111,7 @@ struct DiskWriteSource {
 };
 struct DiskReadStats {
   std::uint64_t bytes{}, filesystem_ns{}, checksum_ns{};
+  // Retained for callers; always false. Metadata cannot attest payload bytes.
   bool verification_cached{};
 };
 // Optional piece lease. acquire runs before touching staging; release runs on
