@@ -2785,6 +2785,9 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       throw TextGenerationError(TextGenerationErrorCode::kDeviceLost,
                                 kDeviceLostMessage);
     }
+    if (impl_->runner_pool->capacity() == 0)
+      throw TextGenerationError(TextGenerationErrorCode::kCacheUnavailable,
+                                "no usable cache slots; reload the model");
     if (impl_->queued_count >= impl_->scheduler_policy.max_pending_requests) {
       refused = true;
       refusal_code = TextGenerationErrorCode::kQueueFull;

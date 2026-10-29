@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <exception>
@@ -252,8 +253,11 @@ struct ComponentTextCache::Impl {
     cache::Identity live_input;
     // Acquisition order breaks ties between equal recovery-cost victims.
     std::uint64_t used{};
-    bool busy{};
+    bool busy{};  // Active execution only; quarantine must not stall other
+                  // slots.
+    bool quarantined{};
     bool decode_ready{};
+    bool Selectable() const noexcept { return !busy && !quarantined; }
   };
   std::shared_ptr<TextModelRunner> runner;
   cache::ResourceLedger ledger;
@@ -307,6 +311,7 @@ struct ComponentTextCache::Impl {
   std::shared_ptr<std::atomic<bool>> transfer_gate =
       std::make_shared<std::atomic<bool>>(false);
   std::vector<std::unique_ptr<Entry>> entries;
+  std::atomic<std::size_t> quarantined_slots{}, diagnostic_leases{};
   std::uint64_t clock{};
   struct Readiness {
     std::weak_ptr<const cache::Checkpoint> checkpoint;
@@ -325,7 +330,7 @@ struct ComponentTextCache::Impl {
           index.Snapshot([&](const cache::PrefixCandidate& candidate) {
             if (candidate.live) {
               const auto& entry = *entries.at(candidate.live->slot.value - 1);
-              return !entry.busy && entry.decode_ready;
+              return entry.Selectable() && entry.decode_ready;
             }
             return runner->LookupFullCheckpointReady() ||
                    (candidate.checkpoint &&
@@ -935,7 +940,19 @@ struct ComponentTextCache::Impl {
         return retention.ReclaimForExecution();
       });
   }
+  void SettleDiagnostic(Entry& entry, bool quarantine,
+                        std::unique_ptr<TextRunnerState> state = {}) {
+    const std::lock_guard lock(mutex.native);
+    if (quarantine) {
+      assert(!entry.quarantined);
+      entry.diagnostic_quarantine = std::move(state);
+      entry.quarantined = true;
+      ++quarantined_slots;
+    }
+    entry.busy = false;
+  }
   ~Impl() {
+    assert(diagnostic_leases == 0 && "diagnostic lease outlived its pool");
     if (resources->bind_execution_reclaimer)
       resources->bind_execution_reclaimer({});
     // Settle immutable-source readers before slots/resources/index unwind.
@@ -1163,16 +1180,26 @@ class DiagnosticRequest final : public TextDiagnosticLease {
 public:
   DiagnosticRequest(ComponentTextCache::Impl& cache,
                     ComponentTextCache::Impl::Entry& entry,
-                    cache::DiagnosticSlotLease slot)
+                    cache::DiagnosticSlotLease slot,
+                    std::unique_ptr<TextRunnerState> state) noexcept
       : cache_(cache),
         entry_(entry),
         slot_(std::move(slot)),
-        state_(cache.runner->BindComponentState(*cache.resources->adapter,
-                                                slot_.Execution())) {}
-  ~DiagnosticRequest() override { Quarantine(); }
+        state_(std::move(state)) {
+    ++cache_.diagnostic_leases;
+  }
+  ~DiagnosticRequest() override {
+    Quarantine();
+    --cache_.diagnostic_leases;
+  }
   bool Initialize() {
-    if (!state_ || Reset(slot_.Execution()) != DiscardResult::kComplete ||
-        !slot_.VerifiedEmpty(cache_.resources->diagnostic_ready))
+    const auto reset = Reset(slot_.Execution());
+    if (reset == DiscardResult::kPending) {
+      (void)Finish(
+          true);  // No native mutation: release the verified-empty claim.
+      return false;
+    }
+    if (reset != DiscardResult::kComplete)
       return false;
     cached_ = cache_.runner->CheckpointPosition(*state_);
     return cached_ == 0;
@@ -1187,31 +1214,38 @@ public:
   void PreparePrefill(std::size_t) override {
     (void)state();  // Deliberately no cache GrowAhead or checkpoint planning.
   }
-  DiscardResult Discard() override {
+  DiscardResult Discard() override { return Finish(false); }
+  void Quarantine() noexcept override {
+    if (!active_)
+      return;
+    slot_.Quarantine();
+    cache_.SettleDiagnostic(entry_, true, std::move(state_));
+    active_ = false;
+    result_ = DiscardResult::kQuarantined;
+  }
+
+private:
+  DiscardResult Finish(bool untouched) {
     if (!active_)
       return result_;
-    result_ = slot_.Discard(cache_.resources->diagnostic_ready,
-                            [this](cache::Slot& slot) { return Reset(slot); });
+    result_ =
+        slot_.Discard(cache_.resources->diagnostic_ready,
+                      [this, untouched](cache::Slot& slot) {
+                        const auto result =
+                            untouched ? DiscardResult::kComplete : Reset(slot);
+                        if (result == DiscardResult::kComplete)
+                          state_.reset();  // Facade destruction precedes
+                                           // availability to the next user.
+                        return result;
+                      });
     if (result_ == DiscardResult::kComplete) {
-      const std::lock_guard lock(cache_.mutex.native);
-      entry_.busy = false;
+      cache_.SettleDiagnostic(entry_, false);
       active_ = false;
     } else if (result_ == DiscardResult::kQuarantined) {
       Quarantine();
     }
     return result_;
   }
-  void Quarantine() noexcept override {
-    if (!active_)
-      return;
-    const std::lock_guard lock(cache_.mutex.native);
-    entry_.diagnostic_quarantine = std::move(state_);
-    slot_.Quarantine();  // Keep entry busy; no ordinary release/reset fallback.
-    active_ = false;
-    result_ = DiscardResult::kQuarantined;
-  }
-
-private:
   DiscardResult Reset(cache::Slot& slot) {
     const auto result = cache_.resources->diagnostic_reset(slot, *state_);
     if (result != DiscardResult::kComplete)
@@ -1234,16 +1268,17 @@ private:
   bool active_{true};
 };
 }  // namespace
+std::size_t ComponentTextCache::DiagnosticRequestBytes() noexcept {
+  return sizeof(DiagnosticRequest);
+}
 std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
     const ContinuationCache::CancellationCheck& cancelled) {
   if (!impl_->resources->diagnostic_ready ||
       !impl_->resources->diagnostic_reset || (cancelled && cancelled()))
     return {};
-  std::unique_lock lock(impl_->mutex.native, std::try_to_lock);
-  if (!lock.owns_lock())
-    return {};
+  std::unique_lock lock(impl_->mutex.native);
   for (auto& entry : impl_->entries) {
-    if (entry->busy || entry->live || !entry->live_tokens.empty() ||
+    if (!entry->Selectable() || entry->live || !entry->live_tokens.empty() ||
         entry->history || entry->branch || entry->durable)
       continue;
     auto slot =
@@ -1252,19 +1287,34 @@ std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
       continue;
     entry->busy = true;
     lock.unlock();  // Native reset/fence never holds publication/queue locks.
+    std::unique_ptr<TextRunnerState> state;
+    std::unique_ptr<DiagnosticRequest> result;
     try {
-      auto result =
-          std::make_unique<DiagnosticRequest>(*impl_, *entry, std::move(*slot));
-      if (!result->Initialize())
-        return {};
-      if (cancelled && cancelled()) {
-        (void)result->Discard();
-        return {};
+      state = impl_->runner->BindComponentState(*impl_->resources->adapter,
+                                                slot->Execution());
+      if (state) {
+        result = std::make_unique<DiagnosticRequest>(
+            *impl_, *entry, std::move(*slot), std::move(state));
+        if (!result->Initialize())
+          return {};
+        if (cancelled && cancelled()) {
+          (void)result->Discard();
+          return {};
+        }
+        return result;
       }
-      return result;
     } catch (...) {
-      return {};  // Exclusive slot and any bound state remain quarantined.
+      if (result)
+        return {};  // Reset started: its destructor conservatively quarantines.
     }
+    // Binding/allocation failed before reset. No native work was started.
+    state.reset();
+    const auto settled = slot->Discard(
+        impl_->resources->diagnostic_ready,
+        [](cache::Slot&) { return cache::DiagnosticDiscardResult::kComplete; });
+    impl_->SettleDiagnostic(
+        *entry, settled != cache::DiagnosticDiscardResult::kComplete);
+    return {};
   }
   return {};
 }
@@ -1871,7 +1921,7 @@ void ComponentTextCache::InitializePins(
 }
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
-  return impl_->entries.size();
+  return impl_->entries.size() - impl_->quarantined_slots.load();
 }
 
 std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
@@ -1909,7 +1959,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (found.selected && found.selected->live) {
       const auto location = *found.selected->live;
       auto& selected_entry = *impl_->entries.at(location.slot.value - 1);
-      if (!selected_entry.busy) {
+      if (selected_entry.Selectable()) {
         entry = &selected_entry;
         live = location;
       }
@@ -1923,7 +1973,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       std::vector<std::pair<Impl::Entry*, Impl::VictimCost>> costs;
       costs.reserve(impl_->entries.size());
       for (const auto& candidate : impl_->entries)
-        if (!candidate->busy)
+        if (candidate->Selectable())
           costs.emplace_back(candidate.get(), impl_->CostToReplace(*candidate));
       const auto cost = [&](const Impl::Entry& e) -> const Impl::VictimCost& {
         return std::ranges::find(costs, &e, &decltype(costs)::value_type::first)
@@ -1941,7 +1991,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       std::string_view victim_reason = "minimum_recovery_cost";
       std::optional<Rank> selected_rank;
       for (auto& candidate : impl_->entries) {
-        if (candidate->busy)
+        if (!candidate->Selectable())
           continue;
         if (!entry) {
           entry = candidate.get();
@@ -1963,7 +2013,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         Impl::Entry* ready = nullptr;
         std::optional<Rank> ready_rank;
         for (auto& candidate : impl_->entries) {
-          if (candidate.get() == entry || candidate->busy ||
+          if (candidate.get() == entry || !candidate->Selectable() ||
               !candidate->slot->ExecutionComplete())
             continue;
           const auto candidate_rank = rank(*candidate);
@@ -1973,8 +2023,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           const auto live_copy = [&] {
             return candidate->history &&
                    std::ranges::any_of(impl_->entries, [&](const auto& other) {
-                     return other != candidate && !other->busy && other->live &&
-                            other->history &&
+                     return other != candidate && other->Selectable() &&
+                            other->live && other->history &&
                             other->history->Lineage() ==
                                 candidate->history->Lineage() &&
                             other->live_input == candidate->live_input &&
@@ -2013,13 +2063,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                 "acquisition_id=" +
                 std::to_string(acquisition_id) +
                 " slot_id=" + std::to_string(i + 1) +
-                " eligible=" + std::to_string(!candidate.busy) +
+                " eligible=" + std::to_string(candidate.Selectable()) +
                 " live_entry_id=" +
                 std::to_string(candidate.live ? candidate.live->value : 0) +
                 " live_tokens=" + std::to_string(candidate.live_tokens.size()) +
                 " last_acquisition=" + std::to_string(candidate.used) +
                 " chosen=" + std::to_string(&candidate == entry);
-            if (!candidate.busy) {
+            if (candidate.Selectable()) {
               const auto& estimate = cost(candidate);
               message +=
                   " recovery_tier=" + std::string(estimate.tier) +
@@ -2035,8 +2085,12 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         }
       }
     }
-    if (!entry)
+    if (!entry) {
+      if (capacity() == 0)
+        throw TextGenerationError(TextGenerationErrorCode::kCacheUnavailable,
+                                  "no usable cache slots; reload the model");
       throw cache::SlotBusy();
+    }
     entry->busy = true;
     entry->used = ++impl_->clock;
     if (!live) {

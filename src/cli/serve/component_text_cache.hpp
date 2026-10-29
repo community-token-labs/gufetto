@@ -153,6 +153,11 @@ public:
       const ContinuationCache::CancellationCheck&,
       std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
       bool persist = true);
+  // Full concrete fixed lease object (not the interface base), with no
+  // allocation. Provider-owned BindComponentState heap storage is separate and
+  // must also be booked by the provider; this object owns no
+  // vectors/strings/functions.
+  [[nodiscard]] static std::size_t DiagnosticRequestBytes() noexcept;
   [[nodiscard]] std::unique_ptr<TextDiagnosticLease> TryAcquireDiagnostic(
       const ContinuationCache::CancellationCheck& = {});
   [[nodiscard]] std::optional<ContinuationReuse> Lookup(

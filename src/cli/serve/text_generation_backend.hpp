@@ -35,6 +35,7 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kToolChoiceUnsatisfied,
   kDeviceLost,
   kCacheLookupBusy,
+  kCacheUnavailable,
 };
 
 /// Client-facing message for a GPU context that can no longer execute work.
@@ -59,6 +60,7 @@ public:
       case TextGenerationErrorCode::kSchedulerStopping:
       case TextGenerationErrorCode::kDeviceLost:
       case TextGenerationErrorCode::kCacheLookupBusy:
+      case TextGenerationErrorCode::kCacheUnavailable:
         return 503;
       case TextGenerationErrorCode::kToolChoiceUnsatisfied:
         return 502;
@@ -85,6 +87,8 @@ public:
         return "device_lost";
       case TextGenerationErrorCode::kCacheLookupBusy:
         return "cache_lookup_busy";
+      case TextGenerationErrorCode::kCacheUnavailable:
+        return "cache_unavailable";
     }
     return "generation_error";
   }

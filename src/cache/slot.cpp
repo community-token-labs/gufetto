@@ -937,6 +937,8 @@ DiagnosticDiscardResult DiagnosticSlotLease::Discard(
       state_->stop = {};
       state_->leased = false;
       state_->live = false;
+      state_->idle_next = state_->rows.begin();
+      state_->idle_failed = false;
       state_->changed.notify_all();
     }
     state_.reset();
