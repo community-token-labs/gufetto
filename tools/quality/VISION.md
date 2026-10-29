@@ -15,8 +15,14 @@ python3 tools/quality/vision_reference.py operator-input.json --output NEW_REFER
 ```
 
 The generator produces three invented geometric images (1024², 2048², 4096²)
-and three synthetic editor/terminal/dashboard screenshots (1280×768, 1920×1088,
-1536×1024). No desktop capture, personal content, external assets or fonts.
+and four synthetic editor/terminal/dashboard screenshots (1280×768, 1920×1088,
+1536×1024, and a dense 1920×1088 code editor). The dense editor has 40 pseudocode
+lines and 35 test/output lines, 10×14-pixel glyphs, and a frozen code-reading
+prompt. Its height is aligned to 32 pixels, eight pixels above 1080. Adding it
+preserves the original six PNG/RGB identities and prompts; the generator source
+hash and seven-case manifest hash change. Freeze a matching amended tensor plan
+and per-case downstream stratum before captures; never pool it with the equally
+sized terminal case. No desktop capture, personal content, external assets or fonts.
 PNG and uncompressed RGB SHA-256, original generator-source provenance, exact
 sizes and frozen prompts are in `manifest.json`. Directory0700/files0600; existing
 paths are refused. Retain assets privately; commit the manifest, not image binaries.
