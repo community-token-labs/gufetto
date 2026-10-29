@@ -5,6 +5,7 @@ add_library(gufo_qwen38_flash_next STATIC
   continuation_layout.cpp
   kv_cache.cpp
   ngram.cpp
+  npu_contracts.cpp
   rope_scaling.cpp
   weights.cpp)
 
