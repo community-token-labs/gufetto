@@ -11,11 +11,15 @@ namespace gufo::core {
 /// Scheme tag for full-content GGUF identities.
 inline constexpr std::string_view kGgufIdentityScheme = "gguf-sha256-v1";
 
-/// Hashes every byte of every shard, including metadata and tensor padding.
-/// File digests are cached privately by inode, size, mtime and ctime; memory
-/// images are always hashed. Copies have identical identities. The initial
-/// scan reads the full artifact; later launches reuse its cached full digest.
-/// Throws if the mapped artifact changes while its identity is computed.
+/// Full-content identity of every shard, including metadata and tensor padding.
+/// Memory images are always hashed. File memos require matching stat fields,
+/// an optional kernel immutable digest, and freshly read header/index plus
+/// bounded payload samples. Copies have identical identities; a memo miss
+/// scans the full artifact. Old stat-only memos are not reused.
+/// Throws on detected changes during lookup, NOT on every possible rewrite:
+/// without fs-verity, a same-stat rewrite confined to unsampled bytes can
+/// escape detection. Models must remain stable during lookup and use.
+/// See docs/GGUF_IDENTITY.md for the trust boundary and sampling contract.
 [[nodiscard]] std::string GgufIdentityHex(const GgufReader& reader);
 
 }  // namespace gufo::core

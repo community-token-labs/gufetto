@@ -1,6 +1,8 @@
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/fsverity.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -136,6 +138,27 @@ Directory OpenDirectoryAt(const Directory& dir, std::string_view name,
   result.path_ = dir.path_ / std::string(name);
   result.fd_ = fd;
   return result;
+}
+
+std::string ImmutableFileDigest(PlatformFile file) {
+  // Same layout as fsverity_digest followed by room for SHA-512.
+  struct Measurement {
+    std::uint16_t algorithm;
+    std::uint16_t size;
+    unsigned char bytes[64];
+  } digest{0, 64, {}};
+  static_assert(offsetof(Measurement, bytes) == sizeof(fsverity_digest));
+  if (::ioctl(file, FS_IOC_MEASURE_VERITY, &digest) != 0 ||
+      !((digest.algorithm == FS_VERITY_HASH_ALG_SHA256 && digest.size == 32) ||
+        (digest.algorithm == FS_VERITY_HASH_ALG_SHA512 && digest.size == 64)))
+    return {};
+  std::string token = "fs-verity:" + std::to_string(digest.algorithm) + ":";
+  constexpr char hex[] = "0123456789abcdef";
+  for (std::size_t i = 0; i < digest.size; ++i) {
+    token += hex[digest.bytes[i] >> 4];
+    token += hex[digest.bytes[i] & 15];
+  }
+  return token;
 }
 
 bool Stat(PlatformFile file, FileInfo* out, std::error_code& ec) noexcept {
