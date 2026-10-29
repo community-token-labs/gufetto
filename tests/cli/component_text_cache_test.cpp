@@ -2722,6 +2722,7 @@ class PredictionRunner : public Runner {
 public:
   std::size_t private_limit{1 << 20};
   mutable std::size_t allocation_refusals{};
+  mutable cache::ResourceLedger* resource_ledger{};
   mutable bool fail_reconcile{};
   PredictionRunner() {
     row_blocks = private_blocks = 0;
@@ -2730,6 +2731,7 @@ public:
   std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
       cache::ResourceLedger& ledger, std::size_t budget) const override {
     auto resources = Runner::CreateComponentCacheResources(ledger, budget);
+    resource_ledger = &ledger;
     resources->allocate = [this,
                            &ledger](const cache::PayloadRequest& request) {
       if (request.category == cache::ResourceCategory::kPrivateState &&
@@ -2762,6 +2764,91 @@ public:
       throw std::runtime_error("test later handoff failure");
   }
 };
+
+void RequiredPublicationUsesOwnedPredictionUnderMetadataPressure() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const std::vector<TextRunnerToken> anchor{90, 91};
+  {
+    auto seed = cache.Acquire(anchor, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(seed->state());
+    runner->adapter->Append(state.slot, anchor, anchor);
+    assert(seed->TryReserveSnapshot(seed->CaptureBytes(), anchor.size(), false,
+                                    SnapshotPurpose::kContinuation, {}));
+    assert(seed->PublishSnapshot(anchor, seed->Capture(), false));
+  }
+  std::vector<TextRunnerToken> prompt(20);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto creator = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(creator->state());
+  const auto root = std::span(prompt).first(8);
+  runner->adapter->Append(state.slot, root, root);
+  assert(creator->TryReserveSnapshot(creator->CaptureBytes(), 8, true,
+                                     SnapshotPurpose::kHistory, {},
+                                     SnapshotOrigin::kPredicted));
+  assert(creator->PublishSnapshot({root.begin(), root.end()},
+                                  creator->Capture(), true));
+  const auto tail = std::span(prompt).subspan(8);
+  runner->adapter->Append(state.slot, tail, tail);
+  assert(creator->TryReserveSnapshot(creator->CaptureBytes(), prompt.size(),
+                                     true, SnapshotPurpose::kContinuation, {}));
+  auto required = creator->Capture();
+  // Real metadata failure occurs inside Admit, after capture and all root
+  // temporaries have gone. Zero headroom must not sacrifice the ordinary
+  // anchor.
+  auto& ledger = *runner->resource_ledger;
+  auto pressure =
+      ledger
+          .Reserve(cache::ResourceCategory::kBackingFree,
+                   ledger.Limits().ram_bytes - ledger.Snapshot().ram_bytes)
+          .Convert();
+  assert(creator->PublishSnapshot(prompt, std::move(required), true));
+  assert(creator->HasSnapshotFor(anchor) && creator->HasSnapshotFor(prompt));
+  assert(!creator->HasSnapshotFor(root));
+}
+
+void RequiredExactReplacementKeepsRootAtFullRecordCapacity() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 1, 1 << 24, {});
+  std::vector<TextRunnerToken> prompt(20);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const auto seed = [&](std::vector<TextRunnerToken> tokens) {
+    auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, tokens, tokens);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), tokens.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     {}));
+    assert(lease->PublishSnapshot(tokens, lease->Capture(), false));
+  };
+  for (std::size_t i = 0; i < cache::RetentionPolicy::kRecordLimit - 2; ++i)
+    seed({static_cast<TextRunnerToken>(1000 + i), 9});
+  seed({prompt.begin(), prompt.begin() + 16});
+  // Cold creator can capture the structural root before the pre-existing
+  // stable point. Publishing it fills the table's final record.
+  auto creator = cache.Acquire(prompt, {}, {}, false, 0, true);
+  auto& state = dynamic_cast<State&>(creator->state());
+  const auto root = std::span(prompt).first(8);
+  runner->adapter->Append(state.slot, root, root);
+  assert(creator->TryReserveSnapshot(creator->CaptureBytes(), 8, true,
+                                     SnapshotPurpose::kHistory, {},
+                                     SnapshotOrigin::kPredicted));
+  assert(creator->PublishSnapshot({root.begin(), root.end()},
+                                  creator->Capture(), true));
+  for (const auto end : {16U, 17U}) {
+    const auto start = end == 16 ? 8 : 16;
+    const auto tail = std::span(prompt).subspan(start, end - start);
+    runner->adapter->Append(state.slot, tail, tail);
+    assert(creator->TryReserveSnapshot(creator->CaptureBytes(), end, true,
+                                       SnapshotPurpose::kContinuation, {}));
+    assert(creator->PublishSnapshot({prompt.begin(), prompt.begin() + end},
+                                    creator->Capture(), true));
+    // Exact replacement requires no extra record. Only the next new record
+    // invokes owner withdrawal, before any unrelated ordinary victim.
+    assert(creator->HasSnapshotFor(root) == (end == 16));
+    assert(creator->HasSnapshotFor(std::vector<TextRunnerToken>{1000, 9}));
+  }
+}
 
 void PredictionPlannerSharesQuotaAndDeduplicatesPending() {
   auto runner = std::make_shared<PredictionRunner>();
@@ -6011,6 +6098,8 @@ int main(int argc, char* argv[]) {
     UnpinnedRunnersKeepTheirLimit();
     DiskDirectoryHasOneOwner();
     PredictedSnapshotsRemainRamOnly();
+    RequiredPublicationUsesOwnedPredictionUnderMetadataPressure();
+    RequiredExactReplacementKeepsRootAtFullRecordCapacity();
     PredictionPlannerSharesQuotaAndDeduplicatesPending();
     SchedulerCarriesStructuralRootMetadata();
     UnreadyPredictionDoesNotObserveOrTaintFallback();
