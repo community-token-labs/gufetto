@@ -17,11 +17,15 @@ constexpr std::uint64_t QfnDeepCheckpointMinimumBytes(
   using models::qwen38_flash_next::KvCacheType;
   using models::qwen38_flash_next::KvRowBytes;
   const auto f16_row_bytes = KvRowBytes(kv_elements, KvCacheType::kF16);
-  const auto selected_row_bytes = KvRowBytes(kv_elements, cache_type);
+  const auto selected_pair_bytes =
+      KvRowBytes(kv_elements,
+                 models::qwen38_flash_next::KvKeyType(cache_type)) +
+      KvRowBytes(kv_elements,
+                 models::qwen38_flash_next::KvValueType(cache_type));
   if (f16_row_bytes == 0)
     throw std::invalid_argument(
         "checkpoint memory bound needs a nonempty KV row");
-  return f16_minimum * selected_row_bytes / f16_row_bytes;
+  return f16_minimum * selected_pair_bytes / (2 * f16_row_bytes);
 }
 
 }  // namespace gufo::test

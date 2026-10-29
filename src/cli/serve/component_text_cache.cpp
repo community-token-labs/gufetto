@@ -66,7 +66,8 @@ bool PackedKvIngress(const TextRunnerDescriptor& descriptor,
   // Inspect the registered append layout even without a durable fingerprint.
   if (std::ranges::any_of(components, [](const auto& c) {
         return c.kind == cache::ComponentKind::kAppendRows &&
-               c.layout_version == 2;
+               (c.layout_version == 2 ||
+                (c.layout_version >= 4 && c.layout_version <= 7));
       }))
     return true;
   return RotatedPackedIngress(descriptor, components);

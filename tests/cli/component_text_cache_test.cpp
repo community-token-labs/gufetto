@@ -3988,6 +3988,7 @@ void LookupRuntimeDefaultsAndDisabled() {
     assert(transfer.Lookup(prompt).epoch.empty());
   }
 }
+#include "tests/cli/cache_completion_fanout_checks.hpp"
 #include "tests/cli/cache_lookup_checks.hpp"
 #include "tests/cli/cache_lookup_r3_checks.hpp"
 #include "tests/cli/cache_packed_transfer_checks.hpp"
@@ -4450,6 +4451,7 @@ int main(int argc, char* argv[]) {
 #endif
   });
   run("lifecycle", [] {
+    completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();
     SchedulerSharesAnExactPendingFrontier();

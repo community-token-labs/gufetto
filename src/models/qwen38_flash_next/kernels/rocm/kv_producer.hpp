@@ -6,6 +6,16 @@
 
 namespace gufo::models::qwen38_flash_next::rocm::detail {
 
+// Storage codecs remain F16 for the control. Only live K insertion carries
+// the perturbation policy; restore and every V producer use the storage type.
+[[nodiscard]] constexpr KvCacheType KvKeyProducerType(KvCacheType type) {
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+  if (type == KvCacheType::kBf16KControl)
+    return type;
+#endif
+  return KvKeyType(type);
+}
+
 // Private executor sequencing boundary for separately projected cache-only
 // rows. Prepare performs K RMS/RoPE; Store is the canonical codec-only store.
 // Callbacks keep this exact production sequence testable without HIP. They do

@@ -233,16 +233,17 @@ Completion FakeStream::SubmitTracked(
 }
 
 Capabilities FakeAdapter::GetCapabilities() const {
-  return {.continuation = true, .persistent_encoding = true};
+  return capabilities_;
 }
-FakeAdapter::FakeAdapter(Rows rows_per_chunk)
+FakeAdapter::FakeAdapter(Rows rows_per_chunk, Capabilities capabilities)
     : components_{{
           {kTarget, 1, ComponentKind::kAppendRows, sizeof(Token),
            rows_per_chunk, 0},
           {kDraft, 1, ComponentKind::kAppendRows, sizeof(Token), rows_per_chunk,
            0},
           {kRecurrent, 1, ComponentKind::kPrivateState, 0, 0, 32},
-      }} {}
+      }},
+      capabilities_(capabilities) {}
 std::span<const ComponentDescriptor> FakeAdapter::Components() const {
   return components_;
 }
@@ -293,6 +294,7 @@ std::vector<ComponentPosition> FakeAdapter::PrefillCheckpointPositions(
 }
 void FakeAdapter::BeginRestore(Slot& slot,
                                std::span<const ComponentPosition> positions) {
+  ++restore_begins_;
   auto& state = AsSlot(slot);
   if (state.Busy() || state.failed || state.restoring)
     throw std::logic_error(
@@ -405,13 +407,15 @@ Completion FakeAdapter::CapturePrivatePiece(const Slot& slot, ComponentId id,
     throw std::invalid_argument("invalid private capture piece");
   const auto& state = AsSlot(slot);
   RequireCapture(state);
-  return SubmitRead(slot, stream, [&state, offset, dst] {
+  auto completion = SubmitRead(slot, stream, [&state, offset, dst] {
     std::memcpy(
         dst.data(),
         reinterpret_cast<const std::byte*>(state.recurrent.data()) + offset,
         dst.size());
     return TransferResult::kSucceeded;
   });
+  return capture_completion ? capture_completion(id, std::move(completion))
+                            : std::move(completion);
 }
 Completion FakeAdapter::CopyRowsOut(const Slot& slot, ComponentId id,
                                     Rows first, Rows end,
@@ -422,11 +426,13 @@ Completion FakeAdapter::CopyRowsOut(const Slot& slot, ComponentId id,
   const auto& rows = RowArray(state, id);
   if (end > rows.size())
     throw std::invalid_argument("cannot capture unavailable rows");
-  return SubmitRead(slot, stream, [&rows, first, dst] {
+  auto completion = SubmitRead(slot, stream, [&rows, first, dst] {
     if (!dst.empty())
       std::memcpy(dst.data(), rows.data() + first, dst.size());
     return TransferResult::kSucceeded;
   });
+  return capture_completion ? capture_completion(id, std::move(completion))
+                            : std::move(completion);
 }
 Completion FakeAdapter::CopyRowsIn(Slot& slot, ComponentId id, Rows first,
                                    Rows end, std::span<const std::byte> src,
