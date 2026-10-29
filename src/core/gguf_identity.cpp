@@ -55,7 +55,7 @@ platform::Directory OpenCacheDirectory() {
   std::filesystem::create_directories(base, error);
   if (error)
     return {};
-  base /= "gguf-sha256-v1";
+  base /= "gguf-sha256-memo-v2";
   (void)platform::MakeDirectory(base, error);
   platform::Directory directory;
   if (!directory.Open(base, error))
@@ -183,60 +183,111 @@ void HashFile(crypto::Sha256Hasher& hash, platform::PlatformFile file,
   }
 }
 
-std::string RegionDigest(const GgufMappedRegion& region) {
-  std::string stamp;
-  if (platform::FileValid(region.file_descriptor))
-    stamp = FileStamp(region.file_descriptor, region.size);
-  platform::Directory cache =
-      stamp.empty() ? platform::Directory{} : OpenCacheDirectory();
-  crypto::Sha256Hasher key_hash;
-  HashString(key_hash, stamp);
-  const auto key = key_hash.FinishHex();
-  std::string digest = ReadDigest(cache, key);
-  const bool cached = !digest.empty();
-  if (!cached) {
-    crypto::Sha256Hasher hash;
-    constexpr std::size_t chunk = 8 * 1024 * 1024;
-    if (platform::FileValid(region.file_descriptor)) {
-      HashFile(hash, region.file_descriptor, region.size);
-    } else {
-      const auto* bytes = static_cast<const std::uint8_t*>(region.data);
-      for (std::size_t offset = 0; offset < region.size;) {
-        const auto length = std::min(chunk, region.size - offset);
-        hash.Update({bytes + offset, length});
-        offset += length;
-      }
+// This is a bounded change detector, not a replacement for the full digest.
+// Keep the layout version in the memo namespace when changing these windows.
+std::string ContentFingerprint(const GgufMappedRegion& region) {
+  constexpr std::size_t kBlock = 64 * 1024;
+  constexpr std::size_t kWindows = 256;
+  if (region.header_size > region.size)
+    throw std::runtime_error("invalid GGUF header extent for identity");
+  crypto::Sha256Hasher hash;
+  std::array<std::uint8_t, kBlock> buffer{};
+  const auto range = [&](std::size_t offset, std::size_t length) {
+    HashString(hash, ":" + std::to_string(offset) + ":" +
+                         std::to_string(length) + ":");
+    while (length) {
+      const auto requested = std::min(length, buffer.size());
+      std::error_code ec;
+      const auto count = platform::ReadAt(region.file_descriptor, offset,
+                                          buffer.data(), requested, ec);
+      if (count == 0 && ec == std::errc::interrupted)
+        continue;
+      if (count == 0)
+        throw std::runtime_error("cannot read GGUF identity fingerprint");
+      hash.Update({buffer.data(), count});
+      offset += count;
+      length -= count;
     }
-    digest = hash.FinishHex();
+  };
+  range(0, region.header_size);
+  const auto payload = region.size - region.header_size;
+  if (payload <= kWindows * kBlock) {
+    range(region.header_size, payload);
+  } else {
+    const auto span = payload - kBlock;
+    for (std::size_t i = 0; i < kWindows; ++i) {
+      // Distribute inclusive first/last windows without overflowing size_t.
+      const auto offset = (span / (kWindows - 1)) * i +
+                          (span % (kWindows - 1)) * i / (kWindows - 1);
+      range(region.header_size + offset, kBlock);
+    }
   }
-  if (!stamp.empty() &&
-      FileStamp(region.file_descriptor, region.size) != stamp) {
-    throw std::runtime_error("GGUF file changed during identity lookup");
+  return hash.FinishHex();
+}
+
+std::string Probe(const GgufMappedRegion& region) {
+  if (!platform::FileValid(region.file_descriptor))
+    return {};
+  const auto stamp = FileStamp(region.file_descriptor, region.size);
+  const auto immutable = platform::ImmutableFileDigest(region.file_descriptor);
+  const auto fingerprint = ContentFingerprint(region);
+  if (FileStamp(region.file_descriptor, region.size) != stamp)
+    throw std::runtime_error("GGUF file changed during identity probe");
+  crypto::Sha256Hasher hash;
+  HashString(hash, stamp + ":" + immutable + ":" + fingerprint);
+  return hash.FinishHex();
+}
+
+std::string RegionDigest(const GgufMappedRegion& region) {
+  crypto::Sha256Hasher hash;
+  constexpr std::size_t chunk = 8 * 1024 * 1024;
+  if (platform::FileValid(region.file_descriptor)) {
+    HashFile(hash, region.file_descriptor, region.size);
+  } else {
+    const auto* bytes = static_cast<const std::uint8_t*>(region.data);
+    for (std::size_t offset = 0; offset < region.size;) {
+      const auto length = std::min(chunk, region.size - offset);
+      hash.Update({bytes + offset, length});
+      offset += length;
+    }
   }
-  if (!cached)
-    StoreDigest(cache, key, digest);
-  return digest;
+  return hash.FinishHex();
 }
 
 }  // namespace
 
 std::string GgufIdentityHex(const GgufReader& reader) {
-  std::vector<std::string> stamps;
-  for (const auto& region : reader.GetMappedRegions())
-    stamps.push_back(platform::FileValid(region.file_descriptor)
-                         ? FileStamp(region.file_descriptor, region.size)
-                         : std::string{});
+  const auto regions = reader.GetMappedRegions();
+  std::vector<std::string> probes;
+  for (const auto& region : regions)
+    probes.push_back(Probe(region));
+  auto cache = std::any_of(probes.begin(), probes.end(),
+                           [](const auto& probe) { return !probe.empty(); })
+                   ? OpenCacheDirectory()
+                   : platform::Directory{};
+  std::vector<std::string> digests;
+  std::vector<bool> misses;
   crypto::Sha256Hasher hash;
   HashString(hash, kGgufIdentityScheme);
-  for (const auto& region : reader.GetMappedRegions()) {
-    HashString(hash, ":" + std::to_string(region.size) + ":");
-    HashString(hash, RegionDigest(region));
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    auto digest =
+        probes[i].empty() ? std::string{} : ReadDigest(cache, probes[i]);
+    misses.push_back(digest.empty());
+    if (digest.empty())
+      digest = RegionDigest(regions[i]);
+    HashString(hash, ":" + std::to_string(regions[i].size) + ":");
+    HashString(hash, digest);
+    digests.push_back(std::move(digest));
   }
-  for (std::size_t index = 0; index < stamps.size(); ++index) {
-    const auto& region = reader.GetMappedRegions()[index];
-    if (!stamps[index].empty() &&
-        stamps[index] != FileStamp(region.file_descriptor, region.size))
+  // Recheck every shard, including those completed before another shard's
+  // full scan. Never publish a memo for a lookup that failed verification.
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    if (Probe(regions[i]) != probes[i])
       throw std::runtime_error("GGUF artifact changed during identity lookup");
+  }
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+    if (misses[i] && !probes[i].empty())
+      StoreDigest(cache, probes[i], digests[i]);
   }
   return hash.FinishHex();
 }

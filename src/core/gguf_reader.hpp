@@ -150,6 +150,8 @@ struct GgufMappedRegion {
   /// instead of resolving `source_path` again.
   platform::PlatformFile file_descriptor{platform::kInvalidFile};
   std::filesystem::path source_path{};
+  /// Complete header and tensor index, including alignment padding.
+  std::size_t header_size{0};
 };
 
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
@@ -242,6 +244,7 @@ private:
 
   const std::uint8_t* data_{nullptr};
   std::size_t size_{0};
+  std::size_t header_size_{0};
   std::filesystem::path source_path_;
   platform::ReadOnlyMappedFile mapping_;
 

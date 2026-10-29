@@ -125,6 +125,11 @@ PlatformFile OpenForAppend(const std::filesystem::path& path,
 Directory OpenDirectoryAt(const Directory& dir, std::string_view name,
                           std::error_code& ec) noexcept;
 
+/// Kernel-measured immutable content token (Linux fs-verity algorithm/digest).
+/// Empty when unavailable, unsupported or not enabled. Never enables verity or
+/// treats inode generation/mtime as a content change counter.
+std::string ImmutableFileDigest(PlatformFile file);
+
 /// Stats an open file. Returns false and sets `ec` on failure.
 bool Stat(PlatformFile file, FileInfo* out, std::error_code& ec) noexcept;
 
