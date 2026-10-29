@@ -93,6 +93,8 @@ public:
   [[nodiscard]] std::uint64_t RecurrentHash(const Slot&) const;
   // Isolate host guard overhead and row-range tests without fixture mutation.
   void GuardRows(Slot&, ComponentId, Rows first, Rows end);
+  // Configure before creating slots; other row components stay borrowable.
+  void DisableBorrowRows(ComponentId);
   void FailNextAllocation() noexcept;
   void FailNextTransfer() noexcept;
   [[nodiscard]] std::size_t Invalidations() const noexcept {
@@ -105,6 +107,7 @@ private:
   [[nodiscard]] Completion SubmitLoad(Slot&, Stream&,
                                       std::function<TransferResult()>);
   std::array<ComponentDescriptor, 3> components_;
+  std::array<bool, 2> borrow_rows_{true, true};
   bool fail_allocation_{false};
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};
