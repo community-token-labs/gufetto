@@ -9,11 +9,15 @@
 
 namespace gufo::cli {
 
+inline constexpr std::string_view kPlainQ4QualityError =
+    "plain q4 KV modes failed the quality screen; use q4_0-rotated or "
+    "q8_0/q4_0-rotated";
+
 inline void RegisterKvCacheTypeOption(
     ArgParser& parser, models::qwen38_flash_next::KvCacheType* type) {
   parser.AddCustomOption(
       "", "--kv-cache-type", "TYPE",
-      "Ordinary K/V storage: f16 (default), q8_0, q4_0, q8_0/q4_0, "
+      "Ordinary K/V storage: f16 (default), q8_0, "
       "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated "
       "(quantized modes are experimental and lossy; Flash-Next only)"
 #ifdef GUFO_ENABLE_BF16_K_CONTROL
@@ -29,11 +33,11 @@ inline void RegisterKvCacheTypeOption(
           *type = KvCacheType::kQ8_0;
         else if (value == "q8_0-rotated")
           *type = KvCacheType::kQ8_0Rotated;
-        else if (value == "q4_0")
-          *type = KvCacheType::kQ4_0;
-        else if (value == "q8_0/q4_0")
-          *type = KvCacheType::kQ8_0Q4_0;
-        else if (value == "q4_0-rotated")
+        else if (value == "q4_0" || value == "q8_0/q4_0") {
+          if (error)
+            *error = kPlainQ4QualityError;
+          return false;
+        } else if (value == "q4_0-rotated")
           *type = KvCacheType::kQ4_0Rotated;
         else if (value == "q8_0/q4_0-rotated")
           *type = KvCacheType::kQ8_0Q4_0Rotated;
@@ -44,7 +48,7 @@ inline void RegisterKvCacheTypeOption(
         else {
           if (error)
             *error =
-                "--kv-cache-type must be f16, q8_0, q4_0, q8_0/q4_0, "
+                "--kv-cache-type must be f16, q8_0, "
                 "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated";
           return false;
         }
@@ -58,6 +62,13 @@ inline bool ValidateKvCacheTypeForArchitecture(
     models::qwen38_flash_next::KvCacheType type, std::string_view architecture,
     std::string* error) {
   using models::qwen38_flash_next::KvCacheType;
+  // The underlying q4 codecs/geometry also serve the rotated implementations;
+  // knowing their storage identity does not admit an unqualified CLI policy.
+  if (type == KvCacheType::kQ4_0 || type == KvCacheType::kQ8_0Q4_0) {
+    if (error)
+      *error = kPlainQ4QualityError;
+    return false;
+  }
   if (models::qwen38_flash_next::IsKnownKvCacheType(type) &&
       (type == KvCacheType::kF16 || architecture == "qwen4exp"))
     return true;

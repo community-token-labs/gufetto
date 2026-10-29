@@ -13,6 +13,7 @@ q8 KV is fork-only: upstream #855 was closed without merging.
 
 - `q8-kv`: experimental plain and rotated block32 q8 Flash-Next KV storage.
 - `q8-speed`: exact q8 prefill/decode/verification optimizations.
+- `kv-q4`: opt-in rotated q4 and rotated K=q8/V=q4 Flash-Next KV storage.
 - `fork-docs`: q8 usage, evidence and numerical limitations.
 - `perf-tracing`: opt-in Flash-Next serving diagnostics.
 - `pinned-prefixes`: persistent, registered multi-prefix caching.
@@ -50,6 +51,48 @@ require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and
 See [README](README.md), [q8 reproduction](docs/q8-kv-cache/reproduce.md) and
 [testing](docs/TESTING.md): CPU passes and a short smoke are not model-quality,
 performance or public-release qualification.
+
+## Rotated q4 capacity options
+
+**F16 remains the default.** For opt-in capacity, prefer
+`--kv-cache-type q8_0/q4_0-rotated` (K=q8, V=q4); use
+`--kv-cache-type q4_0-rotated` for maximum capacity. Both apply the existing
+Hadamard basis and are lossy, Flash-Next-only modes. Plain `q4_0` and
+`q8_0/q4_0` failed the numerical screen and are rejected by the CLI, not aliases.
+The shared low-level q4 codec/geometry remains tested for the rotated paths.
+Snapshot identities distinguish the policies and refuse mismatched restores.
+
+Qualification: **screen-level pass (144-row screen); larger original gates not
+run**. Rotated K8/V4 mean KL was 0.001949 with 99.31% top-1 agreement versus F16;
+rotated q4 was 0.003314 /97.92%. Rotated K8/V4 is near the q8/BF16-K control
+error level in this screen (plain q8 KL 0.001371; BF16-K 0.001796), not a claim
+of irreducible noise or permission to subtract control error. Category/long
+strata with only two histories remain underpowered. The original full corpus,
+independent real-long, retrieval, greedy and coding-agent-loop gates were not run.
+
+**Open speed warning:** free-running MTP can be materially slower with q4 KV;
+its changed output histories and draft acceptance do not isolate loader cost.
+The standard depth8192 benchmark measured rotated q4 about42.3 tokens/s and
+rotated K8/V4 about42.2, versus rotated q8 about47.8 and F16 about96.2. Separate
+fixed-ID whole-model AR measurements met the 0.97×q8 floor for all q4 policies,
+with roughly1–2.4% slowdown. Neither result proves attention-only speed parity.
+
+Measured S1 memory at100000-token capacity, actual target frontier99899:
+
+| Storage | Target tokens/GiB ordinary live payload | Session allocation (decimal GB) |
+|---|---:|---:|
+| F16 |40330|3.08|
+| q8 |75915|1.83|
+| rotated q4 |143396|1.16|
+| rotated K8/V4 |99274|1.49|
+
+Plain/rotated variants have equal persistent geometry. Session allocation
+excludes shared scratch; ordinary borrowed spans are canonical payload, not an
+extra physical allocation. These are not retained-checkpoint RAM measurements.
+The memory run auto-loaded vision; its85.16GB model residency and separate1GiB
+backing allocation are not in the session column. Raw per-format results and
+limitations are retained in the private `gufo-agent-concurrency` repository,
+`docs/kv-q4-r1.md` and `bench/kv-q4-r1/`.
 
 ## Build and process
 

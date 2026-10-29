@@ -97,15 +97,22 @@ def main():
     check(["serve", "image", "--cache-lookup-api"], 2, "Unknown option")
     assert "--kv-cache-type" in help_text
     assert "experimental and lossy" in help_text
-    types = ("f16", "q8_0", "q8_0-rotated", "q4_0", "q8_0/q4_0",
-             "q4_0-rotated", "q8_0/q4_0-rotated")
+    types = ("f16", "q8_0", "q8_0-rotated", "q4_0-rotated", "q8_0/q4_0-rotated")
+    assert "q4_0, " not in help_text
+    assert "q8_0/q4_0, " not in help_text
     for value in types:
         assert value in help_text
-    type_error = ("--kv-cache-type must be f16, q8_0, q4_0, q8_0/q4_0, "
+    type_error = ("--kv-cache-type must be f16, q8_0, "
                   "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated")
     for value in types:
         check(["serve", "llm", "--kv-cache-type", value, "--model",
                "missing.gguf"], 1, "Error loading model 'missing.gguf'")
+    quality_error = ("plain q4 KV modes failed the quality screen; use "
+                     "q4_0-rotated or q8_0/q4_0-rotated")
+    for command in (["serve", "llm"], ["prompt"], ["chat"], ["bench"]):
+        for value in ("q4_0", "q8_0/q4_0"):
+            check([*command, "--kv-cache-type", value, "--model", "missing.gguf"],
+                  2, quality_error)
     invalid_types = ("", "q8", "Q8_0", "bf16", "q4_1", "q4_0/q8_0",
                      "q8_0_rotated", "q8_0-plain")
     for value in invalid_types:
