@@ -43,6 +43,15 @@ struct State final : TextRunnerState {
   cache::Slot& slot;
   State(FakeAdapter& adapter, cache::Slot& slot)
       : adapter(adapter), slot(slot) {}
+  CancellationCheck* native_cancel{};
+  ~State() override {
+    if (native_cancel)
+      *native_cancel = {};
+  }
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    if (native_cancel)
+      *native_cancel = check;
+  }
   void Invalidate() noexcept override { (void)adapter.Invalidate(slot); }
 };
 class Runner : public TextModelRunner {
@@ -2287,6 +2296,22 @@ public:
   int witnesses{3};
   bool ready{true}, pending{}, failed{}, throws{}, lost_ready{}, bad_reset{};
   mutable std::size_t resets{}, grows{};
+  int bind_failure{};
+  mutable std::map<cache::Slot*, TextRunnerState::CancellationCheck>
+      cancellation;
+  mutable std::function<bool()> reclaim;
+  std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    if (bind_failure == 1)
+      throw std::bad_alloc();
+    if (bind_failure == 2)
+      throw std::runtime_error("bind failed");
+    if (bind_failure == 3)
+      return {};
+    auto state = Base::BindComponentState(adapter, slot);
+    dynamic_cast<State&>(*state).native_cancel = &cancellation[&slot];
+    return state;
+  }
   std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
       cache::ResourceLedger& ledger, std::size_t ram) const override {
     auto resources = Base::CreateComponentCacheResources(ledger, ram);
@@ -2309,10 +2334,28 @@ public:
                                                           : R::kQuarantined;
       };
     resources->prepare_prefill = [this](std::size_t) { ++grows; };
+    resources->bind_execution_reclaimer = [this](std::function<bool()> step) {
+      reclaim = std::move(step);
+    };
     return resources;
   }
 };
+template<class Cache>
+auto AcquireDiagnostic(Cache& cache) {
+  auto lease = cache.TryAcquireDiagnostic();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!lease && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+    lease = cache.TryAcquireDiagnostic();  // Slot try-lock may lose to an idle
+                                           // worker.
+  }
+  assert(lease);
+  return lease;
+}
 void DiagnosticColdNoRetention() {
+  assert(ComponentTextCache::DiagnosticRequestBytes() >
+         sizeof(TextDiagnosticLease));
   using R = cache::DiagnosticDiscardResult;
   const TemporaryDirectory temp("gufo-diagnostic-discard");
   const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
@@ -2338,7 +2381,7 @@ void DiagnosticColdNoRetention() {
     unsigned checks{};
     assert(!pool.TryAcquireDiagnostic([&] { return ++checks == 2; }));
     for (int repeat = 0; repeat < 2; ++repeat) {
-      auto lease = pool.TryAcquireDiagnostic();
+      auto lease = AcquireDiagnostic(pool);
       assert(lease && lease->cached_tokens() == 0);
       auto* bound = dynamic_cast<State*>(&lease->state());
       assert(runner->CheckpointPosition(*bound) == 0);
@@ -2392,7 +2435,14 @@ void DiagnosticColdNoRetention() {
     TextRunnerPool pool(runner, 1, disk);
     assert(!pool.TryAcquireDiagnostic());
     runner->failed = runner->pending = runner->lost_ready = false;
-    assert(!pool.TryAcquireDiagnostic() && runner->resets == 1);
+    if (failure == 1) {
+      assert(pool.capacity() == 1);
+      auto retry = AcquireDiagnostic(pool);
+      assert(retry && retry->Discard() == R::kComplete);
+    } else {
+      assert(pool.capacity() == 0);
+      assert(!pool.TryAcquireDiagnostic() && runner->resets == 1);
+    }
   }
   assert(ManagedBytes(disk.directory) == 0);
   for (bool persist : {false, true}) {
@@ -2416,6 +2466,124 @@ void DiagnosticColdNoRetention() {
     }
     assert((ManagedBytes(disk.directory) > 0) == persist);
   }
+}
+void DiagnosticFailuresKeepUsableSlots() {
+  using R = cache::DiagnosticDiscardResult;
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 4, 5, 6, 7, 8};
+  {
+    auto runner = std::make_shared<DiagnosticRunner<>>();
+    TextRunnerPool pool(runner, 1);
+    for (int failure : {1, 2, 3}) {
+      runner->bind_failure = failure;
+      assert(!pool.TryAcquireDiagnostic() && pool.capacity() == 1);
+      assert(runner->resets == 0 && runner->adapter->Invalidations() == 0);
+    }
+    runner->bind_failure = 0;
+    auto diagnostic = AcquireDiagnostic(pool);
+    auto* slot = &dynamic_cast<State&>(diagnostic->state()).slot;
+    assert(diagnostic->Discard() == R::kComplete);
+    bool cancelled{};
+    auto ordinary = pool.Acquire(prompt, [&] { return cancelled; });
+    assert(runner->cancellation[slot] && !runner->cancellation[slot]());
+    diagnostic.reset();  // Must not destroy a facade that clears the NEW hook.
+    cancelled = true;
+    assert(runner->cancellation[slot] && runner->cancellation[slot]());
+    ordinary.Invalidate();
+  }
+  for (std::size_t slots : {1, 2}) {
+    auto runner = std::make_shared<DiagnosticRunner<>>();
+    auto pool = std::make_shared<TextRunnerPool>(runner, slots);
+    TextGenerationScheduler scheduler(pool);
+    auto diagnostic = AcquireDiagnostic(*pool);
+    (void)runner->Prefill(diagnostic->state(), prompt, 0, 3);
+    runner->failed = true;
+    assert(diagnostic->Discard() == R::kQuarantined);
+    diagnostic.reset();
+    runner->failed = false;
+    assert(pool->capacity() == slots - 1 && scheduler.capacity() == slots - 1);
+    if (slots == 1) {
+      for (bool scheduled : {false, true}) {
+        bool refused{};
+        try {
+          if (scheduled)
+            (void)scheduler.Submit(prompt, 1, 0.0f);
+          else
+            (void)pool->Acquire(prompt);
+        } catch (const TextGenerationError& error) {
+          refused =
+              error.code() == TextGenerationErrorCode::kCacheUnavailable &&
+              error.http_status() == 503 && error.retryable();
+        }
+        assert(refused);
+      }
+    } else {
+      auto first = scheduler.Submit(prompt, 1, 0.0f);
+      auto second = scheduler.Submit(prompt, 1, 0.0f);
+      assert(first.Wait().tokens.size() == 1 &&
+             second.Wait().tokens.size() == 1);
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      bool reclaimed{};
+      while (!(reclaimed = runner->reclaim()) &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+      assert(reclaimed);  // Quarantine no longer disables other slots'
+                          // idle/reclaim work.
+    }
+  }
+}
+void DiagnosticPrefillPreservesOtherInventory() {
+  using R = cache::DiagnosticDiscardResult;
+  const TemporaryDirectory temp("gufo-diagnostic-coexistence");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  auto runner = std::make_shared<DiagnosticRunner<>>();
+  ComponentTextCache cache(runner, 2, 1 << 22, disk);
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
+  auto ordinary = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(ordinary->state());
+  (void)runner->Prefill(state, prompt, 0, prompt.size());
+  const auto hash = runner->adapter->RecurrentHash(state.slot);
+  assert(ordinary->TryReserveSnapshot(ordinary->CaptureBytes(), prompt.size(),
+                                      false, SnapshotPurpose::kContinuation,
+                                      {}));
+  assert(ordinary->PublishSnapshot(prompt, ordinary->Capture(), false));
+  (void)ordinary->Commit({}, {}, prompt);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (ordinary->Metrics().persistence->pending &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  const auto before = ordinary->Metrics();
+  assert(before.persistence->pending == 0 && before.persistence->completed > 0);
+  const auto lookup = cache.Lookup(prompt, nullptr, true, 0);
+  const auto bytes = ManagedBytes(disk.directory);
+  const auto captures = runner->captures,
+             restores = runner->adapter->RestoreBegins();
+  assert(bytes > 0 && lookup && lookup->matched_tokens == prompt.size());
+  auto diagnostic = AcquireDiagnostic(cache);
+  assert(diagnostic && diagnostic->cached_tokens() == 0);
+  diagnostic->PreparePrefill(3);
+  (void)runner->Prefill(diagnostic->state(),
+                        std::vector<TextRunnerToken>{91, 92, 93}, 0, 3);
+  assert(diagnostic->Discard() == R::kComplete);
+  diagnostic.reset();
+  const auto after = ordinary->Metrics();
+  const auto again = cache.Lookup(prompt, nullptr, true, 0);
+  assert(again && again->index_version == lookup->index_version);
+  assert(again->matched_tokens == lookup->matched_tokens &&
+         again->tier == lookup->tier);
+  assert(before.captured_checkpoint_ids == after.captured_checkpoint_ids);
+  assert(before.persistence->accepted == after.persistence->accepted);
+  assert(before.ledger.total_bytes == after.ledger.total_bytes);
+  assert(ManagedBytes(disk.directory) == bytes && runner->captures == captures);
+  assert(runner->adapter->RestoreBegins() == restores);
+  auto replay = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(replay->cached_tokens() == prompt.size());
+  assert(runner->adapter->RecurrentHash(
+             dynamic_cast<State&>(replay->state()).slot) == hash);
+  replay->Invalidate();
 }
 void UnpersistedRequestStaysOffDisk() {
   const TemporaryDirectory temp("gufo-component-unpersisted-test");
@@ -4208,7 +4376,7 @@ void UnpersistedRequestCanReuseRegisteredPins() {
       auto runner = std::make_shared<DiagnosticRunner<PinRunner>>();
       TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
       assert(runner->prefilled == 0);
-      auto spare = pool.TryAcquireDiagnostic();
+      auto spare = AcquireDiagnostic(pool);
       assert(spare);
       auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
       assert(request.cached_prompt_tokens() == fixture.tokens.size());
@@ -5569,6 +5737,8 @@ int main(int argc, char* argv[]) {
   });
   run("lifecycle", [] {
     DiagnosticColdNoRetention();
+    DiagnosticFailuresKeepUsableSlots();
+    DiagnosticPrefillPreservesOtherInventory();
     completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();
