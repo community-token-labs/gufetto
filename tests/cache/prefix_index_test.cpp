@@ -65,6 +65,46 @@ void SnapshotParity(const PrefixIndex& index, const PrefixQuery& query) {
     assert(a.transfer_bytes == e.transfer_bytes && a.full_ready);
   }
 }
+void ExactResidentOwnershipWithoutAllocation() {
+  ResourceLedger ledger{kIndexLimits};
+  PrefixIndex index{ledger};
+  index.Register({1}, kIndexComponents);
+  const auto checkpoint = IndexCheckpoint(ledger, Tokens{1, 2, 3});
+  const auto other = IndexCheckpoint(ledger, Tokens{9});
+  const auto entry = index.Insert(checkpoint, ResidentComponents());
+  const auto second = index.Insert(other, ResidentComponents());
+  const std::shared_ptr<const Checkpoint> alias(checkpoint, checkpoint.get());
+  const std::shared_ptr<const Checkpoint> wrong_object(checkpoint, other.get());
+  const std::shared_ptr<const Checkpoint> wrong_owner(checkpoint.get(),
+                                                      [](const Checkpoint*) {});
+  auto pressure =
+      ledger
+          .Reserve(ResourceCategory::kBackingFree,
+                   ledger.Limits().ram_bytes - ledger.Snapshot().ram_bytes)
+          .Convert();
+  const auto before = ledger.Snapshot();
+  const auto owners = checkpoint.use_count();
+  largest_allocation = 0;
+  watch_allocations = true;
+  assert(index.OwnsResidentCheckpoint(entry, checkpoint));
+  assert(index.OwnsResidentCheckpoint(entry, alias));
+  assert(!index.OwnsResidentCheckpoint(entry, wrong_owner));
+  assert(!index.OwnsResidentCheckpoint(entry, wrong_object));
+  assert(!index.OwnsResidentCheckpoint(entry, other));
+  assert(!index.OwnsResidentCheckpoint(second, checkpoint));
+  assert(!index.OwnsResidentCheckpoint({}, checkpoint));
+  assert(!index.OwnsResidentCheckpoint(entry, {}));
+  watch_allocations = false;
+  assert(largest_allocation == 0 && checkpoint.use_count() == owners);
+  assert(ledger.Snapshot() == before);
+  index.DropResident(entry);
+  largest_allocation = 0;
+  watch_allocations = true;
+  assert(!index.OwnsResidentCheckpoint(entry, checkpoint));
+  assert(index.OwnsResidentCheckpoint(second, other));
+  watch_allocations = false;
+  assert(largest_allocation == 0);
+}
 void InvalidationTelemetryDoesNotOwnOrBlockEntries() {
   ResourceLedger ledger{kIndexLimits};
   PrefixIndex index{ledger};
@@ -1026,6 +1066,7 @@ void RepeatedReadOnlyPlan() {
 }
 }  // namespace
 int main() {
+  ExactResidentOwnershipWithoutAllocation();
   InvalidationTelemetryDoesNotOwnOrBlockEntries();
   SnapshotDiskCandidates();
   SnapshotMixedValidity();

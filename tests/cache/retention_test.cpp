@@ -1957,15 +1957,15 @@ void RequiredPublicationMetadataPressure() {
   for (int scenario = 0; scenario < 3; ++scenario) {
     const bool withdraw = scenario != 0;
     const bool proof_room = scenario != 2;
-    const bool removed_prediction = withdraw && proof_room;
+    const bool removed_prediction = withdraw;
     Fixture f;
     const auto ordinary = f.Add({1});
     const auto root = AddPrediction(f, {2}, 17);
     const std::array owned{root};
     const std::vector<Token> tokens{2, 3};
-    // Capture is complete. Leave at most one candidate's owner-proof lookup
-    // metadata, less than a new index publication needs. With no proof room,
-    // withdrawal must fail closed rather than assume the index owns a handle.
+    // Capture is complete. Exhaust publication metadata capacity, including
+    // a zero-headroom case. The exact owner witness needs no lookup allocation;
+    // the owned prediction must give way before the ordinary anchor even then.
     const auto required = IndexCheckpoint(f.ledger, tokens);
     auto pressure = f.ledger
                         .Reserve(ResourceCategory::kBackingFree,
