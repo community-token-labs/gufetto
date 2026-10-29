@@ -558,7 +558,8 @@ struct ComponentTextCache::Impl {
       // Take directory ownership before slots and backing commit, so a
       // second server fails without claiming its RAM budget first.
       disk = std::make_unique<cache::DiskStore>(ledger, options->directory,
-                                                options->capacity_bytes);
+                                                options->capacity_bytes,
+                                                options->space_policy);
     }
     if (pins.enabled()) {
       if (pins.files.empty() ||
@@ -678,13 +679,15 @@ struct ComponentTextCache::Impl {
       disk_capacity = options->capacity_bytes;
       disk_step = options->min_checkpoint_step_tokens;
       disk->ReclaimOrphans();
-      if (disk->Stats().managed_bytes > disk_capacity) {
+      if (disk->Stats().managed_bytes > disk_capacity ||
+          disk->SpacePressure()) {
         // A lowered --cache-disk-bytes keeps its meaning: reclaim orphans and
         // temporaries first, then evict the oldest checkpoints by creation
         // (startup has no use history) to fit.
         disk->WaitForReclamation();
         std::size_t evicted{};
-        while (disk->Stats().managed_bytes > disk_capacity &&
+        while ((disk->Stats().managed_bytes > disk_capacity ||
+                disk->SpacePressure()) &&
                catalog->EvictOne())
           ++evicted;
         const auto managed = disk->Stats().managed_bytes;
@@ -693,9 +696,9 @@ struct ComponentTextCache::Impl {
         if (evicted)
           Logger::Info("cache",
                        "schema=component-cache-v1 event=disk_evicted "
-                       "reason=budget entries=" +
+                       "reason=budget_or_free_space entries=" +
                            std::to_string(evicted) + fields);
-        if (managed > disk_capacity)
+        if (managed > disk_capacity || disk->SpacePressure())
           Logger::Warn(
               "cache",
               "schema=component-cache-v1 event=disk_over_budget" + fields);

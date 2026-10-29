@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/cache/checkpoint.hpp"
+#include "src/cache/disk_policy.hpp"
 
 namespace gufo::cache {
 inline constexpr std::uint32_t kDiskFormatVersion = 2;
@@ -219,7 +220,7 @@ enum class DiskPublicationStep {
 class DiskStore {
 public:
   DiskStore(ResourceLedger&, const std::filesystem::path& directory,
-            std::uint64_t budget_bytes);
+            std::uint64_t budget_bytes, DiskSpacePolicy space_policy = {});
   ~DiskStore();
   DiskStore(const DiskStore&) = delete;
   DiskStore& operator=(const DiskStore&) = delete;
@@ -228,6 +229,9 @@ public:
   [[nodiscard]] std::span<const DurableEntry> Entries() const;
   [[nodiscard]] DiskStartupStats Stats() const;
   [[nodiscard]] DiskPublicationStats PublicationStats() const;
+  // Recheck on startup/write boundaries; unavailable filesystems do not invite
+  // eviction. Existing readers remain usable when optional writes are blocked.
+  [[nodiscard]] bool SpacePressure() const;
   // New bytes are checksummed on write. Inherited references retain expected
   // CRCs after metadata checks only; consumers must verify via ReadPayload.
   void Publish(DiskFileId manifest_file, const DiskManifest&,

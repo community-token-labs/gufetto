@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/cache/adapter.hpp"
+#include "src/cache/disk_policy.hpp"
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/pinned_prefix.hpp"
@@ -89,6 +90,7 @@ struct TextRunnerDiskCacheOptions {
   /// checkpoints are cheaper to re-prefill than that write. Zero disables the
   /// gate.
   std::size_t min_checkpoint_step_tokens{2048};
+  cache::DiskSpacePolicy space_policy;
 };
 
 /// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA

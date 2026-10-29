@@ -739,6 +739,7 @@ struct TextRunnerPool::Impl {
                   disk_cache_options->staging_capacity_bytes,
               .min_checkpoint_step_tokens =
                   disk_cache_options->min_checkpoint_step_tokens,
+              .space_policy = disk_cache_options->space_policy,
           },
           EmitDiskEvent);
       Logger::Info("cache",

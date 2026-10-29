@@ -511,6 +511,8 @@ struct DiskStore::Impl {
   DiskStartupStats stats;
   std::vector<DurableEntry> entries;
   std::uint64_t budget_bytes;
+  DiskSpacePolicy space_policy;
+  bool space_failure{};
   DiskPublicationStats publication_stats;
   bool recovery_required{};
   std::uint64_t next_epoch{1};
@@ -534,7 +536,8 @@ struct DiskStore::Impl {
   std::future<void> reclamation;
 
   Impl(ResourceLedger& l, const std::filesystem::path& path,
-       std::uint64_t budget, ResourceReservation reservation)
+       std::uint64_t budget, ResourceReservation reservation,
+       DiskSpacePolicy policy)
       : ledger(&l),
         metadata(reservation.Convert()),
         root(OpenRoot(path)),
@@ -544,7 +547,8 @@ struct DiskStore::Impl {
         chunks(DirectoryAt(version, "chunks")),
         private_files(DirectoryAt(version, "private")),
         temporary(DirectoryAt(version, "tmp")),
-        budget_bytes(budget) {
+        budget_bytes(budget),
+        space_policy(std::move(policy)) {
     // Persist the layout, including a newly created root and ancestors, before
     // any checkpoint can rely on these directory entries.
     SyncDirectoryFd(version);
@@ -802,14 +806,28 @@ struct DiskStore::Impl {
         platform::RenameResult::kRenamed)
       IoError("publish cache file", ec);
   }
+  void RequireSpace(std::uint64_t bytes) {
+    switch (space_policy.Check(root, bytes)) {
+      case DiskSpaceState::kReady:
+        return;
+      case DiskSpaceState::kPressure:
+        space_failure = true;
+        throw DiskCapacityExhausted();
+      case DiskSpaceState::kUnavailable:
+        throw std::runtime_error("cache filesystem is unavailable for writes");
+    }
+  }
   void WriteFile(platform::PlatformFile fd,
                  std::span<const std::uint8_t> bytes) {
     while (!bytes.empty()) {
+      const auto piece =
+          bytes.first(std::min(bytes.size(), std::size_t{1} << 20));
+      RequireSpace(piece.size());
       std::size_t n;
       {
         CostTimer timer(publication_stats.filesystem_ns);
         std::error_code ec;
-        n = platform::Write(fd, bytes.data(), bytes.size(), ec);
+        n = platform::Write(fd, piece.data(), piece.size(), ec);
         if (n == 0) {
           if (ec == std::errc::interrupted)
             continue;
@@ -934,6 +952,7 @@ struct DiskStore::Impl {
                std::span<std::uint8_t> staging = {},
                const DiskStagingAccess* access = nullptr) {
     RequireRecovered();
+    space_failure = false;
     // Admission covers vector growth, encoding, validation and dependency map
     // before allocating them. Host buffers remain caller-owned.
     std::uint64_t estimate =
@@ -1094,6 +1113,7 @@ struct DiskStore::Impl {
     if (stats.managed_bytes > budget_bytes ||
         additional > budget_bytes - stats.managed_bytes)
       throw DiskCapacityExhausted();
+    RequireSpace(additional);
     std::unique_lock index_guard(index_mutex, std::defer_lock);
     {
       CostTimer timer(publication_stats.metadata_lock_ns);
@@ -1241,6 +1261,13 @@ struct DiskStore::Impl {
       entries.pop_back();
       // Conservatively retain every byte as an orphan, including an uncertain
       // manifest rename. Recovery removes manifests durably before payloads.
+      // A space abort may be retried after eviction: remove partial files first
+      // so their names/charges cannot poison that retry. I/O errors still stop
+      // it.
+      if (space_failure) {
+        index_guard.unlock();
+        Reclaim();
+      }
       throw;
     }
   }
@@ -1397,11 +1424,15 @@ DurableEntry& DurableEntry::operator=(DurableEntry&& other) noexcept {
 }
 DiskStore::DiskStore(ResourceLedger& ledger,
                      const std::filesystem::path& directory,
-                     std::uint64_t budget)
+                     std::uint64_t budget, DiskSpacePolicy space_policy)
     : impl_(std::make_unique<Impl>(
           ledger, directory, budget,
-          ledger.Reserve(ResourceCategory::kMetadata, sizeof(Impl)))) {}
+          ledger.Reserve(ResourceCategory::kMetadata, sizeof(Impl)),
+          std::move(space_policy))) {}
 DiskStore::~DiskStore() = default;
+bool DiskStore::SpacePressure() const {
+  return impl_->space_policy.Check(impl_->root) == DiskSpaceState::kPressure;
+}
 std::span<const DurableEntry> DiskStore::Entries() const {
   return impl_->entries;
 }

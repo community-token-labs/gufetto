@@ -57,6 +57,7 @@ struct TextDiskCacheConfig {
   std::size_t staging_capacity_bytes{0};
   std::string model_artifact_fingerprint;
   std::string draft_model_artifact_fingerprint;
+  cache::DiskSpacePolicy space_policy;
 };
 
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
