@@ -123,6 +123,15 @@ int main() {
   assert(overflow);
   gufo::models::qwen::vision::Prompt prompt;
   prompt.images.resize(2);
+  prompt.images[0].grid = {32768, 8, 8};
+  prompt.images[1].grid = {40000, 8, 8};
+  assert(!prompt.IntersectsImages(0, 32768));
+  assert(prompt.IntersectsImages(32768, 1));
+  assert(!prompt.IntersectsImages(32768, 0));
+  assert(prompt.IntersectsImages(32831, 2));
+  assert(!prompt.IntersectsImages(32832, 40000 - 32832));
+  assert(!prompt.IntersectsImages(40064, 4096));
+  assert(!prompt.IntersectsImages(UINT32_MAX, UINT32_MAX));
   prompt.images[0].grid = {0, 65535, 65535};
   prompt.images[1].grid = {0, 65535, 65535};
   bool rows_overflow = false;

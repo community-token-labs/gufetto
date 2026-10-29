@@ -157,6 +157,13 @@ void CheckFlashIncrementalOracle(
   Require(model->VisionEncoder()->Outputs()->GetStats().reencodes >
               before_eviction.reencodes,
           "Flash oracle did not re-encode evicted images");
+  // Direct native decode after the images must not need output credits.
+  // Keep the entire pool held elsewhere while both sessions decode from KV.
+  const auto pool = model->VisionEncoder()->Outputs();
+  const auto decode_pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-text-decode-pressure", pool->Capacity()));
+  Require(decode_pressure != nullptr,
+          "decode pressure could not evict idle outputs");
   std::vector<tokenization::TokenId> generated;
   double max_kl = 0;
   float max_logit_error = 0;

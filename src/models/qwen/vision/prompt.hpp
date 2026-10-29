@@ -1,6 +1,7 @@
 #ifndef GUFO_MODELS_QWEN_VISION_PROMPT_HPP_
 #define GUFO_MODELS_QWEN_VISION_PROMPT_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -56,6 +57,19 @@ struct Prompt {
   std::size_t stable_prefix_tokens{0};
   RopeLayout rope;
   std::vector<PreparedImage> images;
+  [[nodiscard]] bool IntersectsImages(std::uint32_t position,
+                                      std::uint32_t count) const {
+    for (const auto& image : images) {
+      const auto begin = std::max<std::uint64_t>(position, image.grid.offset);
+      const auto end = std::min<std::uint64_t>(
+          std::uint64_t{position} + count,
+          std::uint64_t{image.grid.offset} +
+              std::uint64_t{image.grid.height} * image.grid.width);
+      if (begin < end)
+        return true;
+    }
+    return false;
+  }
   [[nodiscard]] std::uint32_t ImageRows() const {
     std::uint64_t rows = 0;
     for (const auto& image : images) {
