@@ -71,6 +71,9 @@ public:
   // Startup attests metadata and dependency sizes only. Streaming restore must
   // validate payload checksums before making a destination executable.
   [[nodiscard]] bool Durable() const { return durable_; }
+  // True only for an all-new publication, whose bytes were checked on write.
+  // Inherited dependencies and startup entries are unverified. This historical
+  // observation never authorizes skipping CRC on a later read.
   [[nodiscard]] bool PayloadVerified() const { return payload_verified_; }
   [[nodiscard]] std::uint64_t Epoch() const { return epoch_; }
 
@@ -111,6 +114,7 @@ struct DiskWriteSource {
 };
 struct DiskReadStats {
   std::uint64_t bytes{}, filesystem_ns{}, checksum_ns{};
+  // Retained for callers; always false. Metadata cannot attest payload bytes.
   bool verification_cached{};
 };
 // Optional piece lease. acquire runs before touching staging; release runs on
@@ -224,6 +228,8 @@ public:
   [[nodiscard]] std::span<const DurableEntry> Entries() const;
   [[nodiscard]] DiskStartupStats Stats() const;
   [[nodiscard]] DiskPublicationStats PublicationStats() const;
+  // New bytes are checksummed on write. Inherited references retain expected
+  // CRCs after metadata checks only; consumers must verify via ReadPayload.
   void Publish(DiskFileId manifest_file, const DiskManifest&,
                std::span<const DiskWriteBuffer>);
   // Reuses one caller-admitted staging piece. No payload-sized allocation.

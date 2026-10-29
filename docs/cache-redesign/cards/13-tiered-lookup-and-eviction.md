@@ -110,8 +110,9 @@ has been durably reclaimed. Tests exercise invalidation during verification,
 after dependency sync, and after the manifest barriers. Physical cleanup remains
 caller-scheduled at an idle boundary after reader pins settle.
 
-Reused-dependency verification during publication and restore quarantine at the
-point of detection, raising a typed dependency error. An admitted atomic marker
+Inherited publication checks metadata without payload reads. Restore/export
+checksum failures quarantine at the point of detection, raising a typed
+dependency error; no successful publication attests inherited content. An admitted atomic marker
 shared by a publication's descriptions makes even its RAM-bound lookup record
 unusable immediately, without worker mutation of the caller-serialized index.
 `DiskCatalog::Reconcile` removes these records at a serialized caller boundary;
