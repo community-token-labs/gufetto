@@ -712,6 +712,28 @@ struct ComponentTextCache::Impl {
           },
           [this](cache::CheckpointId id, bool success,
                  const cache::TransferTiming& timing) {
+            // Record I/O even if optional serving metadata admission fails,
+            // and for failed attempts whose temporary files were rolled back.
+            try {
+              Logger::Info(
+                  "cache",
+                  "schema=component-cache-v1 event=persistence_io "
+                  "checkpoint_id=" +
+                      std::to_string(id.value) + " published=" +
+                      std::to_string(success) + " private_write_bytes=" +
+                      std::to_string(timing.private_write_bytes) +
+                      " shared_write_bytes=" +
+                      std::to_string(timing.shared_write_bytes) +
+                      " manifest_write_bytes=" +
+                      std::to_string(timing.manifest_write_bytes) +
+                      " inherited_bytes=" +
+                      std::to_string(timing.inherited_bytes) +
+                      " write_calls=" + std::to_string(timing.write_calls) +
+                      " fsync_calls=" + std::to_string(timing.fsync_calls));
+            } catch (...) {
+              // Optional diagnostics must not retain pending owners or bypass
+              // catalog admission when formatting/the logging sink fails.
+            }
             const std::lock_guard lock(mutex);
             for (auto& checkpoint : pending)
               if (checkpoint && checkpoint->Id() == id)

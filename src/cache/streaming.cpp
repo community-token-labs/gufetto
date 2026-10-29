@@ -91,6 +91,12 @@ void Accumulate(TransferTiming& destination, const TransferTiming& source) {
   ADD_COST(pieces);
   ADD_COST(staging_wait_ns);
   ADD_COST(io_lock_ns);
+  ADD_COST(private_write_bytes);
+  ADD_COST(shared_write_bytes);
+  ADD_COST(manifest_write_bytes);
+  ADD_COST(inherited_bytes);
+  ADD_COST(write_calls);
+  ADD_COST(fsync_calls);
 #undef ADD_COST
 }
 // Cold checkpoints are thousands of small files, and one thread hinting them
@@ -441,6 +447,12 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
     timing.checksum_ns += costs.checksum_ns;
     timing.metadata_lock_ns += costs.metadata_lock_ns;
     timing.io_lock_ns += costs.io_lock_ns;
+    timing.private_write_bytes += costs.private_write_bytes;
+    timing.shared_write_bytes += costs.shared_write_bytes;
+    timing.manifest_write_bytes += costs.manifest_write_bytes;
+    timing.inherited_bytes += costs.inherited_bytes;
+    timing.write_calls += costs.write_calls;
+    timing.fsync_calls += costs.fsync_calls;
   }};
   (void)impl_->disk->PublishStream(file, manifest, writes, impl_->staging.bytes,
                                    &costs, &access, stop);
