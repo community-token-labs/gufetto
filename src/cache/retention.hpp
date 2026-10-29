@@ -121,6 +121,11 @@ struct RetentionRequest {
   AdmissionPolicy admission{AdmissionPolicy::kRanked};
   // Nonzero cache-local request/acquisition ID required for predictions.
   std::uint64_t prediction_owner{};
+  // Ranked admission only: on actual byte/new-record pressure, first attempt
+  // safe withdrawal of these creator-owned predictions using prediction_owner.
+  // Drop temporary root handles before Admit; required-checkpoint shared chunks
+  // still prevent withdrawal. Empty means unchanged ordinary admission.
+  std::span<const CheckpointId> owned_predictions{};
 };
 // Caller serializes policy, index and history operations. Ledger and index
 // outlive this object; sink, if present, does too. Callbacks/sinks cannot
@@ -235,7 +240,7 @@ private:
   std::size_t UniqueBytes(std::size_t) const;
   std::size_t UniquePayloadBytes(std::size_t) const noexcept;
   bool Persisting(std::size_t) const;
-  bool ExecutionEligible(std::size_t) const;
+  bool ExecutionEligible(std::size_t, bool exact_owner_witness = false) const;
   std::size_t Victim(const RetentionRequest&, bool records) const;
   void Erase(std::size_t, RetentionReason, std::uint32_t rank);
   void Emit(RetentionAction, RetentionReason, CheckpointId, Rows,

@@ -1893,6 +1893,169 @@ void PredictionWithdrawalBeforeRequiredCapture() {
     if (event.action == RetentionAction::kRemoved)
       assert(event.checkpoint == prediction);
 }
+void RequiredAdmissionWithdrawsOnlyUnderPressure() {
+  for (const bool full : {false, true}) {
+    Fixture f(full ? 2 : 4);
+    const auto ordinary = f.Add({1});
+    const auto root = AddPrediction(f, {2}, 17);
+    const std::array owned{root};
+    const std::vector<Token> tokens{2, 3};
+    RetentionRequest request{tokens, {1}, {}};
+    request.source = root;
+    request.prediction_owner = 17;
+    request.owned_predictions = owned;
+    if (full) {
+      auto optional = request;
+      optional.admission = AdmissionPolicy::kNoEviction;
+      assert(!f.policy.Admit(
+          optional, [&] { return IndexCheckpoint(f.ledger, tokens); }));
+      assert(f.policy.PredictionUsage().records == 1);
+    }
+    assert(f.policy.Admit(request,
+                          [&] { return IndexCheckpoint(f.ledger, tokens); }));
+    assert(f.policy.Rank(ordinary) == 3);
+    assert(f.policy.PredictionUsage().records == (full ? 0 : 1));
+    for (const auto& event : f.log.events)
+      if (event.action == RetentionAction::kRemoved) {
+        assert(full && event.checkpoint == root);
+        assert(event.reason == RetentionReason::kExplicit);
+      }
+  }
+  // A fitting exact replacement needs no additional slot, even in a full table.
+  Fixture f(2);
+  f.Add({1});
+  const auto root = AddPrediction(f, {2}, 17);
+  const std::array owned{root};
+  const std::vector<Token> tokens{1};
+  RetentionRequest request{tokens, {1}, {}};
+  request.prediction_owner = 17;
+  request.owned_predictions = owned;
+  assert(f.policy.Admit(request,
+                        [&] { return IndexCheckpoint(f.ledger, tokens); }));
+  assert(f.policy.PredictionUsage().records == 1 && f.Cached({2}) == 1);
+}
+void RequiredAdmissionKeepsExplicitProtection() {
+  Fixture f(2);
+  f.Add({1});
+  const auto root = AddPrediction(f, {2}, 17);
+  const std::array owned{root};
+  const std::vector<Token> tokens{3};
+  RetentionRequest request{tokens, {1}, {}};
+  request.prediction_owner = 17;
+  request.owned_predictions = owned;
+  request.protected_checkpoints = owned;
+  assert(f.policy.Admit(request,
+                        [&] { return IndexCheckpoint(f.ledger, tokens); }));
+  assert(f.policy.PredictionUsage().records == 1 && f.Cached({2}) == 1);
+  assert(f.Cached({1}) == 0);
+  for (const auto& event : f.log.events)
+    if (event.action == RetentionAction::kRemoved)
+      assert(event.checkpoint != root &&
+             event.reason != RetentionReason::kExplicit);
+}
+void RequiredPublicationMetadataPressure() {
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    const bool withdraw = scenario != 0;
+    const bool proof_room = scenario != 2;
+    const bool removed_prediction = withdraw;
+    Fixture f;
+    const auto ordinary = f.Add({1});
+    const auto root = AddPrediction(f, {2}, 17);
+    const std::array owned{root};
+    const std::vector<Token> tokens{2, 3};
+    // Capture is complete. Exhaust publication metadata capacity, including
+    // a zero-headroom case. The exact owner witness needs no lookup allocation;
+    // the owned prediction must give way before the ordinary anchor even then.
+    const auto required = IndexCheckpoint(f.ledger, tokens);
+    auto pressure = f.ledger
+                        .Reserve(ResourceCategory::kBackingFree,
+                                 f.ledger.Limits().ram_bytes -
+                                     f.ledger.Snapshot().ram_bytes -
+                                     (proof_room ? sizeof(PrefixCandidate) : 0))
+                        .Convert();
+    RetentionRequest request{tokens, {1}, {}};
+    request.source = root;  // ordinary ranking cannot sacrifice its source
+    request.prediction_owner = 17;
+    if (withdraw)
+      request.owned_predictions = owned;
+    int captures = 0;
+    assert(f.policy.Admit(request, [&] {
+      ++captures;
+      return required;
+    }));
+    assert(captures ==
+           2);  // retry actual admission, never assume reclaimed bytes
+    assert(f.policy.PredictionUsage().records == (removed_prediction ? 0 : 1));
+    if (removed_prediction)
+      assert(f.policy.Rank(ordinary) == 3);
+    std::size_t removed = 0;
+    for (const auto& event : f.log.events)
+      if (event.action == RetentionAction::kRemoved) {
+        ++removed;
+        assert(event.checkpoint == (removed_prediction ? root : ordinary));
+        assert(event.reason == (removed_prediction
+                                    ? RetentionReason::kExplicit
+                                    : RetentionReason::kByteCapacity));
+      }
+    assert(removed == 1);
+  }
+}
+void RequiredSharedChunksPreventWithdrawal() {
+  ResourceLedger ledger{kIndexLimits};
+  const auto descriptors = std::span(kPressureComponents).first(1);
+  PrefixIndex index{ledger};
+  index.Register({1}, descriptors);
+  Log log;
+  RetentionPolicy policy{ledger, index, &log};
+  const std::vector<Token> ordinary{1};
+  assert(policy.Admit({ordinary, {1}, {}}, [&] {
+    return IndexCheckpoint(ledger, ordinary, {1}, {}, descriptors);
+  }));
+  const auto anchor = log.events.back().checkpoint;
+  auto history = ExecutionHistory::Cold(ledger, descriptors, {1});
+  std::vector<Token> tokens(8, 2);
+  const auto capture = [&] {
+    return history.Capture(
+        {tokens,
+         InputIdentity(tokens.size()),
+         {{{1}, tokens.size()}},
+         CheckpointPurpose::kPrompt,
+         1},
+        [&](const PayloadRequest& r) {
+          auto pool =
+              ledger.Reserve(ResourceCategory::kBackingFree, r.bytes).Convert();
+          return Payload::Committed(pool.ReserveBacking(r.category).Convert(),
+                                    std::make_shared<int>(0));
+        });
+  };
+  assert(policy.Admit(Prediction(tokens, 17), capture));
+  const auto root = log.events.back().checkpoint;
+  const auto usage = policy.PredictionUsage();
+  tokens.push_back(3);
+  const auto required = capture();  // genuinely shares the root's full chunks
+  assert(!policy.WithdrawUnprovenPrediction(root, 17));
+  auto pressure =
+      ledger
+          .Reserve(ResourceCategory::kBackingFree,
+                   ledger.Limits().ram_bytes - ledger.Snapshot().ram_bytes)
+          .Convert();
+  const std::array owned{root};
+  RetentionRequest request{tokens, {1}, {}};
+  request.source = root;
+  request.prediction_owner = 17;
+  request.owned_predictions = owned;
+  int captures = 0;
+  assert(policy.Admit(request, [&] {
+    ++captures;
+    return required;
+  }));
+  assert(captures == 2 && policy.PredictionUsage().bytes == usage.bytes);
+  for (const auto& event : log.events)
+    if (event.action == RetentionAction::kRemoved) {
+      assert(event.checkpoint == anchor);
+      assert(event.reason == RetentionReason::kByteCapacity);
+    }
+}
 void NoEvictionBackingFragmentation() {
   constexpr std::array<ComponentDescriptor, 1> components{
       {{{1}, 1, ComponentKind::kPrivateState, 0, 0, 8192}}};
@@ -1966,6 +2129,10 @@ int main() {
   PredictionBorrowedLifecycle();
   PredictionWithdrawalBeforeRequiredCapture();
   NoEvictionBackingFragmentation();
+  RequiredAdmissionWithdrawsOnlyUnderPressure();
+  RequiredAdmissionKeepsExplicitProtection();
+  RequiredPublicationMetadataPressure();
+  RequiredSharedChunksPreventWithdrawal();
   Planning();
   Branches();
   RanksAndSources();
