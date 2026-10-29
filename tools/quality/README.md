@@ -1,5 +1,8 @@
 # Offline matched-history quality
 
+For synthetic images, independent F32 attention fixtures and three-arm
+encoder/downstream comparisons, see [the vision harness](VISION.md).
+
 `matched_kl.py` scores **complete vocabulary logits** against one frozen set of
 teacher-token histories. It reports per-token log probabilities, NLL and rank,
 KL(reference || candidate), top-1 agreement, top-k overlap, and per-stratum tails.
