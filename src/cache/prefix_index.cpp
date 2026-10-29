@@ -708,6 +708,21 @@ void PrefixIndex::AttachDurable(
   record.availability = std::move(admitted);
   record.durable = std::move(durable);
 }
+bool PrefixIndex::OwnsResidentCheckpoint(
+    IndexEntryId id,
+    const std::shared_ptr<const Checkpoint>& checkpoint) const noexcept {
+  if (!checkpoint)
+    return false;
+  const auto node = impl_->directory.find(id.value);
+  if (node == impl_->directory.end())
+    return false;
+  const auto record = node->second->records.find(id.value);
+  if (record == node->second->records.end())
+    return false;
+  const auto& resident = record->second.checkpoint;
+  return resident == checkpoint && !resident.owner_before(checkpoint) &&
+         !checkpoint.owner_before(resident);
+}
 void PrefixIndex::DropResident(IndexEntryId id) {
   if (!impl_->directory.contains(id.value))
     return;
