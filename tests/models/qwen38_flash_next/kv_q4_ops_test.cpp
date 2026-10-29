@@ -141,7 +141,7 @@ void CheckStore() {
 }
 void CheckReaders(Type policy, unsigned n, bool sparse) {
   constexpr unsigned width = 512, qwidth = 6144, depth = 257;
-  const unsigned start = depth - n, words = (depth / 4 + 31) / 32;
+  const unsigned start = depth - n, words = ((depth + 3) / 4 + 31) / 32;
   auto k = Values(depth * width, 134), v = Values(depth * width, 258);
   if (qfn::KvIsRotated(policy)) {
     for (std::size_t i = 0; i < k.size(); i += 256) {
@@ -203,8 +203,11 @@ int main() {
     for (const auto type : {Type::kQ4_0, Type::kQ8_0Q4_0, Type::kQ4_0Rotated,
                             Type::kQ8_0Q4_0Rotated})
       for (const auto n : {1U, 2U, 3U, 8U, 256U})
-        for (bool sparse : {false, true})
+        for (bool sparse : {false, true}) {
+          std::cout << "q4 reader policy=" << static_cast<unsigned>(type)
+                    << " n=" << n << " sparse=" << sparse << std::endl;
           CheckReaders(type, n, sparse);
+        }
     std::cout << "q4/mixed stores, view, dense/sparse scalar/MTP/WMMA "
                  "operands: PASS\n";
   } catch (const std::exception& e) {
