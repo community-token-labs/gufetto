@@ -291,7 +291,8 @@ std::vector<std::uint8_t> Wire(const Artifact& a) {
   }
   return wire;
 }
-void Publish(const std::filesystem::path& root, const Artifact& a) {
+void Publish(const std::filesystem::path& root, const Artifact& a,
+             std::uint8_t publication = 0) {
   cache::ResourceLedger ledger({kRam, kRam, 0, 0});
   cache::DiskStore disk(ledger, root, kRam);
   const auto payloads = CheckpointTransferPayloads(a.header.manifest);
@@ -310,6 +311,7 @@ void Publish(const std::filesystem::path& root, const Artifact& a) {
   assert(next == payloads.size());
   cache::DiskFileId manifest{};
   manifest[0] = 255;
+  manifest[1] = publication;
   disk.Publish(manifest, a.header.manifest, buffers);
 }
 #if 1  // Both packed modes are unconditional in the cleaned q8 topic.
@@ -438,6 +440,17 @@ void RotatedExistingPinsBeforeReady() {
 }
 #endif
 #endif
+void NotExportable(ComponentTextCache& target, const Artifact& source) {
+  bool absent = false;
+  try {
+    (void)target.Export(source.header.manifest.tokens, nullptr, true, 0,
+                        kConfiguration);
+  } catch (const CheckpointTransferError& error) {
+    absent = error.status == 404;
+  }
+  assert(absent && "rejected checkpoint must not be exportable");
+}
+
 void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
                              bool selected_fingerprint) {
   const std::array types{
@@ -474,6 +487,16 @@ void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
         for (unsigned fault = 0; fault < 6; ++fault) {
           auto bad = valid;
           Poison(bad, part, fault);
+          std::string codec_error;
+          try {
+            qfn::ValidateKvRow(
+                std::as_bytes(std::span(bad.images[bad.kv_images[part]]))
+                    .last(qfn::KvRowBytes(kElements, type)),
+                kElements, type);
+          } catch (const std::invalid_argument& error) {
+            codec_error = error.what();
+          }
+          assert(!codec_error.empty());
           const auto wire = Wire(bad);
           auto runner = std::make_shared<AdmissionRunner>(type);
           runner->fingerprint = fingerprint;
@@ -484,8 +507,8 @@ void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
           bool semantic = false;
           try {
             (void)target.Import(Reader(wire), wire.size(), kConfiguration);
-          } catch (const std::invalid_argument&) {
-            semantic = true;
+          } catch (const std::invalid_argument& error) {
+            semantic = codec_error == error.what();
           }
           assert(semantic && "digest-valid malformed q8 import published");
           const auto after = runner->ledger->Snapshot();
@@ -496,6 +519,7 @@ void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
                   ->matched_tokens == 2);
           assert(target.Lookup(valid.header.manifest.tokens, nullptr, true, 0)
                      ->matched_tokens == 0);
+          NotExportable(target, valid);
           (void)target.Import(Reader(valid_wire), valid_wire.size(),
                               kConfiguration);
           assert(target.Lookup(valid.header.manifest.tokens, nullptr, true, 0)
@@ -514,6 +538,7 @@ void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
             assert(restarted
                        .Lookup(valid.header.manifest.tokens, nullptr, true, 0)
                        ->matched_tokens == 0);
+            NotExportable(restarted, valid);
           }
           Publish(temp.path(), valid);  // Same-root repair/retry.
           {
@@ -530,6 +555,139 @@ void MalformedImportsAndDisk(qfn::KvCacheType selected_type,
     }
   }
 }
+// Recovered old-main intent: a digest-valid envelope with wrong identity or
+// component layout must fail before publication, not merely fail at restore.
+// These are current-format mutations, NOT archived native-model captures.
+void IdentityAndImportLayouts() {
+  for (auto type : {kPlain, qfn::KvCacheType::kQ8_0Rotated}) {
+    const auto valid = Canonical(type);
+    const auto valid_wire = Wire(valid);
+    auto survivor = valid;
+    survivor.header.manifest.tokens = {20, 21};
+    const auto survivor_wire = Wire(survivor);
+    std::vector<Artifact> identities;
+    for (auto other :
+         {qfn::KvCacheType::kF16, kPlain, qfn::KvCacheType::kQ8_0Rotated}) {
+      if (other == type)
+        continue;
+      auto bad = valid;
+      bad.header.identity = Identity(other);
+      identities.push_back(std::move(bad));
+    }
+    for (auto epoch : {22U, 23U, 24U, 25U, 26U}) {
+      auto bad = valid;
+      auto text =
+          std::string(bad.header.identity.begin(), bad.header.identity.end());
+      for (auto prefix : {"numerical_kernel_epoch=",
+                          "numerical_build_lane=rocm-qfn-q8-wmma-v"}) {
+        const auto current =
+            std::string(prefix) +
+            std::to_string(qfn::ExpectedKvPayloadVersion(type)) + "\n";
+        const auto at = text.find(current);
+        assert(at != std::string::npos &&
+               epoch != qfn::ExpectedKvPayloadVersion(type));
+        text.replace(at, current.size(),
+                     std::string(prefix) + std::to_string(epoch) + "\n");
+      }
+      bad.header.identity.assign(text.begin(), text.end());
+      identities.push_back(std::move(bad));
+    }
+    for (auto& bad : identities) {
+      assert(bad.header.identity != valid.header.identity);
+      bad.header.manifest.compatibility = Digest(bad.header.identity);
+    }
+    auto cases = identities;
+    for (const auto image : valid.kv_images) {
+      // Map each packed payload back to its manifest component, including
+      // distinct ordinary/draft K/V. Test both wrong layout versions.
+      const auto payloads = CheckpointTransferPayloads(valid.header.manifest);
+      const auto file = payloads.at(image)->file;
+      for (auto layout : {1U, type == kPlain ? 3U : 2U}) {
+        auto bad = valid;
+        bool found = false;
+        for (auto& component : bad.header.manifest.components) {
+          if (component.tail && component.tail->file == file) {
+            assert(component.descriptor.layout_version != layout);
+            component.descriptor.layout_version = layout;
+            found = true;
+          }
+        }
+        assert(found);
+        cases.push_back(std::move(bad));
+      }
+    }
+    for (const auto& bad : cases) {
+      const auto wire =
+          Wire(bad);  // Independently verifies transport with its own identity.
+      auto runner = std::make_shared<AdmissionRunner>(type);
+      ComponentTextCache target(runner, 0, kRam, {});
+      (void)target.Import(Reader(survivor_wire), survivor_wire.size(),
+                          kConfiguration);
+      const auto before = runner->ledger->Snapshot();
+      const auto allocations = runner->allocations, finishes = runner->finishes;
+      bool rejected = false;
+      try {
+        (void)target.Import(Reader(wire), wire.size(), kConfiguration);
+      } catch (const CheckpointTransferError& error) {
+        rejected = error.status == 409;
+      }
+      const auto after = runner->ledger->Snapshot();
+      assert(rejected && allocations == runner->allocations &&
+             finishes == runner->finishes);
+      assert(before.bytes == after.bytes &&
+             before.reserved_bytes == after.reserved_bytes);
+      assert(target.Lookup(valid.header.manifest.tokens, nullptr, true, 0)
+                 ->matched_tokens == 0);
+      NotExportable(target, valid);
+      assert(target.Lookup(survivor.header.manifest.tokens, nullptr, true, 0)
+                 ->matched_tokens == 2);
+      (void)target.Export(survivor.header.manifest.tokens, nullptr, true, 0,
+                          kConfiguration);
+      (void)target.Import(Reader(valid_wire), valid_wire.size(),
+                          kConfiguration);
+      assert(target.Lookup(valid.header.manifest.tokens, nullptr, true, 0)
+                 ->matched_tokens == 2);
+      (void)target.Export(valid.header.manifest.tokens, nullptr, true, 0,
+                          kConfiguration);
+    }
+    for (const auto& bad : identities) {
+      const TemporaryDirectory temp("gufo-packed-identity-restart");
+      const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                            .capacity_bytes = kRam};
+      std::cerr << "identity restart type=" << qfn::KvCacheTypeName(type)
+                << " case=" << (&bad - identities.data()) << " publish bad\n";
+      Publish(temp.path(), bad);
+      {
+        auto runner = std::make_shared<AdmissionRunner>(type);
+        ComponentTextCache restarted(runner, 0, kRam, disk);
+        assert(restarted.Lookup(valid.header.manifest.tokens, nullptr, true, 0)
+                   ->matched_tokens == 0);
+        std::cerr << "identity restart check non-exportable\n";
+        NotExportable(restarted, valid);
+      }
+      // Immutable disk publications cannot reuse the alien manifest/file IDs.
+      // Like old-main's Rekey control, retain the bad entry and publish a
+      // distinct valid checkpoint in the SAME root, then reopen both.
+      auto recovery = valid;
+      recovery.header.manifest.checkpoint = {2000};
+      recovery.header.manifest.lineage = {2000};
+      for (auto& component : recovery.header.manifest.components) {
+        if (component.tail)
+          component.tail->file[1] = 1;
+        if (component.private_state)
+          component.private_state->file[1] = 1;
+      }
+      Publish(temp.path(), recovery, 1);
+      auto runner = std::make_shared<AdmissionRunner>(type);
+      ComponentTextCache repaired(runner, 0, kRam, disk);
+      assert(repaired.Lookup(valid.header.manifest.tokens, nullptr, true, 0)
+                 ->matched_tokens == 2);
+      (void)repaired.Export(valid.header.manifest.tokens, nullptr, true, 0,
+                            kConfiguration);
+    }
+  }
+}
+
 void IncompatibleDiskLayouts() {
   const std::array types{kPlain, qfn::KvCacheType::kQ8_0Rotated};
   for (auto type : types) {

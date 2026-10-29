@@ -4204,6 +4204,7 @@ int main(int argc, char* argv[]) {
         models::qwen38_flash_next::KvCacheType::kQ8_0Rotated, false);
   });
   run("transfer_layout", [] {
+    packed_transfer_cpu::IdentityAndImportLayouts();
     packed_transfer_cpu::IncompatibleDiskLayouts();
     packed_transfer_cpu::RotatedWithoutFingerprintImport();
   });
