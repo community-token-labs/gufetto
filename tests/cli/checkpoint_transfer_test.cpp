@@ -50,8 +50,10 @@ void Check(bool expected, const std::function<void()>& action, int status = 400,
   assert(rejected == expected);
 }
 #include "tests/cli/checkpoint_identity_checks.hpp"
+#include "tests/cli/checkpoint_payload_checks.hpp"
 }  // namespace
 int main() {
+  CheckpointPayloadChecks();
   cache::Identity identity{1, 2, 20, 4};
   crypto::Sha256Hasher hash;
   hash.Update(identity);
