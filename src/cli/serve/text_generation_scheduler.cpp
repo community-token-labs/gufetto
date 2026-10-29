@@ -1297,6 +1297,16 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        // A whole-prompt reservation must precede runner acquisition. Keep
+        // this lease until transferring it to Acquire, so the worker can
+        // never block waiting for credits it just observed.
+        auto resources = request->prompt_context
+                             ? request->prompt_context->TryAdmit()
+                             : TextPromptAdmission{};
+        if (!resources.ready) {
+          waiting.push_back(std::move(request));
+          return;  // active requests still get their next execution step
+        }
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         perf::HostPhase acquisition("admission_acquire",
                                     request->lineage.request_id);
@@ -1310,7 +1320,7 @@ struct TextGenerationScheduler::Impl {
             },
             std::move(request->prompt_context), request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->cache_persist);
+            request->cache_persist, std::move(resources));
         acquisition.Finish();
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);

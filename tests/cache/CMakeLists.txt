@@ -29,6 +29,34 @@ target_link_libraries(cache_adapter_lifecycle_test PRIVATE gufo_cache_fake)
 add_test(NAME cache_adapter_lifecycle_test COMMAND cache_adapter_lifecycle_test)
 set_tests_properties(cache_adapter_lifecycle_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 
+add_executable(cache_backing_cpu_test backing_cpu_test.cpp)
+target_link_libraries(cache_backing_cpu_test PRIVATE gufo_cache_fake Threads::Threads)
+add_test(NAME cache_backing_cpu_test COMMAND cache_backing_cpu_test)
+set_tests_properties(cache_backing_cpu_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
+# Compile the production owner against a private CPU HIP boundary; this target
+# neither links the device runtime nor adds HIP dependencies to gufo_cache.
+add_executable(cache_host_allocations_test host_allocations_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/core/hip/host_allocations.cpp)
+target_include_directories(cache_host_allocations_test BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/hip_stub ${PROJECT_SOURCE_DIR})
+add_test(NAME cache_host_allocations_test COMMAND cache_host_allocations_test)
+set_tests_properties(cache_host_allocations_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(cache_backing_platform_test backing_platform_test.cpp)
+  target_link_libraries(cache_backing_platform_test PRIVATE gufo_cache)
+  target_link_options(cache_backing_platform_test PRIVATE
+    -Wl,--wrap=munmap -Wl,--wrap=madvise -Wl,--wrap=syscall -Wl,--wrap=close)
+  add_test(NAME cache_backing_platform_test COMMAND cache_backing_platform_test)
+  set_tests_properties(cache_backing_platform_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
+  add_executable(cache_backing_rss_test backing_rss_test.cpp)
+  target_link_libraries(cache_backing_rss_test PRIVATE gufo_cache)
+  add_test(NAME cache_backing_rss_test COMMAND cache_backing_rss_test)
+  set_tests_properties(cache_backing_rss_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+endif()
+
 add_executable(cache_ledger_test ledger_test.cpp)
 target_link_libraries(cache_ledger_test PRIVATE gufo_cache Threads::Threads)
 add_test(NAME cache_ledger_test COMMAND cache_ledger_test)

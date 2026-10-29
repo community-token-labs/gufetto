@@ -64,6 +64,14 @@ public:
   [[nodiscard]] ResourceCategory Category() const;
   [[nodiscard]] PersistencePin PinPersistence() const;
   [[nodiscard]] bool PersistencePinned() const;
+  // Synchronized eligibility observation, NOT a lease or physical-byte claim.
+  // True only for valid managed backing after materialization, with no source
+  // or backing RowPins, preservation-copy pins, closing operation or disk pin.
+  // Unbacked/partial/retired states fail closed. Source and backing readers are
+  // counted separately: backing readers must not delay source overwrite.
+  // New reader acquisition must follow the retention owner's serialization;
+  // existing owners/pins still retain storage if they outlive RAM removal.
+  [[nodiscard]] bool RetentionEvictable() const;
   [[nodiscard]] bool HasBacking() const;
   // Bytes a pin of rows not yet preserved exposes from their slot.
   [[nodiscard]] std::size_t SourceViewBytes() const;

@@ -1,10 +1,14 @@
 #ifndef GUFO_MODELS_QWEN_VISION_PROMPT_HPP_
 #define GUFO_MODELS_QWEN_VISION_PROMPT_HPP_
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -54,6 +58,29 @@ struct Prompt {
   std::size_t stable_prefix_tokens{0};
   RopeLayout rope;
   std::vector<PreparedImage> images;
+  [[nodiscard]] bool IntersectsImages(std::uint32_t position,
+                                      std::uint32_t count) const {
+    for (const auto& image : images) {
+      const auto begin = std::max<std::uint64_t>(position, image.grid.offset);
+      const auto end = std::min<std::uint64_t>(
+          std::uint64_t{position} + count,
+          std::uint64_t{image.grid.offset} +
+              std::uint64_t{image.grid.height} * image.grid.width);
+      if (begin < end)
+        return true;
+    }
+    return false;
+  }
+  [[nodiscard]] std::uint32_t ImageRows() const {
+    std::uint64_t rows = 0;
+    for (const auto& image : images) {
+      const auto count = std::uint64_t{image.grid.height} * image.grid.width;
+      if (count > std::numeric_limits<std::uint32_t>::max() - rows)
+        throw std::length_error("aggregate image rows overflow");
+      rows += count;
+    }
+    return static_cast<std::uint32_t>(rows);
+  }
   /// SHA-256 covers decoded pixels, grid placement, preprocessing version,
   /// and the model-specific encoder identity. Tokens remain a separate key.
   std::vector<std::uint8_t> cache_identity;
@@ -72,7 +99,10 @@ struct Prompt {
     std::span<const tokenization::ChatTool> tools,
     const tokenization::ChatTemplateOptions& options,
     std::string_view encoder_identity, std::uint32_t max_context,
-    ImageCache* image_cache = nullptr);
+    ImageCache* image_cache = nullptr,
+    // Absence preserves the original context-only validation and diagnostics.
+    // Explicit zero retains the pooled policy's aggregate context bound.
+    std::optional<std::uint32_t> max_image_tokens = std::nullopt);
 
 }  // namespace gufo::models::qwen::vision
 #endif

@@ -38,7 +38,10 @@ struct RowState {
   ResourceCategory category;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
-  std::size_t readers{};
+  // Source RowPins and preservation copies prevent source overwrite. Backing
+  // RowPins only prevent retention eviction; keeping these counts separate
+  // preserves the existing guard/lease behavior after materialization.
+  std::size_t readers{}, backing_readers{};
   bool closing{false};
   enum Completion : unsigned { kMaterialized = 1, kRetired = 2 };
   // Completion bits only accumulate. Publish after the copy and accounting
@@ -522,16 +525,21 @@ RowPin RowPin::Clone() const {
   result.charge_ = charge_;
   result.owner_ = owner_;
   result.bytes_ = bytes_;
-  if (result.state_ && result.location_) {
+  if (result.state_) {
     std::lock_guard lock(result.state_->mutex);
-    ++result.state_->readers;
+    if (result.location_)
+      ++result.state_->readers;
+    else
+      ++result.state_->backing_readers;
   }
   return result;
 }
 void RowPin::Release() noexcept {
-  if (state_ && location_) {
+  if (state_) {
     std::lock_guard lock(state_->mutex);
-    --state_->readers;
+    auto& readers = location_ ? state_->readers : state_->backing_readers;
+    assert(readers);
+    --readers;
     state_->changed.notify_all();
   }
   owner_.reset();
@@ -551,8 +559,8 @@ RowPin BorrowedRows::Pin(std::stop_token stop) const {
   if (r.Retired())
     throw std::runtime_error("borrowed rows retired");
   RowPin pin;
-  pin.state_ = state_;
   if (r.Materialized()) {
+    ++r.backing_readers;
     pin.owner_ = r.owner;
     pin.bytes_ = r.buffer;
   } else {
@@ -566,6 +574,7 @@ RowPin BorrowedRows::Pin(std::stop_token stop) const {
     pin.location_ = r.location;
     pin.bytes_ = r.source_bytes;
   }
+  pin.state_ = state_;
   return pin;
 }
 std::optional<BorrowedLocation> BorrowedRows::Location() const {
@@ -622,6 +631,20 @@ bool BorrowedRows::PersistencePinned() const {
     return false;
   return state_->Materialized() ? state_->charge.Info().persistence_pinned
                                 : state_->reservation.Info().persistence_pinned;
+}
+bool BorrowedRows::RetentionEvictable() const {
+  if (!state_)
+    return false;
+  std::lock_guard lock(state_->mutex);
+  // Only SlotLease::Borrow creates managed assigned backing. Observe's
+  // unbacked views and any incomplete/unknown state remain ineligible.
+  // CopyPiece and batched reassignment retain a source-reader count through
+  // conversion/publication until their transfer has drained and pin releases.
+  // Use this same row mutex as Pin/PinPersistence, never shared_ptr use_count.
+  return !state_->buffer.empty() && state_->Materialized() &&
+         !state_->Retired() && !state_->closing && !state_->readers &&
+         !state_->backing_readers && state_->charge &&
+         !state_->charge.Info().persistence_pinned;
 }
 bool BorrowedRows::HasBacking() const {
   return !state_->buffer.empty();

@@ -18,10 +18,12 @@
 #include <vector>
 
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/reclaimable_memory.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
+#include "src/models/qwen38_flash_next/execution_budget.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -125,6 +127,9 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  [[nodiscard]] std::size_t AllocatedVisionBytes() const noexcept {
+    return vision_input_.Bytes();
+  }
   /// PLE rows this session has gathered, including prefetches, since creation.
   [[nodiscard]] NgramTotals NgramRowTotals() const noexcept {
     return ngram_counters_.Load();
@@ -273,7 +278,14 @@ public:
   [[nodiscard]] std::size_t SessionBytes(
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
-  [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  [[nodiscard]] std::size_t DeferredScratchBytes(
+      SnapshotRoute route = SnapshotRoute::kNative) const;
+  void SetComponentMemoryBudget(
+      std::shared_ptr<core::ReclaimableMemory>) noexcept;
+  [[nodiscard]] const std::shared_ptr<core::ReclaimableMemory>&
+  ComponentMemoryBudget() const noexcept {
+    return image_memory_;
+  }
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
   [[nodiscard]] std::unique_ptr<PrefillCheckpoint> MakePrefillCheckpoint(
@@ -658,6 +670,7 @@ private:
   NgramTable* ngram_{nullptr};
   Options options_;
   [[nodiscard]] std::shared_ptr<SnapshotAllocator> GetSnapshotAllocator() const;
+  std::shared_ptr<core::ReclaimableMemory> image_memory_;
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;

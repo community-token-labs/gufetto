@@ -27,6 +27,11 @@ set(gufo_pr_targets
   component_text_cache_test text_model_runner_test continuation_disk_store_test
   bench_cli_test prompt_cli_test eval_http_client_test
   qwen_tokenizer_test qwen_chat_template_test qwen_prefill_scratch_test
+  qwen_vision_policy_test
+  qwen_vision_model_path_test
+  qwen_vision_cache_test
+  qwen_vision_memory_budget_test
+  qwen_vision_output_pool_test
   qwen27b_continuation_layout_test
   qwen38_flash_next_npu_contracts_test
   qwen38_flash_next_kv_cache_test

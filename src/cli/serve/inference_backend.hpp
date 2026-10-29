@@ -14,6 +14,7 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen/vision/input_budget.hpp"
 #include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::hip {
@@ -89,7 +90,10 @@ public:
             TextRunnerRamCacheOptions ram_cache_config = {},
             bool enable_yarn = false,
             models::qwen38_flash_next::KvCacheType kv_cache_type =
-                models::qwen38_flash_next::KvCacheType::kF16);
+                models::qwen38_flash_next::KvCacheType::kF16,
+            bool enable_vision = true,
+            std::uint32_t vision_max_tokens_per_slot = 0,
+            std::optional<std::uint32_t> vision_pool_tokens = std::nullopt);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -99,7 +103,8 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            TextRunnerRamCacheOptions ram_cache_config = {});
+            TextRunnerRamCacheOptions ram_cache_config = {},
+            std::uint32_t vision_max_tokens_per_slot = 0);
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
@@ -113,7 +118,11 @@ public:
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
   /// request-owned sessions, the model's tokenizer, and host-memory
-  /// continuation snapshots.
+  /// continuation snapshots. Only one component-serving backend may be alive
+  /// per Model; finish/release its requests and release it before binding
+  /// another, or load a separate Model. A second binding fails before startup
+  /// allocation and leaves the first backend unchanged. Native use is restored
+  /// when component resources unwind, including after failed initialization.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
             std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,

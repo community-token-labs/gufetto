@@ -18,6 +18,13 @@ public:
                       std::uint32_t context, cache::Identity);
   ~ContinuationAdapter() override;
   [[nodiscard]] Session& GetSession(cache::Slot&);
+  // Startup-only reconciliation, frozen before asynchronous backing growth.
+  [[nodiscard]] std::size_t InitialPendingExecutionBytes() const noexcept {
+    return initial_pending_execution_bytes_;
+  }
+  [[nodiscard]] std::size_t InitialPendingImageBytes() const noexcept {
+    return initial_pending_image_bytes_;
+  }
   // Capture synchronously while the coherent boundary is exposed; settle
   // all transfers before the callback returns and the shared arena is reused.
   void PrefillThrough(cache::Slot&, std::span<const std::int32_t>,
@@ -85,6 +92,8 @@ private:
       State&, bool load, cache::Stream&,
       const std::function<void(gufo::hip::TransferStream&)>&);
   std::shared_ptr<Model> model_;
+  std::size_t initial_pending_execution_bytes_{};
+  std::size_t initial_pending_image_bytes_{};
   core::SessionMode mode_;
   std::uint32_t context_;
   ContinuationLayout layout_;

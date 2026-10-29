@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <filesystem>
+#include <future>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -398,6 +401,461 @@ void PersistingCheckpointIsNotAVictim() {
   assert(!f.policy.Reclaim({std::vector<Token>(9, 99), {1}, {}}));
   pins.clear();
   assert(f.Reclaim() == written);
+}
+void ExecutionPressureOrder() {
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    PressureFixture f;
+    const auto old = f.Add(Conversation(1, 16));
+    const auto reused =
+        f.Add(Conversation(2, 16), RetentionPurpose::kContinuation, true);
+    const auto cheap = f.Add(Conversation(3, 7));
+    const auto source = f.Add(Conversation(4, 7));
+    auto retry = Conversation(4, 7);
+    retry.push_back(5);
+    assert(f.policy.Admit({retry, {1}, {}, RetentionPurpose::kRetry, 7}, [&] {
+      return IndexCheckpoint(f.ledger, retry, {1}, {}, kPressureComponents);
+    }));
+    const auto copy = f.log.events.back().checkpoint;
+    assert(f.policy.Rank(copy) == 0);
+    for (const auto expected : {copy, cheap, source, old, reused}) {
+      const auto size = f.policy.Size();
+      assert(f.policy.ReclaimForExecution());
+      assert(f.policy.Size() == size - 1);
+      assert(f.log.events.back().checkpoint == expected);
+      assert(f.log.events.back().reason == RetentionReason::kByteCapacity);
+    }
+    assert(!f.policy.ReclaimForExecution());
+  }
+  // Protection is absolute, including a nearby retry source; external
+  // pressure has neither an incoming rank ceiling nor a source exception.
+  Fixture f;
+  const auto source = f.Add({1, 2});
+  const auto other = f.Add({9, 9});
+  const std::array protected_ids{source};
+  assert(f.policy.ReclaimForExecution(protected_ids));
+  assert(f.log.events.back().checkpoint == other);
+  const auto events = f.log.events.size();
+  assert(!f.policy.ReclaimForExecution(protected_ids));
+  assert(f.log.events.size() == events && f.Cached({1, 2}) == 2);
+  assert(f.policy.ReclaimForExecution());
+  assert(f.log.events.back().checkpoint == source);
+}
+void ExecutionPressureExternalHandles() {
+  for (bool drop_index : {false, true}) {
+    Fixture f;
+    const std::vector<Token> tokens{1, 2, 3, 4};
+    f.Add(tokens);
+    auto lookup = f.index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+    assert(!f.policy.ReclaimForExecution());
+    auto checkpoint = lookup.selected->checkpoint;
+    const auto entry = lookup.selected->entry;
+    lookup = {};
+    assert(checkpoint.use_count() == 3);  // policy, index, external handle
+    if (drop_index) {
+      f.index.DropResident(entry);
+      assert(checkpoint.use_count() == 2);
+    }
+    // Two owners can mean policy + external, NOT necessarily policy + index.
+    assert(!f.policy.ReclaimForExecution());
+    checkpoint.reset();
+    assert(f.policy.ReclaimForExecution());
+    assert(f.policy.Size() == 0);
+  }
+}
+void ExecutionPressurePins() {
+  constexpr std::array<ComponentDescriptor, 3> components{
+      {{{1}, 1, ComponentKind::kAppendRows, 64, 4, 0},
+       {{2}, 1, ComponentKind::kPrivateState, 0, 0, 32},
+       {{3}, 1, ComponentKind::kPrivateState, 0, 0, 32}}};
+  for (bool private_states : {false, true}) {
+    const auto descriptors =
+        std::span(components).first(private_states ? 3 : 1);
+    for (int kind = 0; kind < (private_states ? 7 : 5); ++kind) {
+      ResourceLedger ledger{kIndexLimits};
+      PrefixIndex index{ledger};
+      index.Register({1}, descriptors);
+      Log log;
+      RetentionPolicy policy{ledger, index, &log};
+      const std::vector<Token> tokens(9, 1);
+      assert(policy.Admit({tokens, {1}, {}}, [&] {
+        return IndexCheckpoint(ledger, tokens, {1}, {}, descriptors);
+      }));
+      auto lookup = index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+      const auto& c = lookup.selected->checkpoint->Components()[0];
+      std::optional<ChunkReference> reference;
+      std::optional<CheckpointChunk> chunk_copy;
+      PersistencePin pin;
+      if (kind == 0)
+        reference = c.chunks[0].PinReader();
+      else if (kind == 1)
+        reference = c.chunks[0].PinPersistence();
+      else if (kind == 2)
+        reference.emplace(c.chunks[0]);  // escaped checkpoint-kind reference
+      else if (kind == 3)
+        chunk_copy = c.chunks[0];
+      else if (kind == 4)
+        pin = c.tail->CommittedCharge().PinPersistence();
+      else
+        pin = lookup.selected->checkpoint->Components()[kind - 4]
+                  .private_state->CommittedCharge()
+                  .PinPersistence();
+      lookup = {};
+      const auto events = log.events.size();
+      assert(!policy.ReclaimForExecution());
+      assert(policy.Size() == 1 && log.events.size() == events);
+      reference.reset();
+      chunk_copy.reset();
+      pin = {};
+      assert(policy.ReclaimForExecution());
+      assert(policy.Size() == 0);
+    }
+  }
+  // Skip a pinned lowest-value record, not the whole scan.
+  PressureFixture f;
+  auto tokens = Conversation(1, 7);
+  const auto pinned = f.Add(tokens);
+  const auto eligible = f.Add(Conversation(2, 16));
+  auto lookup = f.index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+  auto reader =
+      lookup.selected->checkpoint->Components()[0].chunks[0].PinReader();
+  lookup = {};
+  assert(f.policy.ReclaimForExecution());
+  assert(f.log.events.back().checkpoint == eligible);
+  assert(f.policy.Size() == 1 && f.policy.Rank(pinned) == 3);
+}
+void ExecutionPressureSharedAndInFlight() {
+  ResourceLedger ledger{kIndexLimits};
+  const auto descriptors = std::span(kPressureComponents).first(1);
+  PrefixIndex index{ledger};
+  index.Register({1}, descriptors);
+  RetentionPolicy policy{ledger, index};
+  auto history = ExecutionHistory::Cold(ledger, descriptors, {1});
+  std::vector<Token> tokens(8, 1);
+  const auto save = [&](const PayloadRequest& r) {
+    auto pool =
+        ledger.Reserve(ResourceCategory::kBackingFree, r.bytes).Convert();
+    return Payload::Committed(pool.ReserveBacking(r.category).Convert(),
+                              std::make_shared<int>(0));
+  };
+  const auto capture = [&] {
+    return history.Capture({tokens,
+                            InputIdentity(tokens.size()),
+                            {{{1}, tokens.size()}},
+                            CheckpointPurpose::kPrompt,
+                            1},
+                           save);
+  };
+  assert(policy.Admit({tokens, {1}, {}}, capture));
+  tokens.push_back(2);
+  bool prepared = false;
+  try {
+    (void)history.Capture({tokens,
+                           InputIdentity(tokens.size()),
+                           {{{1}, tokens.size()}},
+                           CheckpointPurpose::kPrompt,
+                           1},
+                          save, [&](std::span<const PayloadRequest>) {
+                            prepared = true;
+                            // Unpublished capture already owns the shared
+                            // chunks, but no Checkpoint handle has escaped and
+                            // no reader-kind pin exists.
+                            assert(!policy.ReclaimForExecution());
+                            throw std::runtime_error("cancel capture");
+                          });
+    assert(false);
+  } catch (const std::runtime_error&) {
+    assert(prepared);
+  }
+  assert(policy.Admit({tokens, {1}, {}}, capture));
+  // Two retained checkpoints share complete chunks, with only weak history
+  // bookkeeping outside retention. Normal sharing must not exclude both.
+  assert(policy.ReclaimForExecution());
+  assert(policy.Size() == 1);
+  assert(policy.ReclaimForExecution());
+}
+void ExecutionPressureDirectRows() {
+  ResourceLedger ledger{kIndexLimits};
+  const auto descriptors = std::span(kPressureComponents).first(1);
+  PrefixIndex index{ledger};
+  index.Register({1}, descriptors);
+  RetentionPolicy policy{ledger, index};
+  std::vector<ResourceCharge> pools;
+  const std::vector<Token> tokens{1, 2, 3};
+  auto history = ExecutionHistory::Cold(ledger, descriptors, {1});
+  assert(policy.Admit({tokens, {1}, {}}, [&] {
+    return history.Capture(
+        {tokens,
+         InputIdentity(tokens.size()),
+         {{{1}, tokens.size()}},
+         CheckpointPurpose::kPrompt,
+         1},
+        [&](const PayloadRequest& r) {
+          pools.push_back(
+              ledger.Reserve(ResourceCategory::kBackingFree, r.bytes)
+                  .Convert());
+          return Payload::Committed(
+              pools.back().ReserveBacking(r.category).Convert(),
+              std::make_shared<std::vector<std::byte>>(r.bytes));
+        });
+  }));
+  auto lookup = index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+  const std::array protected_ids{lookup.selected->checkpoint->Id()};
+  auto reader = lookup.selected->checkpoint->Components()[0].tail->PinRows();
+  lookup = {};
+  // Direct RowPins have no public count: the owner must publish protection.
+  assert(!policy.ReclaimForExecution(protected_ids));
+  // Demonstrate the documented safety boundary even if a caller omits that
+  // protection. Logical removal cannot release the reader's backing token.
+  assert(policy.ReclaimForExecution());
+  assert(reader.Owner() &&
+         pools[0].Info().category == ResourceCategory::kPrivateTail);
+  reader = {};
+  assert(pools[0].Info().category == ResourceCategory::kBackingFree);
+}
+void ExecutionPressureBorrowedRows() {
+  ResourceLedger ledger{kIndexLimits};
+  FakeAdapter adapter;
+  FakeStream stream{true};
+  LeasedSlot slot{ledger, adapter, stream, {1}};
+  auto lease = slot.Acquire();
+  const std::vector<Token> tokens{1, 2, 3, 4, 5};
+  adapter.Append(lease.Execution(), tokens, tokens);
+  const auto hash = adapter.RecurrentHash(lease.Execution());
+  const auto invalidations = adapter.Invalidations();
+  PrefixIndex index{ledger};
+  index.Register(adapter.CompatibilityIdentity(), adapter.Components());
+  RetentionPolicy policy{ledger, index};
+  auto history = ExecutionHistory::Cold(ledger, adapter.Components(),
+                                        adapter.CompatibilityIdentity());
+  assert(policy.Admit({tokens, adapter.CompatibilityIdentity(), {}}, [&] {
+    return history.Capture(
+        {tokens, InputIdentity(tokens.size()),
+         adapter.Positions(lease.Execution()), CheckpointPurpose::kPrompt, 1},
+        [&](const PayloadRequest& r) {
+          auto pool =
+              ledger.Reserve(ResourceCategory::kBackingFree, r.bytes).Convert();
+          auto reservation = pool.ReserveBacking(r.category);
+          auto bytes = std::make_shared<std::vector<std::byte>>(r.bytes);
+          if (r.category == ResourceCategory::kPrivateState) {
+            auto copy = adapter.CapturePrivate(lease.Execution(), r.component,
+                                               *bytes, stream);
+            assert(copy.Wait() == TransferResult::kSucceeded);
+            return Payload::Committed(reservation.Convert(), bytes);
+          }
+          return Payload::Borrowed(lease.Borrow(r.component, r.first, r.end,
+                                                std::move(reservation), bytes,
+                                                *bytes));
+        });
+  }));
+  auto lookup = index.Lookup(
+      {adapter.CompatibilityIdentity(), tokens, InputIdentity(tokens.size())});
+  auto borrowed = lookup.selected->checkpoint->Components()[0]
+                      .chunks[0]
+                      .Storage()
+                      .BorrowedStorage();
+  auto reader = borrowed->Pin();
+  lookup = {};
+  assert(!policy.ReclaimForExecution());
+  reader = {};
+  // Materialization alone is not enough: direct backing pins still block.
+  adapter.GuardRows(lease.Execution(), kTarget, 0, tokens.size());
+  adapter.GuardRows(lease.Execution(), kDraft, 0, tokens.size());
+  assert(!borrowed->Location());
+  assert(borrowed->RetentionEvictable());
+  reader = borrowed->Pin();
+  auto persistence = borrowed->PinPersistence();
+  borrowed.reset();
+  assert(!policy.ReclaimForExecution());
+  reader = {};
+  assert(!policy.ReclaimForExecution());
+  persistence = {};
+  assert(policy.ReclaimForExecution());  // no permanent borrowed exclusion
+  assert(policy.Size() == 0 && adapter.Invalidations() == invalidations);
+  assert(adapter.RecurrentHash(lease.Execution()) == hash);
+}
+void ExecutionPressureIdleBorrowedLifecycle() {
+  ResourceLedger ledger{kIndexLimits};
+  FakeAdapter adapter;
+  FakeStream stream{true};
+  std::promise<void> copying, resume;
+  auto started = copying.get_future();
+  auto allowed = resume.get_future();
+  // One target chunk, one idle copy. Hold stream acquisition after CopyPiece
+  // acquires its source/copy pin, without timing-dependent sleeps or GPU work.
+  IdleSpillConfig spill{4 * sizeof(Token),
+                        [&]() -> std::unique_ptr<Stream> {
+                          copying.set_value();
+                          allowed.wait();
+                          return std::make_unique<FakeStream>(true);
+                        },
+                        [] { return true; }};
+  LeasedSlot slot{ledger, adapter, stream, {1}, spill};
+  auto lease = slot.Acquire();
+  const std::vector<Token> tokens{1, 2, 3, 4};
+  adapter.Append(lease.Execution(), tokens, tokens);
+  const auto hash = adapter.RecurrentHash(lease.Execution());
+  const auto invalidations = adapter.Invalidations();
+  const auto live = lease.Location();
+  const auto descriptors = adapter.Components().first(1);
+  PrefixIndex index{ledger};
+  index.Register(adapter.CompatibilityIdentity(), descriptors);
+  RetentionPolicy policy{ledger, index};
+  auto history = ExecutionHistory::Cold(ledger, descriptors,
+                                        adapter.CompatibilityIdentity());
+  assert(policy.Admit({tokens, adapter.CompatibilityIdentity(), {}}, [&] {
+    return history.Capture(
+        {tokens,
+         InputIdentity(tokens.size()),
+         {{kTarget, tokens.size()}},
+         CheckpointPurpose::kPrompt,
+         1},
+        [&](const PayloadRequest& r) {
+          auto pool =
+              ledger.Reserve(ResourceCategory::kBackingFree, r.bytes).Convert();
+          auto bytes = std::make_shared<std::vector<std::byte>>(r.bytes);
+          return Payload::Borrowed(lease.Borrow(r.component, r.first, r.end,
+                                                pool.ReserveBacking(r.category),
+                                                bytes, *bytes));
+        });
+  }));
+  auto lookup = index.Lookup(
+      {adapter.CompatibilityIdentity(), tokens, InputIdentity(tokens.size())});
+  const std::array protected_ids{lookup.selected->checkpoint->Id()};
+  auto rows = lookup.selected->checkpoint->Components()[0]
+                  .chunks[0]
+                  .Storage()
+                  .BorrowedStorage();
+  const std::weak_ptr<BorrowedRows> observed = rows;
+  lookup = {};
+  assert(!rows->RetentionEvictable() && !policy.ReclaimForExecution());
+  lease.Commit();
+  assert(started.wait_for(std::chrono::seconds(3)) ==
+         std::future_status::ready);
+  assert(!rows->RetentionEvictable() && !policy.ReclaimForExecution());
+  auto source_reader = rows->Pin();
+  assert(source_reader.Location());
+  resume.set_value();
+  // Exact-live acquisition drains the current idle copy, not old external
+  // source readers. The old source pin must still exclude the now-materialized
+  // checkpoint, without misclassifying it as an active backing reader.
+  lease = slot.Acquire(live);
+  assert(!rows->Location());
+  assert(slot.Metrics().idle_bytes == 4 * sizeof(Token));
+  assert(!rows->RetentionEvictable() && !policy.ReclaimForExecution());
+  auto backing_reader = rows->Pin();
+  assert(!backing_reader.Location() && backing_reader.Owner());
+  RowPin moved_reader = std::move(backing_reader);
+  source_reader = {};
+  // Backing readers must not enter the source-overwrite wait counter. This
+  // guard must finish while moved_reader still owns materialized backing.
+  adapter.GuardRows(lease.Execution(), kTarget, 0, tokens.size());
+  assert(!rows->RetentionEvictable() && !policy.ReclaimForExecution());
+  moved_reader = {};
+  assert(rows->RetentionEvictable());
+  // ChunkReference copies clone their RowPins; the final clone releases the
+  // backing-reader count, independent of checkpoint/index shared ownership.
+  lookup = index.Lookup(
+      {adapter.CompatibilityIdentity(), tokens, InputIdentity(tokens.size())});
+  std::optional<ChunkReference> first =
+      lookup.selected->checkpoint->Components()[0].chunks[0].PinReader();
+  std::optional<ChunkReference> clone = *first;
+  lookup = {};
+  first.reset();
+  assert(!rows->RetentionEvictable() && !policy.ReclaimForExecution());
+  clone.reset();
+  assert(rows->RetentionEvictable());
+  auto persistence = rows->PinPersistence();
+  assert(!rows->RetentionEvictable() && !policy.ReclaimForExecution());
+  persistence = {};
+  assert(rows->RetentionEvictable());
+  assert(!policy.ReclaimForExecution(protected_ids));
+  // Unbacked observations have no managed materialization/pin proof and
+  // continue to fail closed; only real managed backing can become eligible.
+  auto unbacked = lease.Observe(
+      kTarget, 0, tokens.size(),
+      adapter.BorrowRowsView(lease.Execution(), kTarget, 0, tokens.size()));
+  assert(!unbacked->RetentionEvictable());
+  rows.reset();
+  assert(policy.ReclaimForExecution());
+  assert(policy.Size() == 0 && observed.expired());
+  assert(adapter.RecurrentHash(lease.Execution()) == hash);
+  assert(lease.Location() == live && adapter.Invalidations() == invalidations);
+}
+void ExecutionPressureKeepsDurable() {
+  struct Directory {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("gufo-retention-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    Directory() { assert(std::filesystem::create_directory(path)); }
+    ~Directory() { std::filesystem::remove_all(path); }
+  } directory;
+  ResourceLedger ledger{kIndexLimits};
+  DiskStore disk{ledger, directory.path, 1 << 20};
+  PrefixIndex index{ledger};
+  CompatibilityDigest digest{};
+  index.Register({1}, kIndexComponents, digest);
+  RetentionPolicy policy{ledger, index};
+  const std::vector<Token> tokens{1, 2, 3, 4};
+  assert(policy.Admit({tokens, {1}, {}},
+                      [&] { return IndexCheckpoint(ledger, tokens); }));
+  CheckpointId id;
+  IndexEntryId entry;
+  {
+    auto lookup = index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+    const auto& checkpoint = *lookup.selected->checkpoint;
+    id = checkpoint.Id();
+    entry = lookup.selected->entry;
+    DiskManifest manifest;
+    manifest.checkpoint = id;
+    manifest.lineage = checkpoint.Lineage();
+    manifest.compatibility = digest;
+    manifest.tokens = tokens;
+    std::vector<std::vector<std::uint8_t>> payloads;
+    std::vector<DiskWriteBuffer> buffers;
+    const auto add = [&](const Payload& payload, bool private_file) {
+      auto& bytes = payloads.emplace_back(payload.Bytes(), 0);
+      DiskFileId file{};
+      file[0] = static_cast<std::uint8_t>(payloads.size());
+      buffers.push_back({private_file, file, bytes});
+      return DiskPayload{file, bytes.size(), DiskChecksum(bytes)};
+    };
+    for (const auto& c : checkpoint.Components()) {
+      DiskComponent component{c.descriptor, c.position, {}, {}, {}};
+      for (const auto& chunk : c.chunks)
+        component.chunks.push_back(add(chunk.Storage(), false));
+      if (c.tail)
+        component.tail = add(*c.tail, true);
+      if (c.private_state)
+        component.private_state = add(*c.private_state, true);
+      manifest.components.push_back(std::move(component));
+    }
+    DiskFileId file{};
+    file[0] = 100;
+    disk.Publish(file, manifest, buffers);
+    index.AttachDurable(entry, disk.Describe(id));
+  }
+  assert(policy.ReclaimForExecution());
+  assert(policy.Size() == 0);
+  const auto lookup = index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+  assert(lookup.selected && lookup.selected->entry == entry);
+  assert(!lookup.selected->checkpoint && lookup.selected->durable);
+  assert(lookup.selected->durable->Manifest().checkpoint == id);
+  assert(lookup.selected->boundary == tokens.size());
+}
+void ExecutionPressureDoesNotChangeCaptureReclaim() {
+  Fixture f;
+  const std::vector<Token> tokens{1, 2, 3, 4};
+  const auto source = f.Add(tokens);
+  const std::vector<Token> retry{1, 2, 3, 4, 5};
+  RetentionRequest request{retry, {1}, {}, RetentionPurpose::kRetry, 4, source};
+  auto lookup = f.index.Lookup({{1}, tokens, InputIdentity(tokens.size())});
+  assert(!f.policy.ReclaimForExecution());
+  // Existing capture semantics intentionally permit advancing a leased,
+  // nearby retry source. The new stricter eligibility must not leak into it.
+  assert(f.policy.Reclaim(request));
+  assert(lookup.selected->checkpoint->IsValid() && f.policy.Size() == 0);
 }
 void RetryCopyReplacesItsNearbySource() {
   // An unchanged retry restored from its stable boundary may replace that
@@ -1085,6 +1543,15 @@ int main() {
   CheapCheckpointsGiveWayFirst();
   ReusedCheapCheckpointKeepsRecency();
   PersistingCheckpointIsNotAVictim();
+  ExecutionPressureOrder();
+  ExecutionPressureExternalHandles();
+  ExecutionPressurePins();
+  ExecutionPressureSharedAndInFlight();
+  ExecutionPressureDirectRows();
+  ExecutionPressureBorrowedRows();
+  ExecutionPressureIdleBorrowedLifecycle();
+  ExecutionPressureKeepsDurable();
+  ExecutionPressureDoesNotChangeCaptureReclaim();
   RetryCopyReplacesItsNearbySource();
   ResumedRetryReclaimsCoveredHistory();
   LongResumedRetryReclaimsOnlyOwnAncestors();

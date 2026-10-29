@@ -249,10 +249,50 @@ public:
     return s.adapter.Positions(s.slot).front().valid_rows;
   }
 };
+void ExecutionReclamationWaitsForActiveSourcesAndUnbinds() {
+  class ReclaimRunner final : public Runner {
+  public:
+    mutable std::function<bool()> reclaim;
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->bind_execution_reclaimer = [this](std::function<bool()> step) {
+        reclaim = std::move(step);
+      };
+      return resources;
+    }
+  };
+  auto runner = std::make_shared<ReclaimRunner>();
+  {
+    TextRunnerPool pool(runner, 1);
+    assert(runner->reclaim && !runner->reclaim());
+    {
+      auto request =
+          pool.Acquire(std::vector<TextRunnerToken>{1, 2, 3, 4, 5, 6, 7, 8});
+      while (!request.prefill_complete())
+        (void)request.Prefill(8);
+      (void)request.Commit();
+      assert(!runner->reclaim());  // active source must remain protected
+    }
+    // Managed borrowed rows become eligible after their real idle copy, not
+    // merely when checkpoint metadata says that its slot is idle.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool reclaimed = false;
+    while (!(reclaimed = runner->reclaim()) &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    assert(reclaimed);
+  }
+  assert(!runner->reclaim);  // no callback into a destroyed serving cache
+}
+
 void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
   class BudgetRunner final : public Runner {
   public:
     mutable std::size_t committed{};
+    mutable unsigned frozen{};
+    std::size_t pending{};
     TextRunnerResourceClaim ResourceClaim() const override {
       auto claim = Runner::ResourceClaim();
       claim.state_capacity_bytes = 4ULL << 30;
@@ -267,22 +307,45 @@ void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
     std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
         cache::ResourceLedger& ledger, std::size_t ram) const override {
       auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->freeze_execution_liability = [this] {
+        ++frozen;
+        return pending;
+      };
       resources->commit_backing = [this, &ledger](std::size_t budget) {
+        assert(frozen == 1);
         assert(ledger.Limits().ram_bytes == budget);
         committed = budget;
       };
       return resources;
     }
   };
-  for (const auto requested : {0ULL, 3ULL << 20}) {
+  for (const auto pending : {0ULL, 128ULL << 10}) {
+    for (const auto requested : {0ULL, 3ULL << 20}) {
+      auto runner = std::make_shared<BudgetRunner>();
+      runner->pending = pending;
+      TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = requested});
+      assert(runner->committed ==
+             (requested ? (2ULL << 20) - pending : (1ULL << 20) - pending / 2));
+      // Allocating/freeing the promised storage later never increases the
+      // initial fixed ceiling or invokes this startup hook again.
+      runner->pending = 0;
+      std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
+      auto request = pool.Acquire(prompt);
+      while (!request.prefill_complete())
+        (void)request.Prefill(8);
+      assert(request.SelectNext().token != 0 && runner->frozen == 1);
+    }
+  }
+  for (const bool ram_on : {false, true}) {
     auto runner = std::make_shared<BudgetRunner>();
-    TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = requested});
-    assert(runner->committed == (requested ? 2ULL << 20 : 1ULL << 20));
-    std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
-    auto request = pool.Acquire(prompt);
-    while (!request.prefill_complete())
-      (void)request.Prefill(8);
-    assert(request.SelectNext().token != 0);
+    runner->pending = 3ULL << 20;
+    bool refused = false;
+    try {
+      TextRunnerPool pool(runner, 2, {}, {.enabled = ram_on});
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    assert(refused && runner->committed == 0 && runner->frozen == 1);
   }
 }
 void Prefill(TextRunnerPool::Request& request) {
@@ -3586,7 +3649,7 @@ void OverRamCaptureStagesPrivateStateUnderPressure(bool protect) {
 }
 // Registered pins intentionally retain the strict Linux runtime contract.
 #if defined(__linux__)
-class PinRunner final : public Runner {
+class PinRunner : public Runner {
 public:
   mutable std::size_t prefilled{};
   TextRunnerDescriptor Descriptor() const override {
@@ -3620,6 +3683,78 @@ public:
       logits[i] = static_cast<float>((hash >> (8 * i)) & 255) / 64;
     return {.token = static_cast<TextRunnerToken>(sampler.Sample(logits)),
             .piece = "x"};
+  }
+};
+// Simulate an image envelope without a model or physical GPU allocator. Calling
+// the bound reclaimer also checks that ticket acquisition/release is unlocked.
+class PermanentPinRunner final : public PinRunner {
+public:
+  bool compatible{true};
+  bool require_ticket{true};
+  bool ticket_before_admission{true};
+  bool capture_error{};
+  mutable std::size_t headroom_reads{};
+  mutable std::size_t attempts{}, active{}, released{}, admissions{};
+  mutable std::size_t finishes{}, publication_mutations{};
+  mutable std::function<bool()> reclaim;
+  std::function<void()> on_release;
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t ram) const override {
+    auto resources = PinRunner::CreateComponentCacheResources(ledger, ram);
+    resources->bind_execution_reclaimer = [this](std::function<bool()> step) {
+      assert(active == 0);
+      reclaim = std::move(step);
+    };
+    resources->permanent_backing_headroom = [this] {
+      ++headroom_reads;
+      assert(reclaim && active == 0);
+      (void)reclaim();
+      return std::pair<std::size_t, std::size_t>{8192, 4096};
+    };
+    resources->reserve_permanent_backing = [this]() -> std::shared_ptr<void> {
+      ++attempts;
+      assert(reclaim && active == 0);
+      (void)reclaim();
+      if (!compatible)
+        return {};
+      ++active;
+      finishes = publication_mutations = 0;
+      return std::shared_ptr<void>(new int(0), [this](void* ticket) {
+        delete static_cast<int*>(ticket);
+        assert(active == 1);
+        --active;
+        ++released;
+        assert(reclaim);
+        (void)reclaim();
+        if (on_release)
+          on_release();
+      });
+    };
+    resources->test_barrier = [this](std::string_view point) {
+      if (point == "admission") {
+        ++admissions;
+        if (ticket_before_admission)
+          assert(active == 1);
+      }
+      if (point == "mutation" && active && finishes)
+        ++publication_mutations;
+    };
+    resources->allocate = [this, allocate = std::move(resources->allocate)](
+                              const cache::PayloadRequest& request) {
+      if (require_ticket)
+        assert(active == 1);
+      if (capture_error)
+        throw std::runtime_error("injected capture failure");
+      auto buffer = allocate(request);
+      buffer.finish = [this, finish = std::move(buffer.finish)] {
+        if (require_ticket)
+          assert(active == 1);
+        ++finishes;
+        return finish();
+      };
+      return buffer;
+    };
+    return resources;
   }
 };
 struct PinFixture {
@@ -3664,6 +3799,196 @@ struct PinFixture {
     return result;
   }
 };
+void PermanentPinBackingRefusesEagerStartup() {
+  for (const bool existing : {false, true}) {
+    PinFixture fixture;
+    if (existing) {
+      TextRunnerPool seed(std::make_shared<PinRunner>(), 1, {},
+                          {.pinned_prefix = fixture.options});
+    }
+    auto runner = std::make_shared<PermanentPinRunner>();
+    runner->compatible = false;
+    bool refused = false;
+    try {
+      TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+    } catch (const std::runtime_error& error) {
+      const std::string message = error.what();
+      refused = message.find("image execution envelope") != std::string::npos;
+      for (const auto expected :
+           {"needed_bytes=8192", "available_bytes=4096", "--pin-prefix-file",
+            "--pin-prefix-dir", "reduce pinned prefixes", "--pin-prefix-lazy",
+            "existing disk pins", "--no-vision"})
+        assert(message.find(expected) != std::string::npos);
+    }
+    assert(refused && runner->attempts == 1 && runner->headroom_reads == 1);
+    assert(runner->admissions == 0 && runner->prefilled == 0 &&
+           runner->captures == 0);
+    assert(runner->active == 0 && runner->released == 0 && !runner->reclaim);
+  }
+}
+void PermanentPinBackingRefusalKeepsLazyDiskUsable() {
+  PinFixture fixture;
+  auto options = fixture.options;
+  options.lazy = true;
+  // New lazy registrations may capture transient RAM, but must not ask for a
+  // permanent claim. Restarting the same disk registration needs no capture.
+  for (const bool existing : {false, true}) {
+    auto runner = std::make_shared<PermanentPinRunner>();
+    runner->compatible = false;
+    runner->require_ticket = false;
+    runner->ticket_before_admission = false;
+    {
+      ComponentTextCache cache(runner, 1, 1 << 22, {}, false, 0, options);
+      runner->require_ticket = true;
+      assert(runner->attempts == 0);
+      assert(bool(runner->captures) == !existing);
+      const auto published = fixture.Files();
+      const auto captures = runner->captures;
+      for (const TextRunnerToken suffix : {100, 101}) {
+        auto prompt = fixture.tokens;
+        prompt.push_back(suffix);
+        assert(cache.Lookup(prompt, nullptr, true, 0)->tier == "disk");
+        auto request = cache.Acquire(prompt, {}, {}, true, 0, true);
+        assert(request->restored_from_disk());
+        assert(request->cached_tokens() == fixture.tokens.size());
+        assert(runner->captures == captures);  // no permanent capture attempted
+        // Exercise the restored runner directly, without ordinary request
+        // snapshots obscuring whether the registered pin was promoted.
+        auto& state = dynamic_cast<TextRunnerState&>(request->state());
+        const auto step =
+            runner->Prefill(state, prompt, request->cached_tokens(), 1);
+        assert(step.consumed_tokens == 1);
+        sampling::SamplerState sampler({}, prompt);
+        const auto actual = runner->SelectNext(state, sampler).token;
+        request->Invalidate();
+        TextRunnerPool cold(std::make_shared<PinRunner>(), 1);
+        auto control = cold.Acquire(prompt);
+        Prefill(control);
+        assert(Generate(control) == actual);
+        control.Invalidate();
+        assert(cache.Lookup(prompt, nullptr, true, 0)->tier == "disk");
+      }
+      assert(runner->attempts == 2 && runner->released == 0);
+      assert(fixture.Files() == published);
+    }
+    assert(!runner->reclaim && runner->active == 0);
+  }
+}
+void PermanentPinBackingTicketCoversCaptureAndPublication() {
+  for (const bool lazy : {false, true}) {
+    for (const bool existing : {false, true}) {
+      PinFixture fixture;
+      const std::vector<TextRunnerToken> other_tokens{20, 21, 22, 23};
+      if (lazy)
+        fixture.AddTokens(other_tokens);
+      if (existing) {
+        TextRunnerPool seed(std::make_shared<PinRunner>(), 1, {},
+                            {.pinned_prefix = fixture.options});
+      }
+      auto options = fixture.options;
+      options.lazy = lazy;
+      auto runner = std::make_shared<PermanentPinRunner>();
+      runner->require_ticket = !lazy;
+      runner->ticket_before_admission = !lazy;
+      runner->on_release = [&] {
+        assert(runner->active == 0 && runner->finishes > 0);
+        // Capture readiness, then the final pin publication/Invalidate: both
+        // must precede ticket destruction, not just the physical allocation.
+        assert(runner->publication_mutations >= 2);
+      };
+      auto prompt = fixture.tokens;
+      prompt.push_back(100);
+      {
+        TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+        if (lazy) {
+          assert(runner->attempts == 0);
+          runner->require_ticket = true;
+          runner->on_release = [&] {
+            assert(runner->active == 0 && runner->finishes > 0);
+            assert(runner->publication_mutations >= 2);
+            assert(pool.Lookup(prompt).tier == "ram");
+          };
+          auto request = pool.Acquire(prompt);
+          assert(request.cache_disk_hit());
+          request.Invalidate();
+        }
+        assert(runner->attempts == 1 && runner->released == 1);
+        assert(runner->active == 0 && pool.Lookup(prompt).tier == "ram");
+        runner->on_release = {};
+        if (lazy) {
+          runner->compatible = false;
+          auto other_prompt = other_tokens;
+          other_prompt.push_back(101);
+          auto request = pool.Acquire(other_prompt);
+          assert(request.cache_disk_hit());
+          request.Invalidate();
+          assert(runner->attempts == 2 && runner->released == 1);
+          assert(pool.Lookup(other_prompt).tier == "disk");
+          assert(pool.Lookup(prompt).tier == "ram");  // never evict another pin
+        }
+      }
+      assert(!runner->reclaim);
+    }
+  }
+}
+void PermanentPinBackingTicketUnwindsFailedCapture() {
+  PinFixture fixture;
+  {
+    TextRunnerPool seed(std::make_shared<PinRunner>(), 1, {},
+                        {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  for (const bool lazy : {false, true}) {
+    auto options = fixture.options;
+    options.lazy = lazy;
+    auto runner = std::make_shared<PermanentPinRunner>();
+    // Admit the private allocation, then fail the row allocation. Unwinding
+    // must release both partial physical backing and the envelope ticket.
+    runner->row_blocks = 0;
+    runner->ticket_before_admission = !lazy;
+    bool refused = false;
+    try {
+      TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = options});
+      assert(lazy);
+      for (const TextRunnerToken suffix : {100, 101}) {
+        auto prompt = fixture.tokens;
+        prompt.push_back(suffix);
+        auto request = pool.Acquire(prompt);
+        assert(request.cache_disk_hit());
+        assert(request.cached_prompt_tokens() == fixture.tokens.size());
+        request.Invalidate();
+        assert(pool.Lookup(prompt).tier == "disk");
+        assert(runner->active == 0);
+      }
+    } catch (const std::runtime_error& error) {
+      refused = true;
+      const std::string message = error.what();
+      for (const auto expected :
+           {"--pin-prefix-file", "--pin-prefix-dir", "needed_payload_bytes=",
+            "ram_budget_bytes=", "vision capacity remains protected",
+            "--pin-prefix-lazy", "existing disk pins"})
+        assert(message.find(expected) != std::string::npos);
+    }
+    assert(refused == !lazy);
+    assert(runner->captures > 0);
+    assert(runner->attempts == (lazy ? 2 : 1));
+    assert(runner->released == runner->attempts && runner->active == 0);
+    assert(!runner->reclaim && fixture.Files() == published);
+  }
+  // An unrelated capture failure keeps its original cause, not a misleading
+  // capacity/vision diagnosis, and still releases the ticket before teardown.
+  auto runner = std::make_shared<PermanentPinRunner>();
+  runner->capture_error = true;
+  bool refused = false;
+  try {
+    TextRunnerPool pool(runner, 1, {}, {.pinned_prefix = fixture.options});
+  } catch (const std::runtime_error& error) {
+    refused = std::string(error.what()) == "injected capture failure";
+  }
+  assert(refused && runner->attempts == 1 && runner->released == 1);
+  assert(runner->active == 0 && !runner->reclaim);
+  assert(fixture.Files() == published);
+}
 void PinnedPrefixRestartReplayAndNoRewrite() {
   for (const bool ordinary_disk : {false, true}) {
     PinFixture fixture;
@@ -4679,15 +5004,47 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
   class CountingRunner final : public Runner {
   public:
     mutable std::size_t committed{};
+    std::optional<std::size_t> pending;
+    std::size_t ceiling{};
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto claim = Runner::ResourceClaim();
+      if (pending) {
+        claim.retained_snapshot_capacity_bytes = ceiling / 2;
+        claim.retained_snapshot_ceiling_bytes = ceiling;
+      }
+      return claim;
+    }
     std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
         cache::ResourceLedger& ledger, std::size_t ram) const override {
       auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      if (pending)
+        resources->freeze_execution_liability = [bytes = *pending] {
+          return bytes;
+        };
       resources->commit_backing = [this](std::size_t bytes) {
         committed = bytes;
       };
       return resources;
     }
   };
+  // 128MiB pending execution + the unchanged512MiB backing +1MiB staging.
+  for (const auto ceiling : {640ULL << 20, 641ULL << 20}) {
+    const TemporaryDirectory bounded("gufo-component-protected-disk-test");
+    auto bounded_disk = disk;
+    bounded_disk.directory = bounded.path();
+    auto protected_runner = std::make_shared<CountingRunner>();
+    protected_runner->pending = 128ULL << 20;
+    protected_runner->ceiling = ceiling;
+    bool refused = false;
+    try {
+      ComponentTextCache protected_cache(protected_runner, 1, 1 << 24,
+                                         bounded_disk, false, 0, {}, false);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    assert(refused == (ceiling == 640ULL << 20));
+    assert(protected_runner->committed == (refused ? 0 : 512ULL << 20));
+  }
   const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
   std::uint64_t hash;
   {
@@ -5060,6 +5417,10 @@ int main(int argc, char* argv[]) {
     PinnedPrefixCorruptionFailsClosed();
     PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk();
     PinnedPrefixLazySurvivesRamRefusal();
+    PermanentPinBackingRefusesEagerStartup();
+    PermanentPinBackingRefusalKeepsLazyDiskUsable();
+    PermanentPinBackingTicketCoversCaptureAndPublication();
+    PermanentPinBackingTicketUnwindsFailedCapture();
 #else
     std::cout << "SKIP: registered pins require strict Linux fingerprinting\n";
 #endif
@@ -5075,6 +5436,7 @@ int main(int argc, char* argv[]) {
     PartialFrontierDoesNotServeAnEqualPrompt();
     CompletedCancelledPromptGetsARetrySnapshot();
     BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
+    ExecutionReclamationWaitsForActiveSourcesAndUnbinds();
     InPassCapturePreservesBoundaryAndLiveTail();
     ColdAcquireResetsOnce();
     ColdAssignmentAvoidsDrainingCancelledSlot();

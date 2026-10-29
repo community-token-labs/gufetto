@@ -30,10 +30,18 @@ struct ComponentCacheResources;
 
 using TextRunnerToken = ContinuationToken;
 
+struct TextPromptAdmission {
+  bool ready{true};
+  std::shared_ptr<void> lease;
+};
+
 /// Immutable model-owned input which travels with one scheduled request.
 /// Cache identity supplements token IDs for inputs such as image embeddings.
 struct TextPromptContext {
   virtual ~TextPromptContext() = default;
+  /// Nonblocking whole-request resource reservation. An unavailable budget
+  /// queues the request before it acquires a runner or begins GPU work.
+  [[nodiscard]] virtual TextPromptAdmission TryAdmit() const { return {}; }
   std::vector<std::uint8_t> cache_identity;
   std::vector<ContinuationInputPrefix> cache_prefixes;
   [[nodiscard]] std::span<const std::uint8_t> CacheIdentity(
@@ -187,6 +195,8 @@ struct TextRunnerResourceClaim {
   /// retained_snapshot_capacity_bytes is also the ceiling.
   std::optional<std::size_t> retained_snapshot_ceiling_bytes;
   bool requires_device_runtime_lock{false};
+  /// Outstanding shared execution storage, charged once, not per slot.
+  std::size_t shared_execution_bytes{0};
 };
 
 struct TextRunnerMeasuredResources {
@@ -699,7 +709,8 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true, bool persist = true);
+      bool stop_at_eos = true, bool persist = true,
+      std::optional<TextPromptAdmission> reserved_resources = std::nullopt);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Read-only published Acquire inventory. Never waits for admission,

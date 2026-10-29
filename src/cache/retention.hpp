@@ -147,6 +147,25 @@ public:
   // Reclaim one eligible record for a caller that captures outside its index
   // lock. The caller retries the same frozen frontier before publication.
   [[nodiscard]] bool Reclaim(const RetentionRequest&);
+  // External execution pressure: remove at most one eligible RAM record in
+  // byte-pressure order, with no incoming capture rank/source exceptions.
+  // True means logical removal ONLY; trim backing and measure physical release
+  // separately. Durable index entries and live execution state are preserved.
+  // An unverified index owner (including exhausted lookup metadata) is skipped.
+  //
+  // Hold the same publication/cache mutex used for index lookup, lease/pin
+  // acquisition and retention mutation throughout this call. Include current
+  // sources, in-flight captures and direct payload RowPin users in
+  // protected_ids. Observable checkpoint/chunk readers and persistence pins are
+  // excluded. Managed borrowed payloads must be materialized with no source,
+  // backing-reader, preservation-copy or persistence pins; eligibility is
+  // observed under their row mutex. Committed direct RowPins/charge copies
+  // still have no public reader count. External payload owners can outlive
+  // removal: this is NOT a physical safety fence. The backing trimmer must
+  // still require wholly free, unassigned, unpinned segments under its own
+  // allocation/trim serialization.
+  [[nodiscard]] bool ReclaimForExecution(
+      std::span<const CheckpointId> protected_ids = {});
   void Touch(CheckpointId);
   void Remove(CheckpointId);
   [[nodiscard]] std::uint32_t Rank(CheckpointId) const;
@@ -173,11 +192,12 @@ private:
   bool Related(std::size_t, std::size_t) const;
   void Relate(std::size_t);
   std::array<std::uint64_t, 4> PressureOrder(std::size_t,
-                                             const RetentionRequest&,
+                                             const RetentionRequest*,
                                              std::uint32_t priority) const;
   std::size_t UniqueBytes(std::size_t) const;
   std::size_t UniquePayloadBytes(std::size_t) const noexcept;
   bool Persisting(std::size_t) const;
+  bool ExecutionEligible(std::size_t) const;
   std::size_t Victim(const RetentionRequest&, bool records) const;
   void Erase(std::size_t, RetentionReason, std::uint32_t rank);
   void Emit(RetentionAction, RetentionReason, CheckpointId, Rows,

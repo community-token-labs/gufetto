@@ -198,7 +198,7 @@ void RetentionPolicy::Relate(std::size_t added) {
         records_[parent].forked = true;
 }
 std::array<std::uint64_t, 4> RetentionPolicy::PressureOrder(
-    std::size_t i, const RetentionRequest& r, std::uint32_t priority) const {
+    std::size_t i, const RetentionRequest* r, std::uint32_t priority) const {
   const auto& e = records_[i];
   if (!priority)
     return {0, e.last_used, 0, 0};
@@ -218,10 +218,11 @@ std::array<std::uint64_t, 4> RetentionPolicy::PressureOrder(
   // A shared system/tools prefix of the incoming prompt is also not cheap:
   // removing it to admit the new conversation leaves the next one with no
   // checkpoint at the prefix they share (tool-agent peers).
-  const bool shared_prefix = e.checkpoint->Compatibility() == r.compatibility &&
-                             e.checkpoint->Input() == r.input &&
-                             e.checkpoint->Boundary() < r.tokens.size() &&
-                             Prefix(e.checkpoint->Tokens(), r.tokens);
+  const bool shared_prefix =
+      r && e.checkpoint->Compatibility() == r->compatibility &&
+      e.checkpoint->Input() == r->input &&
+      e.checkpoint->Boundary() < r->tokens.size() &&
+      Prefix(e.checkpoint->Tokens(), r->tokens);
   const bool cheap = rows * 8 < state && !shared_prefix;
   if (cheap && !fresh(e))
     return {1, e.last_used, 0, 0};
@@ -422,7 +423,7 @@ std::size_t RetentionPolicy::Victim(const RetentionRequest& r,
       continue;
     if (!record_pressure) {
       lowest = std::min(lowest, priority(i));
-      const auto candidate = PressureOrder(i, r, priority(i));
+      const auto candidate = PressureOrder(i, &r, priority(i));
       if (target == limit_ || candidate < order) {
         target = i;
         order = candidate;
@@ -498,6 +499,99 @@ bool RetentionPolicy::Reclaim(const RetentionRequest& r) {
   if (victim == limit_)
     return false;
   Erase(victim, RetentionReason::kByteCapacity, Priority(victim, &r));
+  return true;
+}
+
+bool RetentionPolicy::ExecutionEligible(std::size_t i) const {
+  const auto& e = records_[i];
+  const auto& checkpoint = e.checkpoint;
+  // Normally there are exactly two owners: this record and PrefixIndex's
+  // resident record. Lookup results (selected AND candidates), serving source
+  // handles and persistence jobs add owners; weak history entries do not.
+  if (!checkpoint || checkpoint.use_count() > 2)
+    return false;
+  const auto available = [](const Payload& payload) {
+    // Location()==nullopt alone cannot prove absence of source/backing readers
+    // or a copy finishing publication. Managed rows observe all those pins and
+    // persistence under their row mutex; materialized idle rows can recover.
+    if (const auto rows = payload.BorrowedStorage())
+      return rows->RetentionEvictable();
+    return !payload.PersistencePinned();
+  };
+  for (const auto& c : checkpoint->Components()) {
+    if ((c.private_state && !available(*c.private_state)) ||
+        (c.tail && !available(*c.tail)))
+      return false;
+    for (std::size_t n = 0; n < c.chunks.size(); ++n) {
+      const auto& chunk = c.chunks[n];
+      const auto references = chunk.References();
+      if (references.readers || references.persistence ||
+          !available(chunk.Storage()))
+        return false;
+      // Checkpoint-kind handles can also escape, including into an in-flight
+      // capture. Count actual retained membership, not index/shared_ptr owners
+      // (those share one Checkpoint object). Ordinary shared prefixes remain
+      // eligible. Components/chunks are immutable and ordered from row zero.
+      std::size_t retained = 0;
+      for (const auto& peer : records_) {
+        if (!peer.checkpoint)
+          continue;
+        for (const auto& component : peer.checkpoint->Components())
+          if (component.descriptor.id == c.descriptor.id) {
+            if (n < component.chunks.size() &&
+                chunk.SameChunk(component.chunks[n]))
+              ++retained;
+            break;
+          }
+      }
+      if (references.checkpoints != retained)
+        return false;
+    }
+  }
+  if (checkpoint.use_count() == 1)
+    return true;
+  // Do not blindly subtract an assumed index owner: corruption/removal may
+  // already have erased that entry, leaving one external handle instead.
+  // Lookup is owner-serialized (PrefixIndex's contract). Its temporary pins
+  // die before selection returns. Unavailable entries fail conservatively.
+  try {
+    const auto lookup = index_.Lookup(
+        {checkpoint->Compatibility(), checkpoint->Tokens(),
+         InputIdentity(checkpoint->Boundary(), checkpoint->Input())});
+    std::size_t temporary =
+        lookup.selected && lookup.selected->checkpoint == checkpoint ? 1 : 0;
+    bool indexed = false;
+    for (const auto& candidate : lookup.candidates)
+      if (candidate.checkpoint == checkpoint) {
+        ++temporary;
+        indexed |= candidate.entry == e.entry;
+      }
+    return indexed &&
+           static_cast<std::size_t>(checkpoint.use_count()) == 2 + temporary;
+  } catch (const std::bad_alloc&) {
+    // No spare lookup metadata is not proof that the second owner is ours.
+    return false;
+  }
+}
+bool RetentionPolicy::ReclaimForExecution(
+    std::span<const CheckpointId> protected_ids) {
+  std::size_t victim = limit_;
+  std::array<std::uint64_t, 4> order{};
+  for (std::size_t i = 0; i < limit_; ++i) {
+    if (!records_[i].checkpoint ||
+        std::ranges::find(protected_ids, records_[i].checkpoint->Id()) !=
+            protected_ids.end() ||
+        !ExecutionEligible(i))
+      continue;
+    const auto candidate = PressureOrder(i, nullptr, Priority(i));
+    if (victim == limit_ || candidate < order) {
+      victim = i;
+      order = candidate;
+    }
+  }
+  if (victim == limit_)
+    return false;
+  Erase(victim, RetentionReason::kByteCapacity, Priority(victim));
   return true;
 }
 

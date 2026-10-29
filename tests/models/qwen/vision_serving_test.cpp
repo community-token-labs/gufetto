@@ -1,5 +1,6 @@
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -8,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -106,6 +108,86 @@ void CheckConcurrent(Backend& backend,
             << " physical_width=" << width << '\n';
 }
 
+void EvictIdleOutputs(
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
+  const auto pool = encoder->Outputs();
+  auto pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-pressure", pool->Capacity()));
+  Require(pressure != nullptr, "completed image readers still pin idle output");
+  Require(pool->GetStats().encoded_rows == 0,
+          "idle eviction retained GPU output rows");
+}
+
+void CheckPoolQueue(
+    Backend& backend,
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
+    const tokenization::QwenTokenizer& tokenizer,
+    std::span<const server::ChatRequest> requests,
+    std::span<const Backend::Result> expected,
+    const sampling::SamplingConfig& sampling) {
+  const auto pool = encoder->Outputs();
+  std::uint32_t largest = 0;
+  for (std::size_t i = 0; i < 2; ++i) {
+    const auto prompt = models::qwen::vision::Prepare(
+        tokenizer, requests[i].messages, {},
+        tokenization::ResolveQwenChatOptions(requests[i].reasoning,
+                                             requests[i].add_vision_id),
+        encoder->identity(), 1024);
+    largest = std::max(largest, prompt.ImageRows());
+  }
+  Require(largest > 0 && largest < pool->Capacity(),
+          "invalid pool queue fixture");
+  auto pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-queue-pressure", pool->Capacity() - largest));
+  Require(pressure != nullptr, "idle outputs cannot admit pressure fixture");
+  const auto before = pool->GetStats();
+  std::vector<std::shared_ptr<Backend::GenerationRequest>> pending;
+  for (std::size_t i = 0; i < 2; ++i) {
+    auto request = requests[i];
+    request.cache_prompt = false;
+    pending.push_back(backend.start_chat(request, 16, sampling));
+  }
+  for (std::size_t i = 0; i < pending.size(); ++i)
+    Require(pending[i]->Wait().tokens == expected[i].tokens,
+            "queued image output differs from fresh reference");
+  const auto after = pool->GetStats();
+  Require(after.waits > before.waits,
+          "native image fixture did not wait for output credits");
+  Require(after.peak_rows <= pool->Capacity() &&
+              after.peak_encoded_rows <= pool->Capacity(),
+          "output pool exceeded capacity");
+  std::cout << "vision_pool waits=" << after.waits - before.waits
+            << " encodes=" << after.encodes - before.encodes
+            << " reencodes=" << after.reencodes - before.reencodes << '\n';
+
+  pressure.reset();
+  auto blocked_pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-cancel-pressure", pool->Capacity()));
+  Require(blocked_pressure != nullptr, "completed requests still hold credits");
+  const auto before_cancel = pool->GetStats();
+  auto request = requests[0];
+  request.cache_prompt = false;
+  auto blocked = backend.start_chat(request, 16, sampling);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool->GetStats().waits == before_cancel.waits &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool waited = pool->GetStats().waits > before_cancel.waits;
+  blocked->Cancel();
+  const auto cancelled = blocked->Wait();
+  Require(waited && cancelled.cancelled && cancelled.tokens.empty(),
+          "queued image request did not cancel before execution");
+  Require(pool->GetStats().encodes == before_cancel.encodes &&
+              pool->GetStats().rows == pool->Capacity(),
+          "cancelled resource waiter encoded or stole held credits");
+  blocked_pressure.reset();
+  Require(backend.chat(request, 16, sampling).tokens == expected[0].tokens,
+          "image queue did not recover after cancellation");
+  std::cout << "queued image cancellation/recovery exact, no encode before "
+               "admission\n";
+}
+
 void CheckFlashIncrementalOracle(
     const std::shared_ptr<models::qwen38_flash_next::Model>& model,
     const server::ChatRequest& request, const Backend::Result& cached) {
@@ -125,11 +207,23 @@ void CheckFlashIncrementalOracle(
   Require(incremental && bulk, error);
   incremental->ConfigureVision(prompt);
   bulk->ConfigureVision(prompt);
+  Require(bulk->Sync(tokens, &error), error);
+  const auto before_eviction = model->VisionEncoder()->Outputs()->GetStats();
+  EvictIdleOutputs(model->VisionEncoder());
   Require(incremental->Sync(
               std::span(tokens).first(cached.cached_prompt_tokens), &error),
           error);
-  Require(incremental->Sync(tokens, &error) && bulk->Sync(tokens, &error),
-          error);
+  Require(incremental->Sync(tokens, &error), error);
+  Require(model->VisionEncoder()->Outputs()->GetStats().reencodes >
+              before_eviction.reencodes,
+          "Flash oracle did not re-encode evicted images");
+  // Direct native decode after the images must not need output credits.
+  // Keep the entire pool held elsewhere while both sessions decode from KV.
+  const auto pool = model->VisionEncoder()->Outputs();
+  const auto decode_pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-text-decode-pressure", pool->Capacity()));
+  Require(decode_pressure != nullptr,
+          "decode pressure could not evict idle outputs");
   std::vector<tokenization::TokenId> generated;
   double max_kl = 0;
   float max_logit_error = 0;
@@ -164,8 +258,11 @@ void CheckFlashIncrementalOracle(
   }
   std::cout << "Flash fresh incremental oracle exact="
             << (generated == cached.tokens)
+            << " evaluated_steps=" << generated.size()
             << " bulk_incremental_max_logit_error=" << max_logit_error
             << " max_KL_temperature1=" << max_kl << '\n';
+  Require(!generated.empty(),
+          "Flash image oracle did not evaluate after prefill");
   Require(generated == cached.tokens,
           "Flash snapshot changed incremental inference");
   Require(max_logit_error == 0,
@@ -222,7 +319,12 @@ void CheckQwenIncrementalOracle(
   const auto split_logits = incremental.CopyLastLogits();
   const std::vector<float> expected(split_logits.begin(), split_logits.end());
   incremental.Reset();
+  const auto before_eviction = model->VisionEncoder()->Outputs()->GetStats();
+  EvictIdleOutputs(model->VisionEncoder());
   (void)incremental.ForwardPromptBatch(tokens);
+  Require(model->VisionEncoder()->Outputs()->GetStats().reencodes >
+              before_eviction.reencodes,
+          "Qwen oracle did not re-encode evicted images");
   const auto cold_logits = incremental.CopyLastLogits();
   Require(std::ranges::equal(expected, cold_logits),
           "Qwen image prefill logits changed with chunk boundaries");
@@ -434,7 +536,10 @@ int main(int argc, char** argv) {
           &error);
       Require(qfn != nullptr && qfn->VisionEncoder() != nullptr, error);
     } else {
-      auto encoder = models::qwen::vision::Encoder::Open(model_path, {}, 5120);
+      // This fixture exercises shared-pool eviction, now a Qwen opt-in.
+      auto encoder = models::qwen::vision::Encoder::Open(
+          model_path, {}, 5120, true,
+          models::qwen::vision::kDefaultOutputPoolRows);
       Require(encoder != nullptr, "missing vision sidecar");
       qwen =
           hip::QwenGpuModel::CreateFromGguf(reader, &error, std::move(encoder));
@@ -467,6 +572,19 @@ int main(int argc, char** argv) {
         "Continue counting from one, with commas between the numbers.");
     requests[3].reasoning.enabled = false;
     auto ar = load(false);
+    if (flash) {
+      Backend duplicate;
+      std::string duplicate_error;
+      Require(!duplicate.load(qfn, &duplicate_error, context, 4) &&
+                  duplicate_error ==
+                      "a second component backend on the same Model is not "
+                      "supported "
+                      "(one backend per Model); release the first or load a "
+                      "separate Model" &&
+                  !duplicate.ready() && ar->ready() &&
+                  qfn->HasComponentBackend(),
+              "second component binding did not fail cleanly");
+    }
     sampling::SamplingConfig greedy;
     greedy.temperature = 0;
     sampling::SamplingConfig sampled;
@@ -476,7 +594,37 @@ int main(int argc, char** argv) {
     sampled.min_p = 0.05F;
     sampled.seed = 47;
     std::array<Backend::Result, 4> references;
-    std::unique_ptr<Backend> spec;
+    // Preserve per-mode sampling/cancellation checks with sequential backend
+    // lifetimes on the same Model; saved results remain independent oracles.
+    const auto check_sampled = [&](Backend& backend, bool use_spec) {
+      std::array<Backend::Result, 4> expected;
+      for (std::size_t i = 0; i < requests.size(); ++i) {
+        expected[i] = backend.chat(requests[i], 16, sampled);
+        Require(
+            expected[i].tokens == backend.chat(requests[i], 16, sampled).tokens,
+            "seeded image generation is not reproducible");
+      }
+      CheckConcurrent(backend, requests, expected, sampled, flash && use_spec);
+      auto interrupted = requests[0];
+      interrupted.messages.back().content =
+          "Name the image color, then count from one to one hundred.";
+      for (const auto& sampling : {greedy, sampled}) {
+        const auto expected = backend.chat(interrupted, 8, sampling);
+        std::size_t pieces = 0;
+        const auto cancelled =
+            backend.chat(interrupted, 128, sampling, {},
+                         [&](std::string_view) { return ++pieces < 3; });
+        Require(cancelled.cancelled,
+                "image cancellation fixture did not interrupt generation");
+        const auto resumed = backend.chat(interrupted, 8, sampling);
+        Require(resumed.cache_hit && resumed.prefill_tokens == 0 &&
+                    resumed.tokens == expected.tokens,
+                "cancelled image request lost its exact reusable frontier");
+      }
+      std::cout << "image cancellation/resume exact, speculative=" << use_spec
+                << '\n';
+    };
+
     if (!disk_only) {
       for (std::size_t i = 0; i < requests.size(); ++i) {
         references[i] = ar->chat(requests[i], 16, greedy);
@@ -498,54 +646,10 @@ int main(int argc, char** argv) {
       ar.reset();
       ar = load(false);
       CheckConcurrent(*ar, requests, references, greedy);
-      if (!draft.empty()) {
-        spec = load(true);
-        std::array<Backend::Result, 4> speculative_references;
-        for (std::size_t i = 0; i < requests.size(); ++i) {
-          speculative_references[i] = spec->chat(requests[i], 16, greedy);
-          Require(speculative_references[i].tokens == references[i].tokens,
-                  "greedy image speculation differs from autoregression");
-          Require(speculative_references[i].draft_tokens > 0,
-                  "image request bypassed speculative decoding");
-        }
-        spec.reset();
-        spec = load(true);
-        CheckConcurrent(*spec, requests, speculative_references, greedy, flash);
-      }
-      // Sampled replay and per-request RNG independence. Existing sampler
-      // suites cover the distribution itself; this checks image-path
-      // integration.
-      for (auto* backend : {ar.get(), spec.get()}) {
-        if (!backend)
-          continue;
-        std::array<Backend::Result, 4> expected;
-        for (std::size_t i = 0; i < requests.size(); ++i) {
-          expected[i] = backend->chat(requests[i], 16, sampled);
-          Require(expected[i].tokens ==
-                      backend->chat(requests[i], 16, sampled).tokens,
-                  "seeded image generation is not reproducible");
-        }
-        CheckConcurrent(*backend, requests, expected, sampled,
-                        flash && backend == spec.get());
-        auto interrupted = requests[0];
-        interrupted.messages.back().content =
-            "Name the image color, then count from one to one hundred.";
-        for (const auto& sampling : {greedy, sampled}) {
-          const auto expected = backend->chat(interrupted, 8, sampling);
-          std::size_t pieces = 0;
-          const auto cancelled =
-              backend->chat(interrupted, 128, sampling, {},
-                            [&](std::string_view) { return ++pieces < 3; });
-          Require(cancelled.cancelled,
-                  "image cancellation fixture did not interrupt generation");
-          const auto resumed = backend->chat(interrupted, 8, sampling);
-          Require(resumed.cache_hit && resumed.prefill_tokens == 0 &&
-                      resumed.tokens == expected.tokens,
-                  "cancelled image request lost its exact reusable frontier");
-        }
-        std::cout << "image cancellation/resume exact, speculative="
-                  << (backend == spec.get()) << '\n';
-      }
+      CheckPoolQueue(*ar, flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
+                     flash ? qfn->tokenizer() : qwen->GetTokenizer(), requests,
+                     references, greedy);
+      check_sampled(*ar, false);
     } else {
       references[0] = ar->chat(requests[0], 16, greedy);
     }
@@ -580,7 +684,6 @@ int main(int argc, char** argv) {
               "multiple image order/content was lost");
     }
     ar.reset();
-    spec.reset();
     // Fresh executors are independent cold oracles for a continued image chat.
     ar = load(false);
     const auto cold_continuation = ar->chat(continuation, 16, greedy);
@@ -602,6 +705,26 @@ int main(int argc, char** argv) {
       CheckQwenIncrementalOracle(qwen, continuation, references[0], continued);
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
+
+    if (!disk_only && !draft.empty()) {
+      auto spec = load(true);
+      std::array<Backend::Result, 4> speculative_references;
+      for (std::size_t i = 0; i < requests.size(); ++i) {
+        speculative_references[i] = spec->chat(requests[i], 16, greedy);
+        Require(speculative_references[i].tokens == references[i].tokens,
+                "greedy image speculation differs from autoregression");
+        Require(speculative_references[i].draft_tokens > 0,
+                "image request bypassed speculative decoding");
+      }
+      spec.reset();
+      spec = load(true);
+      CheckConcurrent(*spec, requests, speculative_references, greedy, flash);
+      CheckPoolQueue(*spec,
+                     flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
+                     flash ? qfn->tokenizer() : qwen->GetTokenizer(), requests,
+                     speculative_references, greedy);
+      check_sampled(*spec, true);
+    }
 
     TemporaryDirectory cache_root("gufo-vision-cache");
     server::TextDiskCacheConfig cache{

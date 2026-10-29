@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <semaphore>
@@ -464,6 +465,45 @@ void TestResourceClaimsAreValidatedBeforeAllocation() {
   Expect(rejected, "aggregate request-state claim must fit capacity");
   Expect(stats->states_created == 0,
          "invalid resource claim is rejected before state allocation");
+
+  class SharedWorkspaceRunner final : public FakeRunner {
+  public:
+    using FakeRunner::FakeRunner;
+    std::size_t shared_bytes{96};
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto claim = FakeRunner::ResourceClaim();
+      claim.shared_execution_bytes = shared_bytes;
+      return claim;
+    }
+  };
+  // Two 80-byte slot claims and one 96-byte encoder workspace fit exactly256.
+  for (const auto capacity : {255U, 256U}) {
+    auto shared_stats = std::make_shared<FakeStats>();
+    auto runner =
+        std::make_shared<SharedWorkspaceRunner>(shared_stats, 64, capacity);
+    bool denied = false;
+    try {
+      TextRunnerPool pool(runner, 2);
+    } catch (const std::invalid_argument&) {
+      denied = true;
+    }
+    Expect(denied == (capacity == 255),
+           "shared workspace is charged exactly once");
+    Expect(shared_stats->states_created == (denied ? 0 : 2),
+           "shared workspace refusal happens before slot allocation");
+  }
+  auto overflow_stats = std::make_shared<FakeStats>();
+  auto overflow = std::make_shared<SharedWorkspaceRunner>(
+      overflow_stats, 64, std::numeric_limits<std::size_t>::max());
+  overflow->shared_bytes = std::numeric_limits<std::size_t>::max();
+  bool denied = false;
+  try {
+    TextRunnerPool pool(overflow, 2);
+  } catch (const std::invalid_argument&) {
+    denied = true;
+  }
+  Expect(denied && overflow_stats->states_created == 0,
+         "aggregate shared and per-slot claims cannot wrap");
 }
 
 class FakeSnapshot final : public TextRunnerSnapshot {

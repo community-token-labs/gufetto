@@ -259,10 +259,13 @@ public:
   // blocks of it committed for the next captures: ROCm commits pool pages on
   // each allocation (about 25 GB/s here), and an allocation also stalls other
   // HIP calls, so a background refill would land in a peer's decode instead.
-  static constexpr std::size_t kSpareBlocks = 2;
+  static constexpr std::size_t kSpareBlocks = kNativeSnapshotSpareBlocks;
 
   /// `reserve` is the device memory every commit leaves free.
-  explicit SnapshotAllocator(std::uint64_t reserve) : reserve_(reserve) {
+  explicit SnapshotAllocator(
+      std::uint64_t reserve,
+      std::shared_ptr<core::ReclaimableMemory> memory = {})
+      : reserve_(reserve), image_memory_(std::move(memory)) {
     hipMemPoolProps properties{};
     properties.allocType = hipMemAllocationTypePinned;
     properties.handleTypes = hipMemHandleTypeNone;
@@ -288,6 +291,20 @@ public:
   std::shared_ptr<void> Allocate(std::uint64_t bytes) {
     std::lock_guard lock(mutex_);
     return Own(Commit(bytes), bytes);
+  }
+  // Optional borrowed-row preservation competes with image headroom just as
+  // backing growth does. Denial keeps the existing host-materialization
+  // fallback; never reclaim recursively under the snapshot registry lock.
+  void SetMemoryBudget(
+      std::shared_ptr<core::ReclaimableMemory> memory) noexcept {
+    image_memory_ = std::move(memory);
+  }
+  std::shared_ptr<void> AllocateRows(std::uint64_t bytes) {
+    auto ticket = image_memory_ ? image_memory_->TryAcquireGrowth(bytes)
+                                : std::shared_ptr<void>{};
+    if (image_memory_ && !ticket)
+      throw SnapshotDeviceExhausted("snapshot rows exceed image headroom");
+    return Allocate(bytes);
   }
   /// Allocates the recurring mutable-state size, from a released block when
   /// one is kept.
@@ -381,6 +398,7 @@ private:
     (void)hipStreamSynchronize(stream_);
   }
   std::uint64_t reserve_;
+  std::shared_ptr<core::ReclaimableMemory> image_memory_;
   std::mutex mutex_;
   std::vector<void*> spares_;
   std::uint64_t spare_bytes_{0};
@@ -390,11 +408,20 @@ private:
   hipMemPool_t pool_{nullptr};
 };
 
+void Executor::SetComponentMemoryBudget(
+    std::shared_ptr<core::ReclaimableMemory> memory) noexcept {
+  // Binding/unbinding is quiescent. An allocator created by a prior native or
+  // component route must follow the same lifetime as the executor/encoder.
+  image_memory_ = std::move(memory);
+  if (snapshot_allocator_)
+    snapshot_allocator_->SetMemoryBudget(image_memory_);
+}
+
 std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
   std::call_once(snapshot_allocator_once_, [&] {
     // Admission reserved the lazy scratch; snapshots must not consume it.
     snapshot_allocator_ = std::make_shared<SnapshotAllocator>(
-        DeferredScratchBytes() + kSnapshotDeviceSlackBytes);
+        DeferredScratchBytes() + kSnapshotDeviceSlackBytes, image_memory_);
   });
   return snapshot_allocator_;
 }
@@ -441,7 +468,7 @@ struct SnapshotLineage {
 struct SnapshotBlock {
   SnapshotBlock(const std::shared_ptr<SnapshotAllocator>& allocator,
                 std::uint64_t bytes)
-      : storage(allocator->Allocate(bytes)), capacity(bytes) {}
+      : storage(allocator->AllocateRows(bytes)), capacity(bytes) {}
   std::shared_ptr<void> storage;
   std::uint64_t capacity;
   std::atomic<std::uint32_t> chunks{0};
@@ -1737,7 +1764,7 @@ std::size_t Executor::SessionBytes(
               : 0);
 }
 
-std::size_t Executor::DeferredScratchBytes() const {
+std::size_t Executor::DeferredScratchBytes(SnapshotRoute route) const {
   const auto& c = config();
   std::size_t bytes = batch_logits_ == nullptr
                           ? std::size_t{8} *
@@ -1758,7 +1785,7 @@ std::size_t Executor::DeferredScratchBytes() const {
                                    : 0);
   }
   // Committed spare blocks for captures, whether or not they exist yet.
-  return bytes + SnapshotAllocator::SpareBytes(mutable_bytes);
+  return core::AddMemoryBytes(bytes, SnapshotSpareBytes(mutable_bytes, route));
 }
 
 /// Column-tile width for the routed expert GEMMs: the tile at or above twice
