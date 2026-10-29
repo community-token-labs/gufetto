@@ -146,6 +146,8 @@ limitations are retained in the private `gufo-agent-concurrency` repository,
 
 ## Known limits
 
+- A fatal GPU copy error stops the server; restart it. Automatic restart requires
+  a configured supervisor policy; the server does not restart itself.
 - Under heavy image load (several sessions each sending maximum-size images at
   once), image requests wait their turn for the shared image pool instead of
   reserving memory per session; they can queue for minutes. Raise the pool with
