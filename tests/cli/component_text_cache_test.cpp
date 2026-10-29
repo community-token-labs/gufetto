@@ -2738,6 +2738,41 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
     }
   }
 }
+void UnpersistedRequestCanReuseRegisteredPins() {
+  PinFixture fixture;
+  const TextRunnerDiskCacheOptions disk{.directory = fixture.root / "ordinary",
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  {
+    // Explicit operator registration is independent of request persistence.
+    TextRunnerPool create(std::make_shared<PinRunner>(), 2, disk,
+                          {.pinned_prefix = fixture.options});
+  }
+  const auto published = fixture.Files();
+  auto prompt = fixture.tokens;
+  prompt.insert(prompt.end(), {100, 101, 102});
+  for (bool lazy : {false, true}) {
+    auto options = fixture.options;
+    options.lazy = lazy;
+    {
+      auto runner = std::make_shared<PinRunner>();
+      TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
+      assert(runner->prefilled == 0);
+      auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
+      assert(request.cached_prompt_tokens() == fixture.tokens.size());
+      assert(request.cache_disk_hit() == lazy);
+      Prefill(request);
+      (void)Generate(request);
+      assert(request.Commit().disk_queued_bytes == 0);
+      auto replay = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
+      assert(replay.cached_prompt_tokens() == prompt.size());
+      assert(!replay.cache_disk_hit());
+      replay.Invalidate();
+    }
+    assert(ManagedBytes(disk.directory) == 0);
+    assert(fixture.Files() == published);
+  }
+}
 void PinnedPrefixesRespectOffAndAutomaticRam() {
   PinFixture fixture;
   // 0 is AUTO, not off: creating the registered RAM checkpoint still works.
@@ -4026,6 +4061,7 @@ int main(int argc, char* argv[]) {
     MultiplePinsExplicitReplacementAndValidation();
     MultiplePinsLazyCorruptionPreservesOtherRegistrations();
     PinnedPrefixRestartReplayAndNoRewrite();
+    UnpersistedRequestCanReuseRegisteredPins();
     PinnedPrefixesRespectOffAndAutomaticRam();
     PinnedPrefixPressureIdentityAndAccounting();
     PinnedPrefixPressureIdentityAndAccounting(true);
