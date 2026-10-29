@@ -5,6 +5,10 @@ function(add_qwen_cpu_test target source labels)
   set_tests_properties(${target} PROPERTIES LABELS "${labels}")
 endfunction()
 
+add_qwen_cpu_test(qwen_vision_model_path_test
+  tests/models/qwen/vision_model_path_test.cpp
+  "cpu;vision;qwen;correctness")
+
 # Qwen tests mirror src/models/qwen so focused module, policy, and runtime
 # changes have an obvious validation target while preserving CTest names.
 add_qwen_cpu_test(qwen_vision_cache_test

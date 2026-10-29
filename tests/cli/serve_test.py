@@ -79,6 +79,14 @@ def main():
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
+    assert "--no-vision" in help_text
+    for args in (["llm", "--no-vision"], ["--no-vision"]):
+        check(["serve", *args, "--model", "missing.gguf"], 1,
+              "Error loading model 'missing.gguf'")
+        check(["serve", *args, "--mmproj", "missing-mmproj.gguf"], 2,
+              "--no-vision cannot be combined with --mmproj")
+        check(["serve", *args, "--mmproj="], 2,
+              "--no-vision cannot be combined with --mmproj")
     assert "--cache-ram-bytes <N|off>" in help_text
     for value in ("off", "0", "536870912"):
         check(["serve", "llm", "--cache-ram-bytes", value,
