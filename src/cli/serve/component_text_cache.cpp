@@ -1216,6 +1216,8 @@ private:
     const auto result = cache_.resources->diagnostic_reset(slot, *state_);
     if (result != DiscardResult::kComplete)
       return result;
+    if (!slot_.VerifiedEmpty(cache_.resources->diagnostic_ready))
+      return DiscardResult::kQuarantined;
     state_->SetCancellationCheck({});
     state_->SetPrefillLookahead({});
     cache_.runner->ReconcileComponentState(*state_, 0);
