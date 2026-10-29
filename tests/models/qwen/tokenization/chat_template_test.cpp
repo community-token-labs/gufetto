@@ -1122,6 +1122,106 @@ void TestEmptyReasoningReplayChangesThinkingSuffixTokens() {
          "Replayed reasoning keeps the full prompt as a prefix");
 }
 
+void TestStructuralRootPrefix() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  using gufo::tokenization::ChatTemplateOptions;
+  using gufo::tokenization::ChatTool;
+  using gufo::tokenization::QwenChatTemplate;
+
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials;
+  for (const auto* spelling :
+       {"<|im_start|>", "<|im_end|>", "<think>", "</think>", "<|endoftext|>"}) {
+    specials.emplace(spelling, vocab.size());
+    vocab.emplace_back(spelling);
+  }
+  std::string error;
+  const auto tokenizer =
+      gufo::tokenization::QwenTokenizer::CreateFromVocabulary(vocab, {},
+                                                              specials, &error);
+  Expect(tokenizer != nullptr, "Root fixture tokenizer initializes");
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  const auto check = [&](const std::vector<ChatMessage>& messages,
+                         std::span<const ChatTool> tools = {}) {
+    std::size_t stable = 0, root = 99, old_stable = 0;
+    const auto rendered = QwenChatTemplate::Render(
+        messages, tools, options, &error, nullptr, &stable, nullptr, &root);
+    const auto without_hint = QwenChatTemplate::Render(
+        messages, tools, options, &error, nullptr, &old_stable);
+    Expect(rendered && rendered == without_hint && stable == old_stable,
+           "Optional root does not change rendered bytes or stable frontier");
+    Expect(root <= stable && root < rendered->size(),
+           "Root precedes stable/full and generation suffix");
+    const auto prepared = gufo::models::qwen::vision::Prepare(
+        *tokenizer, messages, tools, options, {}, 65536);
+    Expect(prepared.root_prefix_tokens.has_value() == (root != 0),
+           "Exact structural root is present iff the preamble exists");
+    if (prepared.root_prefix_tokens) {
+      Expect(*prepared.root_prefix_tokens <= prepared.stable_prefix_tokens &&
+                 tokenizer->Decode(std::span(prepared.tokens)
+                                       .first(*prepared.root_prefix_tokens)) ==
+                     rendered->substr(0, root),
+             "Root tokens are an exact prefix of the full prepared vector");
+    }
+    return std::pair{*rendered, root};
+  };
+
+  const auto absent = check({{ChatRole::kUser, "Hi"}});
+  Expect(absent.second == 0, "No system/tools/reasoning means no root");
+  const std::vector<ChatMessage> short_chat{{ChatRole::kSystem, "Be brief."},
+                                            {ChatRole::kUser, "Hi"}};
+  const auto short_root = check(short_chat);
+  const std::string golden = "<|im_start|>system\nBe brief.<|im_end|>\n";
+  Expect(short_root.first.substr(0, short_root.second) == golden,
+         "Short root ends the complete system preamble, not the first user");
+  Expect(check(short_chat) == short_root, "Exact repeat has the same root");
+
+  const std::vector<ChatMessage> late{
+      {ChatRole::kSystem, "Be brief."},
+      {ChatRole::kUser, "Hi"},
+      {ChatRole::kAssistant, "Hello", "", "Think"},
+      {ChatRole::kDeveloper, "Use tools."},
+      {ChatRole::kTool, "result"},
+      {ChatRole::kUser, "Next"}};
+  const auto hoisted = check(late);
+  Expect(hoisted.first.substr(0, hoisted.second) ==
+             "<|im_start|>system\nBe brief.\nUse tools.<|im_end|>\n",
+         "Late developer belongs inside the root, without rewriting its role");
+  auto changed = late;
+  changed[3].content = "Avoid tools.";
+  const auto edited = check(changed);
+  Expect(edited.first.substr(0, edited.second) !=
+             hoisted.first.substr(0, hoisted.second),
+         "A developer edit before root end changes the prefix identity");
+  options.preserve_thinking = false;
+  Expect(
+      check(late).second == hoisted.second,
+      "Historical reasoning policy does not move the root into conversation");
+
+  std::vector<ChatTool> tools{{.name = "read",
+                               .description = "Read a file",
+                               .parameters_json = R"({"type":"object"})"}};
+  const auto tools_only = check({{ChatRole::kUser, "Hi"}}, tools);
+  Expect(tools_only.second > 0 && tools_only.first.substr(tools_only.second)
+                                      .starts_with("<|im_start|>user\n"),
+         "Tools-only root ends its actual preamble before the user");
+  tools[0].description = "Read another file";
+  const auto changed_tools = check({{ChatRole::kUser, "Hi"}}, tools);
+  Expect(changed_tools.first.substr(0, changed_tools.second) !=
+             tools_only.first.substr(0, tools_only.second),
+         "Tool definition changes retain their distinct root identity");
+  std::size_t invalid_root = 99;
+  Expect(!QwenChatTemplate::Render(
+             std::vector<ChatMessage>{{ChatRole::kSystem, "No user"}}, {},
+             options, &error, nullptr, nullptr, nullptr, &invalid_root) &&
+             invalid_root == 0,
+         "Failed rendering cannot leave a stale root hint");
+}
+
 void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
   using gufo::tokenization::ChatMessage;
   using gufo::tokenization::ChatRole;
@@ -1216,6 +1316,7 @@ int main() {
   TestToolRendering();
   TestToolReplayPreservesGeneratedPrefix();
   TestEmptyReasoningReplayChangesThinkingSuffixTokens();
+  TestStructuralRootPrefix();
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
