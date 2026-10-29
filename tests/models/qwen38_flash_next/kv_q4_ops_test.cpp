@@ -91,6 +91,78 @@ void FloatEqual(const std::vector<float>& a, const std::vector<float>& b) {
       throw std::runtime_error("attention operand control mismatch at " +
                                std::to_string(i));
 }
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+std::uint16_t Bf16Control(std::uint16_t half) {
+  const float value = qfn::KvHalfBitsToFloat(half);
+  if (!std::isfinite(value))
+    return 0x7e00;
+  // Independent arithmetic reference: round to a BF16 mantissa on the
+  // original half grid, with ties to even, rather than the device bit trick.
+  int exponent = 0;
+  (void)std::frexp(value, &exponent);
+  const double quantum = std::ldexp(1.0, exponent - 8);
+  const double scaled = std::abs(static_cast<double>(value)) / quantum;
+  double rounded = std::floor(scaled);
+  if (scaled - rounded > 0.5 ||
+      (scaled - rounded == 0.5 && std::fmod(rounded, 2.0) != 0))
+    rounded += 1;
+  const auto result = qfn::KvFloatToHalfBits(
+      static_cast<float>(std::copysign(rounded * quantum, value)));
+  return (result & 0x7c00) == 0x7c00 ? 0x7e00 : result;
+}
+void CheckBf16Control() {
+  constexpr unsigned width = 512, rows = 128;
+  std::vector<float> input(rows * width);
+  std::vector<std::uint16_t> expected(input.size());
+  for (std::size_t i = 0; i < input.size(); ++i) {
+    input[i] = qfn::KvHalfBitsToFloat(static_cast<std::uint16_t>(i));
+    expected[i] = Bf16Control(static_cast<std::uint16_t>(i));
+  }
+  Buffer<float> values(input.size());
+  values.Put(input);
+  Buffer<std::uint32_t> position(1);
+  position.Put(std::vector<std::uint32_t>{0});
+  Buffer<std::uint16_t> stored(input.size());
+  gpu::StoreKv(values.data, stored.data, rows, width, position.data, nullptr,
+               Type::kBf16KControl);
+  auto actual = stored.Get();
+  for (std::size_t i = 0; i < actual.size(); ++i)
+    if (expected[i] == 0x7e00) {
+      Require((actual[i] & 0x7c00) == 0x7c00 && (actual[i] & 0x3ff) != 0,
+              "BF16 control did not poison nonfinite reconstruction");
+      actual[i] = 0x7e00;
+    }
+  HalfEqual(actual, expected);
+
+  // Compare the complete fused RMS/RoPE producer to F16 output: only K may
+  // change, after the exact first F16 rounding boundary. Includes MTP shapes.
+  for (const unsigned n : {1U, 9U, 256U}) {
+    constexpr unsigned heads = 2, kv_heads = 1, d = 256;
+    constexpr unsigned stride = (2 * heads + 2 * kv_heads) * d;
+    Buffer<float> packed(n * stride), q(n * heads * d), gate(n * heads * d);
+    packed.Put(Values(packed.count, 43));
+    Buffer<std::uint16_t> k(n * d), v(n * d);
+    const auto run = [&](Type type) {
+      Require(gpu::PrepareAttention(packed.data, stride, nullptr, nullptr,
+                                    q.data, gate.data, k.data, v.data, n, heads,
+                                    kv_heads, d, 64, position.data, 10000.0F,
+                                    1e-6F, nullptr, nullptr, n > 1, {}, type),
+              "BF16 control fused producer rejected");
+    };
+    run(Type::kF16);
+    auto kh = k.Get();
+    const auto vh = v.Get();
+    const auto queries = q.Get(), gates = gate.Get();
+    for (auto& half : kh)
+      half = Bf16Control(half);
+    run(Type::kBf16KControl);
+    HalfEqual(k.Get(), kh);
+    HalfEqual(v.Get(), vh);
+    FloatEqual(q.Get(), queries);
+    FloatEqual(gate.Get(), gates);
+  }
+}
+#endif
 void CheckStore() {
   constexpr unsigned rows = 257, width = 512, start = 3;
   auto input = Values(rows * width, 91);
@@ -200,6 +272,9 @@ void CheckReaders(Type policy, unsigned n, bool sparse) {
 int main() {
   try {
     CheckStore();
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    CheckBf16Control();
+#endif
     for (const auto type : {Type::kQ4_0, Type::kQ8_0Q4_0, Type::kQ4_0Rotated,
                             Type::kQ8_0Q4_0Rotated})
       for (const auto n : {1U, 2U, 3U, 8U, 256U})

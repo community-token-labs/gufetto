@@ -1,12 +1,14 @@
 // Model-local capacity and adapter step baseline, with committed D4 backing.
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/hip/committed_backing.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 
@@ -44,7 +46,7 @@ int main(int argc, char** argv) {
     std::string model_path, mtp_path, mode;
     auto cache_type = qfn::KvCacheType::kF16;
     std::uint32_t context = 0, count = 0;
-    std::size_t backing_gib = 4;
+    std::size_t backing_gib = 4, fixed_ar_steps = 0;
     bool round_trip = false;
     for (int i = 1; i < argc; ++i) {
       const std::string_view arg = argv[i];
@@ -66,6 +68,8 @@ int main(int argc, char** argv) {
         count = static_cast<std::uint32_t>(std::stoul(value));
       else if (arg == "--backing-gib")
         backing_gib = std::stoul(value);
+      else if (arg == "--fixed-ar-decode")
+        fixed_ar_steps = std::stoul(value);
       else if (arg == "--kv-cache-type") {
         bool found = false;
         for (const auto type :
@@ -89,7 +93,11 @@ int main(int argc, char** argv) {
                 backing_gib > 0 && backing_gib <= 16,
             "requires --model PATH --mtp-model PATH --mode ar|mtp --context N "
             "--sessions N [--backing-gib N] [--kv-cache-type TYPE] "
-            "[--round-trip]");
+            "[--round-trip] [--fixed-ar-decode N]");
+    Require(
+        fixed_ar_steps <= 128 &&
+            (fixed_ar_steps == 0 || (mode == "ar" && !round_trip)),
+        "fixed AR replay requires mode ar, no round trip, and 1..128 steps");
     Require(count <= 4 || context <= 32768,
             "long high-concurrency histories are excluded from the admitted "
             "envelope");
@@ -156,7 +164,54 @@ int main(int argc, char** argv) {
       Require(adapter.GetSession(*slots[i]).Sync(prompt, &error), error);
     }
     auto& source = adapter.GetSession(*slots[0]);
-    if (!round_trip) {
+    if (fixed_ar_steps != 0) {
+      // Teacher-forced IDs preserve identical work/history across KV policies.
+      // Time full EvaluateBatch (including logits), not attention alone. No
+      // sampling or speculative drafts; caller chooses context = prefix + 128.
+      std::vector<qfn::Session::AdvanceRequest> requests;
+      for (auto& slot : slots)
+        requests.push_back({&adapter.GetSession(*slot), 0});
+      std::vector<double> steps;
+      steps.reserve(fixed_ar_steps);
+      Check(hipDeviceSynchronize());
+      const auto total_start = Clock::now();
+      for (std::size_t step = 0; step < fixed_ar_steps; ++step) {
+        for (std::size_t lane = 0; lane < requests.size(); ++lane)
+          requests[lane].token =
+              pattern[(prompt.size() + step + 5 * lane) % pattern.size()];
+        const auto start = Clock::now();
+        Require(qfn::Session::EvaluateBatch(requests, &error), error);
+        Check(hipDeviceSynchronize());
+        steps.push_back(Ms(start));
+      }
+      const double elapsed = Ms(total_start);
+      std::cout.precision(12);
+      for (std::size_t step = 0; step < steps.size(); ++step)
+        std::cout << "fixed_ar_step," << step << ",batch_ms," << steps[step]
+                  << '\n';
+      for (std::size_t lane = 0; lane < slots.size(); ++lane) {
+        const auto& session = adapter.GetSession(*slots[lane]);
+        const auto tokens = session.Tokens();
+        Require(tokens.size() == prompt.size() + fixed_ar_steps &&
+                    session.Statistics().drafted == 0,
+                "fixed AR replay did not complete exactly");
+        for (std::size_t i = 0; i < tokens.size(); ++i)
+          Require(tokens[i] == pattern[(i + 5 * lane) % pattern.size()],
+                  "fixed AR token history changed");
+        const auto logits = session.Logits();
+        Require(!logits.empty() &&
+                    std::ranges::all_of(
+                        logits, [](float v) { return std::isfinite(v); }),
+                "fixed AR replay has invalid final logits");
+        const auto bytes =
+            std::span(reinterpret_cast<const std::uint8_t*>(tokens.data()),
+                      tokens.size_bytes());
+        std::cout << "fixed_ar_lane," << lane << ",input_sha256,"
+                  << gufo::crypto::Sha256Hex(bytes) << ",prefix_tokens,"
+                  << prompt.size() << ",evaluated_tokens," << fixed_ar_steps
+                  << ",request_ms," << elapsed << '\n';
+      }
+    } else if (!round_trip) {
       std::vector<gufo::sampling::SamplerState> samplers;
       samplers.reserve(count);
       for (auto& slot : slots) {

@@ -2568,6 +2568,8 @@ __device__ __forceinline__ uint4 LoadQ8Kv8(const void* cache,
 __device__ __forceinline__ _Float16 DiagnosticBf16Kv(float value) {
   const float half =
       OpaqueQ8KvF32(static_cast<float>(static_cast<_Float16>(value)));
+  if (!__builtin_isfinite(half))
+    return static_cast<_Float16>(NAN);
   unsigned bits = __builtin_bit_cast(unsigned, half);
   bits = (bits + 0x7fffU + ((bits >> 16) & 1U)) & 0xffff0000U;
   const float rounded = __builtin_bit_cast(float, bits);
