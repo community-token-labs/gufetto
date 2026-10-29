@@ -171,8 +171,7 @@ float KvHalfBitsToFloat(std::uint16_t bits) noexcept {
 // inline them. A separate translation unit added two calls per packed block.
 void detail::ValidateQ8Rows(std::span<const std::byte> input) {
   for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ8_0)) {
-    const auto scale_bits = std::to_integer<std::uint16_t>(input[i]) |
-                            (std::to_integer<std::uint16_t>(input[i + 1]) << 8);
+    const auto scale_bits = ReadHalf(input.data() + i);
     if ((scale_bits & 0x8000) != 0 || !IsFiniteHalf(scale_bits))
       throw std::invalid_argument("invalid Flash-Next KV scale");
     const float scale = KvHalfBitsToFloat(scale_bits);
