@@ -219,12 +219,17 @@ void ValidateKvRow(std::span<const std::byte> input, std::uint32_t elements,
       if (!IsFiniteHalf(bits))
         throw std::invalid_argument("invalid Flash-Next q4 scale");
       const float scale = KvHalfBitsToFloat(bits);
-      for (std::size_t j = 0; j < 32; ++j) {
-        const auto byte = std::to_integer<unsigned>(input[i + 2 + j % 16]);
-        const int code = static_cast<int>((byte >> (j / 16 * 4)) & 15) - 8;
-        if (!IsFiniteHalf(KvFloatToHalfBits(code * scale)))
-          throw std::invalid_argument("invalid Flash-Next KV reconstruction");
+      int largest = 0;
+      for (std::size_t j = 0; j < 16; ++j) {
+        const auto byte = std::to_integer<unsigned>(input[i + 2 + j]);
+        const int low = static_cast<int>(byte & 15) - 8;
+        const int high = static_cast<int>(byte >> 4) - 8;
+        largest = std::max(largest, std::max(std::abs(low), std::abs(high)));
       }
+      // Half overflow is monotone in magnitude and symmetric in sign, even
+      // for signed q4 scales. One check covers every nibble in this block.
+      if (!IsFiniteHalf(KvFloatToHalfBits(largest * scale)))
+        throw std::invalid_argument("invalid Flash-Next KV reconstruction");
     }
   } else {
     for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ8_0)) {

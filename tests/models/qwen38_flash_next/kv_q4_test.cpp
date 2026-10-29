@@ -110,6 +110,63 @@ void CheckValidation() {
     Require(qfn::ExpectedKvPayloadVersion(type) == 24, "new numerical epoch");
   }
 }
+void CheckValidationDomain() {
+  // Independent acceptance oracle: binary16 overflow rounds to infinity at
+  // magnitude 65520, including the tie. Products here are exact binary32.
+  // Exhaust every scale bit pattern and nibble, isolated in each packed half.
+  for (const auto type : {KvCacheType::kQ4_0, KvCacheType::kQ4_0Rotated}) {
+    for (unsigned bits = 0; bits < 65536; ++bits) {
+      const auto exponent = (bits >> 10) & 31;
+      const auto fraction = bits & 1023;
+      const float magnitude = exponent == 0 ? std::ldexp(float(fraction), -24)
+                                            : std::ldexp(float(1024 + fraction),
+                                                         int(exponent) - 25);
+      for (unsigned nibble = 0; nibble < 16; ++nibble) {
+        const bool expected =
+            exponent != 31 && magnitude * std::abs(int(nibble) - 8) < 65520.0F;
+        for (unsigned half = 0; half < 2; ++half) {
+          std::array<std::byte, 18> packed{};
+          packed.fill(std::byte{0x88});
+          packed[0] = std::byte(bits & 255);
+          packed[1] = std::byte(bits >> 8);
+          if (half == 0)
+            packed[2] = std::byte(0x80 | nibble);
+          else
+            packed[17] = std::byte(8 | (nibble << 4));
+          const auto before = packed;
+          bool accepted = true;
+          try {
+            qfn::ValidateKvRow(packed, 32, type);
+          } catch (const std::invalid_argument&) {
+            accepted = false;
+          }
+          Require(accepted == expected, "q4 scale/nibble acceptance domain");
+          Require(packed == before, "validation mutated q4 bytes");
+        }
+      }
+    }
+    std::array<std::byte, 36> packed{};
+    packed.fill(std::byte{0x88});
+    packed[0] = std::byte{0};
+    packed[1] = std::byte{0x3c};
+    packed[18] = std::byte{0};
+    // A bad final high nibble in a later block must reject before any output.
+    packed[35] = std::byte{0x08};
+    for (auto scale_high : {0x70, 0xf0}) {
+      packed[19] = std::byte(scale_high);  // +/-8192 times -8 overflows half.
+      std::array<float, 64> output{};
+      output.fill(123);
+      Reject([&] { qfn::DecodeKvRow(packed, type, output); });
+      Require(std::ranges::all_of(output, [](float x) { return x == 123; }),
+              "partial decode on late reconstruction overflow");
+    }
+    packed[19] = std::byte{0x3c};
+    packed[35] = std::byte{0x88};
+    qfn::ValidateKvRow(packed, 64, type);
+    Reject([&] { qfn::ValidateKvRow(std::span(packed).first(35), 64, type); });
+    Reject([&] { qfn::ValidateKvRow(packed, 63, type); });
+  }
+}
 void CheckPopulation() {
   // Independently compute the scalar ggml convention and pack expected bytes.
   std::uint32_t state = 0x934681;
@@ -153,6 +210,7 @@ int main() {
   try {
     CheckBlocks();
     CheckValidation();
+    CheckValidationDomain();
     CheckPopulation();
     std::cout << "Flash-Next q4 codec: PASS\n";
   } catch (const std::exception& e) {
