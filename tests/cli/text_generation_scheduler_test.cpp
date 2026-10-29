@@ -13,6 +13,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,6 +33,7 @@
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/json.hpp"
+#include "src/core/perf_trace.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
@@ -3557,7 +3559,80 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
+std::filesystem::path attribution_path;
+void RemoveAttributionTrace() {
+  std::error_code error;
+  std::filesystem::remove(attribution_path, error);
+}
+
+void TestAttributionTrace(const char* retained_path = nullptr) {
+  attribution_path =
+      retained_path
+          ? std::filesystem::path(retained_path)
+          : std::filesystem::temp_directory_path() /
+                ("gufo-attribution-" +
+                 std::to_string(gufo::platform::ProcessId()) + ".jsonl");
+  std::filesystem::remove(attribution_path);
+  if (!retained_path)
+    Expect(std::atexit(RemoveAttributionTrace) == 0,
+           "trace cleanup registered");
+  Expect(gufo::platform::SetEnv("GUFO_PERF_TRACE", attribution_path.string()),
+         "trace enabled before first scheduler");
+  {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = true;
+    control->preview_first_token = true;
+    auto scheduler = MakeScheduler(control, 1);
+    for (int i = 0; i < 2; ++i)
+      Expect(scheduler->Submit({1, 10}, 7, 0.0F).Wait().tokens ==
+                 ExpectedTokens(1, 7),
+             "trace preserves native output on recycled slot");
+  }
+  std::map<std::size_t, std::vector<gufo::json::Value>> events;
+  std::ifstream input(attribution_path);
+  for (std::string line; std::getline(input, line);) {
+    const auto record = gufo::json::parse(line);
+    const auto* attr = record.find("attribution");
+    Expect(attr && attr->member_size("dropped") == 0,
+           "complete attribution record");
+    for (const auto& event : attr->find("events")->items())
+      events[event.member_size("request_id")].push_back(event);
+  }
+  Expect(events.size() == 2, "two unique request generations on one slot");
+  for (const auto& [id, request] : events) {
+    std::size_t tokens = 0, terminal = 0, submit = 0, admit = 0,
+                previous_burst = 0;
+    bool separate_burst = false;
+    for (const auto& event : request) {
+      const auto name = event.member_str("event");
+      if (name == "token") {
+        ++tokens;
+        Expect(event.member_size("ordinal") == tokens,
+               "native ordinals contiguous");
+        Expect(event.member_size("slot_generation") == id,
+               "generation follows request");
+        const auto burst = event.member_size("burst_id");
+        Expect(burst != 0, "publication has explicit burst");
+        separate_burst |= previous_burst != 0 && previous_burst != burst;
+        previous_burst = burst;
+      }
+      terminal += name == "terminal";
+      submit += name == "submit";
+      admit += name == "admit";
+    }
+    Expect(tokens == 7 && terminal == 1 && submit == 1 && admit == 1,
+           "full request lifecycle and native token counts");
+    Expect(separate_burst,
+           "preview and target publications remain distinct bursts");
+  }
+}
+
 int main(int argc, char** argv) {
+  if ((argc == 2 || argc == 3) &&
+      std::string_view(argv[1]) == "--attribution") {
+    TestAttributionTrace(argc == 3 ? argv[2] : nullptr);
+    return 0;
+  }
   const bool trace_only =
       argc == 2 && std::string_view(argv[1]) == "--prerequisite-trace-only";
   Expect(argc == 1 || trace_only,
