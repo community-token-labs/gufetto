@@ -15,7 +15,7 @@ static_assert(requires(gufo::server::InferenceBackend& backend,
                        std::string& error) {
   backend.load("missing.gguf", &error, 262144, 1, {}, {}, {}, {}, {}, {}, false,
                gufo::models::qwen38_flash_next::KvCacheType::kF16, false,
-               16384U);
+               16384U, 65536U);
 });
 
 int main() {
@@ -24,8 +24,13 @@ int main() {
       .max_context = 262144,
       .enable_vision = false,
       .vision_max_tokens_per_slot = 16384,
+      .vision_pool_tokens = 65536,
   };
   assert(!options.enable_vision && options.vision_max_tokens_per_slot == 16384);
+  assert(options.vision_pool_tokens == 65536);
+  assert(gufo::models::qwen::vision::OutputReservationBytes(65536, 2560) ==
+         640ULL * 1024 * 1024);
+  assert(gufo::models::qwen::vision::InputPositionBytes(262144) == 3145792);
   assert(gufo::models::qwen::vision::InputReservationBytes(
              options.max_context, 2560, options.vision_max_tokens_per_slot) ==
          170917952);

@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 
 #include "src/models/qwen/vision/device_input.hpp"
@@ -10,6 +12,62 @@ void Check(hipError_t error) {
   if (error != hipSuccess)
     throw std::runtime_error(hipGetErrorString(error));
 }
+
+// Metadata survives idle eviction so first encodes and re-encodes remain
+// distinguishable. Each stream's last read is fenced, including draft readers.
+struct PooledEmbeddings final : OutputPool::Storage {
+  explicit PooledEmbeddings(std::size_t count)
+      : embeddings(count), ever_encoded(count) {}
+  ~PooledEmbeddings() override {
+    if (uncertain_reader)
+      (void)hipDeviceSynchronize();
+    for (const auto& [stream, event] : readers) {
+      (void)hipEventSynchronize(event);
+      (void)hipEventDestroy(event);
+    }
+  }
+  bool TryEvict() override {
+    const std::lock_guard lock(mutex);
+    if (uncertain_reader)
+      throw std::runtime_error("vision reader completion unknown; reload the model");
+    for (const auto& [stream, event] : readers) {
+      const auto status = hipEventQuery(event);
+      if (status == hipErrorNotReady)
+        return false;
+      Check(status);
+    }
+    for (auto& embedding : embeddings)
+      embedding.reset();
+    for (const auto& [stream, event] : readers)
+      (void)hipEventDestroy(event);
+    readers.clear();
+    return true;
+  }
+  hipEvent_t Reader(hipStream_t stream) {
+    for (auto it = readers.begin(); it != readers.end();) {
+      if (it->first != stream && hipEventQuery(it->second) == hipSuccess) {
+        Check(hipEventDestroy(it->second));
+        it = readers.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    auto [it, inserted] = readers.try_emplace(stream, nullptr);
+    if (inserted) {
+      const auto status = hipEventCreateWithFlags(&it->second, hipEventDisableTiming);
+      if (status != hipSuccess) {
+        readers.erase(it);
+        Check(status);
+      }
+    }
+    return it->second;
+  }
+  std::mutex mutex;
+  std::vector<std::shared_ptr<const Encoder::Embedding>> embeddings;
+  std::vector<bool> ever_encoded;
+  std::map<hipStream_t, hipEvent_t> readers;
+  bool uncertain_reader{};
+};
 
 __global__ void InjectRows(float* hidden, const float* embedding,
                            std::uint32_t rows, std::uint32_t width,
@@ -49,15 +107,22 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
   if (prompt && !prompt->images.empty() && !encoder) {
     throw std::invalid_argument("image input has no vision encoder");
   }
-  const bool reuse = prompt_ && prompt && !prompt->cache_identity.empty() &&
-                     encoder_ == encoder &&
-                     prompt_->cache_identity == prompt->cache_identity;
+  std::shared_ptr<OutputPool::Owner> owner;
+  if (prompt && !prompt->images.empty()) {
+    for (const auto& image : prompt->images) {
+      if (!image.pixels ||
+          std::uint64_t{image.grid.width} * 32 != image.pixels->width ||
+          std::uint64_t{image.grid.height} * 32 != image.pixels->height ||
+          std::uint64_t{image.grid.width} * image.grid.height > 16384)
+        throw std::invalid_argument("image grid exceeds encoder workspace envelope");
+    }
+    owner = encoder->Outputs()->GetOwner(
+        std::string(prompt->cache_identity.begin(), prompt->cache_identity.end()),
+        prompt->ImageRows());
+  }
   prompt_ = std::move(prompt);
   encoder_ = std::move(encoder);
-  if (!reuse)
-    embeddings_.clear();
-  if (prompt_)
-    embeddings_.resize(prompt_->images.size());
+  output_owner_ = std::move(owner);
   RestoreLayout(prompt_ ? prompt_->rope : RopeLayout{}, stream);
 }
 
@@ -98,8 +163,16 @@ void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
 void DeviceInput::Inject(float* hidden, std::uint32_t position,
                          std::uint32_t count, std::uint32_t width,
                          std::uint32_t hc, hipStream_t stream) {
-  if (!prompt_)
+  if (!prompt_ || prompt_->images.empty())
     return;
+  const auto lease = encoder_->Outputs()->TryAcquire(output_owner_);
+  if (!lease)
+    throw std::runtime_error("vision output budget unavailable; admit the whole prompt before execution");
+  const auto cache = std::dynamic_pointer_cast<PooledEmbeddings>(
+      lease->GetStorage([&] { return std::make_shared<PooledEmbeddings>(prompt_->images.size()); }));
+  if (!cache || cache->embeddings.size() != prompt_->images.size())
+    throw std::logic_error("invalid shared vision output storage");
+  const std::lock_guard lock(cache->mutex);
   for (std::size_t index = 0; index < prompt_->images.size(); ++index) {
     const auto& image = prompt_->images[index];
     const auto image_end =
@@ -108,19 +181,36 @@ void DeviceInput::Inject(float* hidden, std::uint32_t position,
     const auto end = std::min(position + count, image_end);
     if (begin >= end)
       continue;
-    if (!embeddings_[index])
-      embeddings_[index] = encoder_->Encode(*image.pixels, {}, is_cancelled_);
-    const auto& embedding = *embeddings_[index];
+    if (!cache->embeddings[index]) {
+      auto embedding = encoder_->Encode(*image.pixels, {}, is_cancelled_);
+      if (embedding->width() != width ||
+          embedding->rows() != image.grid.height * image.grid.width)
+        throw std::logic_error("vision embedding does not match reserved input");
+      lease->RecordEncode(cache->ever_encoded[index], embedding->rows());
+      cache->embeddings[index] = std::move(embedding);
+      cache->ever_encoded[index] = true;
+    }
+    const auto& embedding = *cache->embeddings[index];
     if (embedding.width() != width ||
         embedding.rows() != image.grid.height * image.grid.width) {
       throw std::logic_error("vision embedding does not match language input");
     }
     const auto rows = end - begin;
-    InjectRows<<<(rows * width * hc + 255) / 256, 256, 0, stream>>>(
-        hidden + std::size_t{begin - position} * width * hc,
-        embedding.data() + std::size_t{begin - image.grid.offset} * width, rows,
-        width, hc);
-    Check(hipGetLastError());
+    const auto reader = cache->Reader(stream);
+    try {
+      InjectRows<<<(rows * width * hc + 255) / 256, 256, 0, stream>>>(
+          hidden + std::size_t{begin - position} * width * hc,
+          embedding.data() + std::size_t{begin - image.grid.offset} * width, rows,
+          width, hc);
+      Check(hipGetLastError());
+      Check(hipEventRecord(reader, stream));
+    } catch (...) {
+      // A failed event record must never make an in-flight source evictable.
+      // Retain its credits if the fallback drain cannot establish completion.
+      if (hipStreamSynchronize(stream) != hipSuccess)
+        cache->uncertain_reader = true;
+      throw;
+    }
   }
 }
 }  // namespace gufo::models::qwen::vision

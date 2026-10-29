@@ -9,6 +9,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "src/cli/serve/cache_lookup_support.hpp"
@@ -1275,6 +1276,8 @@ struct TextRunnerPool::Request::Impl {
   std::size_t observed_prefill_tokens{};
   double observed_prefill_ms{};
   std::shared_ptr<ContinuationDiskStore> disk_store;
+  // Outlive runner-lease cleanup as well as asynchronous snapshot completion.
+  std::shared_ptr<void> prompt_resources;
   ServingCacheLease lease;
   std::vector<TextRunnerToken> prompt;
   std::vector<TextRunnerToken> snapshot_tokens;
@@ -2174,7 +2177,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos) {
+    std::size_t cache_prefix_tokens, bool stop_at_eos,
+    std::optional<TextPromptAdmission> reserved_resources) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -2188,6 +2192,19 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   if (cache_prefix_tokens > prompt.size())
     throw std::invalid_argument("cache prefix exceeds prompt length");
 
+  TextPromptAdmission resources;
+  if (reserved_resources) {
+    resources = std::move(*reserved_resources);
+    if (!resources.ready)
+      throw std::logic_error(
+          "cannot acquire runner with unavailable prompt resources");
+  } else if (context) {
+    while (!(resources = context->TryAdmit()).ready) {
+      if (is_cancelled && is_cancelled())
+        return {};
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
   std::unique_lock admission(impl_->admission_mutex, std::defer_lock);
   while (!admission.try_lock_for(std::chrono::milliseconds(10))) {
     if (is_cancelled && is_cancelled())
@@ -2204,6 +2221,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         impl_->validated.runner, nullptr, ServingCacheLease(std::move(lease)),
         std::move(prompt), std::vector<std::size_t>{}, sampling_config,
         std::move(context), cache_prefix_tokens, capacity() > 1));
+    request.impl_->prompt_resources = std::move(resources.lease);
     request.impl_->cancelled = is_cancelled;
     request.impl_->lookup_timings = impl_->lookup_timings;
     if (request.cache_hit())
@@ -2350,6 +2368,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
       std::move(prompt), std::move(boundaries), sampling_config,
       std::move(context), cache_prefix_tokens, impl_->cache->capacity() > 1));
+  request.impl_->prompt_resources = std::move(resources.lease);
   request.impl_->cancelled = is_cancelled;
   request.impl_->lookup_timings = impl_->lookup_timings;
   if (request.cache_hit())

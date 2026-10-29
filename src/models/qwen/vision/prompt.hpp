@@ -3,8 +3,10 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -54,6 +56,16 @@ struct Prompt {
   std::size_t stable_prefix_tokens{0};
   RopeLayout rope;
   std::vector<PreparedImage> images;
+  [[nodiscard]] std::uint32_t ImageRows() const {
+    std::uint64_t rows = 0;
+    for (const auto& image : images) {
+      const auto count = std::uint64_t{image.grid.height} * image.grid.width;
+      if (count > std::numeric_limits<std::uint32_t>::max() - rows)
+        throw std::length_error("aggregate image rows overflow");
+      rows += count;
+    }
+    return static_cast<std::uint32_t>(rows);
+  }
   /// SHA-256 covers decoded pixels, grid placement, preprocessing version,
   /// and the model-specific encoder identity. Tokens remain a separate key.
   std::vector<std::uint8_t> cache_identity;

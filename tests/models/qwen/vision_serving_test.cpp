@@ -75,6 +75,59 @@ void CheckConcurrent(Backend& backend,
             << " physical_width=" << width << '\n';
 }
 
+void EvictIdleOutputs(
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
+  const auto pool = encoder->Outputs();
+  auto pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-pressure", pool->Capacity()));
+  Require(pressure != nullptr, "completed image readers still pin idle output");
+  Require(pool->GetStats().encoded_rows == 0,
+          "idle eviction retained GPU output rows");
+}
+
+void CheckPoolQueue(
+    Backend& backend,
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
+    const tokenization::QwenTokenizer& tokenizer,
+    std::span<const server::ChatRequest> requests,
+    std::span<const Backend::Result> expected,
+    const sampling::SamplingConfig& sampling) {
+  const auto pool = encoder->Outputs();
+  std::uint32_t largest = 0;
+  for (std::size_t i = 0; i < 2; ++i) {
+    const auto prompt = models::qwen::vision::Prepare(
+        tokenizer, requests[i].messages, {},
+        tokenization::ResolveQwenChatOptions(requests[i].reasoning,
+                                             requests[i].add_vision_id),
+        encoder->identity(), 1024);
+    largest = std::max(largest, prompt.ImageRows());
+  }
+  Require(largest > 0 && largest < pool->Capacity(),
+          "invalid pool queue fixture");
+  auto pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-queue-pressure", pool->Capacity() - largest));
+  Require(pressure != nullptr, "idle outputs cannot admit pressure fixture");
+  const auto before = pool->GetStats();
+  std::vector<std::shared_ptr<Backend::GenerationRequest>> pending;
+  for (std::size_t i = 0; i < 2; ++i) {
+    auto request = requests[i];
+    request.cache_prompt = false;
+    pending.push_back(backend.start_chat(request, 16, sampling));
+  }
+  for (std::size_t i = 0; i < pending.size(); ++i)
+    Require(pending[i]->Wait().tokens == expected[i].tokens,
+            "queued image output differs from fresh reference");
+  const auto after = pool->GetStats();
+  Require(after.waits > before.waits,
+          "native image fixture did not wait for output credits");
+  Require(after.peak_rows <= pool->Capacity() &&
+              after.peak_encoded_rows <= pool->Capacity(),
+          "output pool exceeded capacity");
+  std::cout << "vision_pool waits=" << after.waits - before.waits
+            << " encodes=" << after.encodes - before.encodes
+            << " reencodes=" << after.reencodes - before.reencodes << '\n';
+}
+
 void CheckFlashIncrementalOracle(
     const std::shared_ptr<models::qwen38_flash_next::Model>& model,
     const server::ChatRequest& request, const Backend::Result& cached) {
@@ -94,11 +147,16 @@ void CheckFlashIncrementalOracle(
   Require(incremental && bulk, error);
   incremental->ConfigureVision(prompt);
   bulk->ConfigureVision(prompt);
+  Require(bulk->Sync(tokens, &error), error);
+  const auto before_eviction = model->VisionEncoder()->Outputs()->GetStats();
+  EvictIdleOutputs(model->VisionEncoder());
   Require(incremental->Sync(
               std::span(tokens).first(cached.cached_prompt_tokens), &error),
           error);
-  Require(incremental->Sync(tokens, &error) && bulk->Sync(tokens, &error),
-          error);
+  Require(incremental->Sync(tokens, &error), error);
+  Require(model->VisionEncoder()->Outputs()->GetStats().reencodes >
+              before_eviction.reencodes,
+          "Flash oracle did not re-encode evicted images");
   std::vector<tokenization::TokenId> generated;
   double max_kl = 0;
   float max_logit_error = 0;
@@ -191,7 +249,12 @@ void CheckQwenIncrementalOracle(
   const auto split_logits = incremental.CopyLastLogits();
   const std::vector<float> expected(split_logits.begin(), split_logits.end());
   incremental.Reset();
+  const auto before_eviction = model->VisionEncoder()->Outputs()->GetStats();
+  EvictIdleOutputs(model->VisionEncoder());
   (void)incremental.ForwardPromptBatch(tokens);
+  Require(model->VisionEncoder()->Outputs()->GetStats().reencodes >
+              before_eviction.reencodes,
+          "Qwen oracle did not re-encode evicted images");
   const auto cold_logits = incremental.CopyLastLogits();
   Require(std::ranges::equal(expected, cold_logits),
           "Qwen image prefill logits changed with chunk boundaries");
@@ -467,6 +530,9 @@ int main(int argc, char** argv) {
       ar.reset();
       ar = load(false);
       CheckConcurrent(*ar, requests, references, greedy);
+      CheckPoolQueue(*ar, flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
+                     flash ? qfn->tokenizer() : qwen->GetTokenizer(), requests,
+                     references, greedy);
       if (!draft.empty()) {
         spec = load(true);
         std::array<Backend::Result, 4> speculative_references;
@@ -480,6 +546,10 @@ int main(int argc, char** argv) {
         spec.reset();
         spec = load(true);
         CheckConcurrent(*spec, requests, speculative_references, greedy, flash);
+        CheckPoolQueue(*spec,
+                       flash ? qfn->VisionEncoder() : qwen->VisionEncoder(),
+                       flash ? qfn->tokenizer() : qwen->GetTokenizer(),
+                       requests, speculative_references, greedy);
       }
       // Sampled replay and per-request RNG independence. Existing sampler
       // suites cover the distribution itself; this checks image-path

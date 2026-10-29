@@ -101,6 +101,14 @@ def main():
     for value in ("-1", "4294967296", "invalid"):
         check(["serve", "llm", "--vision-max-tokens-per-slot", value], 2,
               "--vision-max-tokens-per-slot")
+    assert "--vision-pool-tokens" in help_text
+    for value in ("1", "128", "65536", "4294967295"):
+        check(["serve", "llm", "--vision-pool-tokens", value,
+               "--vision-max-tokens-per-slot", "64", "--no-vision",
+               "--model", "missing.gguf"], 1, "Error loading model")
+    for value in ("0", "-1", "4294967296", "invalid"):
+        check(["serve", "llm", "--vision-pool-tokens", value], 2,
+              "--vision-pool-tokens")
     assert "--cache-ram-bytes <N|off>" in help_text
     for value in ("off", "0", "536870912"):
         check(["serve", "llm", "--cache-ram-bytes", value,

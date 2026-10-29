@@ -44,32 +44,39 @@ compatible model and speculative selection. Our standard development profile
 explicitly enables **shared-Q8 MTP at C1–C4** (`--speculative mtp --mtp-model …`);
 the generic CLI defaults to speculation off, not implicit Q8 draft loading.
 Vision defaults to automatic discovery of `mmproj-BF16.gguf` beside the model
-or in its parent directory. For text-only serving, `gufo serve llm --no-vision`
-skips both projector loading (about 0.9 GB for the current Flash-Next sidecar)
-and per-slot vision-input reservation. At 262144 context that reservation is
-about 2.50 GiB per Flash-Next slot; four 524288-context slots reserve about
-20.02 GiB. These are reservation savings, not guaranteed extra usable RAM.
-Image requests are rejected when vision is disabled. `--no-vision` conflicts
-with an explicit `--mmproj`; it does not silently ignore that file.
-`--vision-max-tokens-per-slot N` bounds aggregate Qwen image tokens across the
-whole request history, including images before a cache hit. The default `0`
-keeps the full-context bound; a value above context does not expand it. Requests
-above the effective cap get HTTP 400 before GPU encoding, without truncation.
-CPU image decoding/preprocessing still occurs to determine resized dimensions.
-Flash-Next reserves `N * 10240 + context * 12 + 64` bytes per vision-enabled
-slot (using the effective cap). Position rows span preceding text through the
-last image, so only the embedding term shrinks. At 262144 context, a 16384 cap
-reduces the input reservation by 2.34375 GiB/slot, not measured physical RAM.
-Encoder workspace and shared-pool accounting are separate concerns.
-Vision-enabled startup charges one shared encoder workspace in addition to
-per-slot input storage. After allocating slots, cache budgeting protects their
-still-unallocated execution storage and deferred shared scratch; resident
-weights and eager state are not charged twice. AUTO halves the remaining
-protected headroom, so correcting formerly unprotected promises can reduce the
-cache budget. Explicit and disk-only backing retain execution/OS reserves too.
-The frozen growth guard is conservative after lazy buffers materialize. CPU
-image preprocessing, other processes and runtime overhead remain separate
-pressure sources; this is not an unconditional OOM guarantee.
+or in its parent directory. `gufo serve llm --no-vision` skips the projector
+(about0.9GB for the current Flash-Next sidecar), shared image-output pool,
+encoder workspace and per-slot image positions. Image requests then get4xx;
+`--no-vision` conflicts with an explicit `--mmproj`.
+
+`--vision-pool-tokens N` sets one shared retained image-output budget, default
+65536 rows (640MiB for Flash-Next), and must be positive. Whole-history requests
+larger than the pool get HTTP400 before GPU encoding. Otherwise fitting requests
+wait for credits before acquiring a runner. Idle outputs are evicted in LRU order;
+active requests and unfinished GPU readers remain protected. Replay re-encodes
+from the same pixels. Debug `event=vision_pool` reports cumulative total
+encodes, re-encodes, reserved/encoded row peaks, evictions and waits when a
+request context is retired. A hard reader-fence failure retains its credits and
+reports an error rather than recycling storage of unknown completion.
+
+`--vision-max-tokens-per-slot N` remains an independent whole-history request
+cap;0 keeps the context bound. Both limits count images before a cache hit.
+This cap does not shrink the shared pool reservation. CPU decoding/preprocessing
+still occurs to determine dimensions. Position storage spans text before the
+last image and retains its context-sized allowance, not merely the image count.
+
+Vision admission reserves `10240 * pool_rows + slots * (context * 12 + 64)`
+bytes for Flash-Next inputs, plus one conservative3471376384-byte encoder
+workspace. At S4/context524288, default P64K plus workspace is about3.881GiB,
+versus23.256GiB for independently reserved full-context inputs plus the same
+workspace. These are reservation figures, not measured RAM or latency gains.
+
+After slot allocation, cache budgeting protects outstanding lazy execution and
+shared scratch without charging eager state again. AUTO halves the protected
+headroom; explicit and disk-only backing retain execution/OS reserves too. The
+frozen growth guard stays conservative after lazy buffers materialize. CPU
+pixels, processor caches, queued bodies, runtime overhead and other processes
+remain separate pressure sources; this is not an unconditional OOM guarantee.
 RAM caching defaults to AUTO (`--cache-ram-bytes 0`); `off` disables retention.
 Disk caching, pins, `--cache-lookup-api`, `--cache-transfer-api` and `--trace`
 require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and

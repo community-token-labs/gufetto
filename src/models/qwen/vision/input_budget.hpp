@@ -33,6 +33,23 @@ private:
   std::uint64_t used_{0};
 };
 
+inline constexpr std::uint32_t kDefaultOutputPoolRows = 65536;
+
+[[nodiscard]] inline std::size_t OutputReservationBytes(std::uint32_t rows,
+                                                        std::uint32_t hidden) {
+  const auto elements = std::uint64_t{rows} * hidden;
+  if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float))
+    throw std::overflow_error("vision output pool byte size overflows");
+  return static_cast<std::size_t>(elements) * sizeof(float);
+}
+
+[[nodiscard]] inline std::size_t InputPositionBytes(std::uint32_t context) {
+  const auto bytes = std::uint64_t{context} * 12 + 64;
+  if (bytes > std::numeric_limits<std::size_t>::max())
+    throw std::overflow_error("vision position reservation overflows");
+  return static_cast<std::size_t>(bytes);
+}
+
 /// Embeddings are bounded by image rows, but positions span preceding text
 /// through the last image and retain their context-sized high-water allowance.
 [[nodiscard]] inline std::size_t InputReservationBytes(

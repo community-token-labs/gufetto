@@ -14,6 +14,7 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen/vision/input_budget.hpp"
 #include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::hip {
@@ -90,7 +91,9 @@ public:
             models::qwen38_flash_next::KvCacheType kv_cache_type =
                 models::qwen38_flash_next::KvCacheType::kF16,
             bool enable_vision = true,
-            std::uint32_t vision_max_tokens_per_slot = 0);
+            std::uint32_t vision_max_tokens_per_slot = 0,
+            std::uint32_t vision_pool_tokens =
+                models::qwen::vision::kDefaultOutputPoolRows);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

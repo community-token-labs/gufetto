@@ -81,6 +81,31 @@ void SetError(std::string* error, std::string message) {
 
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
+  std::shared_ptr<models::qwen::vision::OutputPool> pool;
+  std::shared_ptr<models::qwen::vision::OutputPool::Owner> owner;
+  ~QwenImageContext() override {
+    // Cumulative completed encode/re-encode counters, after request execution.
+    // Diagnostic allocation/formatting failures must not break resource
+    // teardown.
+    try {
+      if (pool && Logger::Enabled(LogLevel::kDebug)) {
+        const auto stats = pool->GetStats();
+        Logger::LogFormatted(LogLevel::kDebug, "vision",
+                             "event=vision_pool reserved_rows=%zu "
+                             "peak_reserved_rows=%zu evictions=%zu "
+                             "waits=%zu encodes=%zu reencodes=%zu "
+                             "encoded_rows=%zu peak_encoded_rows=%zu",
+                             stats.rows, stats.peak_rows, stats.evictions,
+                             stats.waits, stats.encodes, stats.reencodes,
+                             stats.encoded_rows, stats.peak_encoded_rows);
+      }
+    } catch (...) {
+    }
+  }
+  TextPromptAdmission TryAdmit() const override {
+    auto lease = pool->TryAcquire(owner);
+    return {lease != nullptr, std::move(lease)};
+  }
 };
 
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request,
@@ -133,14 +158,15 @@ std::optional<std::size_t> CountQwenPromptTokens(
   // the GPU or admit the prompt to an execution context. Keep only the shared
   // layout's signed position limit so oversized text prompts can still be
   // sized, while enforcing the configured aggregate image bound.
-  return models::qwen::vision::Prepare(
-             tokenizer, request.messages, tools, options,
-             encoder ? encoder->identity() : std::string_view{},
-             std::numeric_limits<std::int32_t>::max(),
-             request.cache_prompt ? &image_cache : nullptr,
-             models::qwen::vision::ImageTokenLimit(max_context,
-                                                   max_image_tokens))
-      .tokens.size();
+  const auto prompt = models::qwen::vision::Prepare(
+      tokenizer, request.messages, tools, options,
+      encoder ? encoder->identity() : std::string_view{},
+      std::numeric_limits<std::int32_t>::max(),
+      request.cache_prompt ? &image_cache : nullptr,
+      models::qwen::vision::ImageTokenLimit(max_context, max_image_tokens));
+  if (encoder)
+    encoder->Outputs()->ValidateRows(prompt.ImageRows());
+  return prompt.tokens.size();
 }
 
 TextPreparedPrompt PrepareQwenPrompt(
@@ -185,6 +211,11 @@ TextPreparedPrompt PrepareQwenPrompt(
         {image.grid.offset, {identity.begin(), identity.end()}});
   }
   context->prompt = prompt;
+  context->pool = encoder->Outputs();
+  context->owner = context->pool->GetOwner(
+      std::string(prompt->cache_identity.begin(), prompt->cache_identity.end()),
+      prompt->ImageRows());
+
   return {prompt->tokens, std::move(context), cache_prefix};
 }
 
@@ -1214,12 +1245,12 @@ public:
     if (model_->VisionEncoder())
       usage.temporary_scratch_bytes = core::AddMemoryBytes(
           usage.temporary_scratch_bytes,
-          models::qwen::vision::InputReservationBytes(
-              max_context_, model_->GetConfig().hidden_size,
-              vision_max_tokens_per_slot_));
+          models::qwen::vision::InputPositionBytes(max_context_));
     const auto shared =
         model_->VisionEncoder()
-            ? models::qwen::vision::EncoderWorkspaceBytes(max_context_)
+            ? core::AddMemoryBytes(
+                  models::qwen::vision::EncoderWorkspaceBytes(max_context_),
+                  model_->VisionEncoder()->OutputBudgetBytes())
             : 0;
     std::size_t resident_weights = model_->GetResidentBytes();
     if (dflash_model_ != nullptr) {
@@ -3211,7 +3242,12 @@ bool InferenceBackend::load(
     const std::string& vision_model_path,
     TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
     models::qwen38_flash_next::KvCacheType kv_cache_type, bool enable_vision,
-    std::uint32_t vision_max_tokens_per_slot) {
+    std::uint32_t vision_max_tokens_per_slot,
+    std::uint32_t vision_pool_tokens) {
+  if (vision_pool_tokens == 0) {
+    SetError(error, "vision-pool-tokens must be positive");
+    return false;
+  }
   if (!enable_vision && !vision_model_path.empty()) {
     SetError(error, "--no-vision cannot be combined with --mmproj");
     return false;
@@ -3376,6 +3412,7 @@ bool InferenceBackend::load(
             .kv_cache_type = kv_cache_type,
             .enable_vision = enable_vision,
             .vision_max_tokens_per_slot = vision_max_tokens_per_slot,
+            .vision_pool_tokens = vision_pool_tokens,
         },
         &load_error);
     if (model == nullptr) {
@@ -3420,7 +3457,8 @@ bool InferenceBackend::load(
   try {
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
       vision = models::qwen::vision::Encoder::Open(
-          model_path, vision_model_path, 5120, enable_vision);
+          model_path, vision_model_path, 5120, enable_vision,
+          vision_pool_tokens);
     } else if (!vision_model_path.empty()) {
       throw std::invalid_argument(
           "image input supports Qwen3.8-27B and Flash-Next");
