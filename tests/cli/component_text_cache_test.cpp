@@ -1080,6 +1080,132 @@ void ColdAssignmentKeepsLiveFrontiers() {
     assert(turn(conversation) == frontier);
   }
 }
+void RestorePreservesTheCostlierLiveFrontier(
+    std::size_t b_count = 8192, std::size_t a_count = 4096, bool disk_b = false,
+    bool capture_b = true, bool preserve_b = true, bool keep_b = true) {
+  // The default is persist's older8193-B/newer4097-A reproduction. Changing
+  // only B's tier at closer depths distinguishes cost from depth/LRU.
+  class HeapRunner final : public Runner {
+  public:
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t budget) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, budget);
+      resources->allocate = [&ledger](const cache::PayloadRequest& request) {
+        auto bytes = std::make_shared<std::vector<std::byte>>(request.bytes);
+        auto backing =
+            ledger.Reserve(cache::ResourceCategory::kBackingFree, request.bytes)
+                .Convert();
+        auto reservation = std::make_shared<cache::ResourceReservation>(
+            backing.ReserveBacking(request.category));
+        return ComponentCaptureBuffer{
+            *bytes,
+            [bytes, reservation] {
+              return cache::Payload::Committed(
+                  reservation->Convert(),
+                  std::shared_ptr<const void>(bytes, bytes->data()));
+            },
+            bytes.get(),
+            [bytes, reservation, request](cache::SlotLease& lease,
+                                          auto source) {
+              auto owner = std::shared_ptr<const void>(bytes, bytes->data());
+              return cache::Payload::Borrowed(lease.Borrow(
+                  request.component, request.first, request.end,
+                  std::move(*reservation), std::move(owner), *bytes, source));
+            }};
+      };
+      return resources;
+    }
+  };
+  auto runner = std::make_shared<HeapRunner>();
+  runner->defer_idle = true;
+  runner->max_context = 16384;
+  const TemporaryDirectory temp("gufo-victim-cost");
+  const std::optional<TextRunnerDiskCacheOptions> disk =
+      disk_b ? std::optional<TextRunnerDiskCacheOptions>(
+                   {.directory = temp.path(),
+                    .capacity_bytes = 1 << 22,
+                    .staging_capacity_bytes = 4096})
+             : std::nullopt;
+  const auto capture = [](auto& lease, const auto& prompt) {
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    assert(lease->PublishSnapshot(prompt, lease->Capture(), false));
+  };
+  if (disk_b) {
+    runner->defer_idle = false;
+    // Actual durable-only coverage: the first cache drains publication, then
+    // all RAM ownership is destroyed before the tested cache opens the store.
+    ComponentTextCache prior(runner, 1, 1 << 25, disk);
+    const std::vector<TextRunnerToken> prompt(b_count, 10);
+    auto lease = prior.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    capture(lease, prompt);
+    (void)lease->Commit({}, {}, prompt);
+  }
+  runner->defer_idle = true;
+  ComponentTextCache cache(runner, 2, 1 << 25, disk);
+  std::uint64_t a_prefix_hash{};
+  const auto seed = [&](std::size_t count, TextRunnerToken token, bool b) {
+    std::vector<TextRunnerToken> prompt(count, token);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true, false);
+    auto& state = dynamic_cast<State&>(lease->state());
+    auto* slot = &state.slot;
+    const auto tail = std::span(prompt).subspan(lease->cached_tokens());
+    runner->adapter->Append(state.slot, tail, tail);
+    if (b && disk_b) {
+      assert(lease->cached_tokens() == count && lease->restored_from_disk());
+    } else if (!b || capture_b) {
+      capture(lease, prompt);
+    }
+    if (!b)
+      a_prefix_hash = runner->adapter->RecurrentHash(state.slot);
+    if (!b || preserve_b) {
+      runner->adapter->GuardRows(state.slot, cache::testing::kTarget, 0, count);
+      runner->adapter->GuardRows(state.slot, cache::testing::kDraft, 0, count);
+    }
+    const std::array<TextRunnerToken, 1> reply{token + 1};
+    runner->adapter->Append(state.slot, reply, reply);
+    prompt.push_back(reply.front());
+    (void)lease->Commit({}, {}, prompt);
+    return std::pair{std::move(prompt), slot};
+  };
+  auto [b, b_slot] = seed(b_count, 10, true);
+  auto [a, a_slot] = seed(a_count, 20, false);
+  assert(a_slot != b_slot);
+  auto edited = a;
+  edited.back() = 999;
+  std::ostringstream output;
+  const auto level = Logger::Level();
+  Logger::SetLevel(LogLevel::kInfo);
+  auto* sink = std::clog.rdbuf(output.rdbuf());
+  auto restore = cache.Acquire(edited, {}, {}, true, 0, true, false);
+  std::clog.rdbuf(sink);
+  Logger::SetLevel(level);
+  assert(restore->cached_tokens() == a_count &&
+         restore->restored_snapshot_bytes() > 0);
+  assert(&dynamic_cast<State&>(restore->state()).slot ==
+             (keep_b ? a_slot : b_slot) &&
+         "RAM restore overwrote the more expensive live frontier");
+  assert(runner->adapter->RecurrentHash(
+             dynamic_cast<State&>(restore->state()).slot) == a_prefix_hash);
+  auto returned = cache.Acquire(keep_b ? b : a, {}, {}, true, 0, true, false);
+  assert(returned->cached_tokens() == (keep_b ? b_count : a_count) + 1 &&
+         returned->restored_snapshot_bytes() == 0 &&
+         &dynamic_cast<State&>(returned->state()).slot ==
+             (keep_b ? b_slot : a_slot));
+  const auto log = output.str();
+  assert(log.find("event=slot_victim_candidate acquisition_id=3 slot_id=1") !=
+         std::string::npos);
+  assert(log.find("slot_id=2 eligible=1") != std::string::npos);
+  assert(log.find(!keep_b && disk_b
+                      ? "chosen=1 recovery_tier=disk"
+                      : "chosen=1 recovery_tier=ram") != std::string::npos);
+  assert(log.find("reason=minimum_recovery_cost") != std::string::npos);
+  if (disk_b)
+    assert(log.find("recovery_tier=disk") != std::string::npos);
+}
 void ColdSideRequestsKeepPreservedDeepFrontier() {
   auto runner = std::make_shared<Runner>();
   runner->defer_idle = true;
@@ -4899,6 +5025,19 @@ int main(int argc, char* argv[]) {
   run("reuse", [] {
     ColdAssignmentPrefersPreservedSlot();
     ColdAssignmentKeepsLiveFrontiers();
+    RestorePreservesTheCostlierLiveFrontier();
+    RestorePreservesTheCostlierLiveFrontier(8192, 2048);
+    RestorePreservesTheCostlierLiveFrontier(8192, 4096, false, false);
+    RestorePreservesTheCostlierLiveFrontier(8192, 4096, false, true, false);
+    // At 9us RAM / 12us disk, half-depth B is cheaper in either tier.
+    RestorePreservesTheCostlierLiveFrontier(4096, 8192, false, true, true,
+                                            false);
+    RestorePreservesTheCostlierLiveFrontier(4096, 8192, true, true, true,
+                                            false);
+    // B7168: RAM64.512ms < A73.728ms < disk86.016ms, plus equal tail cost.
+    RestorePreservesTheCostlierLiveFrontier(7168, 8192, false, true, true,
+                                            false);
+    RestorePreservesTheCostlierLiveFrontier(7168, 8192, true);
     ColdSideRequestsKeepPreservedDeepFrontier();
     ReuseAndBranches();
     EditBoundariesSurviveActualBackingPressure();
