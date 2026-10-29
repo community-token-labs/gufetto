@@ -603,7 +603,10 @@ std::optional<std::string> QwenChatTemplate::Render(
     std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
     const ChatTemplateOptions& options, std::string* error_msg,
     std::vector<std::size_t>* image_offsets, std::size_t* stable_prefix_bytes,
-    std::vector<ContentSpan>* content_spans) {
+    std::vector<ContentSpan>* content_spans, std::size_t* root_prefix_bytes) {
+  if (root_prefix_bytes != nullptr)
+    *root_prefix_bytes = 0;
+  std::size_t root = 0;
   if (image_offsets != nullptr)
     image_offsets->clear();
   if (content_spans != nullptr)
@@ -718,6 +721,7 @@ std::optional<std::string> QwenChatTemplate::Render(
     const auto prefix_offset = output.size();
     output.append(system_prefix);
     output.append(kImEnd).append("\n");
+    root = output.size();
     if (content_spans != nullptr) {
       for (const auto& span : system_spans)
         content_spans->push_back({prefix_offset + span.offset, span.size});
@@ -822,9 +826,10 @@ std::optional<std::string> QwenChatTemplate::Render(
     }
   }
 
+  const auto stable = std::min(mutable_reasoning.value_or(output.size()),
+                               final_user_start.value_or(output.size()));
   if (stable_prefix_bytes != nullptr)
-    *stable_prefix_bytes = std::min(mutable_reasoning.value_or(output.size()),
-                                    final_user_start.value_or(output.size()));
+    *stable_prefix_bytes = stable;
   if (options.add_generation_prompt)
     output.append(GenerationPrompt(options.enable_thinking));
 
@@ -835,6 +840,8 @@ std::optional<std::string> QwenChatTemplate::Render(
     return std::nullopt;
   }
 
+  if (root_prefix_bytes != nullptr && root <= stable)
+    *root_prefix_bytes = root;
   return output;
 }
 
