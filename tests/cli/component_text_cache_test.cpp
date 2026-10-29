@@ -784,12 +784,17 @@ void SharedPeerReusesTheCurrentStableCapture() {
          "an uncaptured partial pass cannot be offered to a peer");
   leader.Invalidate();
 }
-void SchedulerSharesAnExactPendingFrontier() {
+void SchedulerSharesAnExactPendingFrontier(bool fail_capture = false,
+                                           bool cancel_leader = false) {
   // Hold the first real component capture after allocation, outside the cache
   // mutex. An unrelated queued request releases it only after the scheduler
   // has considered the earlier follower: no arrival sleeps or race lottery.
   class PendingRunner final : public Runner {
   public:
+    explicit PendingRunner(bool fail_capture) : fail_capture(fail_capture) {}
+    const bool fail_capture;
+    std::function<void()> peer_action;
+    mutable std::atomic<bool> injected_failure{false};
     mutable std::binary_semaphore entered{0}, release{0};
     mutable std::atomic<bool> first{true}, resumed{false}, timed_out{false};
     mutable std::mutex mutex;
@@ -826,6 +831,11 @@ void SchedulerSharesAnExactPendingFrontier() {
             timed_out = true;
             throw std::runtime_error("pending component capture timed out");
           }
+          if (fail_capture) {
+            injected_failure = true;
+            throw std::runtime_error(
+                "injected pending component capture failure");
+          }
         }
         return stream();
       };
@@ -835,12 +845,15 @@ void SchedulerSharesAnExactPendingFrontier() {
                             std::span<const TextRunnerToken> prompt,
                             std::size_t offset,
                             std::size_t budget) const override {
-      if (prompt.front() == 999)
+      if (prompt.front() == 999) {
+        if (peer_action)
+          peer_action();
         Resume();
+      }
       return Runner::Prefill(state, prompt, offset, budget);
     }
   };
-  auto runner = std::make_shared<PendingRunner>();
+  auto runner = std::make_shared<PendingRunner>(fail_capture);
   auto pool = std::make_shared<TextRunnerPool>(runner, 3);
   TextGenerationScheduler scheduler(pool);
   struct ReleaseOnExit {
@@ -854,17 +867,45 @@ void SchedulerSharesAnExactPendingFrontier() {
   auto leader = scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata);
   if (!runner->entered.try_acquire_for(std::chrono::seconds(5)))
     throw std::runtime_error("leader did not enter pending capture window");
+  if (cancel_leader)
+    runner->peer_action = [&] { leader.Cancel(); };
   auto follower = scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata);
   auto unrelated = scheduler.Submit({999, 1000}, 1, 0.0f);
   const auto peer = unrelated.Wait();
   const auto a = leader.Wait();
   const auto b = follower.Wait();
-  assert(!runner->timed_out && runner->resumed);
-  assert(peer.tokens.size() == 1 && a.tokens.size() == 1 &&
-         a.tokens == b.tokens);
-  assert(a.prefill_tokens == prompt.size());
+  assert(!runner->timed_out && runner->resumed &&
+         runner->injected_failure == fail_capture);
+  assert(peer.tokens.size() == 1 && !b.cancelled && b.tokens.size() == 1);
+  assert(a.cancelled == cancel_leader);
+  if (cancel_leader)
+    assert(a.tokens.empty());
+  else
+    assert(a.tokens == b.tokens && a.prefill_tokens == prompt.size());
   assert(b.shared_prefix_wait_ms > 0);
-  assert(b.cached_prompt_tokens == prompt.size() - 1 && b.prefill_tokens == 1);
+  assert(b.cached_prompt_tokens + b.prefill_tokens == prompt.size());
+  if (!fail_capture && !cancel_leader)
+    assert(b.cached_prompt_tokens == prompt.size() - 1 &&
+           b.prefill_tokens == 1);
+  if (fail_capture && cancel_leader) {
+    // Cancel preserves the already executed live frontier even when its copy
+    // failed. The follower must reuse that state, not a nonexistent snapshot.
+    assert(a.component_cache && a.component_cache->captures == 0);
+    assert(b.cached_prompt_tokens == prompt.size() - 1 &&
+           b.prefill_tokens == 1 && b.cache_restore_bytes == 0);
+  }
+  // Cancellation may retain a completed safe checkpoint. Capture failure may
+  // fall back to a later coherent live frontier. Neither permits stale state.
+  auto cold_runner = std::make_shared<Runner>();
+  auto cold_pool = std::make_shared<TextRunnerPool>(cold_runner, 1);
+  TextGenerationScheduler cold(cold_pool);
+  const auto expected = cold.Submit(prompt, 1, 0.0f).Wait();
+  assert(b.tokens == expected.tokens);
+  const auto later =
+      scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata).Wait();
+  assert(!later.cancelled && later.tokens == expected.tokens &&
+         later.cached_prompt_tokens >= prompt.size() - 1 &&
+         later.prefill_tokens <= 1);
 }
 void PrefillLookaheadReachesTheNextFrontier() {
   class LookaheadRunner final : public Runner {
@@ -5174,7 +5215,9 @@ int main(int argc, char* argv[]) {
     completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();
-    SchedulerSharesAnExactPendingFrontier();
+    for (const bool fail_capture : {false, true})
+      for (const bool cancel_leader : {false, true})
+        SchedulerSharesAnExactPendingFrontier(fail_capture, cancel_leader);
     SharedPeerReusesTheCurrentStableCapture();
     BackingPreparationFollowsCaptures();
     PrefillLookaheadReachesTheNextFrontier();
