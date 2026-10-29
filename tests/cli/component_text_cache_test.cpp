@@ -2850,6 +2850,47 @@ void RequiredExactReplacementKeepsRootAtFullRecordCapacity() {
   }
 }
 
+void OptionalPlanningPressureDoesNotFailAdmittedRequest() {
+  for (const auto root :
+       {std::optional<std::size_t>{}, std::optional<std::size_t>{120}}) {
+    auto runner = std::make_shared<PredictionRunner>();
+    runner->max_context = 2048;
+    TextRunnerPool pool(runner, 1);
+    std::vector<TextRunnerToken> prompt(256);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    // Many matching short checkpoints make Lookup's candidate inventory
+    // larger than the remaining headroom, although a cold lease still fits.
+    for (std::size_t end = 16; end < 80; ++end) {
+      auto request = pool.Acquire({prompt.begin(), prompt.begin() + end},
+                                  sampling::SamplingConfig{}, {}, {}, false);
+      Prefill(request);
+      (void)Generate(request);
+      assert(request.Commit().snapshot_bytes);
+    }
+    auto& ledger = *runner->resource_ledger;
+    auto pressure = ledger
+                        .Reserve(cache::ResourceCategory::kBackingFree,
+                                 ledger.Limits().ram_bytes -
+                                     ledger.Snapshot().ram_bytes - 4096)
+                        .Convert();
+    // Exercise the actual request constructor, both without any optional
+    // capture and with a structural root. Planning must not fail generation.
+    auto request = pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {},
+                                false, 200, true, true, {}, root);
+    assert(request.cached_prompt_tokens() == 0);
+    pressure = {};
+    Prefill(request);
+    const auto actual = Generate(request);
+    assert(request.Commit().snapshot_bytes);
+    auto oracle_runner = std::make_shared<PredictionRunner>();
+    oracle_runner->max_context = 2048;
+    TextRunnerPool oracle_pool(oracle_runner, 1);
+    auto oracle = oracle_pool.Acquire(prompt);
+    Prefill(oracle);
+    assert(Generate(oracle) == actual);
+  }
+}
+
 void PredictionPlannerSharesQuotaAndDeduplicatesPending() {
   auto runner = std::make_shared<PredictionRunner>();
   ComponentTextCache cache(runner, 5, 1 << 22, {});
@@ -6100,6 +6141,7 @@ int main(int argc, char* argv[]) {
     PredictedSnapshotsRemainRamOnly();
     RequiredPublicationUsesOwnedPredictionUnderMetadataPressure();
     RequiredExactReplacementKeepsRootAtFullRecordCapacity();
+    OptionalPlanningPressureDoesNotFailAdmittedRequest();
     PredictionPlannerSharesQuotaAndDeduplicatesPending();
     SchedulerCarriesStructuralRootMetadata();
     UnreadyPredictionDoesNotObserveOrTaintFallback();
