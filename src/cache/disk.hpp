@@ -128,6 +128,12 @@ struct DiskPublicationStats {
   std::uint64_t fsync_calls{}, fsync_ns{};
   std::uint64_t filesystem_ns{}, checksum_ns{}, metadata_lock_ns{};
   std::uint64_t io_lock_ns{};
+  // Bytes accepted by write syscalls, including short writes and bytes later
+  // rolled back. These are application writes, not retained, block-device or
+  // NAND bytes. Inherited bytes are logical references validated per attempt.
+  std::uint64_t private_write_bytes{}, shared_write_bytes{},
+      manifest_write_bytes{};
+  std::uint64_t inherited_bytes{}, write_calls{};
 };
 // Retains a checkpoint's dependency pin while the store is alive.
 class DiskReadPin {

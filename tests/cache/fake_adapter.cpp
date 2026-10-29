@@ -549,6 +549,8 @@ std::span<const std::byte> FakeAdapter::BorrowRowsView(const Slot& slot,
   const auto& rows = RowArray(state, component);
   if (first >= end || end > rows.size())
     throw std::invalid_argument("invalid borrowed fake range");
+  if (!borrow_rows_[component == kTarget ? 0 : 1])
+    return {};
   // Append, restore and release guard the old allocation before replacing
   // the vector, so views stay fixed even though this fixture moves storage.
   return std::as_bytes(std::span(rows).subspan(first, end - first));
@@ -583,6 +585,11 @@ std::uint64_t FakeAdapter::RecurrentHash(const Slot& slot) const {
 }
 void FakeAdapter::GuardRows(Slot& slot, ComponentId c, Rows first, Rows end) {
   AsSlot(slot).guard_.BeforeOverwrite(c, first, end);
+}
+void FakeAdapter::DisableBorrowRows(ComponentId component) {
+  if (component != kTarget && component != kDraft)
+    throw std::invalid_argument("not a fake row component");
+  borrow_rows_[component == kTarget ? 0 : 1] = false;
 }
 void FakeAdapter::FailNextAllocation() noexcept {
   fail_allocation_ = true;
