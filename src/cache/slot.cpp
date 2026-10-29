@@ -488,6 +488,17 @@ struct LeaseState final : MutationGuard {
       std::terminate();
     source->generation.store(generation + 1, std::memory_order_release);
   }
+  bool DiagnosticEmpty() const {
+    const auto positions = adapter.Positions(*slot);
+    const auto components = adapter.Components();
+    if (positions.empty() || positions.size() != components.size())
+      return false;
+    return std::ranges::all_of(components, [&](const auto& component) {
+      const auto p =
+          std::ranges::find(positions, component.id, &ComponentPosition::id);
+      return p != positions.end() && p->valid_rows == 0;
+    });
+  }
   void Invalidate() noexcept {
     live = false;
     if (slot && !adapter.Invalidate(*slot)) {
@@ -866,6 +877,74 @@ SlotLease LeasedSlot::Acquire(std::optional<BorrowedLocation> live,
     state_->changed.notify_all();
     throw;
   }
+}
+
+std::optional<DiagnosticSlotLease> LeasedSlot::TryAcquireDiagnostic(
+    const std::function<bool(const Slot&)>& ready, std::stop_token stop) try {
+  std::unique_lock lock(state_->mutex, std::try_to_lock);
+  if (!lock.owns_lock() || !ready || stop.stop_requested() || state_->leased ||
+      state_->live || state_->spilling || state_->idle_failed ||
+      !state_->slot || !state_->slot->IsValid())
+    return {};
+  for (const auto& entry : state_->rows)
+    if (!entry.rows.expired())
+      return {};  // Even materialized/observed/pinned registrations refuse.
+  if (!ready(*state_->slot) || !state_->DiagnosticEmpty() ||
+      stop.stop_requested())
+    return {};
+  state_->leased = true;
+  state_->stop = stop;
+  return DiagnosticSlotLease(state_);
+} catch (...) {
+  return {};  // No state changed before the nonthrowing exclusive claim.
+}
+Slot& DiagnosticSlotLease::Execution() const {
+  if (!state_)
+    throw std::logic_error("diagnostic lease is settled");
+  state_->CheckStop();
+  return *state_->slot;
+}
+bool DiagnosticSlotLease::VerifiedEmpty(
+    const std::function<bool(const Slot&)>& ready) const {
+  return state_ && ready && state_->slot->IsValid() && ready(*state_->slot) &&
+         state_->DiagnosticEmpty();
+}
+void DiagnosticSlotLease::Quarantine() noexcept {
+  if (state_) {
+    // Leave leased=true: the facade retains native storage, and neither
+    // ordinary acquisition nor idle preservation can touch it. Its model
+    // owner must remain alive while native completion is uncertain.
+    result_ = DiagnosticDiscardResult::kQuarantined;
+    state_.reset();
+  }
+}
+DiagnosticDiscardResult DiagnosticSlotLease::Discard(
+    const std::function<bool(const Slot&)>& ready,
+    const std::function<DiagnosticDiscardResult(Slot&)>& reset) {
+  if (!state_)
+    return result_;
+  try {
+    const auto result =
+        reset ? reset(*state_->slot) : DiagnosticDiscardResult::kQuarantined;
+    if (result == DiagnosticDiscardResult::kPending)
+      return result;
+    if (result != DiagnosticDiscardResult::kComplete || !VerifiedEmpty(ready)) {
+      Quarantine();
+      return result_;
+    }
+    {
+      const std::lock_guard lock(state_->mutex);
+      state_->stop = {};
+      state_->leased = false;
+      state_->live = false;
+      state_->changed.notify_all();
+    }
+    state_.reset();
+    result_ = DiagnosticDiscardResult::kComplete;
+  } catch (...) {
+    Quarantine();
+  }
+  return result_;
 }
 
 bool LeasedSlot::PreservationComplete() const {

@@ -2183,6 +2183,13 @@ std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
   return steps;
 }
 
+std::unique_ptr<TextRunnerPool::DiagnosticLease>
+TextRunnerPool::TryAcquireDiagnostic(const CancellationCheck& cancelled) {
+  return impl_->component_cache
+             ? impl_->component_cache->TryAcquireDiagnostic(cancelled)
+             : nullptr;
+}
+
 TextRunnerPool::Request TextRunnerPool::Acquire(
     std::vector<TextRunnerToken> prompt,
     const sampling::SamplingConfig& sampling_config,

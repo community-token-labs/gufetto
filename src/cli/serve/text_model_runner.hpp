@@ -20,6 +20,7 @@
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/pinned_prefix.hpp"
+#include "src/cli/serve/text_diagnostic_lease.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 #include "src/core/sampling.hpp"
@@ -584,6 +585,10 @@ private:
 class TextRunnerPool {
 public:
   using CancellationCheck = std::function<bool()>;
+
+  using DiagnosticLease = TextDiagnosticLease;
+  [[nodiscard]] std::unique_ptr<DiagnosticLease> TryAcquireDiagnostic(
+      const CancellationCheck& is_cancelled = {});
 
   class Request {
   public:

@@ -239,6 +239,8 @@ struct ComponentTextCache::Impl {
     // obtain fresh one-completion leases from the shared transfer pool.
     std::unique_ptr<cache::Stream> preservation;
     std::unique_ptr<cache::LeasedSlot> slot;
+    // Diagnostic quarantine retains the bound facade as well as native state.
+    std::unique_ptr<TextRunnerState> diagnostic_quarantine;
     std::optional<cache::IndexEntryId> live;
     std::unique_ptr<cache::ExecutionHistory> history;
     // Identity of uninterrupted native execution; token equality alone does
@@ -1155,6 +1157,115 @@ struct ComponentTextCache::Impl {
     return PayloadBytes(capture->manifest);
   }
 };
+
+namespace {
+class DiagnosticRequest final : public TextDiagnosticLease {
+public:
+  DiagnosticRequest(ComponentTextCache::Impl& cache,
+                    ComponentTextCache::Impl::Entry& entry,
+                    cache::DiagnosticSlotLease slot)
+      : cache_(cache),
+        entry_(entry),
+        slot_(std::move(slot)),
+        state_(cache.runner->BindComponentState(*cache.resources->adapter,
+                                                slot_.Execution())) {}
+  ~DiagnosticRequest() override { Quarantine(); }
+  bool Initialize() {
+    if (!state_ || Reset(slot_.Execution()) != DiscardResult::kComplete ||
+        !slot_.VerifiedEmpty(cache_.resources->diagnostic_ready))
+      return false;
+    cached_ = cache_.runner->CheckpointPosition(*state_);
+    return cached_ == 0;
+  }
+  TextRunnerState& state() const override {
+    if (!active_)
+      throw std::logic_error("diagnostic lease is settled");
+    (void)slot_.Execution();
+    return *state_;
+  }
+  std::size_t cached_tokens() const noexcept override { return cached_; }
+  void PreparePrefill(std::size_t) override {
+    (void)state();  // Deliberately no cache GrowAhead or checkpoint planning.
+  }
+  DiscardResult Discard() override {
+    if (!active_)
+      return result_;
+    result_ = slot_.Discard(cache_.resources->diagnostic_ready,
+                            [this](cache::Slot& slot) { return Reset(slot); });
+    if (result_ == DiscardResult::kComplete) {
+      const std::lock_guard lock(cache_.mutex.native);
+      entry_.busy = false;
+      active_ = false;
+    } else if (result_ == DiscardResult::kQuarantined) {
+      Quarantine();
+    }
+    return result_;
+  }
+  void Quarantine() noexcept override {
+    if (!active_)
+      return;
+    const std::lock_guard lock(cache_.mutex.native);
+    entry_.diagnostic_quarantine = std::move(state_);
+    slot_.Quarantine();  // Keep entry busy; no ordinary release/reset fallback.
+    active_ = false;
+    result_ = DiscardResult::kQuarantined;
+  }
+
+private:
+  DiscardResult Reset(cache::Slot& slot) {
+    const auto result = cache_.resources->diagnostic_reset(slot, *state_);
+    if (result != DiscardResult::kComplete)
+      return result;
+    state_->SetCancellationCheck({});
+    state_->SetPrefillLookahead({});
+    cache_.runner->ReconcileComponentState(*state_, 0);
+    return cache_.runner->CheckpointPosition(*state_) == 0
+               ? DiscardResult::kComplete
+               : DiscardResult::kQuarantined;
+  }
+  ComponentTextCache::Impl& cache_;
+  ComponentTextCache::Impl::Entry& entry_;
+  cache::DiagnosticSlotLease slot_;
+  std::unique_ptr<TextRunnerState> state_;
+  std::size_t cached_{};
+  DiscardResult result_{DiscardResult::kPending};
+  bool active_{true};
+};
+}  // namespace
+std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
+    const ContinuationCache::CancellationCheck& cancelled) {
+  if (!impl_->resources->diagnostic_ready ||
+      !impl_->resources->diagnostic_reset || (cancelled && cancelled()))
+    return {};
+  std::unique_lock lock(impl_->mutex.native, std::try_to_lock);
+  if (!lock.owns_lock())
+    return {};
+  for (auto& entry : impl_->entries) {
+    if (entry->busy || entry->live || !entry->live_tokens.empty() ||
+        entry->history || entry->branch || entry->durable)
+      continue;
+    auto slot =
+        entry->slot->TryAcquireDiagnostic(impl_->resources->diagnostic_ready);
+    if (!slot)
+      continue;
+    entry->busy = true;
+    lock.unlock();  // Native reset/fence never holds publication/queue locks.
+    try {
+      auto result =
+          std::make_unique<DiagnosticRequest>(*impl_, *entry, std::move(*slot));
+      if (!result->Initialize())
+        return {};
+      if (cancelled && cancelled()) {
+        (void)result->Discard();
+        return {};
+      }
+      return result;
+    } catch (...) {
+      return {};  // Exclusive slot and any bound state remain quarantined.
+    }
+  }
+  return {};
+}
 
 struct ComponentTextCache::Lease::Impl {
   ComponentTextCache::Impl* cache;

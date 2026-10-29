@@ -18,6 +18,7 @@ namespace gufo::server {
 class TextModelRunner;
 class TextRunnerState;
 class TextRunnerSnapshot;
+class TextDiagnosticLease;
 struct TextRunnerDiskCacheOptions;
 struct TextPromptContext;
 
@@ -40,6 +41,15 @@ struct ComponentCacheResources {
   cache::StreamLease stream;
   std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;
+  // Opt-in diagnostic witnesses; absent means immediate refusal. Called only
+  // with exclusive slot ownership (ready also participates in atomic claim).
+  // Ready is strong, nonblocking native quiescence +
+  // healthy/materialized/empty, not Slot::ExecutionComplete's hint. Reset
+  // returns pending without mutation, or clears native/bound-state residue and
+  // fences before reporting complete.
+  std::function<bool(const cache::Slot&)> diagnostic_ready;
+  std::function<cache::DiagnosticDiscardResult(cache::Slot&, TextRunnerState&)>
+      diagnostic_reset;
   // Prepare on-demand backing immediately before the next prefill chunk.
   std::function<void(std::size_t)> prepare_prefill;
   // Optional capacity bound before assigning a complete capture. False takes
@@ -143,6 +153,8 @@ public:
       const ContinuationCache::CancellationCheck&,
       std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
       bool persist = true);
+  [[nodiscard]] std::unique_ptr<TextDiagnosticLease> TryAcquireDiagnostic(
+      const ContinuationCache::CancellationCheck& = {});
   [[nodiscard]] std::optional<ContinuationReuse> Lookup(
       std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
       std::size_t stable) const;
