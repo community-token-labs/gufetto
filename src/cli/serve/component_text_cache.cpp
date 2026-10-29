@@ -22,8 +22,8 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/os_info.hpp"
-#include "src/models/qwen38_flash_next/kv_cache.hpp"
 #include "src/core/platform/runtime_fingerprint.hpp"
+#include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::server {
 namespace {

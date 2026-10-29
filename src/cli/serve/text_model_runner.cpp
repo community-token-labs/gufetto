@@ -16,8 +16,8 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
-#include "src/core/platform/os_info.hpp"
 #include "src/core/perf_trace.hpp"
+#include "src/core/platform/os_info.hpp"
 
 namespace gufo::server {
 

@@ -9,9 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -2822,24 +2822,24 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       } else
 #endif
       {
-      // The Z rows feed only the output norm: the side stream computes them
-      // beside the convolution boundary, the alpha/beta GEMM and the
-      // recurrence; the epilogue waits for them before it reads z. With the
-      // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
-      // pp2048 and pp4096 within 1 %.
-      convolved = DenseF16SsmGemm(
-          l.ssm_in.data, static_cast<const __half*>(s_.x_half),
-          l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
-          l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_,
-          checkpoint.tokens, side_stream_, side_start_);
-      if (convolved) {
-        if (!Check(hipEventRecord(side_done_, side_stream_), "side stream join",
-                   error_msg)) {
-          (void)hipStreamSynchronize(side_stream_);
-          return false;
-        }
-        z_ready = side_done_;
-        z_join.event = side_done_;
+        // The Z rows feed only the output norm: the side stream computes them
+        // beside the convolution boundary, the alpha/beta GEMM and the
+        // recurrence; the epilogue waits for them before it reads z. With the
+        // shared-expert overlap on ROCm 10.1: pp512 1,287 -> 1,330 tok/s,
+        // pp2048 and pp4096 within 1 %.
+        convolved = DenseF16SsmGemm(
+            l.ssm_in.data, static_cast<const __half*>(s_.x_half),
+            l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
+            n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
+            stream_, checkpoint.tokens, side_stream_, side_start_);
+        if (convolved) {
+          if (!Check(hipEventRecord(side_done_, side_stream_),
+                     "side stream join", error_msg)) {
+            (void)hipStreamSynchronize(side_stream_);
+            return false;
+          }
+          z_ready = side_done_;
+          z_join.event = side_done_;
         }
       }
     }
@@ -3411,9 +3411,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       npu_shexp_groups == 0 &&
 #endif
       ExpertMatrixRows(n_tokens) && !last_only &&
-                       l.shexp_gate.type == GgmlType::kQ8_0 &&
-                       l.shexp_up.type == GgmlType::kQ8_0 &&
-                       l.shexp_down.type == GgmlType::kQ8_0;
+      l.shexp_gate.type == GgmlType::kQ8_0 &&
+      l.shexp_up.type == GgmlType::kQ8_0 &&
+      l.shexp_down.type == GgmlType::kQ8_0;
   const hipStream_t main = stream_;
   if (overlap) {
     if (!Check(hipEventRecord(side_start_, main), "side stream fork",
