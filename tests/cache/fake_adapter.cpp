@@ -407,13 +407,15 @@ Completion FakeAdapter::CapturePrivatePiece(const Slot& slot, ComponentId id,
     throw std::invalid_argument("invalid private capture piece");
   const auto& state = AsSlot(slot);
   RequireCapture(state);
-  return SubmitRead(slot, stream, [&state, offset, dst] {
+  auto completion = SubmitRead(slot, stream, [&state, offset, dst] {
     std::memcpy(
         dst.data(),
         reinterpret_cast<const std::byte*>(state.recurrent.data()) + offset,
         dst.size());
     return TransferResult::kSucceeded;
   });
+  return capture_completion ? capture_completion(id, std::move(completion))
+                            : std::move(completion);
 }
 Completion FakeAdapter::CopyRowsOut(const Slot& slot, ComponentId id,
                                     Rows first, Rows end,
@@ -424,11 +426,13 @@ Completion FakeAdapter::CopyRowsOut(const Slot& slot, ComponentId id,
   const auto& rows = RowArray(state, id);
   if (end > rows.size())
     throw std::invalid_argument("cannot capture unavailable rows");
-  return SubmitRead(slot, stream, [&rows, first, dst] {
+  auto completion = SubmitRead(slot, stream, [&rows, first, dst] {
     if (!dst.empty())
       std::memcpy(dst.data(), rows.data() + first, dst.size());
     return TransferResult::kSucceeded;
   });
+  return capture_completion ? capture_completion(id, std::move(completion))
+                            : std::move(completion);
 }
 Completion FakeAdapter::CopyRowsIn(Slot& slot, ComponentId id, Rows first,
                                    Rows end, std::span<const std::byte> src,

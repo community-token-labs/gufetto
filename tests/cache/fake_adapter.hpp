@@ -97,6 +97,9 @@ public:
   [[nodiscard]] std::uint64_t RecurrentHash(const Slot&) const;
   // Isolate host guard overhead and row-range tests without fixture mutation.
   void GuardRows(Slot&, ComponentId, Rows first, Rows end);
+  // Optional CPU-fixture wrapper; retains ownership of the actual read until
+  // its completion settles. Empty preserves the ordinary fake behavior.
+  std::function<Completion(ComponentId, Completion)> capture_completion;
   void FailNextAllocation() noexcept;
   void FailNextTransfer() noexcept;
   [[nodiscard]] std::size_t Invalidations() const noexcept {
