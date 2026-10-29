@@ -5051,11 +5051,11 @@ __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
   static_assert(kWaveRowTiles % 2 == 0, "the epilogue pairs row tiles");
   __shared__ __attribute__((aligned(16))) std::uint8_t lds[kLdsBytes];
   auto* s_a = reinterpret_cast<int32x4_t(*)[kRowTiles][32]>(lds);
-  auto* s_dw = reinterpret_cast<float(*)[kRowTiles][16]>(lds + kABytes);
+  auto* s_dw = reinterpret_cast<float (*)[kRowTiles][16]>(lds + kABytes);
   auto* s_b =
       reinterpret_cast<int32x4_t(*)[kTokTiles][32]>(lds + kABytes + kDwBytes);
-  auto* s_dx = reinterpret_cast<float(*)[kTokTiles][16]>(lds + kABytes +
-                                                         kDwBytes + kBBytes);
+  auto* s_dx = reinterpret_cast<float (*)[kTokTiles][16]>(lds + kABytes +
+                                                          kDwBytes + kBBytes);
 
   const auto* w_blocks = static_cast<const Q8_0Block*>(w);
   const std::size_t num_blocks = k / 32;
