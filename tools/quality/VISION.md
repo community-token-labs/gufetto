@@ -45,9 +45,10 @@ same pixels and matched model artifacts through the entire tower and merger, wit
 F32 accumulators. It must not consume candidate/current hidden states. A pinned
 upstream teacher such as the official Qwen vision implementation is an appropriate
 source; record source/config/weight hashes, actual arithmetic/casts and any bounded
-attention adaptation. The scalar operator reference is NOT a substitute. Capture
-adapters and real-model reference execution are deliberately separate from this
-CPU harness. Independence metadata is a declaration requiring source audit.
+attention adaptation. The scalar operator reference is NOT a substitute. The standalone [CPU encoder reference](VISION_REFERENCE.md) provides this
+pixels-to-merger path, with an explicitly registered F32-QK/projection,
+F64-softmax/PV policy. Capture execution remains separate from comparison.
+Independence metadata is a declaration requiring source audit.
 
 Current Gufo vision uses16×72 heads, global per-image noncausal attention and
 27 layers. Q/K/V are BF16 after bias/RoPE. Scores accumulate F32, but softmax rounds

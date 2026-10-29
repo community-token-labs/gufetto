@@ -179,6 +179,25 @@ class VisionCompareTest(unittest.TestCase):
                     tool.validate(self.fixture.plan, contract,
                                   self.fixture.contract["plan_sha256"], 200000)
 
+    def test_approved_mixed_reference_requires_complete_exact_plan(self):
+        producer = self.fixture.contract["headers"]["reference"]["producer"]
+        producer.update(accumulator_dtype="f32_qk_f64_softmax_pv", arithmetic_plan={
+            "projections": "f32", "qk": "f32", "softmax": "f64", "pv": "f64",
+            "output": "f32", "query_block": 128, "full_keys": True})
+        self.fixture.save_index("reference")
+        self.fixture.save_contract()
+        self.assertEqual(self.fixture.run()["status"], "PASS")
+        for changes in ({"qk": "bf16"}, {"pv": "f32"}, {"full_keys": 1},
+                        {"query_block": 64}, {"output": "bf16"}):
+            contract = copy.deepcopy(self.fixture.contract)
+            contract["headers"]["reference"]["producer"]["arithmetic_plan"].update(changes)
+            with self.assertRaisesRegex(ValueError, "arithmetic plan"):
+                tool.validate(self.fixture.plan, contract, contract["plan_sha256"], 200000)
+        contract = copy.deepcopy(self.fixture.contract)
+        del contract["headers"]["reference"]["producer"]["arithmetic_plan"]
+        with self.assertRaisesRegex(ValueError, "arithmetic plan"):
+            tool.validate(self.fixture.plan, contract, contract["plan_sha256"], 200000)
+
     def test_budget_and_output_exclusivity(self):
         with self.assertRaisesRegex(ValueError, "budget"):
             self.fixture.run(max_rows=3)
