@@ -356,11 +356,14 @@ struct ComponentTextCache::Impl {
     VictimCost cost{.preserved = entry.slot->PreservationComplete()};
     if (!entry.live)
       return cost;
-    // Fixed relative work model, not a measured latency prediction. The q8
-    // 150K reference is about 0.3s RAM restore, 2s SSD restore and 94s prefill.
+    // Fixed relative work model, not a per-request latency prediction. Source:
+    // gufo-agent-concurrency/docs/cache-persist-native/r61/phase-comparison.csv,
+    // cache_restore_ms: history-0084 baseline RAM 150016 tokens/1354.929ms
+    // (history-0082..0088: 1343..1376ms); return-C disk 150000/1815.627ms.
+    // Rounded rates are 9us RAM, 12us disk; prefill remains ~94s per150K.
     // Charge the uncaptured generated tail too; a checkpoint is never free.
-    constexpr std::uint64_t kRamNsPerToken = 2000;
-    constexpr std::uint64_t kDiskNsPerToken = 13333;
+    constexpr std::uint64_t kRamNsPerToken = 9000;
+    constexpr std::uint64_t kDiskNsPerToken = 12000;
     constexpr std::uint64_t kPrefillNsPerToken = 625000;
     const auto tokens = entry.live_tokens.size();
     cost.recovery_ns = tokens * kPrefillNsPerToken;

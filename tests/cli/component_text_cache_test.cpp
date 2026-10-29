@@ -1080,13 +1080,11 @@ void ColdAssignmentKeepsLiveFrontiers() {
     assert(turn(conversation) == frontier);
   }
 }
-void RestorePreservesTheCostlierLiveFrontier(std::size_t b_count = 8192,
-                                             std::size_t a_count = 4096,
-                                             bool disk_b = false,
-                                             bool capture_b = true,
-                                             bool preserve_b = true) {
-  // The default is persist's older8193-B/newer4097-A reproduction. Reversing
-  // depths and changing only B's tier distinguishes cost from depth/LRU.
+void RestorePreservesTheCostlierLiveFrontier(
+    std::size_t b_count = 8192, std::size_t a_count = 4096, bool disk_b = false,
+    bool capture_b = true, bool preserve_b = true, bool keep_b = true) {
+  // The default is persist's older8193-B/newer4097-A reproduction. Changing
+  // only B's tier at closer depths distinguishes cost from depth/LRU.
   class HeapRunner final : public Runner {
   public:
     std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
@@ -1187,7 +1185,6 @@ void RestorePreservesTheCostlierLiveFrontier(std::size_t b_count = 8192,
   Logger::SetLevel(level);
   assert(restore->cached_tokens() == a_count &&
          restore->restored_snapshot_bytes() > 0);
-  const bool keep_b = !capture_b || disk_b || b_count > a_count;
   assert(&dynamic_cast<State&>(restore->state()).slot ==
              (keep_b ? a_slot : b_slot) &&
          "RAM restore overwrote the more expensive live frontier");
@@ -1202,7 +1199,9 @@ void RestorePreservesTheCostlierLiveFrontier(std::size_t b_count = 8192,
   assert(log.find("event=slot_victim_candidate acquisition_id=3 slot_id=1") !=
          std::string::npos);
   assert(log.find("slot_id=2 eligible=1") != std::string::npos);
-  assert(log.find("chosen=1 recovery_tier=ram") != std::string::npos);
+  assert(log.find(!keep_b && disk_b
+                      ? "chosen=1 recovery_tier=disk"
+                      : "chosen=1 recovery_tier=ram") != std::string::npos);
   assert(log.find("reason=minimum_recovery_cost") != std::string::npos);
   if (disk_b)
     assert(log.find("recovery_tier=disk") != std::string::npos);
@@ -4603,8 +4602,15 @@ int main(int argc, char* argv[]) {
     RestorePreservesTheCostlierLiveFrontier(8192, 2048);
     RestorePreservesTheCostlierLiveFrontier(8192, 4096, false, false);
     RestorePreservesTheCostlierLiveFrontier(8192, 4096, false, true, false);
-    RestorePreservesTheCostlierLiveFrontier(4096, 8192);
-    RestorePreservesTheCostlierLiveFrontier(4096, 8192, true);
+    // At 9us RAM / 12us disk, half-depth B is cheaper in either tier.
+    RestorePreservesTheCostlierLiveFrontier(4096, 8192, false, true, true,
+                                            false);
+    RestorePreservesTheCostlierLiveFrontier(4096, 8192, true, true, true,
+                                            false);
+    // B7168: RAM64.512ms < A73.728ms < disk86.016ms, plus equal tail cost.
+    RestorePreservesTheCostlierLiveFrontier(7168, 8192, false, true, true,
+                                            false);
+    RestorePreservesTheCostlierLiveFrontier(7168, 8192, true);
     ColdSideRequestsKeepPreservedDeepFrontier();
     ReuseAndBranches();
     EditBoundariesSurviveActualBackingPressure();

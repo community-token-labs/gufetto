@@ -606,7 +606,7 @@ last acquisition and chosen status. Eligible slots also report `recovery_tier`,
 safe ready-executor override. IDs/counters do not contain prompt text.
 
 Victim ranking estimates the cheapest compatible checkpoint restore plus
-re-prefill of the uncovered tail: 2 microseconds/token for RAM, 13.333 for disk
+re-prefill of the uncovered tail: 9 microseconds/token for RAM, 12 for disk
 (including mixed restores), and 625 for prefill. These fixed relative costs are
 calibrated to long q8 histories, not measured per-request latency or a promise
 for other models/hardware. An equivalent idle execution lineage or empty slot
