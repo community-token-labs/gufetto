@@ -51,6 +51,10 @@ See [README](README.md), [q8 reproduction](docs/q8-kv-cache/reproduce.md) and
 [testing](docs/TESTING.md): CPU passes and a short smoke are not model-quality,
 performance or public-release qualification.
 
+## Known limits
+
+Do not combine `--cache-disk` with image inputs while MTP is enabled: a disk-restored image history may continue differently (bug under investigation, owner: cache-persist).
+
 ## Build and process
 
 With the dependencies described by README installed:
