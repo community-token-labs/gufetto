@@ -1444,6 +1444,9 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   resp["model_alias"] = b.model_id();
   resp["template"] = "";
   resp["model_info"] = json::Value::object();
+  // Process-wide component acquisition outcomes (not request completion
+  // counts).
+  resp["cache_reuse_acquisitions"] = CacheReuseCountersJson();
   if (auto path = b.model_path(); !path.empty()) {
     resp["model_path"] = std::move(path);
   }
