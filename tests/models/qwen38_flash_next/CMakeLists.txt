@@ -16,6 +16,7 @@ add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_cache gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(kv_q4 gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(kv_rotation gufo_qwen38_flash_next "cpu")
 target_compile_options(qwen38_flash_next_kv_rotation_test PRIVATE
   -fno-fast-math -ffp-contract=off -frounding-math)
@@ -52,7 +53,7 @@ if (ENGINE_ENABLE_HIP)
   target_compile_options(qwen38_flash_next_kv_rotation_ops_test PRIVATE
     -fno-fast-math -ffp-contract=off -frounding-math)
   foreach(name IN ITEMS mtp_ops blaslt_ops hc_mix_ops gdn_ops
-      attention_ops kv_q8_ops moe_epilogue_ops moe_ids_ops projection_ops
+      attention_ops kv_q8_ops kv_q4_ops moe_epilogue_ops moe_ids_ops projection_ops
       routed_wmma_ops select_ops snapshot_copy verification_sampling)
     add_qwen38_flash_next_test(${name} gufo_qwen38_flash_next "hip;gpu;gfx1151")
   endforeach()

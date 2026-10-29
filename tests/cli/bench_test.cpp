@@ -46,11 +46,13 @@ void TestKvCacheType() {
                                                    : KvCacheType::kQ8_0),
            "benchmark parses canonical KV type names");
   }
-  for (const auto value : {"", "q8", "Q8_0", "bf16", "q4_0"}) {
+  for (const auto value : {"", "q8", "Q8_0", "bf16", "q4", "q4_0/q8_0"}) {
     std::string error;
     Expect(!gufo::cli::ParseBenchOptions(std::array{"--kv-cache-type", value},
                                          &error) &&
-               error == "--kv-cache-type must be f16, q8_0 or q8_0-rotated",
+               error ==
+                   "--kv-cache-type must be f16, q8_0, q4_0, q8_0/q4_0, "
+                   "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated",
            "benchmark rejects unsupported KV types");
   }
   const auto rotated = gufo::cli::ParseBenchOptions(
