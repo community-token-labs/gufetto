@@ -65,6 +65,8 @@ struct ModelOptions {
   bool enable_vision = true;
   /// Aggregate image rows per session; zero keeps the full-context bound.
   std::uint32_t vision_max_tokens_per_slot = 0;
+  /// Whole-model retained image-output rows, independent of per-slot caps.
+  std::uint32_t vision_pool_tokens = qwen::vision::kDefaultOutputPoolRows;
 };
 
 class Session;

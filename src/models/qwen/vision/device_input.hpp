@@ -43,11 +43,7 @@ public:
   [[nodiscard]] std::size_t Bytes() const noexcept {
     std::size_t bytes = capacity_ * 3 * sizeof(std::int32_t) +
                         (descriptor_ == nullptr ? 0 : sizeof(DeviceRope));
-    for (const auto& embedding : embeddings_) {
-      if (embedding)
-        bytes +=
-            std::size_t{embedding->rows()} * embedding->width() * sizeof(float);
-    }
+    // Embeddings belong to the encoder's shared pool, not this session.
     return bytes;
   }
 
@@ -57,7 +53,7 @@ private:
   RopeLayout layout_;
   std::shared_ptr<const Prompt> prompt_;
   std::shared_ptr<Encoder> encoder_;
-  std::vector<std::shared_ptr<const Encoder::Embedding>> embeddings_;
+  std::shared_ptr<OutputPool::Owner> output_owner_;
   DeviceRope* descriptor_{nullptr};
   std::int32_t* positions_{nullptr};
   std::size_t capacity_{0};

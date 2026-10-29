@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/core/image.hpp"
+#include "src/models/qwen/vision/output_pool.hpp"
 
 namespace gufo::models::qwen::vision {
 
@@ -37,17 +38,23 @@ public:
   using Observer =
       std::function<void(std::string_view, std::span<const float>)>;
   using CancellationCheck = std::function<bool()>;
-  Encoder(const std::filesystem::path& path, std::uint32_t output_width);
+  Encoder(const std::filesystem::path& path, std::uint32_t output_width,
+          std::uint32_t pool_rows = OutputPool::kDefaultRows);
   /// An explicit sidecar is required to exist. Otherwise discover the canonical
   /// sidecar beside the target or its quantization subdirectory.
   [[nodiscard]] static std::shared_ptr<Encoder> Open(
       const std::filesystem::path& target, const std::filesystem::path& sidecar,
-      std::uint32_t output_width, bool enabled = true);
+      std::uint32_t output_width, bool enabled = true,
+      std::uint32_t pool_rows = OutputPool::kDefaultRows);
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
   [[nodiscard]] const std::string& identity() const;
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  [[nodiscard]] const std::shared_ptr<OutputPool>& Outputs() const noexcept {
+    return outputs_;
+  }
+  [[nodiscard]] std::size_t OutputBudgetBytes() const;
   /// Upload the weights now instead of in the first Encode. Repeated calls
   /// keep the existing upload.
   void Upload();
@@ -61,6 +68,8 @@ public:
 
 private:
   struct Impl;
+  std::shared_ptr<OutputPool> outputs_;
+  std::uint32_t output_width_;
   std::unique_ptr<Impl> impl_;
 };
 

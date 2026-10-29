@@ -4,6 +4,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <limits>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -557,14 +558,17 @@ struct Encoder::Impl {
   }
 };
 
-Encoder::Encoder(const std::filesystem::path& path, std::uint32_t width)
-    : impl_(std::make_unique<Impl>(path, width)) {}
+Encoder::Encoder(const std::filesystem::path& path, std::uint32_t width,
+                 std::uint32_t pool_rows)
+    : outputs_(std::make_shared<OutputPool>(pool_rows)), output_width_(width),
+      impl_(std::make_unique<Impl>(path, width)) {}
 Encoder::~Encoder() = default;
 std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
                                        const std::filesystem::path& sidecar,
-                                       std::uint32_t width, bool enabled) {
+                                       std::uint32_t width, bool enabled,
+                                       std::uint32_t pool_rows) {
   const auto path = ResolveModelPath(target, sidecar, enabled);
-  return path.empty() ? nullptr : std::make_shared<Encoder>(path, width);
+  return path.empty() ? nullptr : std::make_shared<Encoder>(path, width, pool_rows);
 }
 const std::string& Encoder::identity() const {
   std::call_once(impl_->identity_once, [&] {
@@ -594,6 +598,9 @@ const std::string& Encoder::identity() const {
 }
 std::size_t Encoder::ResidentBytes() const noexcept {
   return impl_->resident_bytes.load();
+}
+std::size_t Encoder::OutputBudgetBytes() const {
+  return OutputReservationBytes(outputs_->Capacity(), output_width_);
 }
 void Encoder::Upload() {
   const auto lease = impl_->workspace.Acquire();

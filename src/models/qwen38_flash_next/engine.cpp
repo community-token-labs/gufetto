@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 
+#include "src/core/memory_budget.hpp"
 #include "src/models/qwen/vision/input_budget.hpp"
 #if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
 #include "src/models/qwen38_flash_next/pd_profile.hpp"
@@ -140,9 +141,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   try {
-    m->vision_ =
-        qwen::vision::Encoder::Open(model_path, options.vision_model_path,
-                                    c.hidden_size, options.enable_vision);
+    m->vision_ = qwen::vision::Encoder::Open(
+        model_path, options.vision_model_path, c.hidden_size,
+        options.enable_vision, options.vision_pool_tokens);
   } catch (const std::exception& e) {
     AssignError(error_msg, e.what());
     return nullptr;
@@ -322,10 +323,8 @@ std::size_t Model::ResidentBytes() const noexcept {
 
 std::size_t Model::SessionBytes(core::SessionMode mode,
                                 std::uint32_t context) const {
-  const std::size_t vision = vision_ ? qwen::vision::InputReservationBytes(
-                                           context, config().hidden_size,
-                                           options_.vision_max_tokens_per_slot)
-                                     : 0;
+  const std::size_t vision =
+      vision_ ? qwen::vision::InputPositionBytes(context) : 0;
   return executor_->SessionBytes(mode, context,
                                  mode == core::SessionMode::kSpeculative
                                      ? executor_->max_speculative() - 1
@@ -334,7 +333,8 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
 }
 
 std::size_t Model::DeferredScratchBytes() const {
-  return executor_->DeferredScratchBytes();
+  return core::AddMemoryBytes(executor_->DeferredScratchBytes(),
+                              vision_ ? vision_->OutputBudgetBytes() : 0);
 }
 
 std::size_t Session::AllocatedBytes() const noexcept {

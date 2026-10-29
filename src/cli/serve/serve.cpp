@@ -657,6 +657,8 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "llm") {
     std::string model;
     std::string served_model_name;
+    std::uint32_t vision_pool_tokens =
+        models::qwen::vision::kDefaultOutputPoolRows;
     bool no_vision = false;
     std::uint32_t vision_max_tokens_per_slot = 0;
     std::uint32_t max_context = 0;
@@ -714,6 +716,10 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddFlag("", "--no-vision",
                    "Disable vision loading and image inputs (default: auto)",
                    "Model", &no_vision);
+    parser.AddOption("", "--vision-pool-tokens", "N",
+                     "Shared retained image rows (default: 65536; positive; "
+                     "fitting requests wait for credits)",
+                     "Model", &vision_pool_tokens);
     parser.AddOption("", "--vision-max-tokens-per-slot", "N",
                      "Aggregate image tokens per slot (default: 0 = context; "
                      "oversized requests are rejected)",
@@ -1299,6 +1305,8 @@ int RunServe(std::span<const char* const> args) {
     // Default to LLM server
     std::string model;
     std::vector<std::string> served_model_names;
+    std::uint32_t vision_pool_tokens =
+        models::qwen::vision::kDefaultOutputPoolRows;
     bool no_vision = false;
     std::uint32_t vision_max_tokens_per_slot = 0;
     std::uint32_t max_context = 0;
@@ -1357,6 +1365,11 @@ int RunServe(std::span<const char* const> args) {
         "", "--no-vision",
         "Disable vision loading and image inputs (default: auto)", "Model",
         &no_vision);
+    llm_parser.AddOption(
+        "", "--vision-pool-tokens", "N",
+        "Shared retained image rows (default: 65536; positive; "
+        "fitting requests wait for credits)",
+        "Model", &vision_pool_tokens);
     llm_parser.AddOption(
         "", "--vision-max-tokens-per-slot", "N",
         "Aggregate image tokens per slot (default: 0 = context; "
@@ -1509,6 +1522,10 @@ int RunServe(std::span<const char* const> args) {
     if (llm_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "llm");
       return 0;
+    }
+    if (vision_pool_tokens == 0) {
+      std::cerr << "Error: --vision-pool-tokens must be positive\n";
+      return 2;
     }
     if (no_vision && llm_parser.WasSupplied("--mmproj")) {
       std::cerr << "Error: --no-vision cannot be combined with --mmproj\n";
@@ -1751,7 +1768,8 @@ int RunServe(std::span<const char* const> args) {
             .publish_lookup = cache_lookup_api,
             .transfer_api = cache_transfer_api,
         },
-        enable_yarn, kv_cache_type, !no_vision, vision_max_tokens_per_slot);
+        enable_yarn, kv_cache_type, !no_vision, vision_max_tokens_per_slot,
+        vision_pool_tokens);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
