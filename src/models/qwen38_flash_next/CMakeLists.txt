@@ -4,6 +4,7 @@ add_library(gufo_qwen38_flash_next STATIC
   config.cpp
   continuation_layout.cpp
   kv_cache.cpp
+  kv_cache_validation.cpp
   ngram.cpp
   npu_contracts.cpp
   rope_scaling.cpp
