@@ -72,6 +72,23 @@ workspace. At S4/context524288, default P64K plus workspace is about3.881GiB,
 versus23.256GiB for independently reserved full-context inputs plus the same
 workspace. These are reservation figures, not measured RAM or latency gains.
 
+Flash-Next component serving measures startup memory after creating its resource
+pool, then measures a real first slot and keeps it on success. Host and HIP
+capacity are tracked separately; later slots are rechecked using the largest
+observed debit. Pending execution/image obligations and disk staging are counted
+once. The final guard and cache budget use the same post-slot observation, not
+payload bytes as a prediction of allocator overhead.
+
+A measured refusal may suggest `verified to fit: --context X`: the largest
+smaller probe that passed the full staged execution pool and final memory guard,
+**not a maximum** or a guarantee under future pressure. No verified probe yields
+`no fitting context found within the search limits`. Search runs only on refusal,
+uses positive multiples of4096 tokens and at most8 probes, and never changes the
+requested setting. It stops starting work at30s; an in-flight allocation/free
+plus cleanup can overrun that deadline. Logs report elapsed time and limit hits.
+On Windows, HIP's free-memory query is process-only and optimistic; other GPU
+activity during startup can skew observations on any platform.
+
 After slot allocation, cache budgeting protects outstanding lazy execution and
 shared scratch without charging eager state again. AUTO halves the protected
 headroom; explicit and disk-only backing retain execution/OS reserves too. The
