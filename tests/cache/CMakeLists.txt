@@ -91,6 +91,11 @@ if (NOT WIN32)
   add_test(NAME cache_slot_test COMMAND cache_slot_test)
   set_tests_properties(cache_slot_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 
+  add_executable(cache_disk_policy_test disk_policy_test.cpp)
+  target_link_libraries(cache_disk_policy_test PRIVATE gufo_cache)
+  add_test(NAME cache_disk_policy_test COMMAND cache_disk_policy_test)
+  set_tests_properties(cache_disk_policy_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
   add_executable(cache_disk_test disk_test.cpp)
   target_link_libraries(cache_disk_test PRIVATE gufo_cache)
   target_link_options(cache_disk_test PRIVATE

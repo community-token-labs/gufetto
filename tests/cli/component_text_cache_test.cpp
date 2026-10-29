@@ -1926,6 +1926,47 @@ void LoweredDiskBudgetEvictsOldestAtStartup() {
   }
   std::filesystem::remove_all(directory);
 }
+void FilesystemFloorBlocksWritesAndReclaimsAtStartup() {
+  const TemporaryDirectory temp("gufo-component-floor-test");
+  std::atomic<std::uint64_t> available{1ULL << 30};
+  TextRunnerDiskCacheOptions disk{
+      .directory = temp.path(),
+      .capacity_bytes = 1 << 20,
+      .space_policy = {1 << 20, [&](const auto&) {
+                         return platform::FilesystemInfo{
+                             1ULL << 30, available.load(), true, true};
+                       }}};
+  const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
+  {
+    TextRunnerPool pool(std::make_shared<Runner>(), 1, disk);
+    auto request = pool.Acquire(prompt);
+    Prefill(request);
+    (void)Generate(request);
+    assert(request.Commit().disk_queued_bytes > 0);
+  }
+  assert(ManagedBytes(temp.path()) > 0);
+  available = 0;
+  {
+    TextRunnerPool pool(std::make_shared<Runner>(), 1, disk);
+    assert(ManagedBytes(temp.path()) == 0);
+    auto request = pool.Acquire(prompt);
+    assert(!request.cache_hit());
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  assert(ManagedBytes(temp.path()) == 0);
+  available = 1ULL << 30;
+  {
+    TextRunnerPool pool(std::make_shared<Runner>(), 1, disk);
+    auto request = pool.Acquire(prompt);
+    Prefill(request);
+    (void)Generate(request);
+    assert(request.Commit().disk_queued_bytes > 0);
+  }
+  assert(ManagedBytes(temp.path()) > 0);
+}
+
 void OrphansLeaveBeforeCheckpoints() {
   const TemporaryDirectory temp("gufo-component-orphan-test");
   const std::filesystem::path directory = temp.path();
@@ -3993,6 +4034,7 @@ int main(int argc, char* argv[]) {
     packed_ingress_cpu::AdmissionFailuresPreserveDisk();
     DiskBudgetEvictsAnUnpinnedConversation();
     LoweredDiskBudgetEvictsOldestAtStartup();
+    FilesystemFloorBlocksWritesAndReclaimsAtStartup();
     OrphansLeaveBeforeCheckpoints();
     StagingIsInternal();
     StagingCountsAgainstRamCeiling();

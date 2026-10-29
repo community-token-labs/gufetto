@@ -493,6 +493,42 @@ void TestByteAndStagingLimits() {
          "single entry larger than total disk budget is skipped");
 }
 
+void TestFilesystemReserve() {
+  TemporaryDirectory directory("gufo-continuation-space");
+  const FakeRunner runner("space");
+  gufo::platform::FilesystemInfo info{1ULL << 30, 1ULL << 30, true, true};
+  auto options = StoreOptions(directory.path());
+  options.space_policy = {1 << 20, [&](const auto&) { return info; }};
+  {
+    ContinuationDiskStore store(options);
+    Expect(
+        SaveTokens(store, runner, {1, 2}, *MakeSnapshot(runner, 42, 2)).stored,
+        "reserve permits ordinary write");
+    info.available_bytes = 0;
+    auto state = runner.CreateState();
+    Expect(RestoreTokens(store, runner, *state, {1, 2, 3}).restored,
+           "reads remain usable under space pressure");
+    Expect(
+        !SaveTokens(store, runner, {7, 8}, *MakeSnapshot(runner, 7, 2)).stored,
+        "floor refuses write even after evicting all disposable entries");
+    Expect(store.entry_count() == 0 && CacheFiles(directory.path()).empty(),
+           "floor pressure evicts without optimistic space credit");
+    info.available_bytes = 1ULL << 30;
+    Expect(
+        SaveTokens(store, runner, {7, 8}, *MakeSnapshot(runner, 7, 2)).stored,
+        "write resumes when filesystem reports space");
+    info.writable = false;
+    Expect(!SaveTokens(store, runner, {9, 8}, *MakeSnapshot(runner, 9, 2))
+                   .stored &&
+               store.entry_count() == 1,
+           "unavailable filesystem is not a reason to evict");
+    info.writable = true;
+  }
+  info.available_bytes = 0;
+  ContinuationDiskStore restarted(options);
+  Expect(restarted.entry_count() == 0, "restart rechecks filesystem floor");
+}
+
 void TestAutomaticStagingAndAdmissionDiagnostics() {
   TemporaryDirectory default_directory("gufo-continuation-disk");
   ContinuationDiskStore defaults({.directory = default_directory.path()});
@@ -1205,6 +1241,7 @@ int main() {
   TestLongestPrefixAndForcedHashCollision();
   TestCorruptionBecomesDeterministicMissAndRemoval();
   TestByteAndStagingLimits();
+  TestFilesystemReserve();
   TestAutomaticStagingAndAdmissionDiagnostics();
   TestSmallerStagingPreservesExistingFiles();
   TestLruEvictionUsesActualFileBytes();
