@@ -1,3 +1,9 @@
+add_executable(cache_model_capabilities_test model_capabilities_test.cpp)
+target_link_libraries(cache_model_capabilities_test PRIVATE gufo_cache)
+add_test(NAME cache_model_capabilities_test
+  COMMAND cache_model_capabilities_test ${PROJECT_SOURCE_DIR}/src/models)
+set_tests_properties(cache_model_capabilities_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
 add_library(gufo_cache_fake STATIC fake_adapter.cpp)
 if (ENGINE_ENABLE_HIP)
   add_executable(cache_backing_test backing_test.cpp)
