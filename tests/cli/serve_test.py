@@ -102,6 +102,9 @@ def main():
         check(["serve", "llm", "--vision-max-tokens-per-slot", value], 2,
               "--vision-max-tokens-per-slot")
     assert "--vision-pool-tokens" in help_text
+    assert "Qwen27 default: independent" in help_text
+    assert "Qwen27 opt-in unqualified" in help_text
+    assert "does not enable pooling" in help_text
     for value in ("1", "128", "65536", "4294967295"):
         check(["serve", "llm", "--vision-pool-tokens", value,
                "--vision-max-tokens-per-slot", "64", "--no-vision",

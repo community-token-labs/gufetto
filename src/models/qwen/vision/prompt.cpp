@@ -283,8 +283,10 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
                std::span<const tokenization::ChatTool> tools,
                const tokenization::ChatTemplateOptions& options,
                std::string_view encoder_identity, std::uint32_t max_context,
-               ImageCache* image_cache, std::uint32_t max_image_tokens) {
-  ImageTokenBudget image_budget(ImageTokenLimit(max_context, max_image_tokens));
+               ImageCache* image_cache,
+               std::optional<std::uint32_t> max_image_tokens) {
+  ImageTokenBudget image_budget(
+      ImageTokenLimit(max_context, max_image_tokens.value_or(0)));
   std::vector<std::size_t> offsets;
   std::vector<tokenization::ContentSpan> content_spans;
   std::size_t stable_prefix_bytes = 0;
@@ -335,7 +337,8 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
                            pixels->height / kResizeFactor,
                            pixels->width / kResizeFactor};
       const auto count = std::size_t{grid.height} * grid.width;
-      image_budget.Add(count);
+      if (max_image_tokens)
+        image_budget.Add(count);
       if (count > max_context - prompt.tokens.size()) {
         throw std::length_error("image tokens exceed model context");
       }

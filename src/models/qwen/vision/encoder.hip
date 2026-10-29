@@ -559,15 +559,18 @@ struct Encoder::Impl {
 };
 
 Encoder::Encoder(const std::filesystem::path& path, std::uint32_t width,
-                 std::uint32_t pool_rows)
-    : outputs_(std::make_shared<OutputPool>(pool_rows)), output_width_(width),
+                 std::optional<std::uint32_t> pool_rows)
+    : policy_(ResolvePolicy(width, pool_rows)),
+      outputs_(policy_.pool_rows ? std::make_shared<OutputPool>(*policy_.pool_rows)
+                                : nullptr), output_width_(width),
       impl_(std::make_unique<Impl>(path, width)) {}
 Encoder::~Encoder() = default;
 std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
                                        const std::filesystem::path& sidecar,
                                        std::uint32_t width, bool enabled,
-                                       std::uint32_t pool_rows) {
-  const auto path = ResolveModelPath(target, sidecar, enabled);
+                                       std::optional<std::uint32_t> pool_rows) {
+  const auto policy = ResolvePolicy(width, pool_rows, 0, enabled);
+  const auto path = ResolveModelPath(target, sidecar, policy.enabled);
   return path.empty() ? nullptr : std::make_shared<Encoder>(path, width, pool_rows);
 }
 const std::string& Encoder::identity() const {
@@ -600,10 +603,11 @@ std::size_t Encoder::ResidentBytes() const noexcept {
   return impl_->resident_bytes.load();
 }
 std::size_t Encoder::OutputBudgetBytes() const {
-  return OutputReservationBytes(outputs_->Capacity(), output_width_);
+  return outputs_ ? OutputReservationBytes(outputs_->Capacity(), output_width_) : 0;
 }
 void Encoder::Upload() {
-  const auto lease = impl_->workspace.Acquire();
+  const auto lease = outputs_ ? impl_->workspace.Acquire()
+                              : std::unique_lock<std::mutex>{};
   impl_->Upload();
 }
 Encoder::Embedding::~Embedding() {
@@ -614,7 +618,8 @@ Encoder::Embedding::~Embedding() {
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     const core::Image& image, const Observer& observer,
     const CancellationCheck& is_cancelled) {
-  const auto lease = impl_->workspace.Acquire();
+  const auto lease = outputs_ ? impl_->workspace.Acquire()
+                              : std::unique_lock<std::mutex>{};
   const auto check_cancelled = [&] {
     if (is_cancelled && is_cancelled())
       throw std::runtime_error("vision encoding cancelled");

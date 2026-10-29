@@ -473,7 +473,10 @@ int main(int argc, char** argv) {
           &error);
       Require(qfn != nullptr && qfn->VisionEncoder() != nullptr, error);
     } else {
-      auto encoder = models::qwen::vision::Encoder::Open(model_path, {}, 5120);
+      // This fixture exercises shared-pool eviction, now a Qwen opt-in.
+      auto encoder = models::qwen::vision::Encoder::Open(
+          model_path, {}, 5120, true,
+          models::qwen::vision::kDefaultOutputPoolRows);
       Require(encoder != nullptr, "missing vision sidecar");
       qwen =
           hip::QwenGpuModel::CreateFromGguf(reader, &error, std::move(encoder));

@@ -107,8 +107,12 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
   if (prompt && !prompt->images.empty() && !encoder) {
     throw std::invalid_argument("image input has no vision encoder");
   }
+  const bool pooled = encoder && encoder->Outputs();
+  const bool reuse = prompt_ && prompt && !prompt->cache_identity.empty() &&
+                     encoder_ == encoder &&
+                     prompt_->cache_identity == prompt->cache_identity;
   std::shared_ptr<OutputPool::Owner> owner;
-  if (prompt && !prompt->images.empty()) {
+  if (pooled && prompt && !prompt->images.empty()) {
     for (const auto& image : prompt->images) {
       if (!image.pixels ||
           std::uint64_t{image.grid.width} * 32 != image.pixels->width ||
@@ -123,6 +127,10 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
   prompt_ = std::move(prompt);
   encoder_ = std::move(encoder);
   output_owner_ = std::move(owner);
+  if (pooled || !reuse)
+    embeddings_.clear();
+  if (!pooled && prompt_)
+    embeddings_.resize(prompt_->images.size());
   RestoreLayout(prompt_ ? prompt_->rope : RopeLayout{}, stream);
 }
 
@@ -163,18 +171,25 @@ void DeviceInput::RestoreLayout(const RopeLayout& layout, hipStream_t stream) {
 void DeviceInput::Inject(float* hidden, std::uint32_t position,
                          std::uint32_t count, std::uint32_t width,
                          std::uint32_t hc, hipStream_t stream) {
-  // Text-only spans need positions, not retained outputs. In particular,
-  // native decode must still work after idle outputs were evicted elsewhere.
-  if (!prompt_ || !prompt_->IntersectsImages(position, count))
+  if (!prompt_)
     return;
-  const auto lease = encoder_->Outputs()->TryAcquire(output_owner_);
-  if (!lease)
-    throw std::runtime_error("vision output budget unavailable; admit the whole prompt before execution");
-  const auto cache = std::dynamic_pointer_cast<PooledEmbeddings>(
-      lease->GetStorage([&] { return std::make_shared<PooledEmbeddings>(prompt_->images.size()); }));
-  if (!cache || cache->embeddings.size() != prompt_->images.size())
-    throw std::logic_error("invalid shared vision output storage");
-  const std::lock_guard lock(cache->mutex);
+  std::shared_ptr<OutputPool::Lease> lease;
+  std::shared_ptr<PooledEmbeddings> cache;
+  std::unique_lock<std::mutex> lock;
+  if (encoder_ && encoder_->Outputs()) {
+    // Pooled text-only spans must work even after idle outputs were evicted.
+    if (!prompt_->IntersectsImages(position, count))
+      return;
+    lease = encoder_->Outputs()->TryAcquire(output_owner_);
+    if (!lease)
+      throw std::runtime_error("vision output budget unavailable; admit the whole prompt before execution");
+    cache = std::dynamic_pointer_cast<PooledEmbeddings>(
+        lease->GetStorage([&] { return std::make_shared<PooledEmbeddings>(prompt_->images.size()); }));
+    if (!cache || cache->embeddings.size() != prompt_->images.size())
+      throw std::logic_error("invalid shared vision output storage");
+    lock = std::unique_lock(cache->mutex);
+  }
+  auto& embeddings = cache ? cache->embeddings : embeddings_;
   for (std::size_t index = 0; index < prompt_->images.size(); ++index) {
     const auto& image = prompt_->images[index];
     const auto image_end =
@@ -183,33 +198,38 @@ void DeviceInput::Inject(float* hidden, std::uint32_t position,
     const auto end = std::min(position + count, image_end);
     if (begin >= end)
       continue;
-    if (!cache->embeddings[index]) {
-      auto embedding = encoder_->Encode(*image.pixels, {}, is_cancelled_);
-      if (embedding->width() != width ||
-          embedding->rows() != image.grid.height * image.grid.width)
-        throw std::logic_error("vision embedding does not match reserved input");
-      lease->RecordEncode(cache->ever_encoded[index], embedding->rows());
-      cache->embeddings[index] = std::move(embedding);
-      cache->ever_encoded[index] = true;
+    if (!embeddings[index]) {
+      if (cache) {
+        auto embedding = encoder_->Encode(*image.pixels, {}, is_cancelled_);
+        if (embedding->width() != width ||
+            embedding->rows() != image.grid.height * image.grid.width)
+          throw std::logic_error("vision embedding does not match reserved input");
+        lease->RecordEncode(cache->ever_encoded[index], embedding->rows());
+        embeddings[index] = std::move(embedding);
+        cache->ever_encoded[index] = true;
+      } else {
+        embeddings[index] = encoder_->Encode(*image.pixels, {}, is_cancelled_);
+      }
     }
-    const auto& embedding = *cache->embeddings[index];
+    const auto& embedding = *embeddings[index];
     if (embedding.width() != width ||
         embedding.rows() != image.grid.height * image.grid.width) {
       throw std::logic_error("vision embedding does not match language input");
     }
     const auto rows = end - begin;
-    const auto reader = cache->Reader(stream);
+    const auto reader = cache ? cache->Reader(stream) : nullptr;
     try {
       InjectRows<<<(rows * width * hc + 255) / 256, 256, 0, stream>>>(
           hidden + std::size_t{begin - position} * width * hc,
           embedding.data() + std::size_t{begin - image.grid.offset} * width, rows,
           width, hc);
       Check(hipGetLastError());
-      Check(hipEventRecord(reader, stream));
+      if (cache)
+        Check(hipEventRecord(reader, stream));
     } catch (...) {
       // A failed event record must never make an in-flight source evictable.
       // Retain its credits if the fallback drain cannot establish completion.
-      if (hipStreamSynchronize(stream) != hipSuccess)
+      if (cache && hipStreamSynchronize(stream) != hipSuccess)
         cache->uncertain_reader = true;
       throw;
     }

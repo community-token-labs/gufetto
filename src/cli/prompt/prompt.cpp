@@ -647,7 +647,8 @@ std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
       models::qwen::vision::Prepare(
           tokenizer, messages, {},
           tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id),
-          encoder->identity(), kDefaultContext));
+          encoder->identity(), kDefaultContext, nullptr,
+          encoder->GetPolicy().PromptLimit()));
 }
 
 std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(

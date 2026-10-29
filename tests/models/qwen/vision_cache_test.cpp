@@ -251,6 +251,29 @@ void TestDetailPrompts() {
   const auto small_auto = prepare(small, kAuto, &cache);
   EqualPrompts(small_low, small_auto);
 }
+void TestLegacyDefaultBound() {
+  using namespace gufo::tokenization;
+  const auto tokenizer = MakeTokenizer();
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  std::vector<ChatMessage> messages{{ChatRole::kUser, "image"}};
+  messages.front().images = {{5, Encoded(19)}};
+  bool rejected = false;
+  try {
+    (void)Prepare(*tokenizer, messages, {}, options, "encoder", 32);
+  } catch (const std::length_error& error) {
+    // Independent pre-unit diagnostic: no aggregate gate runs by default.
+    rejected =
+        std::string_view(error.what()) == "image tokens exceed model context";
+  }
+  assert(rejected);
+  // The historical count path prepares against the signed-position limit,
+  // not the serving context. It must be able to size this over-context image.
+  const auto counted =
+      Prepare(*tokenizer, messages, {}, options, "encoder", INT32_MAX);
+  assert(counted.tokens.size() > 32);
+}
+
 void TestAggregateImageBudget() {
   using namespace gufo::tokenization;
   const auto tokenizer = MakeTokenizer();
@@ -321,6 +344,7 @@ int main(int argc, char** argv) {
   TestPromptIdentities();
   TestDetailKeysCache();
   TestDetailPrompts();
+  TestLegacyDefaultBound();
   TestAggregateImageBudget();
   if (argc == 2 && std::string_view(argv[1]) == "--capacity-probe") {
     ImageCache cache;

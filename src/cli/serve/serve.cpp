@@ -714,15 +714,18 @@ void PrintServeHelp(std::string_view program_name,
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
     parser.AddFlag("", "--no-vision",
-                   "Disable vision loading and image inputs (default: auto)",
+                   "Disable vision loading and image inputs (default: auto; "
+                   "Qwen27 opt-in unqualified)",
                    "Model", &no_vision);
-    parser.AddOption("", "--vision-pool-tokens", "N",
-                     "Shared retained image rows (default: 65536; positive; "
-                     "fitting requests wait for credits)",
-                     "Model", &vision_pool_tokens);
+    parser.AddOption(
+        "", "--vision-pool-tokens", "N",
+        "Shared retained image rows (positive; Flash-Next default: "
+        "65536; Qwen27 default: independent; Qwen27 opt-in unqualified)",
+        "Model", &vision_pool_tokens);
     parser.AddOption("", "--vision-max-tokens-per-slot", "N",
-                     "Aggregate image tokens per slot (default: 0 = context; "
-                     "oversized requests are rejected)",
+                     "Aggregate image cap (0 = model default; Qwen27 opt-in "
+                     "unqualified; does not enable pooling; count is uncapped "
+                     "by context for legacy Qwen27)",
                      "Model", &vision_max_tokens_per_slot);
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API (repeatable; "
@@ -1363,17 +1366,19 @@ int RunServe(std::span<const char* const> args) {
         &vision_model_path);
     llm_parser.AddFlag(
         "", "--no-vision",
-        "Disable vision loading and image inputs (default: auto)", "Model",
-        &no_vision);
+        "Disable vision loading and image inputs (default: auto; "
+        "Qwen27 opt-in unqualified)",
+        "Model", &no_vision);
     llm_parser.AddOption(
         "", "--vision-pool-tokens", "N",
-        "Shared retained image rows (default: 65536; positive; "
-        "fitting requests wait for credits)",
+        "Shared retained image rows (positive; Flash-Next default: "
+        "65536; Qwen27 default: independent; Qwen27 opt-in unqualified)",
         "Model", &vision_pool_tokens);
     llm_parser.AddOption(
         "", "--vision-max-tokens-per-slot", "N",
-        "Aggregate image tokens per slot (default: 0 = context; "
-        "oversized requests are rejected)",
+        "Aggregate image cap (0 = model default; Qwen27 opt-in "
+        "unqualified; does not enable pooling; count is uncapped "
+        "by context for legacy Qwen27)",
         "Model", &vision_max_tokens_per_slot);
     llm_parser.AddCustomOption(
         "", "--served-model-name", "ID",
@@ -1769,7 +1774,9 @@ int RunServe(std::span<const char* const> args) {
             .transfer_api = cache_transfer_api,
         },
         enable_yarn, kv_cache_type, !no_vision, vision_max_tokens_per_slot,
-        vision_pool_tokens);
+        llm_parser.WasSupplied("--vision-pool-tokens")
+            ? std::optional{vision_pool_tokens}
+            : std::nullopt);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

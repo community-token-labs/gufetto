@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -98,7 +99,10 @@ struct Prompt {
     std::span<const tokenization::ChatTool> tools,
     const tokenization::ChatTemplateOptions& options,
     std::string_view encoder_identity, std::uint32_t max_context,
-    ImageCache* image_cache = nullptr, std::uint32_t max_image_tokens = 0);
+    ImageCache* image_cache = nullptr,
+    // Absence preserves the original context-only validation and diagnostics.
+    // Explicit zero retains the pooled policy's aggregate context bound.
+    std::optional<std::uint32_t> max_image_tokens = std::nullopt);
 
 }  // namespace gufo::models::qwen::vision
 #endif

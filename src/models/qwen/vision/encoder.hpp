@@ -11,6 +11,7 @@
 
 #include "src/core/image.hpp"
 #include "src/models/qwen/vision/output_pool.hpp"
+#include "src/models/qwen/vision/policy.hpp"
 
 namespace gufo::models::qwen::vision {
 
@@ -39,13 +40,13 @@ public:
       std::function<void(std::string_view, std::span<const float>)>;
   using CancellationCheck = std::function<bool()>;
   Encoder(const std::filesystem::path& path, std::uint32_t output_width,
-          std::uint32_t pool_rows = OutputPool::kDefaultRows);
+          std::optional<std::uint32_t> pool_rows = std::nullopt);
   /// An explicit sidecar is required to exist. Otherwise discover the canonical
   /// sidecar beside the target or its quantization subdirectory.
   [[nodiscard]] static std::shared_ptr<Encoder> Open(
       const std::filesystem::path& target, const std::filesystem::path& sidecar,
       std::uint32_t output_width, bool enabled = true,
-      std::uint32_t pool_rows = OutputPool::kDefaultRows);
+      std::optional<std::uint32_t> pool_rows = std::nullopt);
   ~Encoder();
   Encoder(const Encoder&) = delete;
   Encoder& operator=(const Encoder&) = delete;
@@ -55,10 +56,11 @@ public:
     return outputs_;
   }
   [[nodiscard]] std::size_t OutputBudgetBytes() const;
+  [[nodiscard]] const Policy& GetPolicy() const noexcept { return policy_; }
   /// Upload the weights now instead of in the first Encode. Repeated calls
   /// keep the existing upload.
   void Upload();
-  /// Serialized per encoder, including callers outside the model scheduler.
+  /// Pooled encoders serialize callers; legacy Qwen relies on its scheduler.
   /// Pixel grid is already resized.
   /// Uploads the weights if Upload has not; scratch is bounded by image
   /// dimensions.
@@ -68,6 +70,7 @@ public:
 
 private:
   struct Impl;
+  Policy policy_;
   std::shared_ptr<OutputPool> outputs_;
   std::uint32_t output_width_;
   std::unique_ptr<Impl> impl_;

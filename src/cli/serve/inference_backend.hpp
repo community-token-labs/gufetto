@@ -92,8 +92,7 @@ public:
                 models::qwen38_flash_next::KvCacheType::kF16,
             bool enable_vision = true,
             std::uint32_t vision_max_tokens_per_slot = 0,
-            std::uint32_t vision_pool_tokens =
-                models::qwen::vision::kDefaultOutputPoolRows);
+            std::optional<std::uint32_t> vision_pool_tokens = std::nullopt);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
