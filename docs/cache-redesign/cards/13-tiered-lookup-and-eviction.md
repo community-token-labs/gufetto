@@ -22,6 +22,9 @@ tiers by references, so a short RAM hit never hides a deeper disk checkpoint.
   references it (reverse dependencies). Lookup falls back to an earlier
   complete checkpoint or a cold prefill.
 
+For serving path selection, automatic sizing and filesystem pressure guards,
+see [Persistent disk cache](../../DISK_CACHE.md).
+
 ## Not in this PR
 
 A cost-aware rule that prefers a shorter RAM hit for latency. It is an RFC
