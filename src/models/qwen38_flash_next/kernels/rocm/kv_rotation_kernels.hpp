@@ -34,7 +34,7 @@ __device__ __forceinline__ float RotateKvChannel(float value, float* shared) {
 /// Separate correctness-first producer: keep all legacy RMS/RoPE operations,
 /// then transform before the canonical Store. This also handles both predictor
 /// cache-only catch-up callers (heads == 0, null Q/gate/query gamma).
-template<bool kYarn>
+template<bool kYarn, unsigned kFormat = 1>
 __global__ void PrepareRotatedAttentionKernel(
     const float* __restrict__ packed, std::uint32_t stride,
     const float* __restrict__ q_gamma, const float* __restrict__ k_gamma,
@@ -90,10 +90,10 @@ __global__ void PrepareRotatedAttentionKernel(
         std::size_t{*start_pos + t} * kv_width + head * 256 + tid;
     // StoreQ8KvLane preserves the qualified divide/round/scale contract and
     // explicitly NaN-poisons nonfinite/half-reconstruction-overflow payloads.
-    StoreQ8KvLane(key_storage, index, rotated);
+    StoreKvLane<kFormat == 3 ? 1 : kFormat>(key_storage, index, rotated);
     const float v = row[2 * width + kv_width + head * 256 + tid];
     const float rotated_v = RotateKvChannel<64>(v, norm);
-    StoreQ8KvLane(value_storage, index, rotated_v);
+    StoreKvLane<kFormat == 3 ? 2 : kFormat>(value_storage, index, rotated_v);
   }
 }
 

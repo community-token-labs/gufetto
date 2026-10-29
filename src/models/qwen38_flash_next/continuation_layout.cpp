@@ -18,17 +18,6 @@ bool IsPool(ContinuationPart part) {
   return part == ContinuationPart::kPooledKeys ||
          part == ContinuationPart::kDraftPooledKeys;
 }
-std::uint32_t KvComponentLayoutVersion(KvCacheType type) {
-  switch (type) {
-    case KvCacheType::kF16:
-      return 1;
-    case KvCacheType::kQ8_0:
-      return 2;
-    case KvCacheType::kQ8_0Rotated:
-      return 3;
-  }
-  throw std::invalid_argument("unsupported Flash-Next KV cache type");
-}
 }  // namespace
 
 std::string KvCacheCompatibilityIdentity(KvCacheType type) {
@@ -46,6 +35,18 @@ std::string KvCacheCompatibilityIdentity(KvCacheType type) {
           "ordinary_kv_rounding_saturation_revision=f16-rne-v1\n"
           "ordinary_kv_reconstruction=f16-identity-v1\n";
       break;
+#ifdef GUFO_ENABLE_BF16_K_CONTROL
+    case KvCacheType::kBf16KControl:
+      identity +=
+          "ordinary_kv_layout=row-major-f16-le-v1\n"
+          "ordinary_kv_block_elements=1\n"
+          "ordinary_kv_scale_dtype=none\n"
+          "ordinary_kv_rounding_saturation_revision="
+          "k-f32-f16-bf16-rne-f16-v1-v-f16-rne-v1\n"
+          "ordinary_kv_reconstruction=f16-identity-v1\n"
+          "ordinary_kv_control_nonfinite=nan\n";
+      break;
+#endif
     case KvCacheType::kQ8_0:
     case KvCacheType::kQ8_0Rotated:
       identity +=
@@ -58,6 +59,22 @@ std::string KvCacheCompatibilityIdentity(KvCacheType type) {
           "ordinary_kv_gpu_reconstruction_equality=ieee-values-zero-sign-"
           "equivalent-v1\n"
           "ordinary_kv_zero_or_f32_scale_underflow=scale0-codes0\n"
+          "ordinary_kv_f16_scale_underflow=preserve-codes-value-zero-v1\n";
+      break;
+    case KvCacheType::kQ4_0:
+    case KvCacheType::kQ8_0Q4_0:
+    case KvCacheType::kQ4_0Rotated:
+    case KvCacheType::kQ8_0Q4_0Rotated:
+      identity += "ordinary_kv_key_codec=";
+      identity += KvCacheTypeName(KvKeyType(type));
+      identity += "\nordinary_kv_value_codec=q4_0\n";
+      identity +=
+          "ordinary_kv_q4_layout=f16le-signed-scale-low16-high16-offset8-v1\n"
+          "ordinary_kv_q4_rounding=first-signed-absmax-div-neg8-rne32-recip-"
+          "mul-add8.5-trunc-clamp0-15-v1\n"
+          "ordinary_kv_reconstruction=f16-rne-of-f32-scale-times-code-v1\n"
+          "ordinary_kv_q8_codec=absmax-div127-roundf-away-clamp127-v1\n"
+          "ordinary_kv_q4_zero_or_f32_scale_underflow=scale0-codes8\n"
           "ordinary_kv_f16_scale_underflow=preserve-codes-value-zero-v1\n";
       break;
     default:
@@ -106,7 +123,9 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
                             c.num_heads != 24 || c.num_kv_heads != 2))
     throw std::invalid_argument(
         "rotated Flash-Next KV requires D256/R64/24Q/2KV");
-  const auto kv_row_bytes = KvRowBytes(c.AttentionKvDim(), type);
+  const auto key_row_bytes = KvRowBytes(c.AttentionKvDim(), KvKeyType(type));
+  const auto value_row_bytes =
+      KvRowBytes(c.AttentionKvDim(), KvValueType(type));
   raw_capacity_ = std::min(context, std::max(c.indexer_top_k, ratio_ - 1));
   const auto add = [&](ContinuationPart part, std::size_t row,
                        std::size_t state, std::uint32_t layer = 0,
@@ -136,9 +155,9 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
               sizeof(float),
           layer);
     } else {
-      add(ContinuationPart::kKey, kv_row_bytes, 0, layer,
+      add(ContinuationPart::kKey, key_row_bytes, 0, layer,
           KvComponentLayoutVersion(type));
-      add(ContinuationPart::kValue, kv_row_bytes, 0, layer,
+      add(ContinuationPart::kValue, value_row_bytes, 0, layer,
           KvComponentLayoutVersion(type));
       add(ContinuationPart::kPooledKeys, std::size_t{c.indexer_head_dim} * 2, 0,
           layer);
@@ -151,9 +170,9 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
     add(ContinuationPart::kPleHistory, 0,
         std::size_t{c.PleConvHistory()} * c.HcDim() * sizeof(float));
   if (mtp) {
-    add(ContinuationPart::kDraftKey, kv_row_bytes, 0, 0,
+    add(ContinuationPart::kDraftKey, key_row_bytes, 0, 0,
         KvComponentLayoutVersion(type));
-    add(ContinuationPart::kDraftValue, kv_row_bytes, 0, 0,
+    add(ContinuationPart::kDraftValue, value_row_bytes, 0, 0,
         KvComponentLayoutVersion(type));
     add(ContinuationPart::kDraftPooledKeys, std::size_t{c.indexer_head_dim} * 2,
         0);

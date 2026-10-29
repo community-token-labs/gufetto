@@ -63,6 +63,47 @@ KvBlockQ8_0 QuantizeBlock(const float* input) {
   }
   return block;
 }
+// Materialize each binary32 boundary; in particular product and +8.5 must
+// not contract into FMA. This is independent of the host's FMA availability.
+float Q4F32(float value) {
+  volatile float rounded = value;
+  return rounded;
+}
+KvBlockQ4_0 QuantizeQ4Block(const float* input) {
+  float amax = 0, signed_max = 0;
+  for (std::size_t i = 0; i < 32; ++i) {
+    if (!std::isfinite(input[i]))
+      throw std::invalid_argument("nonfinite Flash-Next KV input");
+    if (std::abs(input[i]) > amax) {
+      amax = std::abs(input[i]);
+      signed_max = input[i];
+    }
+  }
+  KvBlockQ4_0 block{};
+  std::fill(std::begin(block.values), std::end(block.values), 0x88);
+  const float d = Q4F32(signed_max / -8.0f);
+  if (d == 0)
+    return block;
+  const float inverse = Q4F32(1.0f / d);
+  block.scale = KvFloatToHalfBits(d);
+  if (!std::isfinite(inverse) || !IsFiniteHalf(block.scale))
+    throw std::invalid_argument("invalid Flash-Next q4 scale");
+  const float scale = KvHalfBitsToFloat(block.scale);
+  for (std::size_t j = 0; j < 16; ++j) {
+    unsigned packed = 0;
+    for (unsigned half = 0; half < 2; ++half) {
+      const float shifted = Q4F32(Q4F32(input[j + half * 16] * inverse) + 8.5f);
+      const auto code = static_cast<unsigned>(std::clamp(shifted, 0.0f, 15.0f));
+      if (!IsFiniteHalf(
+              KvFloatToHalfBits((static_cast<int>(code) - 8) * scale)))
+        throw std::invalid_argument(
+            "Flash-Next KV reconstruction overflows F16");
+      packed |= code << (half * 4);
+    }
+    block.values[j] = static_cast<std::uint8_t>(packed);
+  }
+  return block;
+}
 }  // namespace
 
 std::int8_t RoundKvQ8Code(float scaled) {
@@ -139,6 +180,16 @@ void EncodeKvRow(std::span<const float> input, KvCacheType type,
     }
     for (std::size_t i = 0; i < input.size(); ++i)
       WriteHalf(output.data() + i * 2, KvFloatToHalfBits(input[i]));
+  } else if (!KvUsesQ8Codec(type)) {
+    for (std::size_t i = 0; i < input.size(); i += 32)
+      (void)QuantizeQ4Block(input.data() + i);
+    for (std::size_t i = 0; i < input.size(); i += 32) {
+      const auto block = QuantizeQ4Block(input.data() + i);
+      auto* dst = output.data() + (i / 32) * sizeof(KvBlockQ4_0);
+      WriteHalf(dst, block.scale);
+      for (std::size_t j = 0; j < 16; ++j)
+        dst[2 + j] = std::byte(block.values[j]);
+    }
   } else {
     for (std::size_t i = 0; i < input.size(); i += kKvQ8BlockElements)
       (void)QuantizeBlock(input.data() + i);
@@ -161,6 +212,19 @@ void ValidateKvRow(std::span<const std::byte> input, std::uint32_t elements,
     for (std::size_t i = 0; i < input.size(); i += 2) {
       if (!IsFiniteHalf(ReadHalf(input.data() + i)))
         throw std::invalid_argument("nonfinite Flash-Next F16 KV payload");
+    }
+  } else if (!KvUsesQ8Codec(type)) {
+    for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ4_0)) {
+      const auto bits = ReadHalf(input.data() + i);
+      if (!IsFiniteHalf(bits))
+        throw std::invalid_argument("invalid Flash-Next q4 scale");
+      const float scale = KvHalfBitsToFloat(bits);
+      for (std::size_t j = 0; j < 32; ++j) {
+        const auto byte = std::to_integer<unsigned>(input[i + 2 + j % 16]);
+        const int code = static_cast<int>((byte >> (j / 16 * 4)) & 15) - 8;
+        if (!IsFiniteHalf(KvFloatToHalfBits(code * scale)))
+          throw std::invalid_argument("invalid Flash-Next KV reconstruction");
+      }
     }
   } else {
     for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ8_0)) {
@@ -191,6 +255,16 @@ void DecodeKvRow(std::span<const std::byte> input, KvCacheType type,
   if (type == KvCacheType::kF16) {
     for (std::size_t i = 0; i < output.size(); ++i)
       output[i] = KvHalfBitsToFloat(ReadHalf(input.data() + i * 2));
+  } else if (!KvUsesQ8Codec(type)) {
+    for (std::size_t i = 0; i < output.size(); i += 32) {
+      const auto* src = input.data() + (i / 32) * sizeof(KvBlockQ4_0);
+      const float scale = KvHalfBitsToFloat(ReadHalf(src));
+      for (std::size_t j = 0; j < 32; ++j) {
+        const auto byte = std::to_integer<unsigned>(src[2 + j % 16]);
+        const int code = static_cast<int>((byte >> (j / 16 * 4)) & 15) - 8;
+        output[i + j] = KvHalfBitsToFloat(KvFloatToHalfBits(code * scale));
+      }
+    }
   } else {
     for (std::size_t i = 0; i < output.size(); i += kKvQ8BlockElements) {
       const auto* src =

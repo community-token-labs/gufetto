@@ -414,18 +414,22 @@ int main(int argc, char** argv) {
       kv_cache_type = qfn::KvCacheType::kQ8_0;
     else if (value == "q8_0-rotated")
       kv_cache_type = qfn::KvCacheType::kQ8_0Rotated;
+    else if (value == "q4_0")
+      kv_cache_type = qfn::KvCacheType::kQ4_0;
+    else if (value == "q8_0/q4_0")
+      kv_cache_type = qfn::KvCacheType::kQ8_0Q4_0;
+    else if (value == "q4_0-rotated")
+      kv_cache_type = qfn::KvCacheType::kQ4_0Rotated;
+    else if (value == "q8_0/q4_0-rotated")
+      kv_cache_type = qfn::KvCacheType::kQ8_0Q4_0Rotated;
     else if (value != "f16") {
-      std::cerr << "--kv-cache-type must be f16 or q8_0"
-                   " or q8_0-rotated"
-                   "\n";
+      std::cerr << "unsupported --kv-cache-type\n";
       return 2;
     }
     argc -= 2;
   } else if (argc >= 2 &&
              std::string_view(argv[argc - 1]) == "--kv-cache-type") {
-    std::cerr << "--kv-cache-type requires f16 or q8_0"
-                 " or q8_0-rotated"
-                 "\n";
+    std::cerr << "--kv-cache-type requires a value\n";
     return 2;
   }
   const bool extended = argc == 6 && std::string_view(argv[5]) == "--extended";
@@ -439,9 +443,8 @@ int main(int argc, char** argv) {
     std::cerr << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
                  "[--extended|--yarn-stacked-producer-only|--yarn-separate-"
                  "producer-only] "
-                 "[--kv-cache-type f16|q8_0"
-                 "|q8_0-rotated"
-                 "]\n";
+                 "[--kv-cache-type f16|q8_0|q4_0|q8_0/q4_0|q8_0-rotated"
+                 "|q4_0-rotated|q8_0/q4_0-rotated]\n";
     return 77;
   }
   try {

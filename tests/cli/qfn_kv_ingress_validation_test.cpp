@@ -494,10 +494,52 @@ void FailedCaptureRollback(qfn::KvCacheType type) {
               f.ledger.Snapshot().reserved_bytes == baseline.reserved_bytes,
           "failed complete capture leaked committed payloads/reservations");
 }
+void Q4SideAdmission() {
+  for (const auto type :
+       {qfn::KvCacheType::kQ4_0, qfn::KvCacheType::kQ8_0Q4_0,
+        qfn::KvCacheType::kQ4_0Rotated, qfn::KvCacheType::kQ8_0Q4_0Rotated}) {
+    const qfn::ContinuationLayout layout(Geometry(), true, kContext, 1, type);
+    for (const auto& component : layout.Components()) {
+      if (!Packed(component.part))
+        continue;
+      const bool value = component.part == qfn::ContinuationPart::kValue ||
+                         component.part == qfn::ContinuationPart::kDraftValue;
+      const auto codec = value ? qfn::KvValueType(type) : qfn::KvKeyType(type);
+      const auto row = component.descriptor.row_bytes;
+      std::vector<float> values(kElements, 0.5F);
+      values[0] = 8;  // q4 negative scales must remain admissible.
+      std::vector<std::byte> canonical(row);
+      qfn::EncodeKvRow(values, codec, canonical);
+      for (bool corrupt : {false, true}) {
+        Fixture fixture;
+        fixture.Install(Geometry(), true, type);
+        {
+          auto request = cache::PayloadRequest{
+              component.descriptor.id, cache::ResourceCategory::kPrivateTail, 5,
+              6, row};
+          auto buffer = fixture.resources.allocate(request);
+          Fill(buffer, canonical);
+          if (corrupt) {
+            buffer.bytes[0] = std::byte{0};
+            buffer.bytes[1] = std::byte{0x7c};
+            Reject([&] { (void)buffer.finish(); });
+            Require(fixture.stats->finishes == 0, "q4 poison published");
+          } else {
+            Require(buffer.finish().IsValid(), "valid q4/mixed row rejected");
+          }
+          request.bytes = row == 288 ? 544 : 288;
+          Reject([&] { (void)fixture.resources.allocate(request); });
+        }
+        fixture.Released();
+      }
+    }
+  }
+}
 }  // namespace
 int main() {
   try {
     PlainRejectsBeforeOwnership();
+    Q4SideAdmission();
     for (auto type : kPackedTypes) {
       CodecAndClassification(type);
       RequestsAndLifetime(type);
