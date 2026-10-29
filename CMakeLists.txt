@@ -761,10 +761,9 @@ if (BUILD_TESTING)
     src/cli/serve/component_text_cache.cpp
     src/cli/serve/continuation_cache.cpp
     src/cli/serve/continuation_disk_store.cpp
-    src/cli/serve/text_model_runner.cpp)
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/text_generation_scheduler.cpp)
   if (GUFO_ENABLE_PREFILL_PREREQUISITES)
-    target_sources(component_text_cache_test PRIVATE
-      src/cli/serve/text_generation_scheduler.cpp)
     add_executable(prefill_prerequisites_test
       tests/cli/prefill_prerequisites_test.cpp)
     add_test(NAME prefill_prerequisites_test COMMAND prefill_prerequisites_test)
