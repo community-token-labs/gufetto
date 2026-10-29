@@ -6,36 +6,11 @@
 #include <string>
 #include <string_view>
 
-#include "src/models/deepseek_v4_flash/cache_capabilities.hpp"
-#include "src/models/embedding_gemma2/cache_capabilities.hpp"
-#include "src/models/minimax_h3/cache_capabilities.hpp"
-#include "src/models/qwen/cache_capabilities.hpp"
-#include "src/models/qwen38_flash_next/cache_capabilities.hpp"
-#include "src/models/qwen3_asr/cache_capabilities.hpp"
-#include "src/models/qwen3_tts/cache_capabilities.hpp"
-#include "src/models/qwen_image_21/cache_capabilities.hpp"
+#include "tests/cache/model_capability_records.hpp"
 
 namespace {
-
-struct Record {
-  std::string_view family;
-  gufo::cache::Capabilities capabilities;
-};
-
-// One record per src/models/ directory, keyed by the directory name.
-constexpr std::array kRecords{
-    Record{"deepseek_v4_flash",
-           gufo::models::deepseek_v4_flash::kCacheCapabilities},
-    Record{"embedding_gemma2",
-           gufo::models::embedding_gemma2::kCacheCapabilities},
-    Record{"minimax_h3", gufo::minimax_h3::kCacheCapabilities},
-    Record{"qwen", gufo::models::qwen::kCacheCapabilities},
-    Record{"qwen38_flash_next",
-           gufo::models::qwen38_flash_next::kCacheCapabilities},
-    Record{"qwen3_asr", gufo::models::qwen3_asr::kCacheCapabilities},
-    Record{"qwen3_tts", gufo::models::qwen3_tts::kCacheCapabilities},
-    Record{"qwen_image_21", gufo::models::qwen_image_21::kCacheCapabilities},
-};
+using gufo::cache::testing::Record;
+constexpr auto& kRecords = gufo::cache::testing::kModelCapabilityRecords;
 
 const Record* Find(std::string_view family) {
   for (const auto& record : kRecords)

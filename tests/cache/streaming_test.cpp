@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "tests/cache/fake_adapter.hpp"
+#include "tests/cache/model_capability_records.hpp"
 
 using namespace gufo::cache;
 using namespace gufo::cache::testing;
@@ -139,6 +140,63 @@ struct Fixture {
     return result;
   }
 };
+// Capability failure must occur before destination mutation or any payload I/O.
+// Pattern only: SGLang #46972 (8044ed4e), no upstream implementation copied.
+void CapabilityRejectionsAreObservable() {
+  Directory dir;
+  ResourceLedger ledger{{1 << 22, 1 << 21, 35, 4096}};
+  DiskStore disk(ledger, dir.path, 1 << 20);
+  StreamedStore streams(ledger, disk, 35, Allocate, Lease);
+  Fixture fixture(ledger);
+  auto sources = fixture.Sources();
+  TransferTiming written;
+  streams.Write(Id(100), fixture.manifest, sources, written);
+  for (const auto& record : kModelCapabilityRecords) {
+    // Use the same family records as the enumeration test; independently
+    // remove each capability to catch either check being silently dropped.
+    for (const auto caps :
+         {record.capabilities,
+          Capabilities{false, record.capabilities.persistent_encoding},
+          Capabilities{record.capabilities.continuation, false}}) {
+      FakeAdapter adapter(4, caps);
+      auto destination = adapter.CreateSlot(fixture.guard);
+      TransferTiming timing;
+      unsigned fallbacks{};
+      const bool accepted =
+          streams.Restore({1}, fixture.manifest.compatibility, adapter,
+                          *destination, timing, {}, [&] { ++fallbacks; });
+      const bool expected = caps.continuation && caps.persistent_encoding;
+      assert(accepted == expected);
+      assert(adapter.RestoreBegins() == (expected ? 1 : 0));
+      assert(adapter.Invalidations() == (expected ? 0 : 1));
+      assert(fallbacks == (expected ? 0 : 1));
+      if (expected) {
+        assert(timing.bytes > 0 && timing.pieces > 0);
+        assert(adapter.Positions(*destination) ==
+               fixture.adapter.Positions(*fixture.source));
+        assert(adapter.RecurrentHash(*destination) == fixture.hash);
+      } else {
+        assert(timing.bytes == 0 && timing.pieces == 0);
+        for (const auto position : adapter.Positions(*destination))
+          assert(position.valid_rows == 0);
+      }
+    }
+    // Even a continuation-capable family cannot reinterpret incompatible
+    // chunk geometry as its own persistent encoding.
+    if (record.capabilities.continuation &&
+        record.capabilities.persistent_encoding) {
+      FakeAdapter incompatible(8, record.capabilities);
+      auto destination = incompatible.CreateSlot(fixture.guard);
+      TransferTiming timing;
+      unsigned fallbacks{};
+      assert(!streams.Restore({1}, fixture.manifest.compatibility, incompatible,
+                              *destination, timing, {}, [&] { ++fallbacks; }));
+      assert(incompatible.RestoreBegins() == 0);
+      assert(incompatible.Invalidations() == 1 && fallbacks == 1);
+      assert(timing.bytes == 0 && timing.pieces == 0);
+    }
+  }
+}
 void PrefetchDoesNotValidateOrAdmitPayload() {
   Directory dir;
   ResourceLedger ledger{{1 << 22, 1 << 21, 35, 4096}};
@@ -1082,6 +1140,7 @@ void MinimumStagingHoldsWidestRow() {
 }
 }  // namespace
 int main() {
+  CapabilityRejectionsAreObservable();
   MinimumStagingHoldsWidestRow();
   PrefetchDoesNotValidateOrAdmitPayload();
   RestoreGroupsAdjacentFilesWithinStaging();

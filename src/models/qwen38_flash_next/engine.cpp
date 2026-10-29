@@ -127,7 +127,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     AssignError(error_msg, "rotated Flash-Next KV requires D256/R64/24Q/2KV");
     return nullptr;
   }
-  if (!IsValidKvRow(c.AttentionKvDim(), options.kv_cache_type)) {
+  if (!IsValidKvRow(c.AttentionKvDim(), KvKeyType(options.kv_cache_type)) ||
+      !IsValidKvRow(c.AttentionKvDim(), KvValueType(options.kv_cache_type))) {
     AssignError(error_msg, "invalid Flash-Next KV cache row geometry");
     return nullptr;
   }
