@@ -1485,7 +1485,10 @@ ComponentTextCache::Lease::Impl::CaptureDurable() {
       for (auto& copy : copies)
         copy.buffer = {};
       const std::lock_guard lock(cache->mutex);
-      if (!cache->retention.Reclaim(retain))
+      // Required disk staging has the same priority over this creator's
+      // optional roots as a required RAM capture. Buffers were dropped above;
+      // retry the real allocations after any logical withdrawal.
+      if (!WithdrawPredictions() && !cache->retention.Reclaim(retain))
         throw;
     }
   }
@@ -3324,7 +3327,16 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     return 0;
   // Publication uses the captured origin, not the most recent reservation.
   auto retain = impl_->Retain(tokens, {}, component->capture_origin);
-  retain.prediction_owner = component->prediction_owner;
+  if (component->capture_origin == SnapshotOrigin::kPredicted) {
+    retain.prediction_owner = component->prediction_owner;
+  } else if (retain.purpose != cache::RetentionPurpose::kHistory) {
+    // Root capture/publication temporaries are gone before this required
+    // publication. The span carries IDs only; RetentionPolicy decides whether
+    // actual new-record/metadata pressure warrants safe creator withdrawal.
+    retain.prediction_owner = impl_->metrics.acquisition_id;
+    retain.owned_predictions =
+        std::span(impl_->predictions).first(impl_->prediction_count);
+  }
   retain.preserve_source = preserve;
   bool admitted;
   {
@@ -3334,13 +3346,6 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
       impl_->entry->pending_tokens = {};
       impl_->entry->pending_input = {};
     }
-    if (component->capture_origin == SnapshotOrigin::kOrdinary &&
-        retain.purpose != cache::RetentionPurpose::kHistory &&
-        impl_->cache->retention.Size() == cache::RetentionPolicy::kRecordLimit)
-      (void)impl_->WithdrawPredictions();
-    // Admission-metadata pressure needs the retention owner's pre-eviction
-    // seam: Admit currently catches allocation failures internally. Pending
-    // that follow-up, do not preemptively delete a root with headroom.
     admitted = impl_->cache->retention.Admit(
         retain, [&] { return component->checkpoint; });
     if (admitted && component->capture_origin == SnapshotOrigin::kPredicted &&
