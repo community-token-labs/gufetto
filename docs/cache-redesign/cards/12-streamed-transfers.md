@@ -17,8 +17,8 @@ payloads during restore before the slot can execute.
 - **Restore:** file → staging piece → device. Checksum each dependency while
   streaming. The destination becomes executable only after every checksum and
   position check passes; any failure invalidates it before a fallback runs.
-- **Verification cache:** a verified immutable file stays verified for its
-  file identity (inode, size, modification time).
+- **Verification:** every consumed payload is checksummed, even on repeat reads;
+  file identity is not a content version.
 - **Persistence queue:**
   - bounded depth and pinned bytes;
   - redundant jobs are coalesced or skipped;
@@ -109,8 +109,13 @@ layout checks and independent target/draft positions remain mandatory.
 Every restore verifies CRC during its existing streaming read, then checks file
 identity again after copying. Device/inode/size/mtime/ctime are not a content
 version: a same-size write can retain identical timestamps. Inherited publication
-also re-reads and verifies shared files; there is no metadata-only verification
-cache. Retirement is blocked by snapshot pins.
+checks shared-file metadata and retains the existing expected CRC without
+rereading payloads. This can publish a corrupt dependency, but never bless its
+contents: restore, packed preflight and export all verify the full dependency
+before accepting bytes. Shared references survive GC and are quarantined together
+on a failed read, including after restart. `PayloadVerified()` is false for
+publications with inherited files and is never an execution authorization.
+Retirement is blocked by snapshot pins.
 
 One optional persistence worker bounds active plus pending depth and retained
 allocation capacities. Admission/coalescing precedes pinning; duplicate logical
@@ -142,7 +147,8 @@ coalescing, skipping, yielding without blocking index/accounting queries, and
 stop cleanup. A concurrent restore completes while an optional writer yields,
 which would deadlock if the writer held staging through its transaction. Admission tests inject every staging reserve/convert and source pin
 failure; physical staging is freed while its charge is still live. Frozen-timestamp
-regressions require corrupt repeat reads and inherited publications to fail. Reused chunks
+regressions require corrupt repeat reads to fail, including newly published
+inherited references after original-parent retirement and restart. Reused chunks
 also publish with no new sources and no hidden verification buffer.
 
 Normal and ASan/UBSan checks cover the changed common cache contract. The pinned

@@ -211,7 +211,7 @@ void MixedSourcesAndCompatibility() {
   }
   assert(rejected);
 }
-void PublicationCorruptionQuarantinesImmediately() {
+void InheritedPublicationCorruptionQuarantinesOnRead() {
   for (bool queued : {false, true}) {
     TieredFixture f;
     f.Append(16, 12);
@@ -250,12 +250,20 @@ void PublicationCorruptionQuarantinesImmediately() {
       assert(queue.TrySubmit(
           PersistenceJob(f.ledger, TieredFile(4, 999), manifest, {})));
       queue.Drain();
-      assert(queue.Stats().failed == 1);
+      assert(queue.Stats().failed == 0 && queue.Stats().completed == 1);
     } else {
       TransferTiming timing;
+      f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
+    }
+    f.catalog.Track({999});
+    {
+      auto snapshot = f.disk.Open({999});
+      assert(snapshot);
+      std::array<std::uint8_t, 16> staging{};
       bool failed{};
       try {
-        f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
+        (void)f.disk.ReadPayload(*snapshot, false, chunk, staging,
+                                 [](auto, auto) {});
       } catch (const DiskDependencyError& error) {
         failed = !error.private_file && error.file == chunk.file;
       }
@@ -270,7 +278,7 @@ void PublicationCorruptionQuarantinesImmediately() {
     // No worker mutates the caller-serialized prefix index/catalog. Cleanup
     // reconciles retained descriptions even after disk-layer invalidation.
     f.catalog.Reconcile();
-    assert(f.catalog.ReclaimInvalid() == 2);
+    assert(f.catalog.ReclaimInvalid() == 3);
     assert(f.disk.Stats().managed_bytes == 0);
     assert(description->Quarantined());
   }
@@ -294,13 +302,21 @@ void RepublishedQuarantineCannotRehabilitateOldRAM() {
       file.put('\xff');
     }
     TransferTiming timing;
-    bool failed{};
-    try {
-      f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
-    } catch (const DiskDependencyError&) {
-      failed = true;
+    f.streams.Write(TieredFile(4, 999), manifest, {}, timing);
+    {
+      auto snapshot = f.disk.Open({999});
+      assert(snapshot);
+      std::array<std::uint8_t, 16> staging{};
+      bool failed{};
+      try {
+        (void)f.disk.ReadPayload(*snapshot, false, chunk, staging,
+                                 [](auto, auto) {});
+      } catch (const DiskDependencyError&) {
+        failed = true;
+      }
+      assert(failed && old->Quarantined());
     }
-    assert(failed && old->Quarantined());
+    assert(f.disk.Retire({999}));
     assert(!f.index.Lookup(f.Query()).selected);
     // Direct retirement/republication may precede caller reconciliation. Track
     // must erase the poisoned RAM record before dropping its old marker.
@@ -538,7 +554,7 @@ int main() {
   CorruptionInvalidatesAllDependents();
   GlobalLRUAndSharedFiles();
   MixedSourcesAndCompatibility();
-  PublicationCorruptionQuarantinesImmediately();
+  InheritedPublicationCorruptionQuarantinesOnRead();
   RepublishedQuarantineCannotRehabilitateOldRAM();
   InvalidUnusedRAMComponentStillSelectsMixed();
   DurableAvailabilityAdmissionOrder();
