@@ -43,6 +43,16 @@ not met the original strict quality gates. Shared-Q4 MTP requires an explicit
 compatible model and speculative selection. Our standard development profile
 explicitly enables **shared-Q8 MTP at C1–C4** (`--speculative mtp --mtp-model …`);
 the generic CLI defaults to speculation off, not implicit Q8 draft loading.
+`--vision-max-tokens-per-slot N` bounds aggregate Qwen image tokens across the
+whole request history, including images before a cache hit. The default `0`
+keeps the full-context bound; a value above context does not expand it. Requests
+above the effective cap get HTTP 400 before GPU encoding, without truncation.
+CPU image decoding/preprocessing still occurs to determine resized dimensions.
+Flash-Next reserves `N * 10240 + context * 12 + 64` bytes per vision-enabled
+slot (using the effective cap). Position rows span preceding text through the
+last image, so only the embedding term shrinks. At 262144 context, a 16384 cap
+reduces the input reservation by 2.34375 GiB/slot, not measured physical RAM.
+Encoder workspace and shared-pool accounting are separate concerns.
 RAM caching defaults to AUTO (`--cache-ram-bytes 0`); `off` disables retention.
 Disk caching, pins, `--cache-lookup-api`, `--cache-transfer-api` and `--trace`
 require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and
