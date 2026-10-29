@@ -368,6 +368,7 @@ struct Trial {
   std::size_t context{}, attempts{}, created{}, destroyed{}, observations{};
   std::size_t pending_calls{}, throw_at{};
   bool adapter_alive{true};
+  std::function<void(std::string_view)> step;
   std::vector<const cache::Slot*> slots;
   std::vector<Observation> capacity;
   std::vector<ComponentStartupPending> pending;
@@ -385,6 +386,8 @@ public:
       : native(std::move(native)), trial(std::move(trial)) {
     this->trial->slots.push_back(this->native.get());
     ++this->trial->created;
+    if (this->trial->step)
+      this->trial->step("created");
   }
   ~ObservedSlot() override {
     assert(trial->adapter_alive);
@@ -424,6 +427,8 @@ public:
   }
   std::unique_ptr<cache::Slot> CreateSlot(
       cache::MutationGuard& guard) override {
+    if (trial->step)
+      trial->step("creating");
     if (++trial->attempts == trial->throw_at)
       throw CreationFailure();
     return std::make_unique<ObservedSlot>(native->CreateSlot(guard), trial);
@@ -494,6 +499,7 @@ public:
     }
   };
   std::function<void(ComponentCacheResources&)> alter;
+  std::function<std::size_t(std::size_t)> logical_slot;
   MeasuredRunner() { max_context = 32768; }
   bool UsesMeasuredStartupAdmission() const override { return measured; }
   TextRunnerResourceClaim ResourceClaim() const override {
@@ -542,8 +548,14 @@ public:
           std::make_unique<ComponentStartupAdmission>();
       auto& startup = *resources->startup_admission;
       startup.context = max_context;
+      startup.slot_bytes = [this](std::size_t context) {
+        return logical_slot ? logical_slot(context)
+                            : (logical_overclaim ? 64 : 1) * kMiB;
+      };
       startup.observe = [this] {
         auto& trial = *trials.back();
+        if (trial.step)
+          trial.step("observe");
         // A fresh observation after the last slot would disagree. The last
         // actual slot sample must be shared by freeze_capacity and AUTO.
         if (++trial.observations > trial.capacity.size())
@@ -639,6 +651,84 @@ void MeasuredDebitRefusesBeforeRemainingSlots() {
   assert(runner->trials.front()->observations == 2);
   for (std::size_t i = 1; i < runner->trials.size(); ++i)
     assert(runner->trials[i]->created == 0);
+}
+
+void FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation() {
+  for (const bool device_limits : {false, true}) {
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->logical_slot = [](std::size_t context) {
+      return (context > 8192 ? 6 : 5) * kMiB;
+    };
+    runner->configure = [device_limits](Trial& trial) {
+      trial.capacity = {Capacity(8, 64, 4), Capacity(7, 63, 4),
+                        Capacity(6, 62, 3), Capacity(5, 61, 3)};
+      if (device_limits)
+        for (auto& capacity : trial.capacity)
+          std::swap(capacity.host, capacity.device);
+      trial.pending.assign(4, Pending(2, 0, 1, 0));
+    };
+    const auto message = Refuse(runner);
+    assert(message.find("verified to fit: --context 8192") !=
+           std::string::npos);
+    assert((runner->probes == std::vector<std::size_t>{16384, 8192, 12288}));
+    for (const auto& trial : runner->trials) {
+      // Six logical MiB alone and three pending MiB alone both fit, but
+      // together exceed one lane. Neither the request nor failing probes
+      // may create even their first slot. The exact 5+3 boundary is allowed.
+      assert(trial->created == (trial->context == 8192 ? 3 : 0));
+      assert(trial->attempts == trial->created);
+    }
+  }
+}
+
+void StagedProbeDeadlineStopsSlotCreation() {
+  using Clock = std::chrono::steady_clock;
+  using namespace std::chrono_literals;
+  // Expire during adapter creation, baseline observation, first allocation,
+  // or the first post-slot observation. No sleep or native GPU is involved.
+  for (const int phase : {0, 1, 2, 3}) {
+    Clock::time_point now{};
+    const auto deadline = Clock::time_point{} + 30s;
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->configure = [&](Trial& trial) {
+      trial.capacity.assign(4, Capacity(100, 100, 50));
+      trial.pending.assign(4, Pending(0, 0, 0, 0));
+      if (trial.context == 32768) {
+        trial.capacity[0] = Capacity(0, 0, 0);
+        return;
+      }
+      trial.step = [&, current = &trial](std::string_view point) {
+        if (point == "creating")
+          assert(now < deadline);  // Must hold BEFORE every native allocation.
+        if ((phase == 1 && point == "observe" && current->Live() == 0) ||
+            (phase == 2 && point == "created") ||
+            (phase == 3 && point == "observe" && current->Live() == 1))
+          now = deadline + 1s;
+      };
+    };
+    runner->alter = [&](ComponentCacheResources& resources) {
+      auto& startup = *resources.startup_admission;
+      startup.now = [&] { return now; };
+      if (phase == 0) {
+        const auto make = startup.make_probe;
+        startup.make_probe = [&, make](std::size_t context) {
+          auto adapter = make(context);
+          now = deadline + 1s;
+          return adapter;
+        };
+      }
+    };
+    const auto message = Refuse(runner);
+    assert(message.find("no fitting context found within the search limits") !=
+           std::string::npos);
+    assert(message.find("verified to fit:") == std::string::npos);
+    assert(runner->trials.front()->created == 0);
+    assert(runner->probes.size() == 1 && runner->trials.size() == 2);
+    const auto& probe = *runner->trials.back();
+    assert(probe.created == (phase >= 2 ? 1 : 0));
+    assert(probe.observations == (phase == 0 ? 0 : phase == 3 ? 2 : 1));
+    assert(now == deadline + 1s);
+  }
 }
 
 void SuccessRetainsAllSlotsAndOneFrozenObservation() {
@@ -889,7 +979,7 @@ void UnknownCreationExceptionsPropagateWithoutSuggestions() {
 }
 
 void MissingProvidersCannotBypassAdmission() {
-  for (const int missing : {0, 1, 2, 3, 4, 5, 6, 7, 8}) {
+  for (const int missing : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
     auto runner = std::make_shared<MeasuredRunner>();
     runner->logical_overclaim = true;
     runner->alter = [missing](ComponentCacheResources& resources) {
@@ -921,6 +1011,12 @@ void MissingProvidersCannotBypassAdmission() {
           break;
         case 8:
           break;  // A provider without the opt-in is a mismatch, too.
+        case 9:
+          startup.slot_bytes = {};
+          break;
+        case 10:
+          startup.now = {};
+          break;
       }
     };
     if (missing == 8) {
@@ -972,6 +1068,8 @@ void DefaultDisabledKeepsTheOriginalGateAndBudget() {
 
 void Check() {
   MeasuredDebitRefusesBeforeRemainingSlots();
+  FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation();
+  StagedProbeDeadlineStopsSlotCreation();
   SuccessRetainsAllSlotsAndOneFrozenObservation();
   LaterPressureSwitchesTheLimitingLane();
   EarlierMaximumDebitSurvivesASmallerLatestSlot();
