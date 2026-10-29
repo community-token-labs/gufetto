@@ -95,6 +95,7 @@ struct ScheduledRequest {
   bool cache_prompt{true};
   bool cache_persist{true};
   std::size_t cache_prefix_tokens{0};
+  std::optional<std::size_t> root_prefix_tokens;
   bool stop_at_eos{true};
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
@@ -1320,7 +1321,8 @@ struct TextGenerationScheduler::Impl {
             },
             std::move(request->prompt_context), request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->cache_persist, std::move(resources));
+            request->cache_persist, std::move(resources),
+            request->root_prefix_tokens);
         acquisition.Finish();
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
@@ -2727,6 +2729,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->cache_prompt = metadata.cache_prompt;
   request->cache_persist = metadata.cache_persist;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+  request->root_prefix_tokens = metadata.root_prefix_tokens;
   request->stop_at_eos = metadata.stop_at_eos;
   request->token_limit =
       max_tokens > 0 ? std::min(max_tokens, available) : available;

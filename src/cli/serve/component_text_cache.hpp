@@ -125,8 +125,8 @@ public:
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
-    [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-        std::size_t stable) const;
+    [[nodiscard]] std::vector<PlannedSnapshotCapture> PlannedCaptures(
+        std::size_t stable, std::optional<std::size_t> root = {}) const;
 
   private:
     friend class ComponentTextCache;
@@ -223,8 +223,8 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
   void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
-  [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-      std::size_t stable) const;
+  [[nodiscard]] std::vector<PlannedSnapshotCapture> PlannedCaptures(
+      std::size_t stable, std::optional<std::size_t> root = {}) const;
 
 private:
   ContinuationCache::Lease legacy_;

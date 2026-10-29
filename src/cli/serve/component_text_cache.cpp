@@ -255,6 +255,12 @@ struct ComponentTextCache::Impl {
     // The live frontier's prompt, to tell whether any checkpoint covers it.
     std::vector<cache::Token> live_tokens;
     cache::Identity live_input;
+    // Non-owning reservation intent; publication mutex protects these views.
+    // Lease storage outlives them, including asynchronous capture workers.
+    std::span<const cache::Token> pending_tokens;
+    std::span<const std::uint8_t> pending_input;
+    SnapshotPurpose pending_purpose{SnapshotPurpose::kContinuation};
+    SnapshotOrigin pending_origin{SnapshotOrigin::kOrdinary};
     // Acquisition order breaks ties between equal recovery-cost victims.
     std::uint64_t used{};
     bool busy{};
@@ -2020,7 +2026,6 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       request.metrics.used_entry_id = found.selected->entry.value;
     }
     bool restore_cancelled = false;
-    std::vector<cache::IndexEntryId> rejected;
     cache::CheckpointId used_prediction{};
     for (const auto& candidate : found.candidates) {
       if (restored)
@@ -2034,7 +2039,6 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       ++request.metrics.restore_attempts;
       std::string_view failure_reason = "ram_begin_restore";
       const auto failed = [&](std::string_view reason) {
-        rejected.push_back(candidate.entry);
         ++request.metrics.restore_failures;
         request.metrics.restore_failure_reason = reason;
         Logger::Warn(
@@ -2236,7 +2240,6 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           }
         }
         if (restored && !decodable(candidate.boundary)) {
-          rejected.push_back(candidate.entry);
           ++request.metrics.unready_frontiers;
           // Intentional conservative full-boundary fallback, not a failed
           // transfer/restore. Lookup omits the same unready boundary.
@@ -2297,8 +2300,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       // Prospective ordinary fallback, not a promise an unattempted disk
       // restore succeeds. The lookup already checked input, stability,
       // compatibility and coherence; exclude failed/unready candidates too.
+      bool reached_used_source = false;
       for (const auto& candidate : found.candidates) {
-        if (std::ranges::find(rejected, candidate.entry) != rejected.end())
+        reached_used_source |=
+            candidate.entry.value == request.metrics.used_entry_id;
+        // Earlier non-live candidates were tried and rejected; earlier live
+        // candidates were not executable. Do not allocate a rejection list.
+        if (!reached_used_source)
           continue;
         if (candidate.live) {
           const auto& alternative =
@@ -2669,7 +2677,9 @@ bool ComponentTextCache::Lease::ObserveSnapshotFor(
       !std::ranges::equal(tokens,
                           std::span(impl_->prompt).first(impl_->cached)))
     return false;
-  const std::lock_guard lock(impl_->cache->mutex);
+  // Provenance changes no lookup identity/readiness; serialize without
+  // rebuilding the observational index snapshot.
+  const std::lock_guard lock(impl_->cache->mutex.native);
   if (!impl_->cache->retention.ObservePrediction(impl_->observation_source,
                                                  impl_->metrics.acquisition_id))
     return false;
@@ -2700,17 +2710,43 @@ bool ComponentTextCache::Lease::TryReserveSnapshot(
   if (!impl_->cache->ram_enabled && purpose != SnapshotPurpose::kBranchPoint &&
       impl_->cache->WithinDiskStep(tokens, At(impl_->input, tokens.size())))
     return false;
+  // Reservation intent does not change the published lookup inventory.
+  const std::lock_guard lock(impl_->cache->mutex.native);
+  if (capture_origin == SnapshotOrigin::kPredicted) {
+    const auto input = impl_->input.At(tokens.size());
+    if (impl_->cache->index.HasCheckpoint({impl_->cache->identity, tokens,
+                                           impl_->input.Through(tokens.size())},
+                                          tokens.size()))
+      return false;
+    for (const auto& entry : impl_->cache->entries)
+      if (std::ranges::equal(entry->pending_tokens, tokens) &&
+          std::ranges::equal(entry->pending_input, input))
+        return false;
+  }
+  impl_->entry->pending_tokens = {};
+  impl_->entry->pending_input = {};
   impl_->capture_boundary = boundary;
   impl_->capture_tokens.assign(tokens.begin(), tokens.end());
   impl_->preserve_source = preserve;
   impl_->purpose = purpose;
   impl_->capture_origin = capture_origin;
+  impl_->entry->pending_tokens = impl_->capture_tokens;
+  impl_->entry->pending_input = impl_->input.At(tokens.size());
+  impl_->entry->pending_purpose = purpose;
+  impl_->entry->pending_origin = capture_origin;
   return true;
 }
 void ComponentTextCache::Lease::SkipSnapshot(SnapshotEventReason reason,
                                              std::size_t bytes,
                                              std::size_t boundary) noexcept {
   try {
+    {
+      const std::lock_guard lock(impl_->cache->mutex.native);
+      if (impl_->entry->pending_tokens.size() == boundary) {
+        impl_->entry->pending_tokens = {};
+        impl_->entry->pending_input = {};
+      }
+    }
     Logger::Info("cache",
                  "schema=component-cache-v1 event=snapshot_skipped reason=" +
                      std::to_string(static_cast<unsigned>(reason)) +
@@ -2992,6 +3028,17 @@ std::size_t ComponentTextCache::Lease::CaptureBytes(
 std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
   auto& request = *impl_;
   auto& cache = *request.cache;
+  struct PendingGuard {
+    Impl& request;
+    bool captured{};
+    ~PendingGuard() {
+      if (!captured) {
+        const std::lock_guard lock(request.cache->mutex.native);
+        request.entry->pending_tokens = {};
+        request.entry->pending_input = {};
+      }
+    }
+  } pending{request};
   auto positions =
       cache.resources->adapter->Positions(request.slot.Execution());
   const auto bytes = request.entry->history->NewPayloadBytes(positions);
@@ -3254,6 +3301,7 @@ std::unique_ptr<TextRunnerSnapshot> ComponentTextCache::Lease::Capture() {
       request.capture_origin, request.metrics.acquisition_id);
   snapshot->checkpoint = std::move(checkpoint);
   snapshot->bytes = bytes;
+  pending.captured = true;
   return snapshot;
 }
 std::size_t ComponentTextCache::Lease::PublishSnapshot(
@@ -3281,6 +3329,11 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
   bool admitted;
   {
     const std::lock_guard lock(impl_->cache->mutex);
+    if (component->capture_origin == impl_->entry->pending_origin &&
+        std::ranges::equal(tokens, impl_->entry->pending_tokens)) {
+      impl_->entry->pending_tokens = {};
+      impl_->entry->pending_input = {};
+    }
     if (component->capture_origin == SnapshotOrigin::kOrdinary &&
         retain.purpose != cache::RetentionPurpose::kHistory &&
         impl_->cache->retention.Size() == cache::RetentionPolicy::kRecordLimit)
@@ -3341,6 +3394,8 @@ std::size_t ComponentTextCache::Lease::Commit(
   {
     const std::lock_guard lock(impl_->cache->mutex);
     impl_->entry->decode_ready = decode_ready;
+    impl_->entry->pending_tokens = {};
+    impl_->entry->pending_input = {};
     impl_->entry->live_tokens = live;
     impl_->entry->live_input = At(impl_->input, impl_->prompt.size());
     impl_->entry->live = impl_->cache->index.Insert(cache::LiveFrontier{
@@ -3361,14 +3416,16 @@ void ComponentTextCache::Lease::Invalidate() noexcept {
     const std::lock_guard lock(impl_->cache->mutex);
     impl_->entry->branch.reset();
     impl_->entry->durable.reset();
+    impl_->entry->pending_tokens = {};
+    impl_->entry->pending_input = {};
     impl_->entry->busy = false;
   } catch (...) {
   }
   impl_->active = false;
 }
 
-std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
-    std::size_t stable) const {
+std::vector<PlannedSnapshotCapture> ComponentTextCache::Lease::PlannedCaptures(
+    std::size_t stable, std::optional<std::size_t> root) const {
   // Off with no disk cache keeps no checkpoint, so skip the planning.
   if (!impl_->cache->ram_enabled && !impl_->cache->queue)
     return {};
@@ -3377,27 +3434,74 @@ std::vector<std::size_t> ComponentTextCache::Lease::PlannedCaptures(
   for (const auto& d : adapter.Components())
     if (d.kind == cache::ComponentKind::kPrivateState)
       private_bytes += d.state_bytes;
+  const auto limit = cache::GridLimit(impl_->cache->budget, private_bytes);
   const auto plan = cache::PlanCaptures(
       adapter, impl_->slot.Execution(),
-      {impl_->prompt.size(),
-       impl_->cached,
-       stable,
-       0,
-       true,
-       false,
-       {},
-       cache::GridLimit(impl_->cache->budget, private_bytes)});
-  std::vector<std::size_t> boundaries;
+      {impl_->prompt.size(), impl_->cached, stable, 0, true, false, {}, limit});
+  const auto prompt = std::span<const cache::Token>(impl_->prompt);
+  const bool predict = root && *root && *root > impl_->cached &&
+                       *root < stable && *root < prompt.size() &&
+                       impl_->cache->ram_enabled;
+  const std::lock_guard lock(impl_->cache->mutex.native);
+  const auto retained = impl_->cache->index.Lookup(
+      {impl_->cache->identity, prompt, impl_->input, stable});
+  std::vector<std::size_t> occupied;
+  std::vector<std::size_t> exact;
+  const auto add = [](auto& values, std::size_t value) {
+    if (std::ranges::find(values, value) == values.end())
+      values.push_back(value);
+  };
+  for (const auto& candidate : retained.candidates) {
+    if (candidate.live)
+      continue;
+    add(exact, candidate.boundary);
+    if (candidate.checkpoint &&
+        candidate.checkpoint->Purpose() == cache::CheckpointPurpose::kGrid)
+      add(occupied, candidate.boundary);
+  }
+  for (const auto& entry : impl_->cache->entries) {
+    const auto pending = entry->pending_tokens;
+    if (pending.empty() || pending.size() > prompt.size() ||
+        !std::ranges::equal(pending, prompt.first(pending.size())) ||
+        !std::ranges::equal(entry->pending_input,
+                            impl_->input.At(pending.size())))
+      continue;
+    add(exact, pending.size());
+    if (entry->pending_origin == SnapshotOrigin::kPredicted ||
+        entry->pending_purpose == SnapshotPurpose::kHistory)
+      add(occupied, pending.size());
+  }
+  std::vector<PlannedSnapshotCapture> boundaries;
   for (const auto& capture : plan)
     if (!capture.required &&
-        !HasSnapshotFor(std::span<const cache::Token>(impl_->prompt)
-                            .first(capture.boundary)))
-      boundaries.push_back(capture.boundary);
+        std::ranges::find(exact, capture.boundary) == exact.end() &&
+        (!predict || occupied.size() + boundaries.size() < limit))
+      boundaries.push_back({capture.boundary, SnapshotPurpose::kHistory});
+  if (!predict || std::ranges::find(exact, *root) != exact.end() ||
+      std::ranges::find(boundaries, *root, &PlannedSnapshotCapture::boundary) !=
+          boundaries.end())
+    return boundaries;
+  const PlannedSnapshotCapture prediction{*root, SnapshotPurpose::kHistory,
+                                          SnapshotOrigin::kPredicted};
+  if (occupied.size() + boundaries.size() < limit) {
+    boundaries.push_back(prediction);
+  } else {
+    // Only a genuinely planned optional grid at/after the root can move.
+    // Never advance an earlier fallback or replace a retained/pending point.
+    const auto later = std::ranges::find_if(
+        boundaries,
+        [&](const auto& capture) { return capture.boundary >= *root; });
+    if (later == boundaries.end())
+      return boundaries;
+    *later = prediction;
+  }
+  std::ranges::sort(boundaries, {}, &PlannedSnapshotCapture::boundary);
   return boundaries;
 }
-std::vector<std::size_t> ServingCacheLease::PlannedCaptures(
-    std::size_t stable) const {
-  return component_->PlannedCaptures(stable);
+std::vector<PlannedSnapshotCapture> ServingCacheLease::PlannedCaptures(
+    std::size_t stable, std::optional<std::size_t> root) const {
+  return component_ ? component_->PlannedCaptures(stable, root)
+                    : std::vector<PlannedSnapshotCapture>{};
 }
 
 ComponentCacheMetrics ComponentTextCache::Lease::Metrics() const {
