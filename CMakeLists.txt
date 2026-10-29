@@ -655,6 +655,11 @@ if (BUILD_TESTING)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
 
+  add_executable(startup_admission_test tests/core/startup_admission_test.cpp)
+  target_link_libraries(startup_admission_test PRIVATE gufo_core)
+  add_test(NAME startup_admission_test COMMAND startup_admission_test)
+  set_tests_properties(startup_admission_test PROPERTIES LABELS "cpu;core")
+
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)
   add_test(NAME heap_placement_test COMMAND heap_placement_test)
