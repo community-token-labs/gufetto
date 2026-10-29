@@ -142,9 +142,9 @@ std::atomic<bool> device_lost{false};
 // progress for tens of seconds.
 constexpr std::uint64_t kMinStallTimeoutMs = 60000;
 
-// A lost GPU context cannot recover in-process. Leave through the SIGTERM
-// shutdown path so a supervisor restarts the server, and bound that teardown:
-// joining requests or freeing device memory may block on the dead device.
+// Ordinary-thread callback, never an OS signal handler. Request shutdown and
+// bound dead-device joins/logging; FatalGpuCopy exits immediately after this
+// request instead of attempting a graceful HTTP drain.
 void ShutdownAfterDeviceLoss(void (*report)(const void*) = nullptr,
                              const void* context = nullptr) {
   constexpr auto kShutdownTimeout = std::chrono::seconds(10);
