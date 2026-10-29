@@ -943,6 +943,8 @@ void TestRunnerCanSkipUnusedFinalAdvance() {
   }
   Expect(advances == 1,
          "runner skips the unused frontier computation after the final token");
+  Expect(result.committed_tokens == 2,
+         "committed prefix excludes the sampled but unadvanced final token");
 }
 
 void TestRunnerCanReuseExactIncrementalText() {
@@ -1020,6 +1022,18 @@ void TestGenerationTraceRecordsPromptAndOutput() {
              record.member_size("prompt_tokens") == 2 &&
              record.member_size("generated_tokens") == result.tokens.size(),
          "the record carries the effective limits and counts");
+  const auto* prompt_ids = record.find("prompt_token_ids");
+  const auto* generated_ids = record.find("generated_token_ids");
+  Expect(prompt_ids && prompt_ids->items().size() == 2 &&
+             prompt_ids->items()[0].as_size() == 7 &&
+             prompt_ids->items()[1].as_size() == 8,
+         "trace records native prompt IDs without retokenizing text");
+  Expect(generated_ids && generated_ids->items().size() == 2 &&
+             generated_ids->items()[0].as_size() == 700 &&
+             generated_ids->items()[1].as_size() == 701 &&
+             record.member_size("committed_tokens") == 4 &&
+             record.member_size("prefill_tokens") == 2,
+         "trace records published IDs and the exact executed commit frontier");
   const auto* recorded_sampling = record.find("sampling");
   Expect(recorded_sampling != nullptr &&
              recorded_sampling->find("temperature")->as_double() == 0.7 &&
@@ -1036,6 +1050,9 @@ void TestGenerationTraceRecordsPromptAndOutput() {
              failure.member_str("prompt") == "9" &&
              failure.member_str("error") == "injected scheduler runner failure",
          "a failed request still records its prompt and the failure");
+  Expect(failure.find("committed_tokens") &&
+             failure.find("committed_tokens")->is_null(),
+         "failed retention is unknown, never fabricated as zero tokens");
 }
 
 void TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse() {
