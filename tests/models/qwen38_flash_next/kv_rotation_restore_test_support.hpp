@@ -147,8 +147,8 @@ inline void CheckHeaderPairs(qfn::Session& session, const qfn::Model& model,
         version);
     RejectWithoutMutation(session, bad, good);
   };
-  for (auto type : {0U, 1U, 2U, 0xffffffffU})
-    for (auto version : {0U, 18U, 19U, 20U, 21U})
+  for (auto type : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 0xffffffffU})
+    for (auto version : {0U, 18U, 19U, 20U, 21U, 24U, 25U})
       check(type, version);
   Require(session.RestoreSnapshot(saved, &error), error);
   Require(Payload(session) == saved,
