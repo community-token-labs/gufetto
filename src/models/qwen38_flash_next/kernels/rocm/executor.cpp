@@ -3992,7 +3992,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // reuse stale routing from a graph replay. Unsampled calls keep the fast
   // path.
   perf::Forward perf_forward(mode == ForwardMode::kPrefill);
-  perf_forward.Rows(start_pos, n);
+  perf_forward.Rows(start_pos, n, reinterpret_cast<std::uintptr_t>(&session));
   perf::HostPhase perf_trunk(mode == ForwardMode::kPrefill
                                  ? "prefill_trunk_forward"
                                  : "target_forward");
@@ -4194,7 +4194,8 @@ bool Executor::ForwardPair(Session& session,
                  "interleaved bank control upload", error_msg);
   };
   perf::Forward perf_forward(true);
-  perf_forward.Rows(start, 2 * rows);
+  perf_forward.Rows(start, 2 * rows,
+                    reinterpret_cast<std::uintptr_t>(&session));
   perf::HostPhase perf_trunk("prefill_trunk_forward");
   PerfTarget perf_target(perf_events_, stream_);
 

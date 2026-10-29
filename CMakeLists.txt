@@ -865,6 +865,13 @@ if (BUILD_TESTING)
   target_link_libraries(text_generation_scheduler_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache)
   add_test(NAME text_generation_scheduler_test
     COMMAND text_generation_scheduler_test)
+  add_test(NAME pd_attribution_scheduler_test
+    COMMAND text_generation_scheduler_test --attribution)
+  set_tests_properties(pd_attribution_scheduler_test PROPERTIES LABELS "cpu;server;scheduler;trace")
+  add_test(NAME pd_attribution_analyzer_test
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tools/prof -p test_pd_attribution.py)
+  set_tests_properties(pd_attribution_analyzer_test PROPERTIES
+    LABELS "cpu;trace" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
   set_tests_properties(text_generation_scheduler_test PROPERTIES
     LABELS "cpu;server;scheduler;queue;state;lifecycle;cancellation")
 

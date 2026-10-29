@@ -59,6 +59,7 @@ list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.kv_cache" "qwen38_flash_next\\.target_probe"
   "qwen38_flash_next\\.continuation_identity"
+  pd_attribution_scheduler_test pd_attribution_analyzer_test
   perf_trace_disabled_test pinned_prefix_harness_test cache_lookup_harness_test
   cache_lookup_classify_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
