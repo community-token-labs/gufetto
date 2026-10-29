@@ -255,6 +255,8 @@ void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
   class BudgetRunner final : public Runner {
   public:
     mutable std::size_t committed{};
+    mutable unsigned frozen{};
+    std::size_t pending{};
     TextRunnerResourceClaim ResourceClaim() const override {
       auto claim = Runner::ResourceClaim();
       claim.state_capacity_bytes = 4ULL << 30;
@@ -269,22 +271,45 @@ void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
     std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
         cache::ResourceLedger& ledger, std::size_t ram) const override {
       auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      resources->freeze_execution_liability = [this] {
+        ++frozen;
+        return pending;
+      };
       resources->commit_backing = [this, &ledger](std::size_t budget) {
+        assert(frozen == 1);
         assert(ledger.Limits().ram_bytes == budget);
         committed = budget;
       };
       return resources;
     }
   };
-  for (const auto requested : {0ULL, 3ULL << 20}) {
+  for (const auto pending : {0ULL, 128ULL << 10}) {
+    for (const auto requested : {0ULL, 3ULL << 20}) {
+      auto runner = std::make_shared<BudgetRunner>();
+      runner->pending = pending;
+      TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = requested});
+      assert(runner->committed ==
+             (requested ? (2ULL << 20) - pending : (1ULL << 20) - pending / 2));
+      // Allocating/freeing the promised storage later never increases the
+      // initial fixed ceiling or invokes this startup hook again.
+      runner->pending = 0;
+      std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
+      auto request = pool.Acquire(prompt);
+      while (!request.prefill_complete())
+        (void)request.Prefill(8);
+      assert(request.SelectNext().token != 0 && runner->frozen == 1);
+    }
+  }
+  for (const bool ram_on : {false, true}) {
     auto runner = std::make_shared<BudgetRunner>();
-    TextRunnerPool pool(runner, 2, {}, {.capacity_bytes = requested});
-    assert(runner->committed == (requested ? 2ULL << 20 : 1ULL << 20));
-    std::vector<TextRunnerToken> prompt{10, 11, 12, 13};
-    auto request = pool.Acquire(prompt);
-    while (!request.prefill_complete())
-      (void)request.Prefill(8);
-    assert(request.SelectNext().token != 0);
+    runner->pending = 3ULL << 20;
+    bool refused = false;
+    try {
+      TextRunnerPool pool(runner, 2, {}, {.enabled = ram_on});
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    assert(refused && runner->committed == 0 && runner->frozen == 1);
   }
 }
 void Prefill(TextRunnerPool::Request& request) {
@@ -3573,15 +3598,47 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
   class CountingRunner final : public Runner {
   public:
     mutable std::size_t committed{};
+    std::optional<std::size_t> pending;
+    std::size_t ceiling{};
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto claim = Runner::ResourceClaim();
+      if (pending) {
+        claim.retained_snapshot_capacity_bytes = ceiling / 2;
+        claim.retained_snapshot_ceiling_bytes = ceiling;
+      }
+      return claim;
+    }
     std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
         cache::ResourceLedger& ledger, std::size_t ram) const override {
       auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      if (pending)
+        resources->freeze_execution_liability = [bytes = *pending] {
+          return bytes;
+        };
       resources->commit_backing = [this](std::size_t bytes) {
         committed = bytes;
       };
       return resources;
     }
   };
+  // 128MiB pending execution + the unchanged512MiB backing +1MiB staging.
+  for (const auto ceiling : {640ULL << 20, 641ULL << 20}) {
+    const TemporaryDirectory bounded("gufo-component-protected-disk-test");
+    auto bounded_disk = disk;
+    bounded_disk.directory = bounded.path();
+    auto protected_runner = std::make_shared<CountingRunner>();
+    protected_runner->pending = 128ULL << 20;
+    protected_runner->ceiling = ceiling;
+    bool refused = false;
+    try {
+      ComponentTextCache protected_cache(protected_runner, 1, 1 << 24,
+                                         bounded_disk, false, 0, {}, false);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    assert(refused == (ceiling == 640ULL << 20));
+    assert(protected_runner->committed == (refused ? 0 : 512ULL << 20));
+  }
   const std::vector<TextRunnerToken> prompt{10, 11, 12, 13, 14, 15, 16, 17, 18};
   std::uint64_t hash;
   {
