@@ -527,8 +527,10 @@ ownership error or uses another directory.
 Publication order is:
 
 1. Write missing chunks and private payloads to temporary files.
-2. Verify checksums and make dependency files durable, including their directory
-   entries, before publishing anything that references them.
+2. Checksum newly written payloads and make dependency files durable, including
+   their directory entries, before publishing references. Inherited files keep
+   their original expected CRC and undergo metadata checks only; their contents
+   are verified on every consumption, not reread at each publication.
 3. Write and fsync the manifest, atomically rename it into the published
    namespace, and make that rename durable.
 4. Mark the checkpoint durable in the index and release writer reservations.
@@ -547,8 +549,9 @@ and private-state/tail payload. Bytes may be copied into an invalid destination
 incrementally, but that slot becomes executable only after every required
 checksum and component-position check passes. A failed check invalidates the
 destination and affected dependency references before any fallback executes.
-Once-verified immutable dependencies may cache verification for their protected
-file identity; replacement or mutation invalidates that result.
+Do not cache content verification by file identity: same-size writes can retain
+identical mtime/ctime. Every read, including export and packed preflight, verifies
+its complete CRC before accepting bytes.
 
 Corrupt/incomplete entries are excluded when detected. Orphan reclamation follows
 complete manifest-reference discovery and runs outside the serving-critical

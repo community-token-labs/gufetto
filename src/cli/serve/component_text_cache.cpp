@@ -559,7 +559,8 @@ struct ComponentTextCache::Impl {
       // Take directory ownership before slots and backing commit, so a
       // second server fails without claiming its RAM budget first.
       disk = std::make_unique<cache::DiskStore>(ledger, options->directory,
-                                                options->capacity_bytes);
+                                                options->capacity_bytes,
+                                                options->space_policy);
     }
     if (pins.enabled()) {
       if (pins.files.empty() ||
@@ -679,13 +680,15 @@ struct ComponentTextCache::Impl {
       disk_capacity = options->capacity_bytes;
       disk_step = options->min_checkpoint_step_tokens;
       disk->ReclaimOrphans();
-      if (disk->Stats().managed_bytes > disk_capacity) {
+      if (disk->Stats().managed_bytes > disk_capacity ||
+          disk->SpacePressure()) {
         // A lowered --cache-disk-bytes keeps its meaning: reclaim orphans and
         // temporaries first, then evict the oldest checkpoints by creation
         // (startup has no use history) to fit.
         disk->WaitForReclamation();
         std::size_t evicted{};
-        while (disk->Stats().managed_bytes > disk_capacity &&
+        while ((disk->Stats().managed_bytes > disk_capacity ||
+                disk->SpacePressure()) &&
                catalog->EvictOne())
           ++evicted;
         const auto managed = disk->Stats().managed_bytes;
@@ -694,9 +697,9 @@ struct ComponentTextCache::Impl {
         if (evicted)
           Logger::Info("cache",
                        "schema=component-cache-v1 event=disk_evicted "
-                       "reason=budget entries=" +
+                       "reason=budget_or_free_space entries=" +
                            std::to_string(evicted) + fields);
-        if (managed > disk_capacity)
+        if (managed > disk_capacity || disk->SpacePressure())
           Logger::Warn(
               "cache",
               "schema=component-cache-v1 event=disk_over_budget" + fields);
@@ -708,7 +711,8 @@ struct ComponentTextCache::Impl {
             return std::ranges::none_of(
                 entries, [](const auto& entry) { return entry->busy; });
           },
-          [this](cache::CheckpointId id, bool success) {
+          [this](cache::CheckpointId id, bool success,
+                 const cache::TransferTiming& timing) {
             const std::lock_guard lock(mutex);
             for (auto& checkpoint : pending)
               if (checkpoint && checkpoint->Id() == id)
@@ -755,7 +759,16 @@ struct ComponentTextCache::Impl {
                       std::to_string(description->Manifest().tokens.size()) +
                       " checkpoint_id=" + std::to_string(id.value) +
                       " payload_bytes=" +
-                      std::to_string(PayloadBytes(description->Manifest())));
+                      std::to_string(PayloadBytes(description->Manifest())) +
+                      " yield_ms=" + std::to_string(timing.yield_ns / 1e6) +
+                      " stream_wait_ms=" +
+                      std::to_string(timing.stream_wait_ns / 1e6) +
+                      " filesystem_ms=" +
+                      std::to_string(timing.filesystem_ns / 1e6) +
+                      " io_lock_ms=" + std::to_string(timing.io_lock_ns / 1e6) +
+                      " checksum_ms=" +
+                      std::to_string(timing.checksum_ns / 1e6) +
+                      " fsync_ms=" + std::to_string(timing.fsync_ns / 1e6));
             }
           },
           [this](const cache::DiskManifest& manifest) {
@@ -1024,6 +1037,8 @@ struct ComponentTextCache::Lease::Impl {
   double restore_time{};
   bool disk_hit{}, active{true}, preserve_source{}, pin_capture{};
   ComponentTextCache::Impl::Pin* pin_hit{};
+  // False keeps every checkpoint this lease captures in RAM only.
+  bool persist{true};
   cache::CheckpointId source{};
   std::array<cache::CheckpointId, cache::RetentionPolicy::kRecordLimit>
       edit_boundaries{};
@@ -1074,7 +1089,7 @@ struct ComponentTextCache::Lease::Impl {
 
 std::unique_ptr<TextRunnerSnapshot>
 ComponentTextCache::Lease::Impl::CaptureDurable() {
-  if (!cache->queue || !cache->resources->copy_observed_rows ||
+  if (!persist || !cache->queue || !cache->resources->copy_observed_rows ||
       purpose == SnapshotPurpose::kHistory)
     throw cache::ResourceExhausted();
   const auto capture_input = At(input, capture_tokens.size());
@@ -1548,7 +1563,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     std::span<const ContinuationToken> prompt,
     const ContinuationCache::CancellationCheck& cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse,
-    std::size_t stable, bool stop_at_eos) {
+    std::size_t stable, bool stop_at_eos, bool persist) {
   if (cancelled && cancelled())
     return {};
   if (impl_->resources->test_barrier)
@@ -1693,6 +1708,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     lease = std::make_unique<Lease>(std::make_unique<Lease::Impl>(
         impl_.get(), entry, std::move(slot), prompt, input, stable));
     auto& request = *lease->impl_;
+    request.persist = persist;
     request.metrics.acquisition_id = acquisition_id;
     request.metrics.admission_index_version = admission_version;
     request.metrics.selected_entry_id =
@@ -2830,6 +2846,8 @@ std::size_t ComponentTextCache::Lease::PublishSnapshot(
     impl_->edit_boundaries[impl_->edit_boundary_count++] =
         component->checkpoint->Id();
   }
+  if (!impl_->persist)
+    return component->bytes;
   try {
     const auto started = Clock::now();
     impl_->metrics.disk_queued_bytes +=

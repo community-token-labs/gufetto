@@ -1,5 +1,6 @@
 #include "src/cache/disk_catalog.hpp"
 
+#include <algorithm>
 #include <map>
 #include <stdexcept>
 
@@ -94,6 +95,40 @@ struct DiskCatalog::Impl {
       auto node = reverse.extract(bucket);
     }
   }
+  bool CoveredIntermediate(const Record& candidate) const {
+    const auto& manifest = candidate.description->Manifest();
+    // Learned boundaries protect forks whose other branch may not yet be
+    // durable. A deeper hybrid checkpoint cannot be truncated to this state.
+    if (candidate.invalid || manifest.tokens.empty() ||
+        manifest.purpose == CheckpointPurpose::kLearned)
+      return false;
+    bool ancestor = false;
+    std::optional<Token> continuation;
+    for (const auto& [id, record] : records) {
+      (void)id;
+      if (&record == &candidate || record.invalid ||
+          record.description->Quarantined())
+        continue;
+      const auto& other = record.description->Manifest();
+      if (other.compatibility != manifest.compatibility ||
+          other.input != manifest.input || other.tokens.empty() ||
+          other.tokens.size() == manifest.tokens.size())
+        continue;
+      const auto common = std::min(other.tokens.size(), manifest.tokens.size());
+      if (!std::equal(other.tokens.begin(), other.tokens.begin() + common,
+                      manifest.tokens.begin()))
+        continue;
+      if (other.tokens.size() < manifest.tokens.size()) {
+        ancestor = true;
+      } else if (other.tokens.size() > manifest.tokens.size()) {
+        const auto next = other.tokens[manifest.tokens.size()];
+        if (continuation && *continuation != next)
+          return false;  // Keep the exact boundary before durable branches.
+        continuation = next;
+      }
+    }
+    return ancestor && continuation.has_value();
+  }
   void Erase(decltype(records)::iterator it) {
     const auto id = it->first;
     Dependencies(it->second.description->Manifest(), [&](bool priv, auto file) {
@@ -171,20 +206,27 @@ void DiskCatalog::Touch(CheckpointId id) {
 }
 bool DiskCatalog::EvictOne() {
   Reconcile();
-  for (auto it = impl_->lru.begin(); it != impl_->lru.end();) {
-    auto record = impl_->records.find(it->second);
-    ++it;
-    const auto& description = *record->second.description;
-    auto result = impl_->store->TryRetire(description.Manifest().checkpoint,
-                                          description.Epoch());
-    if (result == DiskRetireResult::kBusy)
-      return false;
-    if (result == DiskRetireResult::kPinned)
-      continue;
-    impl_->index->RemoveDurable(description);
-    impl_->Erase(record);
-    if (result == DiskRetireResult::kRetired)
-      return true;
+  // Preserve another conversation's sole anchor before a covered intermediate.
+  // This is retention ranking only, never authority to synthesize earlier
+  // state.
+  for (bool covered_only : {true, false}) {
+    for (auto it = impl_->lru.begin(); it != impl_->lru.end();) {
+      auto record = impl_->records.find(it->second);
+      ++it;
+      if (covered_only && !impl_->CoveredIntermediate(record->second))
+        continue;
+      const auto& description = *record->second.description;
+      auto result = impl_->store->TryRetire(description.Manifest().checkpoint,
+                                            description.Epoch());
+      if (result == DiskRetireResult::kBusy)
+        return false;
+      if (result == DiskRetireResult::kPinned)
+        continue;
+      impl_->index->RemoveDurable(description);
+      impl_->Erase(record);
+      if (result == DiskRetireResult::kRetired)
+        return true;
+    }
   }
   return false;
 }

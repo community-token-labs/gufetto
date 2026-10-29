@@ -395,6 +395,33 @@ bool ListDirectory(
   return true;
 }
 
+FilesystemInfo InspectFilesystem(const Directory& directory) noexcept {
+  wchar_t volume[MAX_PATH]{}, filesystem[MAX_PATH]{};
+  DWORD flags{};
+  ULARGE_INTEGER available{}, capacity{}, free{};
+  if (!GetVolumePathNameW(directory.Path().c_str(), volume, MAX_PATH) ||
+      !GetVolumeInformationW(volume, nullptr, 0, nullptr, nullptr, &flags,
+                             filesystem, MAX_PATH) ||
+      !GetDiskFreeSpaceExW(directory.Path().c_str(), &available, &capacity,
+                           &free))
+    return {};
+  const bool supported =
+      GetDriveTypeW(volume) == DRIVE_FIXED &&
+      (!_wcsicmp(filesystem, L"NTFS") || !_wcsicmp(filesystem, L"ReFS"));
+  // Request directory mutation rights without creating a probe file. Volume
+  // flags alone miss a readable directory whose ACL denies cache creation.
+  const HANDLE writable =
+      CreateFileW(directory.Path().c_str(),
+                  FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD,
+                  kDirectoryShare, nullptr, OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  const bool can_write = writable != INVALID_HANDLE_VALUE;
+  if (can_write)
+    CloseHandle(writable);
+  return {capacity.QuadPart, available.QuadPart, supported,
+          !(flags & FILE_READ_ONLY_VOLUME) && can_write};
+}
+
 std::filesystem::path UserCacheDirectory() noexcept {
   const char* base = std::getenv("LOCALAPPDATA");
   if (base == nullptr || *base == '\0')

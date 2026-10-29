@@ -1,5 +1,6 @@
 #include "src/cache/disk.hpp"
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +18,9 @@ namespace fs = std::filesystem;
 namespace {
 std::atomic<std::uint64_t> actual_manifest_bytes{}, actual_payload_bytes{};
 std::atomic<bool> interrupt_next_read{}, shorten_reads{};
+// Deterministically model same-tick writes / coarse filesystem timestamps.
+// Only the chosen payload inode is affected; size and other metadata stay real.
+std::optional<struct stat> frozen_times;
 void CountRead(int fd, ssize_t bytes) {
   if (bytes <= 0)
     return;
@@ -33,6 +37,16 @@ void CountRead(int fd, ssize_t bytes) {
     actual_payload_bytes += bytes;
 }
 }  // namespace
+extern "C" int __real_fstat(int, struct stat*);
+extern "C" int __wrap_fstat(int fd, struct stat* st) {
+  const int result = __real_fstat(fd, st);
+  if (result == 0 && frozen_times && st->st_dev == frozen_times->st_dev &&
+      st->st_ino == frozen_times->st_ino) {
+    st->st_mtim = frozen_times->st_mtim;
+    st->st_ctim = frozen_times->st_ctim;
+  }
+  return result;
+}
 extern "C" ssize_t __real_read(int, void*, size_t);
 extern "C" ssize_t __wrap_read(int fd, void* buffer, size_t size) {
   if (interrupt_next_read.exchange(false)) {
@@ -233,6 +247,10 @@ void LargePieceReadAndCorruption() {
   auto snapshot = disk.Open({7});
   assert(snapshot);
   const auto payload = *snapshot->Manifest().components[1].private_state;
+  const auto path = directory.path / "v2/private" / DiskFileName(Id(3));
+  struct stat status{};
+  assert(::stat(path.c_str(), &status) == 0);
+  frozen_times = status;
   std::array<std::uint8_t, 513> staging{};
   std::size_t copied{};
   interrupt_next_read = true;
@@ -262,6 +280,7 @@ void LargePieceReadAndCorruption() {
     invalid = error.private_file && error.file == payload.file;
   }
   assert(invalid);
+  frozen_times.reset();
 }
 void Ownership() {
   Directory d;
@@ -626,24 +645,73 @@ void CapacityBeforePayloadReads() {
     actual_payload_bytes = 0;
     (void)store.PublishStream(Id(8), next, sources, staging);
     assert(store.Open({7}) && store.Open({8}));
-    assert(actual_payload_bytes == chunk.size() && copied == state.size());
+    assert(actual_payload_bytes == 0 && copied == state.size());
   }
   {
     DiskStore store(ledger, directory.path, 2 * capacity);
-    // Admitting the write must still verify every reused byte, including
-    // corruption in a file already referenced by multiple checkpoints.
+    // Publication admits metadata only. Every read must still verify reused
+    // bytes, including corruption referenced by multiple checkpoints.
     chunk[0] ^= 1;
     Write(directory.path / "v2/chunks" / DiskFileName(Id(1)), chunk);
     auto corrupted = next;
     corrupted.checkpoint = {9};
+    corrupted.components[1].private_state->file = Id(14);
+    auto new_sources = sources;
+    new_sources[1].file = Id(14);
+    (void)store.PublishStream(Id(9), corrupted, new_sources, staging);
+    auto snapshot = store.Open({9});
+    assert(snapshot);
     bool rejected = false;
     try {
-      (void)store.PublishStream(Id(9), corrupted, sources, staging);
+      (void)store.ReadPayload(*snapshot, false,
+                              snapshot->Manifest().components[0].chunks[0],
+                              staging, [](auto, auto) {});
     } catch (const DiskDependencyError&) {
       rejected = true;
     }
-    assert(rejected && !store.Open({7}) && !store.Open({8}));
+    assert(rejected && !store.Open({7}) && !store.Open({8}) &&
+           !store.Open({9}));
   }
+}
+void InheritedCorruptionAfterRestart() {
+  Directory directory;
+  auto manifest = Manifest();
+  manifest.tokens.resize(2);
+  manifest.components.resize(1);
+  manifest.components[0].position.valid_rows = 2;
+  manifest.components[0].tail.reset();
+  std::array<std::uint8_t, 8> bytes{1, 2, 3};
+  auto& payload = manifest.components[0].chunks[0];
+  payload.checksum = DiskChecksum(bytes);
+  {
+    DiskStore store(ledger, directory.path, 100000);
+    const DiskWriteBuffer buffer{false, payload.file, bytes};
+    store.Publish(Id(7), manifest, std::span(&buffer, 1));
+    bytes[0] ^= 1;
+    Write(directory.path / "v2/chunks" / DiskFileName(payload.file), bytes);
+    manifest.checkpoint = {8};
+    actual_payload_bytes = 0;
+    store.Publish(Id(8), manifest, {});
+    assert(actual_payload_bytes == 0);
+    assert(!store.Entries().back().PayloadVerified());
+    assert(store.Retire({7}));
+  }
+  // GC retained the referenced bytes, but never attested their contents.
+  DiskStore restarted(ledger, directory.path, 100000);
+  {
+    auto snapshot = restarted.Open({8});
+    assert(snapshot);
+    bool rejected = false;
+    try {
+      (void)restarted.ReadPayload(*snapshot, false, payload, bytes,
+                                  [](auto, auto) {});
+    } catch (const DiskDependencyError&) {
+      rejected = true;
+    }
+    assert(rejected && !restarted.Open({8}));
+  }
+  assert(restarted.Retire({8}));
+  assert(restarted.Stats().managed_bytes == 0);
 }
 void VerifiedDependencies() {
   Directory directory;
@@ -677,27 +745,42 @@ void VerifiedDependencies() {
     assert(store.Entries().empty());
     return ledger.Snapshot().total_bytes;
   };
-  // Inherited chunks are read once after they were written, then their
-  // unchanged identity is trusted by later publications.
+  // Inherited publications preserve CRC expectations without payload I/O.
   assert(publish(7) == 0);
-  assert(publish(8) == chunk.size());
+  assert(publish(8) == 0);
   assert(publish(9) == 0);
+  assert(!store.Entries().back().PayloadVerified());
   const auto settled = retire();
-  // Removing a file releases its verification record.
+  // Retiring dependencies releases their metadata charges.
   shared = 2;
   assert(publish(7) == 0);
-  assert(publish(8) == chunk.size());
-  // A rewritten file changes identity and is verified again.
+  assert(publish(8) == 0);
+  // A newly published dependent must reject corrupt bytes on read even if
+  // a same-size rewrite retains identical timestamps.
+  struct stat status{};
+  const auto path = directory.path / "v2/chunks" / DiskFileName(Id(shared));
+  assert(::stat(path.c_str(), &status) == 0);
+  frozen_times = status;
   chunk[0] ^= 1;
   Write(directory.path / "v2/chunks" / DiskFileName(Id(shared)), chunk);
   chunk[0] ^= 1;
-  bool rejected = false;
-  try {
-    (void)publish(9);
-  } catch (const DiskDependencyError&) {
-    rejected = true;
+  assert(publish(9) == 0);
+  {
+    auto snapshot = store.Open({9});
+    assert(snapshot);
+    std::array<std::uint8_t, 8> staging{};
+    bool rejected = false;
+    try {
+      (void)store.ReadPayload(*snapshot, false,
+                              snapshot->Manifest().components[0].chunks[0],
+                              staging, [](auto, auto) {});
+    } catch (const DiskDependencyError&) {
+      rejected = true;
+    }
+    assert(rejected && !store.Open({7}) && !store.Open({8}) &&
+           !store.Open({9}));
   }
-  assert(rejected);
+  frozen_times.reset();
   assert(retire() == settled);
 }
 }  // namespace
@@ -712,6 +795,7 @@ int main() {
   BudgetAndDirectories();
   CapacityBeforePayloadReads();
   VerifiedDependencies();
+  InheritedCorruptionAfterRestart();
   InterruptedCleanup();
   RootSymlinks();
   ParentPathResolution();

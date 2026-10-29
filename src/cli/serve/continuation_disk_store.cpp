@@ -995,12 +995,29 @@ struct ContinuationDiskStore::Impl {
   }
 
   void EvictToCapacity() {
-    while (retained > options.capacity_bytes) {
+    while (retained > options.capacity_bytes ||
+           options.space_policy.Check(directory_handle) ==
+               cache::DiskSpaceState::kPressure) {
       const EntryIterator victim = LeastRecentlyUsed();
       if (victim == entries.end() ||
           !RemoveEntry(victim, ContinuationDiskEventReason::kLru)) {
         break;
       }
+    }
+  }
+
+  bool MakeFreeSpace(std::size_t additional) {
+    for (;;) {
+      const auto state =
+          options.space_policy.Check(directory_handle, additional);
+      if (state == cache::DiskSpaceState::kReady)
+        return true;
+      if (state == cache::DiskSpaceState::kUnavailable)
+        return false;
+      const auto victim = LeastRecentlyUsed();
+      if (victim == entries.end() ||
+          !RemoveEntry(victim, ContinuationDiskEventReason::kLru))
+        return false;
     }
   }
 
@@ -1073,7 +1090,9 @@ struct ContinuationDiskStore::Impl {
         while (!bytes.empty()) {
           const auto chunk =
               bytes.first(std::min(bytes.size(), std::size_t{1024 * 1024}));
-          if (!WriteAll(temporary.get(), chunk)) {
+          if (options.space_policy.Check(directory_handle, chunk.size()) !=
+                  cache::DiskSpaceState::kReady ||
+              !WriteAll(temporary.get(), chunk)) {
             throw std::runtime_error("continuation disk write failed");
           }
           hasher.Update(chunk);
@@ -1212,12 +1231,22 @@ struct ContinuationDiskStore::Impl {
       return {};
     }
 
+    // Filesystem reserve is a hard write guard, independent of retained quota.
+    // Unlike normal quota eviction, emergency free-space reclamation precedes
+    // publication. Do not credit deletion until the filesystem reports space.
+    if (!MakeFreeSpace(file_bytes)) {
+      Emit(ContinuationDiskEventAction::kSkipped,
+           ContinuationDiskEventReason::kByteCapacity, file_bytes,
+           payload_bytes, checkpoint_tokens.size());
+      return {};
+    }
     const std::string filename = NewFinalFilename(digest);
     metadata_lock.Unlock();
     const bool published =
         PublishImage(filename, header, runner, snapshot, payload_bytes);
     metadata_lock.Lock();
     if (!published) {
+      (void)MakeFreeSpace(0);
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kIoFailure, file_bytes, payload_bytes,
            checkpoint_tokens.size());

@@ -691,6 +691,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::uint64_t cache_disk_free_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
     std::string trace_path;
@@ -817,12 +818,17 @@ void PrintServeHelp(std::string_view program_name,
                    "Enable read-only POST /v1/cache/lookup (default: off)",
                    "Cache", &cache_lookup_api);
     AddCacheRamOption(parser, &cache_ram);
-    parser.AddOption("", "--cache-disk", "DIR",
-                     "Opt-in restart-safe continuation cache directory "
-                     "(Flash-Next: owned by one process)",
+    parser.AddOption("", "--cache-disk", "auto|off|DIR",
+                     "Restart-safe cache: auto uses the user cache directory; "
+                     "DIR selects an explicit path (default: off)",
                      "Cache", &cache_disk_directory);
+    parser.AddOption(
+        "", "--cache-disk-free-bytes", "N",
+        "Free-space reserve (default: 0 = max(8 GiB, 2% of filesystem))",
+        "Cache", &cache_disk_free_bytes);
     parser.AddOption("", "--cache-disk-bytes", "N",
-                     "Retained disk-cache byte budget (default: " +
+                     "Retained byte budget (auto: min(64 GiB, 10% available); "
+                     "DIR default: " +
                          std::to_string(cache_disk_bytes) + ")",
                      "Cache", &cache_disk_bytes);
     parser.AddOption(
@@ -1325,6 +1331,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::uint64_t cache_disk_free_bytes = 0;
     bool log_progress = false;
     bool enable_yarn = false;
     std::string trace_path;
@@ -1457,14 +1464,21 @@ int RunServe(std::span<const char* const> args) {
                        "Enable read-only POST /v1/cache/lookup (default: off)",
                        "Cache", &cache_lookup_api);
     AddCacheRamOption(llm_parser, &cache_ram);
-    llm_parser.AddOption("", "--cache-disk", "DIR",
-                         "Opt-in restart-safe continuation cache directory "
-                         "(Flash-Next: owned by one process)",
-                         "Cache", &cache_disk_directory);
-    llm_parser.AddOption("", "--cache-disk-bytes", "N",
-                         "Retained disk-cache byte budget (default: " +
-                             std::to_string(cache_disk_bytes) + ")",
-                         "Cache", &cache_disk_bytes);
+    llm_parser.AddOption(
+        "", "--cache-disk", "auto|off|DIR",
+        "Restart-safe cache: auto uses the user cache directory; "
+        "DIR selects an explicit path (default: off)",
+        "Cache", &cache_disk_directory);
+    llm_parser.AddOption(
+        "", "--cache-disk-free-bytes", "N",
+        "Free-space reserve (default: 0 = max(8 GiB, 2% of filesystem))",
+        "Cache", &cache_disk_free_bytes);
+    llm_parser.AddOption(
+        "", "--cache-disk-bytes", "N",
+        "Retained byte budget (auto: min(64 GiB, 10% available); "
+        "DIR default: " +
+            std::to_string(cache_disk_bytes) + ")",
+        "Cache", &cache_disk_bytes);
     llm_parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
         "Flash-Next: pinned disk transfer buffer allocated at startup within "
@@ -1490,6 +1504,13 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "llm");
       return 0;
     }
+    const auto disk_option = cache_disk_directory;
+    const bool automatic_disk = disk_option == "auto";
+    if (automatic_disk)
+      cache_disk_directory =
+          cache::AutomaticDiskDirectory(platform::UserCacheDirectory());
+    else if (disk_option == "off")
+      cache_disk_directory.clear();
     const bool pin_prefix_supplied =
         llm_parser.WasSupplied("--pin-prefix-file") ||
         llm_parser.WasSupplied("--pin-prefix-dir") ||
@@ -1566,6 +1587,37 @@ int RunServe(std::span<const char* const> args) {
     if (!prepare_server_options()) {
       return 2;
     }
+    const auto disk_plan = cache::PlanDiskCache(
+        disk_option, platform::UserCacheDirectory(),
+        automatic_disk && !llm_parser.WasSupplied("--cache-disk-bytes")
+            ? 0
+            : cache_disk_bytes,
+        cache_disk_free_bytes);
+    if (!disk_plan.Enabled() && !automatic_disk && !disk_option.empty() &&
+        disk_option != "off" && cache_disk_bytes != 0) {
+      std::cerr << "Error: cache disk unavailable: " << disk_plan.reason
+                << '\n';
+      return 2;
+    }
+    // Preserve the existing explicit-zero rejection before replacing the quota.
+    if (!disk_option.empty() && disk_option != "off" && cache_disk_bytes == 0) {
+      std::cerr << "Error: sampling and scheduling limits are invalid\n";
+      return 2;
+    }
+    cache_disk_directory = disk_plan.directory;
+    cache_disk_bytes = disk_plan.capacity_bytes;
+    server::Logger::Info(
+        "cache",
+        "schema=disk-policy-v1 event=configured mode=" +
+            std::string(automatic_disk        ? "auto"
+                        : disk_plan.Enabled() ? "explicit"
+                                              : "off") +
+            " path=" +
+            (disk_plan.Enabled() ? disk_plan.directory.string() : "off") +
+            " capacity_bytes=" + std::to_string(disk_plan.capacity_bytes) +
+            " minimum_free_bytes=" +
+            std::to_string(disk_plan.minimum_free_bytes) +
+            " reason=" + disk_plan.reason);
     // Progress lines are INFO-tier. Under a quieter threshold `--log-progress`
     // would be accepted and then silently discarded, so reject the combination
     // instead of ignoring an option the caller asked for.
@@ -1718,6 +1770,8 @@ int RunServe(std::span<const char* const> args) {
             .capacity_bytes = cache_disk_bytes,
             .staging_capacity_bytes = cache_disk_staging_bytes,
             .model_artifact_fingerprint = {},
+            .space_policy = {.minimum_free_bytes =
+                                 disk_plan.minimum_free_bytes},
         },
         vision_model_path,
         server::TextRunnerRamCacheOptions{

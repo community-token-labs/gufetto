@@ -110,6 +110,10 @@ backing allocation are not in the session column. Raw per-format results and
 limitations are retained in the private `gufo-agent-concurrency` repository,
 `docs/kv-q4-r1.md` and `bench/kv-q4-r1/`.
 
+## Known limits
+
+Do not combine `--cache-disk` with image inputs while MTP is enabled: a disk-restored image history may continue differently (bug under investigation, owner: cache-persist).
+
 ## Build and process
 
 With the dependencies described by README installed:
