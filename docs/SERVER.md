@@ -830,6 +830,35 @@ Chat messages retain roles, reasoning, tool calls and image content until the
 model's tokenizer and template turn them into model input. The scheduler owns
 request limits, cancellation, cache accounting and completion state.
 
+## OpenAI input token counts
+
+`POST /v1/chat/completions/input_tokens` and
+`POST /v1/responses/input_tokens` accept the same request body and model
+selection as their respective generation endpoints and return:
+
+```json
+{"object":"response.input_tokens","input_tokens":123}
+```
+
+Responses follows OpenAI's input-token-count response shape; Chat Completions
+uses the equivalent llama-server extension. Counts include the model's chat
+template, system/instructions, tools and tool history, reasoning settings,
+structured-output instructions and supported image tokens. They describe the
+complete prompt, independent of any cached prefix, and agree with Chat
+`usage.prompt_tokens` or Responses `usage.input_tokens` for the same request.
+
+Counting does not schedule inference, prefill or generation, and does not
+update the continuation cache or generation metrics. It can count prompts
+larger than the execution context so clients can decide how much to trim.
+Image inputs still undergo the usual image loading and validation and may
+populate the CPU image-preprocessing cache. Generation options are validated as
+usual, but `stream: true` is accepted and still returns
+one JSON count response. Output-token limits are not added to `input_tokens`.
+Malformed requests return 400, a model that is not served returns 404, and a
+backend without prompt-count support returns 501. As with generation, Responses
+clients must supply the complete conversation; server-side history is not
+resolved by these endpoints.
+
 ## Responses API Subset
 
 `POST /v1/responses` accepts `model`, `input` as text or message arrays,
@@ -1529,7 +1558,14 @@ Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   miss detail the completion log also reports, `generated_tokens`, `finish`,
   `error` when generation failed, the `prompt` decoded from its tokens with
   special tokens spelled out, and the raw `output` before reasoning and
-  tool-call parsing.
+  tool-call parsing. It also includes native `prompt_token_ids`, published
+  `generated_token_ids`, executed `prefill_tokens`, and `committed_tokens`:
+  the exact prompt-plus-generated prefix retained at completion, or JSON null
+  if unavailable. IDs include hidden framing, not retokenized visible text;
+  terminal stop IDs are excluded from generated IDs, while historical stop
+  and framing IDs remain in native prompt IDs. A sampled final token need not have advanced
+  state, so do not equate generated count with committed length. The existing
+  `component_cache` object distinguishes actual live/RAM/disk reuse.
 - `response`: `status`, `outcome`, whether the reply was a `stream`, and the
   `body` the client received. For a stream this is the event stream as
   written, `: ping` keepalives included, so a difference between streaming and
@@ -1547,7 +1583,20 @@ pipe, stops tracing with `event=trace_disabled`. To read one request:
 jq 'select(.request == "r12")' trace.jsonl
 ```
 
-The file holds prompts, tool results and generated text in full: treat it
+For sequential, successful text-only reuse measurements, join by `request` and
+use the native prompt plus only the executed generated prefix established by
+`committed_tokens`. Reject missing counts or a frontier outside the recorded
+IDs rather than silently clamping it. Cancellation, speculative stop-sequence
+publication, unsupported retention and failures can leave incomplete execution
+evidence; a retained frontier is not proof that no work beyond it was executed.
+Token IDs alone do not establish supplemental-input identity for images/audio.
+The all-history client-prefix oracle must retain earlier processed prefixes even
+after eviction; `component_cache.indexed_common_tokens` is a separate resident
+lookup diagnostic, never the historical reuse denominator. Tracing is sensitive
+and adds I/O/allocation overhead; keep trace-on evidence separate from trace-off
+performance comparisons.
+
+The file holds prompts, token IDs, tool results and generated text in full: treat it
 like the conversations themselves and delete it when done. It is never
 rotated or truncated.
 

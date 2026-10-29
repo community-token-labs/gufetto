@@ -338,6 +338,31 @@ void InPassCapturePreservesBoundaryAndLiveTail() {
     independent.Invalidate();
   }
 }
+void ContextOverflowDiagnostics() {
+  auto runner = std::make_shared<Runner>();
+  runner->max_context = 32;
+  TextRunnerPool pool(runner, 1);
+  const std::vector<TextRunnerToken> oversized(33, 1);
+  for (const bool lookup : {false, true}) {
+    std::string message;
+    try {
+      if (lookup)
+        (void)pool.Lookup(oversized);
+      else
+        (void)pool.Acquire(oversized);
+    } catch (const std::length_error& error) {
+      message = error.what();
+    }
+    assert(message == "prompt of 33 tokens exceeds the 32-token model context");
+  }
+  assert(runner->captures == 0 && runner->through_calls == 0);
+  const std::vector<TextRunnerToken> at_limit(32, 1);
+  assert(pool.Lookup(at_limit).total_tokens == 32);
+  auto request = pool.Acquire(at_limit);
+  assert(request.prompt_tokens() == 32);
+  request.Invalidate();
+}
+
 void ColdAcquireResetsOnce() {
   auto runner = std::make_shared<Runner>();
   ComponentTextCache cache(runner, 1, 1 << 22, {});
@@ -464,12 +489,89 @@ void FailedRestoreResetsOnce() {
   const auto metrics = failed->Metrics();
   assert(metrics.restore_attempts == 1 && metrics.restore_failures == 1);
   assert(metrics.restore_failure_reason == "ram_transfer");
+  assert(metrics.reuse_reason == CacheReuseReason::kRestoreFailed);
+  assert(metrics.indexed_common_tokens == prompt.size());
+  assert(metrics.indexed_gap_tokens == prompt.size());
+  assert(metrics.used_entry_id == 0);
   // A rejected source must not remain advertised as executable after fallback.
   assert(cache.Lookup(prompt, nullptr, true, 0)->matched_tokens == 0);
   auto& cold = dynamic_cast<State&>(failed->state());
   runner->adapter->Append(cold.slot, prompt, prompt);
   assert(runner->adapter->RecurrentHash(cold.slot) ==
          runner->adapter->RecurrentHash(state.slot));
+}
+void PartialReuseDiagnostics() {
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto source = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(source->Metrics().reuse_reason == CacheReuseReason::kNoIndexedPrefix);
+  auto& state = dynamic_cast<State&>(source->state());
+  const std::vector<TextRunnerToken> shallow(prompt.begin(),
+                                             prompt.begin() + 10);
+  runner->adapter->Append(state.slot, shallow, shallow);
+  assert(source->TryReserveSnapshot(source->CaptureBytes(), shallow.size(),
+                                    false, SnapshotPurpose::kContinuation, {}));
+  assert(source->PublishSnapshot(shallow, source->Capture(), false));
+  const std::vector<TextRunnerToken> tail(prompt.begin() + 10, prompt.end());
+  runner->adapter->Append(state.slot, tail, tail);
+  assert(source->TryReserveSnapshot(source->CaptureBytes(), prompt.size(),
+                                    false, SnapshotPurpose::kContinuation, {}));
+  assert(source->PublishSnapshot(prompt, source->Capture(), false));
+  auto edited =
+      std::vector<TextRunnerToken>(prompt.begin(), prompt.begin() + 20);
+  edited.push_back(999);
+  const auto reason_index =
+      static_cast<std::size_t>(CacheReuseReason::kBoundaryGap);
+  const auto before = CacheReuseReasonCounts()[reason_index].load();
+  auto partial = cache.Acquire(edited, {}, {}, true, 0, true);
+  const auto metrics = partial->Metrics();
+  assert(partial->cached_tokens() == 10);
+  assert(metrics.reuse_reason == CacheReuseReason::kBoundaryGap);
+  assert(metrics.indexed_common_tokens == 20 &&
+         metrics.indexed_gap_tokens == 10);
+  assert(metrics.used_entry_id != 0);
+  const auto json = ComponentCacheJson(metrics);
+  assert(json.member_str("reuse_reason") == "boundary_gap");
+  assert(json.member_size("indexed_gap_tokens") == 10);
+  (void)partial->Metrics();
+  (void)cache.Lookup(edited, nullptr, true, 0);
+  assert(CacheReuseReasonCounts()[reason_index].load() == before + 1);
+  assert(CacheReuseCountersJson().member_size("boundary_gap") == before + 1);
+  partial->Invalidate();
+  auto disabled = cache.Acquire(edited, {}, {}, false, 0, true);
+  assert(disabled->Metrics().reuse_reason == CacheReuseReason::kDisabled);
+  assert(disabled->Metrics().indexed_common_tokens == 0);
+  disabled->Invalidate();
+
+  // Cancellation before trying a found candidate is not a restore failure.
+  unsigned cancellation_checks = 0;
+  auto cancelled = cache.Acquire(
+      prompt, [&] { return ++cancellation_checks > 1; }, {}, true, 0, true);
+  assert(cancelled->Metrics().reuse_reason == CacheReuseReason::kCancelled);
+  assert(cancelled->Metrics().restore_attempts == 0);
+  cancelled->Invalidate();
+
+  runner->adapter->FailNextTransfer();
+  auto fallback = cache.Acquire(prompt, {}, {}, true, 0, true);
+  const auto fallback_metrics = fallback->Metrics();
+  assert(fallback->cached_tokens() == shallow.size());
+  assert(fallback_metrics.reuse_reason == CacheReuseReason::kRestoreFailed);
+  assert(fallback_metrics.restore_attempts == 2 &&
+         fallback_metrics.restore_failures == 1);
+  assert(fallback_metrics.used_entry_id != 0 &&
+         fallback_metrics.used_entry_id != fallback_metrics.selected_entry_id);
+  fallback->Invalidate();
+
+  const auto cold_index =
+      static_cast<std::size_t>(CacheReuseReason::kNoIndexedPrefix);
+  const auto cold_before = CacheReuseReasonCounts()[cold_index].load();
+  for (unsigned i = 0; i < 2; ++i) {
+    ComponentTextCache fresh(std::make_shared<Runner>(), 1, 1 << 22, {});
+    auto cold = fresh.Acquire(prompt, {}, {}, true, 0, true);
+  }
+  assert(CacheReuseReasonCounts()[cold_index].load() == cold_before + 2);
 }
 void RestoreFromBusyBorrowedSource() {
   auto runner = std::make_shared<Runner>();
@@ -827,6 +929,17 @@ void PartialFrontierDoesNotServeAnEqualPrompt() {
     auto resend = pool.Acquire(equal, {}, {}, {}, true, 0);
     assert(resend.cached_prompt_tokens() == lookup.matched_tokens);
     assert(resend.cached_prompt_tokens() < equal.size());
+    const auto metrics = resend.component_cache_metrics();
+    if (!replace_slot) {
+      assert(metrics->reuse_reason == CacheReuseReason::kFrontierNotReady);
+      assert(metrics->unready_frontiers > 0);
+      assert(metrics->indexed_common_tokens == equal.size());
+    } else {
+      // The displaced partial frontier was never checkpointed: absence now
+      // cannot diagnose historical eviction from the resident index alone.
+      assert(metrics->reuse_reason == CacheReuseReason::kNoIndexedPrefix);
+      assert(metrics->unready_frontiers == 0);
+    }
     Prefill(resend);
     (void)Generate(resend);
     resend.Invalidate();
@@ -942,6 +1055,8 @@ void ReuseAndBranches() {
   const auto token = Generate(initial);
   assert(initial.Commit().snapshot_bytes > 0);
   auto retry = pool.Acquire(prompt);
+  assert(retry.component_cache_metrics()->reuse_reason ==
+         CacheReuseReason::kRam);
   assert(retry.cached_prompt_tokens() == prompt.size());
   assert(retry.cache_restore_bytes() > 0);
   assert(Generate(retry) == token);
@@ -964,6 +1079,9 @@ void ReuseAndBranches() {
   auto continued = pool.Acquire(history);
   assert(continued.cached_prompt_tokens() == history.size());
   assert(continued.cache_restore_bytes() == 0);
+  assert(continued.component_cache_metrics()->reuse_reason ==
+         CacheReuseReason::kLive);
+  assert(continued.component_cache_metrics()->indexed_gap_tokens == 0);
   (void)continued.Cancel();
   history.back() += 1;
   auto edit = pool.Acquire(history);
@@ -3913,6 +4031,7 @@ int main(int argc, char* argv[]) {
         models::qwen38_flash_next::KvCacheType::kQ8_0Rotated, false);
   });
   run("transfer_layout", [] {
+    packed_transfer_cpu::IdentityAndImportLayouts();
     packed_transfer_cpu::IncompatibleDiskLayouts();
     packed_transfer_cpu::RotatedWithoutFingerprintImport();
   });
@@ -3924,6 +4043,7 @@ int main(int argc, char* argv[]) {
 #endif
   });
   run("lookup", [] {
+    ContextOverflowDiagnostics();
     LookupRuntimeDefaultsAndDisabled();
     CheckpointTransferRoundTripAndConcurrentServing();
     CheckpointImportRespectsRamOff();
@@ -3971,6 +4091,7 @@ int main(int argc, char* argv[]) {
     ColdAssignmentAvoidsDrainingCancelledSlot(true);
     ColdAssignmentKeepsOneDuplicateDeepFrontier();
     FailedRestoreResetsOnce();
+    PartialReuseDiagnostics();
     RestoreFromBusyBorrowedSource();
     ImageAfterCachedTextPrefixCaptures();
   });

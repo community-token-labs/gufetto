@@ -21,8 +21,8 @@
 #include <type_traits>
 #include <utility>
 
-#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/kv_cache_options.hpp"
+#include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
