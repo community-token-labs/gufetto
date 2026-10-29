@@ -2281,6 +2281,142 @@ std::uintmax_t ManagedBytes(const std::filesystem::path& directory) {
       bytes += file.file_size();
   return bytes;
 }
+template<class Base = Runner>
+class DiagnosticRunner final : public Base {
+public:
+  int witnesses{3};
+  bool ready{true}, pending{}, failed{}, throws{}, lost_ready{}, bad_reset{};
+  mutable std::size_t resets{}, grows{};
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t ram) const override {
+    auto resources = Base::CreateComponentCacheResources(ledger, ram);
+    if (witnesses & 1)
+      resources->diagnostic_ready = [this](const cache::Slot&) {
+        return ready && (!lost_ready || resets == 0);
+      };
+    if (witnesses & 2)
+      resources->diagnostic_reset = [this](cache::Slot& slot,
+                                           TextRunnerState&) {
+        using R = cache::DiagnosticDiscardResult;
+        ++resets;
+        if (pending)
+          return R::kPending;
+        if (throws)
+          throw std::runtime_error("unknown completion");
+        if (bad_reset)
+          return R::kComplete;  // Lie: native positions remain nonzero.
+        return !failed && this->adapter->Invalidate(slot) ? R::kComplete
+                                                          : R::kQuarantined;
+      };
+    resources->prepare_prefill = [this](std::size_t) { ++grows; };
+    return resources;
+  }
+};
+void DiagnosticColdNoRetention() {
+  using R = cache::DiagnosticDiscardResult;
+  const TemporaryDirectory temp("gufo-diagnostic-discard");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  for (int witnesses = 0; witnesses < 3; ++witnesses) {
+    auto runner = std::make_shared<DiagnosticRunner<>>();
+    runner->witnesses = witnesses;
+    TextRunnerPool pool(runner, 1, disk);
+    assert(!pool.TryAcquireDiagnostic());
+    assert(runner->resets == 0 && runner->adapter->Invalidations() == 0);
+  }
+  // Full/partial forwards, pending, failed, throwing and abandoned work all
+  // exercise the actual pool surface, with SSD enabled.
+  for (int exit = 0; exit < 8; ++exit) {
+    auto runner = std::make_shared<DiagnosticRunner<>>();
+    TextRunnerPool pool(runner, 1, disk);
+    runner->ready = false;
+    assert(!pool.TryAcquireDiagnostic() && runner->resets == 0);
+    runner->ready = true;
+    assert(!pool.TryAcquireDiagnostic([] { return true; }));
+    unsigned checks{};
+    assert(!pool.TryAcquireDiagnostic([&] { return ++checks == 2; }));
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      auto lease = pool.TryAcquireDiagnostic();
+      assert(lease && lease->cached_tokens() == 0);
+      auto* bound = dynamic_cast<State*>(&lease->state());
+      assert(runner->CheckpointPosition(*bound) == 0);
+      assert(!pool.TryAcquireDiagnostic());
+      lease->PreparePrefill(prompt.size());
+      (void)runner->Prefill(lease->state(), prompt, 0, exit == 0 ? 9 : 3);
+      const auto invalidations = runner->adapter->Invalidations();
+      runner->pending = exit == 4 || exit == 5;
+      runner->failed = exit == 3;
+      runner->throws = exit == 2;
+      runner->bad_reset = exit == 7;
+      if (runner->pending) {
+        assert(lease->Discard() == R::kPending);
+        assert(!pool.TryAcquireDiagnostic());
+        assert(runner->adapter->Invalidations() == invalidations);
+        runner->pending = exit == 5;
+      }
+      const bool quarantine = exit == 2 || exit == 3 || exit >= 5;
+      if (exit != 5 && exit != 6)
+        assert(lease->Discard() ==
+               (quarantine ? R::kQuarantined : R::kComplete));
+      if (exit == 6) {
+        try {
+          auto abandoned = std::move(lease);
+          throw std::runtime_error(
+              "consumer/backend failure after partial prefill");
+        } catch (const std::runtime_error&) {
+        }
+      }
+      lease.reset();
+      assert(runner->captures == 0 && runner->grows == 0);
+      assert(runner->adapter->RestoreBegins() == 0);
+      assert(pool.CachedPrefixTokens(prompt, nullptr) == 0);
+      assert(ManagedBytes(disk.directory) == 0);
+      if (quarantine) {
+        // Bound facade AND native storage survive destruction while the model
+        // owner is retained. There was no ordinary invalidation fallback.
+        assert(runner->CheckpointPosition(*bound) == 3);
+        assert(runner->adapter->Invalidations() == invalidations);
+        const auto resets = runner->resets;
+        assert(!pool.TryAcquireDiagnostic() && runner->resets == resets);
+        break;
+      }
+    }
+  }
+  for (int failure = 0; failure < 3; ++failure) {
+    auto runner = std::make_shared<DiagnosticRunner<>>();
+    runner->failed = failure == 0;  // Initial checked reset also fails closed.
+    runner->pending = failure == 1;
+    runner->lost_ready = failure == 2;
+    TextRunnerPool pool(runner, 1, disk);
+    assert(!pool.TryAcquireDiagnostic());
+    runner->failed = runner->pending = runner->lost_ready = false;
+    assert(!pool.TryAcquireDiagnostic() && runner->resets == 1);
+  }
+  assert(ManagedBytes(disk.directory) == 0);
+  for (bool persist : {false, true}) {
+    // cache_prompt=false still publishes RAM/live; cache_persist only gates
+    // SSD.
+    {
+      auto runner = std::make_shared<DiagnosticRunner<>>();
+      TextRunnerPool pool(runner, 1, disk);
+      auto request = pool.Acquire(prompt, {}, {}, {}, false, 0, true, persist);
+      Prefill(request);
+      (void)request.ShareCheckpoint(prompt.size());
+      assert(!pool.TryAcquireDiagnostic());
+      assert((request.Commit().disk_queued_bytes > 0) == persist);
+      const auto captures = runner->captures, resets = runner->resets;
+      assert(
+          !pool.TryAcquireDiagnostic());  // Seeded live/RAM/shared inventory.
+      assert(runner->captures == captures && runner->resets == resets);
+      auto replay = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
+      assert(replay.cached_prompt_tokens() == prompt.size());
+      replay.Invalidate();
+    }
+    assert((ManagedBytes(disk.directory) > 0) == persist);
+  }
+}
 void UnpersistedRequestStaysOffDisk() {
   const TemporaryDirectory temp("gufo-component-unpersisted-test");
   const std::filesystem::path directory = temp.path();
@@ -4069,15 +4205,21 @@ void UnpersistedRequestCanReuseRegisteredPins() {
     auto options = fixture.options;
     options.lazy = lazy;
     {
-      auto runner = std::make_shared<PinRunner>();
+      auto runner = std::make_shared<DiagnosticRunner<PinRunner>>();
       TextRunnerPool pool(runner, 2, disk, {.pinned_prefix = options});
       assert(runner->prefilled == 0);
+      auto spare = pool.TryAcquireDiagnostic();
+      assert(spare);
       auto request = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
       assert(request.cached_prompt_tokens() == fixture.tokens.size());
       assert(request.cache_disk_hit() == lazy);
       Prefill(request);
       (void)Generate(request);
       assert(request.Commit().disk_queued_bytes == 0);
+      const auto captures = runner->captures, resets = runner->resets;
+      assert(!pool.TryAcquireDiagnostic());  // Pin/live owner plus busy spare.
+      assert(runner->captures == captures && runner->resets == resets);
+      assert(spare->Discard() == cache::DiagnosticDiscardResult::kComplete);
       auto replay = pool.Acquire(prompt, {}, {}, {}, true, 0, true, false);
       assert(replay.cached_prompt_tokens() == prompt.size());
       assert(!replay.cache_disk_hit());
@@ -5426,6 +5568,7 @@ int main(int argc, char* argv[]) {
 #endif
   });
   run("lifecycle", [] {
+    DiagnosticColdNoRetention();
     completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();

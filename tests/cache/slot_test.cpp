@@ -82,6 +82,56 @@ struct Fixture {
     return bytes;
   }
 };
+void DiagnosticClaims() {
+  const auto ready = [](const Slot&) { return true; };
+  for (unsigned attempt = 0; attempt < 32; ++attempt) {
+    ResourceLedger ledger{kLimits};
+    FakeAdapter adapter;
+    FakeStream stream;
+    LeasedSlot slots(ledger, adapter, stream, SlotId{1});
+    std::stop_source cancelled;
+    cancelled.request_stop();
+    assert(!slots.TryAcquireDiagnostic({}));
+    assert(!slots.TryAcquireDiagnostic(ready, cancelled.get_token()));
+    std::barrier start(2);
+    std::atomic<unsigned> winners{};
+    std::jthread ordinary([&] {
+      start.arrive_and_wait();
+      try {
+        auto lease = slots.Acquire();
+        ++winners;
+        lease.Commit();  // Remains live, so the later diagnostic must refuse.
+      } catch (const SlotBusy&) {
+      }
+    });
+    std::jthread diagnostic([&] {
+      start.arrive_and_wait();
+      if (auto lease = slots.TryAcquireDiagnostic(ready)) {
+        assert(lease->VerifiedEmpty(ready));
+        ++winners;  // Destruction quarantines, never releases to the racer.
+      }
+    });
+    ordinary.join();
+    diagnostic.join();
+    assert(winners == 1);
+  }
+  Fixture f;
+  auto history = ExecutionHistory::Cold(f.ledger, f.adapter.Components(),
+                                        f.adapter.CompatibilityIdentity());
+  auto checkpoint = f.Capture(history);
+  auto observed = f.lease.Observe(
+      kTarget, 0, 4,
+      f.adapter.BorrowRowsView(f.lease.Execution(), kTarget, 0, 4));
+  assert(!f.slots->TryAcquireDiagnostic(ready));
+  f.lease = {};  // Ordinary preservation completes; diagnostic must not do it.
+  auto pin = checkpoint->Components()[0].chunks[0].PinReader();
+  const auto invalidations = f.adapter.Invalidations();
+  const auto bytes = f.ledger.Snapshot().total_bytes;
+  assert(!f.slots->TryAcquireDiagnostic(ready));
+  assert(checkpoint->IsValid() && !observed->IsValid());
+  assert(f.adapter.Invalidations() == invalidations);
+  assert(f.ledger.Snapshot().total_bytes == bytes);
+}
 void Paths() {
   // Prefill/decode share Append; rewind and speculative rollback share the
   // exact-shorter BeginRestore protocol. Reset/reassignment/destruction use
@@ -625,6 +675,7 @@ int main() {
     assert(fixture.ledger.Snapshot().bytes[static_cast<std::size_t>(
                ResourceCategory::kBackingFree)] == 0);
   }
+  DiagnosticClaims();
   Paths();
   Failures();
   EveryPreservationConversion();
