@@ -39,6 +39,8 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
+
+#include "src/core/hip/transfer_pool.hpp"
 #endif
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -133,6 +135,9 @@ void ReportTerminationReason() {
 // Exit status after the GPU context is lost (EX_TEMPFAIL). Only a new process
 // recovers, so a supervisor must restart it.
 constexpr int kDeviceLostExitStatus = 75;
+// Background persistence may fault before/after HTTP signal registration.
+// The fatal hook never captures a stack-local server/backend/scheduler owner.
+std::atomic<bool> device_lost{false};
 // Deep snapshot captures and post-failure device probes legitimately hold
 // progress for tens of seconds.
 constexpr std::uint64_t kMinStallTimeoutMs = 60000;
@@ -140,24 +145,46 @@ constexpr std::uint64_t kMinStallTimeoutMs = 60000;
 // A lost GPU context cannot recover in-process. Leave through the SIGTERM
 // shutdown path so a supervisor restarts the server, and bound that teardown:
 // joining requests or freeing device memory may block on the dead device.
-void ShutdownAfterDeviceLoss() {
+void ShutdownAfterDeviceLoss(void (*report)(const void*) = nullptr,
+                             const void* context = nullptr) {
   constexpr auto kShutdownTimeout = std::chrono::seconds(10);
   // Arm the watchdog before logging or shutdown: neither a blocked log sink
   // nor a dead-device join may prevent the forced exit.
   try {
     std::thread([kShutdownTimeout] {
       std::this_thread::sleep_for(kShutdownTimeout);
-      ::_exit(kDeviceLostExitStatus);
+      platform::ExitAfterDeviceLoss();
     }).detach();
   } catch (...) {
-    ::_exit(kDeviceLostExitStatus);
+    platform::ExitAfterDeviceLoss();
   }
+  if (report)
+    report(context);
   server::Logger::Error(
       "server", "event=device_lost_shutdown exit_status=" +
                     std::to_string(kDeviceLostExitStatus) +
                     " timeout_s=" + std::to_string(kShutdownTimeout.count()));
-  (void)std::raise(SIGTERM);
+  platform::RequestDeviceLossShutdown();
 }
+
+#if defined(ENGINE_ENABLE_HIP)
+[[noreturn]] void FatalGpuCopy(const hip::FatalCopyInfo& info) {
+  device_lost.store(true);
+  ShutdownAfterDeviceLoss(
+      [](const void* pointer) {
+        const auto& fault = *static_cast<const hip::FatalCopyInfo*>(pointer);
+        server::Logger::Error(
+            "cache",
+            "event=fatal_gpu_copy reason=quiescence_unproven operation=" +
+                std::string(fault.operation) +
+                " hip_error=" + std::to_string(fault.error) + " entry_id=" +
+                (fault.has_entry_id ? std::to_string(fault.entry_id) : "none") +
+                " bytes=" + std::to_string(fault.bytes) + " exit_status=75");
+      },
+      &info);
+  platform::ExitAfterDeviceLoss();
+}
+#endif
 
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
@@ -916,6 +943,9 @@ int RunServe(std::span<const char* const> args) {
   // that simply vanished after event=load_started.
   ReportTerminationReason();
   InstallFatalSignalReporter();
+#if defined(ENGINE_ENABLE_HIP)
+  hip::SetFatalCopyHandler(FatalGpuCopy);
+#endif
 
   std::string host = "127.0.0.1";
   if (const char* env_host = std::getenv("HOST");
@@ -1893,8 +1923,6 @@ int RunServe(std::span<const char* const> args) {
         served_names);
   }
 
-  // run() joins every request thread, so no hook call outlives it.
-  std::atomic<bool> device_lost{false};
   server::HttpServer server(
       host, port, backend, video_jobs, tts, asr,
       server::HttpServerOptions{
@@ -1902,7 +1930,7 @@ int RunServe(std::span<const char* const> args) {
           .max_connections = max_connections,
           .api_key = std::move(api_key),
           .on_device_lost =
-              [&device_lost] {
+              [] {
                 device_lost.store(true);
                 ShutdownAfterDeviceLoss();
               },
@@ -1918,9 +1946,9 @@ int RunServe(std::span<const char* const> args) {
   // Releasing model state on a lost device crashes; the kernel reclaims it.
   // The backend is checked as well: an external SIGTERM can stop the server
   // after the scheduler records the loss but before a request fires the hook.
-  const auto exit_if_device_lost = [&device_lost, &backend] {
+  const auto exit_if_device_lost = [&backend] {
     if (device_lost.load() || (backend != nullptr && backend->device_lost())) {
-      ::_exit(kDeviceLostExitStatus);
+      platform::ExitAfterDeviceLoss();
     }
   };
   try {
