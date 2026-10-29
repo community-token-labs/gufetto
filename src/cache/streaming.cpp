@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/cache/slot.hpp"
+#include "src/core/perf_trace.hpp"
 
 namespace gufo::cache {
 namespace {
@@ -70,10 +71,15 @@ void CheckStop(std::stop_token stop) {
   if (stop.stop_requested())
     throw Cancelled();
 }
-void Settle(Completion completion, TransferTiming& timing) {
+void Settle(Completion completion, TransferTiming& timing,
+            bool trace_wait = false) {
+  std::optional<perf::HostPhase> wait;
+  if (trace_wait)
+    wait.emplace("cache_persist_completion_wait");
   const auto start = Clock::now();
   const auto result = completion.Wait();
   timing.stream_wait_ns += Elapsed(start);
+  wait.reset();
   if (result != TransferResult::kSucceeded)
     throw std::runtime_error("cache transfer failed");
 }
@@ -396,6 +402,12 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
       ResourceCategory::kMetadata,
       Add(128, Multiply(sources.size(), sizeof(DiskWriteSource) +
                                             sizeof(PersistencePin) + 64)));
+  // Retain at most one piece's trace. Release flushes it only after the source
+  // completion, transient row pin, stream lease and staging lock are gone.
+  // The disk publication mutex is still held; no lock ordering is changed.
+  // Record end includes the disk checksum/write before release. Use the
+  // source/wait/teardown phases, not the whole record, for transfer timing.
+  std::optional<perf::Work> piece_trace;
   std::optional<std::unique_lock<std::timed_mutex>> piece_lock;
   DiskStagingAccess access{
       [&] {
@@ -416,7 +428,10 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
         }
         piece_lock.emplace(impl_->Lock(stop, timing));
       },
-      [&] { piece_lock.reset(); }};
+      [&] {
+        piece_lock.reset();
+        piece_trace.reset();
+      }};
   std::vector<PersistencePin> pins;
   pins.reserve(sources.size());
   for (auto& source : sources)
@@ -424,19 +439,38 @@ void StreamedStore::Write(DiskFileId file, const DiskManifest& manifest,
   std::vector<DiskWriteSource> writes;
   writes.reserve(sources.size());
   for (auto& source : sources) {
-    writes.push_back({source.private_file_, source.file_, source.bytes_,
-                      [&, source_ptr = &source](auto offset, auto piece) {
-                        CheckStop(stop);
-                        auto stream = impl_->Lease(timing);
-                        Settle(
-                            source_ptr->copy_(
-                                offset, std::as_writable_bytes(piece), *stream),
-                            timing);
-                        CheckStop(stop);
-                        timing.bytes += piece.size();
-                        ++timing.pieces;
-                      },
-                      source.alignment_});
+    writes.push_back(
+        {source.private_file_, source.file_, source.bytes_,
+         [&, source_ptr = &source](auto offset, auto piece) {
+           CheckStop(stop);
+           try {
+             piece_trace.emplace("cache_persist_piece");
+             if (auto* trace = piece_trace->get())
+               trace->cache_persist_piece = perf::CachePersistPiece{
+                   manifest.checkpoint.value, source_ptr->file_, offset,
+                   piece.size(), source_ptr->private_file_};
+           } catch (...) {
+             // Optional trace setup/allocation must not fail a
+             // persistence attempt. Collection/flush also swallow
+             // failures in HostPhase/Work.
+           }
+           auto stream = impl_->Lease(timing);
+           Finally teardown{[&] {
+             perf::HostPhase phase("cache_persist_stream_teardown");
+             stream.reset();
+           }};
+           Settle(
+               [&] {
+                 perf::HostPhase phase("cache_persist_source");
+                 return source_ptr->copy_(offset, std::as_writable_bytes(piece),
+                                          *stream);
+               }(),
+               timing, true);
+           CheckStop(stop);
+           timing.bytes += piece.size();
+           ++timing.pieces;
+         },
+         source.alignment_});
   }
   timing.allocator_ns += Elapsed(start);
   allocation_recorded = true;

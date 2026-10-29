@@ -58,6 +58,56 @@ void TestAttribution() {
              .member_size("request_id") == 42);
   perf::current = previous;
 }
+void TestCachePersistPiece() {
+  using namespace gufo;
+  perf::Record record{};
+  record.kind = "cache_persist_piece";
+  assert(json::parse(perf::Serialize(record, 1)).find("cache_persist_piece") ==
+         nullptr);
+  record.cache_persist_piece = perf::CachePersistPiece{
+      9007199254740993ULL, {}, 9007199254740995ULL, 1048576, true};
+  auto& file = record.cache_persist_piece->file;
+  for (std::size_t i = 0; i < file.size(); ++i)
+    file[i] = static_cast<std::uint8_t>(240 + i);
+  auto* previous = std::exchange(perf::current, &record);
+  for (const auto* label :
+       {"cache_persist_source", "hip_transfer_owned_d2h_enqueue",
+        "hip_transfer_owned_event_record", "cache_persist_completion_wait",
+        "hip_transfer_owned_event_wait", "hip_transfer_owned_wait_drain",
+        "cache_persist_stream_teardown",
+        "hip_transfer_owned_stream_destructor_drain",
+        "hip_transfer_owned_lease_destructor_drain"}) {
+    perf::HostPhase phase(label);
+    phase.Finish();
+    phase.Finish();  // Explicit finish plus destruction records only once.
+  }
+  perf::current = previous;
+  const auto serialized = perf::Serialize(record, perf::Now());
+  const auto value = json::parse(serialized);
+  const auto* piece = value.find("cache_persist_piece");
+  assert(piece && piece->members().size() == 5);
+  assert(serialized.find("\"checkpoint\":9007199254740993") !=
+         std::string::npos);
+  assert(serialized.find("\"offset\":9007199254740995") != std::string::npos);
+  assert(piece->member_size("bytes") == 1048576);
+  assert(piece->find("private_file")->as_bool());
+  const auto& bytes = piece->find("file")->items();
+  assert(bytes.size() == 16);
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    assert(bytes[i].is_number() && bytes[i].as_size() == 240 + i);
+  const auto& phases = value.find("phases")->items();
+  assert(phases.size() == 9);
+  for (const auto& phase : phases) {
+    assert(!phase.member_str("name").empty());
+    assert(phase.member_size("end_ns") >= phase.member_size("start_ns"));
+  }
+  // No source contents or identifiers other than the numeric internal IDs.
+  for (const auto* key : {"path", "pointer", "source", "payload", "tokens",
+                          "prompt", "prompt_text", "input"}) {
+    assert(piece->find(key) == nullptr);
+    assert(value.find(key) == nullptr);
+  }
+}
 void TestMtpCounters() {
   using namespace gufo;
   perf::Record record{};
@@ -153,6 +203,17 @@ int main(int argc, char**) {
     perf::Publish("token", {1, 0, 1, 1}, 1, 0, 1);
     assert(perf::execution_roster.empty());
     assert(perf::current == nullptr);
+    {
+      perf::Work piece("cache_persist_piece");
+      if (auto* record = piece.get())
+        record->cache_persist_piece =
+            perf::CachePersistPiece{1, {}, 0, 16, false};
+      perf::HostPhase enqueue("hip_transfer_owned_d2h_enqueue");
+      perf::HostPhase wait("hip_transfer_owned_event_wait");
+      perf::HostPhase drain("hip_transfer_owned_wait_drain");
+      assert(piece.get() == nullptr && perf::current == nullptr);
+    }
+    assert(perf::current == nullptr);
     return 0;
   }
   const auto path =
@@ -171,6 +232,7 @@ int main(int argc, char**) {
   // TestAttribution consumed a diagnostic forward; reset only this fixture's
   // thread-local sampling counter before the original every-second test.
   perf::forward_counter = 0;
+  TestCachePersistPiece();
   {
     perf::Work work("prefill");
     auto* record = work.get();

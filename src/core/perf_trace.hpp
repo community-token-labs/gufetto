@@ -13,6 +13,7 @@
 #include <locale>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
@@ -158,6 +159,15 @@ struct MtpCycle {
 struct DraftTable {
   std::uint64_t context_depth, used_rows, capacity;
 };
+// Internal identifiers only: file is the 16 numeric bytes of a disk file ID,
+// never a path, pointer, prompt or payload. One record covers one staging
+// piece.
+struct CachePersistPiece {
+  std::uint64_t checkpoint;
+  std::array<std::uint8_t, 16> file;
+  std::uint64_t offset, bytes;
+  bool private_file;
+};
 struct Record {
   const char* kind;
   std::uint64_t start_ns{Now()}, thread_id{0};
@@ -173,6 +183,7 @@ struct Record {
   std::vector<MtpHead> mtp_heads;
   std::vector<MtpCycle> mtp_cycles;
   std::vector<DraftTable> draft_tables;
+  std::optional<CachePersistPiece> cache_persist_piece;
   std::uint64_t work_id{0}, dropped{0};
   std::vector<Lineage> ready, execution;
   std::vector<Publication> publications;
@@ -350,6 +361,18 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
       sep = ",";
     }
     o << ']';
+  }
+  if (r.cache_persist_piece) {
+    const auto& p = *r.cache_persist_piece;
+    o << ",\"cache_persist_piece\":{\"checkpoint\":" << p.checkpoint
+      << ",\"file\":[";
+    sep = "";
+    for (const auto byte : p.file) {
+      o << sep << static_cast<unsigned>(byte);
+      sep = ",";
+    }
+    o << "],\"offset\":" << p.offset << ",\"bytes\":" << p.bytes
+      << ",\"private_file\":" << (p.private_file ? "true" : "false") << '}';
   }
   o << ",\"attribution\":{\"version\":1,\"work_id\":" << r.work_id
     << ",\"dropped\":" << r.dropped << ",\"ready\":[";
