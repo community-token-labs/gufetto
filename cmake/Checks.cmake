@@ -33,6 +33,7 @@ set(gufo_pr_targets
   qwen_vision_memory_budget_test
   qwen_vision_output_pool_test
   qwen27b_continuation_layout_test
+  qwen38_flash_next_npu_contracts_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_rope_scaling_test
@@ -49,6 +50,7 @@ set(gufo_pr_targets
   video_api_test minimax_h3_sampling_test minimax_h3_runtime_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
+  qwen38_flash_next_npu_contracts_test
   component_text_cache_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
@@ -58,12 +60,14 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
+  "qwen38_flash_next\\.npu_contracts"
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.kv_cache" "qwen38_flash_next\\.target_probe"
   "qwen38_flash_next\\.continuation_identity"
+  pd_attribution_scheduler_test pd_attribution_analyzer_test
   perf_trace_disabled_test pinned_prefix_harness_test cache_lookup_harness_test
   cache_lookup_classify_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"

@@ -862,7 +862,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         return Fail(error, "token out of range");
       }
     }
-    perf_forward.Rows(item.session->position_, item.tokens.size());
+    perf_forward.Rows(item.session->position_, item.tokens.size(),
+                      reinterpret_cast<std::uintptr_t>(item.session));
     offsets[i] = rows;
     rows += static_cast<std::uint32_t>(item.tokens.size());
     max_tokens =

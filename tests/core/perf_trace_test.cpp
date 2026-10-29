@@ -16,6 +16,48 @@ void RemoveTrace() {
   std::error_code ec;
   std::filesystem::remove(trace_path, ec);
 }
+void TestAttribution() {
+  using namespace gufo;
+  perf::Record record{};
+  record.kind = "decode_batch";
+  auto* previous = std::exchange(perf::current, &record);
+  std::array<perf::Lineage, 2> roster{{{41, 0, 41, 9}, {42, 1, 42, 9}}};
+  {
+    perf::ExecutionScope scope(roster);
+    perf::BindNative(0, 111);
+    perf::BindNative(1, 222);
+    // Equal context depths and model filtering must not alias requests.
+    perf::Forward forward(false);
+    forward.Rows(4096, 3, 222);
+    assert(record.forwards.back().sessions[0].request_id == 42);
+    assert(perf::RequestForNative(333) == 0);
+    std::array<perf::Lineage, 1> next{{{43, 0, 43, 9}}};
+    {
+      perf::ExecutionScope nested(next);
+      perf::BindNative(0, 111);
+      assert(perf::RequestForNative(111) == 43);
+      assert(perf::RequestForNative(222) == 0);
+    }
+    assert(perf::RequestForNative(111) == 41);
+    for (std::size_t i = 0; i < perf::kAttributionLimit + 2; ++i)
+      perf::Publish("token", roster[0], i + 1, 100 + i, 7);
+    assert(record.publications.size() == perf::kAttributionLimit);
+    assert(record.dropped == 2);
+  }
+  assert(perf::execution_roster.empty());
+  const auto value = json::parse(perf::Serialize(record, 5000));
+  const auto* attr = value.find("attribution");
+  assert(attr->member_size("dropped") == 2);
+  assert(attr->find("events")->items()[0].member_size("burst_id") == 7);
+  assert(attr->find("execution")->items()[1].member_size("native_session") ==
+         222);
+  assert(value.find("forwards")
+             ->items()[0]
+             .find("sessions")
+             ->items()[0]
+             .member_size("request_id") == 42);
+  perf::current = previous;
+}
 void TestCachePersistPiece() {
   using namespace gufo;
   perf::Record record{};
@@ -158,6 +200,8 @@ int main(int argc, char**) {
     assert(!perf::sample_moe);
     perf::TraceMtpHead(4, 4, 4, 98304, 248320, 1024);
     perf::TraceMtpCycle(4096, 5, 4, 3, 5);
+    perf::Publish("token", {1, 0, 1, 1}, 1, 0, 1);
+    assert(perf::execution_roster.empty());
     assert(perf::current == nullptr);
     {
       perf::Work piece("cache_persist_piece");
@@ -184,6 +228,10 @@ int main(int argc, char**) {
   assert(platform::SetEnv("GUFO_PERF_TRACE_MOE", "2"));
   assert(perf::Enabled());
   TestMtpCounters();
+  TestAttribution();
+  // TestAttribution consumed a diagnostic forward; reset only this fixture's
+  // thread-local sampling counter before the original every-second test.
+  perf::forward_counter = 0;
   TestCachePersistPiece();
   {
     perf::Work work("prefill");

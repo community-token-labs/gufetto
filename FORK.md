@@ -146,6 +146,16 @@ limitations are retained in the private `gufo-agent-concurrency` repository,
 
 ## Known limits
 
+- Under heavy image load (several sessions each sending maximum-size images at
+  once), image requests wait their turn for the shared image pool instead of
+  reserving memory per session; they can queue for minutes. Raise the pool with
+  `--vision-pool-tokens` if you need more concurrent large images (each extra
+  64K rows ≈ 640 MiB).
+- A long image encode pauses other sessions' generation until it finishes
+  (also true before; more frequent under maximum image load). These image-load
+  observations use host ROCm/HIP 7.2.4 with patched ROCr 7.2.3, not the production
+  Nix ROCm 10.1 / HIP-Clang 24 package.
+
 - **Development/API:** a Flash-Next `Model` supports one component-serving
   `InferenceBackend` at a time. A second backend using the same shared Model
   fails early without disturbing the first. Finish/release its requests and
