@@ -955,7 +955,8 @@ if (BUILD_TESTING)
   set_tests_properties(h3_profile_report_test PROPERTIES
     LABELS "cpu;tools;models;minimax-h3;profiling")
 
-  foreach(name IN ITEMS scoring_metrics scoring_contract matched_kl)
+  foreach(name IN ITEMS scoring_metrics scoring_contract matched_kl
+                        vision_images vision_reference vision_compare vision_downstream)
     add_test(NAME ${name}_test
       COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/${name}_test.py)
