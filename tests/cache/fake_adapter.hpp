@@ -45,7 +45,11 @@ private:
 class FakeAdapter final : public Adapter {
 public:
   // Wider chunks need less capture metadata for the same row bytes.
-  explicit FakeAdapter(Rows rows_per_chunk = 4);
+  explicit FakeAdapter(Rows rows_per_chunk = 4,
+                       Capabilities capabilities = {true, true});
+  [[nodiscard]] std::size_t RestoreBegins() const noexcept {
+    return restore_begins_;
+  }
   [[nodiscard]] Capabilities GetCapabilities() const override;
   [[nodiscard]] std::span<const ComponentDescriptor> Components()
       const override;
@@ -105,6 +109,8 @@ private:
   [[nodiscard]] Completion SubmitLoad(Slot&, Stream&,
                                       std::function<TransferResult()>);
   std::array<ComponentDescriptor, 3> components_;
+  Capabilities capabilities_;
+  std::size_t restore_begins_{};
   bool fail_allocation_{false};
   bool fail_transfer_{false};
   std::atomic<std::size_t> invalidations_{};

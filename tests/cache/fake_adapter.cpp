@@ -233,16 +233,17 @@ Completion FakeStream::SubmitTracked(
 }
 
 Capabilities FakeAdapter::GetCapabilities() const {
-  return {.continuation = true, .persistent_encoding = true};
+  return capabilities_;
 }
-FakeAdapter::FakeAdapter(Rows rows_per_chunk)
+FakeAdapter::FakeAdapter(Rows rows_per_chunk, Capabilities capabilities)
     : components_{{
           {kTarget, 1, ComponentKind::kAppendRows, sizeof(Token),
            rows_per_chunk, 0},
           {kDraft, 1, ComponentKind::kAppendRows, sizeof(Token), rows_per_chunk,
            0},
           {kRecurrent, 1, ComponentKind::kPrivateState, 0, 0, 32},
-      }} {}
+      }},
+      capabilities_(capabilities) {}
 std::span<const ComponentDescriptor> FakeAdapter::Components() const {
   return components_;
 }
@@ -293,6 +294,7 @@ std::vector<ComponentPosition> FakeAdapter::PrefillCheckpointPositions(
 }
 void FakeAdapter::BeginRestore(Slot& slot,
                                std::span<const ComponentPosition> positions) {
+  ++restore_begins_;
   auto& state = AsSlot(slot);
   if (state.Busy() || state.failed || state.restoring)
     throw std::logic_error(
