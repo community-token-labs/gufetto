@@ -4,6 +4,7 @@
 #include <array>
 #include <barrier>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -11,6 +12,9 @@
 #include <numeric>
 #include <thread>
 
+#include "src/core/json.hpp"
+#include "src/core/perf_trace.hpp"
+#include "src/core/platform/env.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/cache/model_capability_records.hpp"
 
@@ -140,6 +144,119 @@ struct Fixture {
     return result;
   }
 };
+fs::path trace_path;
+void RemoveTrace() {
+  std::error_code ec;
+  fs::remove(trace_path, ec);
+}
+void PersistenceTraceIsPieceBounded() {
+  using namespace gufo;
+  for (const bool fail : {false, true}) {
+    const auto begin = fs::exists(trace_path) ? fs::file_size(trace_path) : 0;
+    Directory dir;
+    ResourceLedger ledger{{1 << 22, 1 << 21, 10, 4096}};
+    DiskStore disk(ledger, dir.path, 1 << 20);
+    unsigned leases{}, copies{}, settled{};
+    StreamedStore streams(ledger, disk, 10, Allocate, [&] {
+      auto stream = std::make_unique<FakeStream>(true);
+      if (++leases == 3 && fail)
+        stream->FailNextSubmission();
+      return stream;
+    });
+    Fixture fixture(ledger);
+    const std::string private_input = "trace-must-not-contain-source-input";
+    fixture.manifest.input.assign(private_input.begin(), private_input.end());
+    auto sources = fixture.Sources(
+        [&] {
+          ++copies;
+          assert(perf::current && perf::current->cache_persist_piece);
+          const auto& piece = *perf::current->cache_persist_piece;
+          assert(piece.checkpoint == 1 && piece.bytes <= 10);
+          // Each callback gets a fresh collector, not the whole job's phases.
+          assert(perf::current->phases.empty());
+        },
+        [&] {
+          ++settled;
+          assert(perf::current->phases.size() == 1);
+          assert(std::string_view(perf::current->phases[0].name) ==
+                 "cache_persist_source");
+        });
+    TransferTiming timing;
+    bool failed{};
+    try {
+      streams.Write(Id(100), fixture.manifest, sources, timing);
+    } catch (const std::exception&) {
+      failed = true;
+    }
+    assert(failed == fail);
+    assert(perf::current == nullptr);
+    assert(ledger.Snapshot().persistence_pinned_bytes == 0);
+    assert(copies == leases && settled == timing.pieces);
+    assert(copies == timing.pieces + (fail ? 1 : 0));
+    std::ifstream input(trace_path);
+    input.seekg(begin);
+    std::string line;
+    std::size_t records{};
+    std::uint64_t bytes{};
+    std::vector<std::size_t> offsets(fixture.buffers.size());
+    while (std::getline(input, line)) {
+      const auto value = json::parse(line);
+      assert(value.member_str("kind") == "cache_persist_piece");
+      const auto* piece = value.find("cache_persist_piece");
+      assert(piece && piece->member_size("checkpoint") == 1);
+      const auto count = piece->member_size("bytes");
+      assert(count > 0 && count <= streams.StagingBytes());
+      const auto& file = piece->find("file")->items();
+      assert(file.size() == 16);
+      const auto id = file[0].as_size() + (file[1].as_size() << 8);
+      assert(id > 0 && id <= fixture.buffers.size());
+      const auto& buffer = fixture.buffers[id - 1];
+      assert(piece->find("private_file")->as_bool() == buffer.private_file);
+      assert(piece->member_size("offset") == offsets[id - 1]);
+      offsets[id - 1] += count;
+      assert(offsets[id - 1] <= buffer.owner->size());
+      const auto& phases = value.find("phases")->items();
+      const bool failed_piece = fail && records == 2;
+      assert(phases.size() == (failed_piece ? 2 : 3));
+      assert(phases.front().member_str("name") == "cache_persist_source");
+      if (!failed_piece) {
+        assert(phases[1].member_str("name") == "cache_persist_completion_wait");
+        bytes += count;
+      }
+      assert(phases.back().member_str("name") ==
+             "cache_persist_stream_teardown");
+      for (std::size_t i = 0; i < phases.size(); ++i) {
+        assert(phases[i].member_size("end_ns") >=
+               phases[i].member_size("start_ns"));
+        if (i)
+          assert(phases[i].member_size("start_ns") >=
+                 phases[i - 1].member_size("end_ns"));
+      }
+      assert(line.find(private_input) == std::string::npos);
+      assert(value.find("input") == nullptr && value.find("tokens") == nullptr);
+      ++records;
+    }
+    assert(records == copies && bytes == timing.bytes);
+    if (!fail) {
+      for (std::size_t i = 0; i < offsets.size(); ++i)
+        assert(offsets[i] == fixture.buffers[i].owner->size());
+      // Inherited dependencies acquire/release staging, but do not copy.
+      const auto before = fs::file_size(trace_path);
+      auto inherited = disk.Open({1})->Manifest();
+      inherited.checkpoint = {2};
+      // Only shared chunks may alias across entries; private files remain
+      // unique to their original checkpoint.
+      inherited.tokens.resize(4);
+      inherited.components.resize(1);
+      inherited.components[0].position.valid_rows = 4;
+      inherited.components[0].chunks.resize(1);
+      TransferTiming reused;
+      streams.Write(Id(101), inherited, {}, reused);
+      assert(reused.pieces == 0 && fs::file_size(trace_path) == before);
+      assert(perf::current == nullptr);
+    }
+  }
+}
 // Capability failure must occur before destination mutation or any payload I/O.
 // Pattern only: SGLang #46972 (8044ed4e), no upstream implementation copied.
 void CapabilityRejectionsAreObservable() {
@@ -1209,6 +1326,15 @@ void MinimumStagingHoldsWidestRow() {
 }
 }  // namespace
 int main() {
+  trace_path = fs::temp_directory_path() /
+               ("gufo-streaming-trace-" +
+                std::to_string(gufo::platform::ProcessId()) + ".jsonl");
+  fs::remove(trace_path);
+  // Sink must close before cleanup, including on platforms forbidding unlink
+  // of an open stream. Configure before any persistence Work is constructed.
+  assert(std::atexit(RemoveTrace) == 0);
+  assert(gufo::platform::SetEnv("GUFO_PERF_TRACE", trace_path.string()));
+  PersistenceTraceIsPieceBounded();
   CapabilityRejectionsAreObservable();
   MinimumStagingHoldsWidestRow();
   PrefetchDoesNotValidateOrAdmitPayload();
