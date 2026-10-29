@@ -1,5 +1,6 @@
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -8,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -126,6 +128,33 @@ void CheckPoolQueue(
   std::cout << "vision_pool waits=" << after.waits - before.waits
             << " encodes=" << after.encodes - before.encodes
             << " reencodes=" << after.reencodes - before.reencodes << '\n';
+
+  pressure.reset();
+  auto blocked_pressure = pool->TryAcquire(
+      pool->GetOwner("native-test-cancel-pressure", pool->Capacity()));
+  Require(blocked_pressure != nullptr, "completed requests still hold credits");
+  const auto before_cancel = pool->GetStats();
+  auto request = requests[0];
+  request.cache_prompt = false;
+  auto blocked = backend.start_chat(request, 16, sampling);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool->GetStats().waits == before_cancel.waits &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool waited = pool->GetStats().waits > before_cancel.waits;
+  blocked->Cancel();
+  const auto cancelled = blocked->Wait();
+  Require(waited && cancelled.cancelled && cancelled.tokens.empty(),
+          "queued image request did not cancel before execution");
+  Require(pool->GetStats().encodes == before_cancel.encodes &&
+              pool->GetStats().rows == pool->Capacity(),
+          "cancelled resource waiter encoded or stole held credits");
+  blocked_pressure.reset();
+  Require(backend.chat(request, 16, sampling).tokens == expected[0].tokens,
+          "image queue did not recover after cancellation");
+  std::cout << "queued image cancellation/recovery exact, no encode before "
+               "admission\n";
 }
 
 void CheckFlashIncrementalOracle(
@@ -198,8 +227,11 @@ void CheckFlashIncrementalOracle(
   }
   std::cout << "Flash fresh incremental oracle exact="
             << (generated == cached.tokens)
+            << " evaluated_steps=" << generated.size()
             << " bulk_incremental_max_logit_error=" << max_logit_error
             << " max_KL_temperature1=" << max_kl << '\n';
+  Require(!generated.empty(),
+          "Flash image oracle did not evaluate after prefill");
   Require(generated == cached.tokens,
           "Flash snapshot changed incremental inference");
   Require(max_logit_error == 0,
