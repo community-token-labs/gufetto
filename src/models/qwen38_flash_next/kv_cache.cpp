@@ -167,6 +167,30 @@ float KvHalfBitsToFloat(std::uint16_t bits) noexcept {
   return std::bit_cast<float>(sign | magnitude);
 }
 
+// Keep q8 validation beside the half converters so production builds can
+// inline them. A separate translation unit added two calls per packed block.
+void detail::ValidateQ8Rows(std::span<const std::byte> input) {
+  for (std::size_t i = 0; i < input.size(); i += sizeof(KvBlockQ8_0)) {
+    const auto scale_bits = std::to_integer<std::uint16_t>(input[i]) |
+                            (std::to_integer<std::uint16_t>(input[i + 1]) << 8);
+    if ((scale_bits & 0x8000) != 0 || !IsFiniteHalf(scale_bits))
+      throw std::invalid_argument("invalid Flash-Next KV scale");
+    const float scale = KvHalfBitsToFloat(scale_bits);
+    int largest = 0;
+    for (std::size_t j = 0; j < kKvQ8BlockElements; ++j) {
+      const auto q = std::bit_cast<std::int8_t>(
+          std::to_integer<std::uint8_t>(input[i + 2 + j]));
+      if (q == -128)
+        throw std::invalid_argument("invalid Flash-Next KV reconstruction");
+      largest = std::max(largest, std::abs(static_cast<int>(q)));
+    }
+    // One overflow check per block; finite nonnegative scales make the
+    // maximum code magnitude sufficient for every reconstructed operand.
+    if (!IsFiniteHalf(KvFloatToHalfBits(largest * scale)))
+      throw std::invalid_argument("invalid Flash-Next KV reconstruction");
+  }
+}
+
 void EncodeKvRow(std::span<const float> input, KvCacheType type,
                  std::span<std::byte> output) {
   const auto bytes = KvRowBytes(CheckedElements(input.size()), type);
