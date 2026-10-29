@@ -493,6 +493,11 @@ void RetentionPolicy::Erase(std::size_t i, RetentionReason reason,
        before > after ? before - after : 0);
 }
 bool RetentionPolicy::Reclaim(const RetentionRequest& r) {
+  if (r.admission == AdmissionPolicy::kNoEviction) {
+    Emit(RetentionAction::kRefused, RetentionReason::kByteCapacity, {},
+         r.tokens.size(), r.purpose, MaxRank(r.purpose), 0);
+    return false;
+  }
   if (r.new_payload_bytes > ledger_.Limits().ram_bytes)
     return false;
   const auto victim = Victim(r, false);
@@ -595,7 +600,63 @@ bool RetentionPolicy::ReclaimForExecution(
   return true;
 }
 
+PredictionBudget RetentionPolicy::PredictionLimits() const {
+  const auto limits = ledger_.Limits();
+  const auto ram = std::min(limits.ram_bytes, limits.total_bytes);
+  return {ram / 12, std::min(limit_, GridLimit(ram, sizeof(Prediction)))};
+}
+PredictionBudget RetentionPolicy::PredictionUsage() const {
+  PredictionBudget usage;
+  for (const auto& record : records_)
+    if (record.prediction) {
+      usage.bytes += record.prediction->bytes;
+      ++usage.records;
+    }
+  return usage;
+}
+bool RetentionPolicy::WithdrawUnprovenPrediction(CheckpointId id,
+                                                 std::uint64_t owner) {
+  const auto i = Find(id);
+  if (!owner || i == limit_)
+    return false;
+  const auto& e = records_[i];
+  if (!e.prediction || e.prediction->owner != owner || e.prediction->observed ||
+      e.forked || Branch(i) || !ExecutionEligible(i))
+    return false;
+  // Execution reclaim deliberately tolerates direct owners that prevent a
+  // physical trim. Creator withdrawal is stricter: an escaped direct RowPin
+  // or payload owner must keep the indexed prediction available as well.
+  const auto unshared_owner = [](const Payload& payload) {
+    if (payload.BorrowedStorage() || !payload.Bytes())
+      return true;  // managed source/backing readers checked above
+    const auto owner = payload.Owner();
+    return owner && owner.use_count() == 2;  // Payload plus this temporary
+  };
+  for (const auto& c : e.checkpoint->Components()) {
+    if ((c.private_state && !unshared_owner(*c.private_state)) ||
+        (c.tail && !unshared_owner(*c.tail)))
+      return false;
+    for (const auto& chunk : c.chunks)
+      if (!unshared_owner(chunk.Storage()))
+        return false;
+  }
+  Erase(i, RetentionReason::kExplicit, Priority(i));
+  return true;
+}
+bool RetentionPolicy::ObservePrediction(CheckpointId id,
+                                        std::uint64_t observer) {
+  const auto i = Find(id);
+  if (!observer || i == limit_)
+    return false;
+  auto& prediction = records_[i].prediction;
+  if (!prediction || prediction->owner == observer)
+    return false;
+  prediction->observed = true;
+  return true;
+}
+
 bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
+  const bool predicted = r.admission == AdmissionPolicy::kNoEviction;
   auto purpose = r.purpose;
   const auto refuse = [&](RetentionReason reason) {
     Emit(RetentionAction::kRefused, reason, {}, r.tokens.size(), purpose,
@@ -604,8 +665,11 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
   };
   if (r.stop.stop_requested())
     return refuse(RetentionReason::kCancelled);
-  if (r.tokens.empty() || r.stable > r.tokens.size() || !capture)
+  if (r.tokens.empty() || r.stable > r.tokens.size() || !capture ||
+      (predicted && !r.prediction_owner))
     return refuse(RetentionReason::kInvalid);
+  if (predicted && size_ == limit_)
+    return refuse(RetentionReason::kRecordCapacity);
   const auto limits = ledger_.Limits();
   if (r.new_payload_bytes > limits.total_bytes ||
       r.new_payload_bytes > limits.ram_bytes)
@@ -630,6 +694,18 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
   }
   if (exact == limit_ && size_ == limit_ && Victim(r, true) == limit_)
     return refuse(RetentionReason::kRecordCapacity);
+  std::size_t prediction_room = 0;
+  if (predicted) {
+    if (exact != limit_)
+      return refuse(RetentionReason::kDuplicate);
+    const auto budget = PredictionLimits();
+    const auto usage = PredictionUsage();
+    if (usage.records >= budget.records)
+      return refuse(RetentionReason::kPredictionRecordCapacity);
+    prediction_room = budget.bytes - std::min(budget.bytes, usage.bytes);
+    if (r.new_payload_bytes > prediction_room)
+      return refuse(RetentionReason::kPredictionByteCapacity);
+  }
   // An exact replacement keeps its conversation's reuse.
   std::optional<std::uint64_t> reused_at;
   while (true) {
@@ -647,6 +723,31 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
       if (r.stop.stop_requested()) {
         checkpoint.reset();
         return refuse(RetentionReason::kCancelled);
+      }
+      std::unique_ptr<Prediction> prediction;
+      if (predicted) {
+        std::size_t bytes = 0;
+        const auto add = [&](std::size_t capacity) {
+          if (capacity > prediction_room - bytes)
+            return false;
+          bytes += capacity;
+          return true;
+        };
+        if (!add(sizeof(Prediction)) || !add(checkpoint->MetadataBytes()))
+          return refuse(RetentionReason::kPredictionByteCapacity);
+        for (const auto& c : checkpoint->Components()) {
+          if ((c.private_state && !add(c.private_state->Bytes())) ||
+              (c.tail && !add(c.tail->Bytes())))
+            return refuse(RetentionReason::kPredictionByteCapacity);
+          for (const auto& chunk : c.chunks)
+            if (!add(chunk.Storage().Bytes()))
+              return refuse(RetentionReason::kPredictionByteCapacity);
+        }
+        auto metadata =
+            ledger_.Reserve(ResourceCategory::kMetadata, sizeof(Prediction))
+                .Convert();
+        prediction = std::make_unique<Prediction>(
+            Prediction{std::move(metadata), r.prediction_owner, bytes});
       }
       std::vector<ComponentAvailability> available;
       for (const auto& c : checkpoint->Components())
@@ -673,7 +774,14 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
       while (records_[target].checkpoint)
         ++target;
       auto& e = records_[target];
-      e = {std::move(checkpoint), entry, purpose, r.stable, ++clock_};
+      e = {.checkpoint = std::move(checkpoint),
+           .entry = entry,
+           .stable = r.stable,
+           .last_used = ++clock_,
+           .reused_at = {},
+           .purpose = purpose,
+           .below = {},
+           .prediction = std::move(prediction)};
       ++size_;
       // Keep each event's exact total without recounting every retained
       // checkpoint after each individual eviction or insertion.
@@ -688,6 +796,8 @@ bool RetentionPolicy::Admit(const RetentionRequest& r, const Capture& capture) {
            Priority(target), e.last_used);
       return true;
     } catch (const ResourceExhausted&) {
+      if (predicted)
+        return refuse(RetentionReason::kByteCapacity);
       auto target = limit_;
       if (exact != limit_ && records_[exact].checkpoint &&
           (records_[exact].checkpoint->Id() != r.source ||

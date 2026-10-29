@@ -42,6 +42,10 @@ struct CapturePlanRequest {
 [[nodiscard]] std::vector<CaptureCandidate> PlanCaptures(
     const Adapter&, const Slot&, const CapturePlanRequest&);
 
+enum class AdmissionPolicy : std::uint8_t { kRanked, kNoEviction };
+struct PredictionBudget {
+  std::size_t bytes{}, records{};
+};
 enum class RetentionAction : std::uint8_t {
   kAdmitted,
   kRefused,
@@ -58,7 +62,10 @@ enum class RetentionReason : std::uint8_t {
   kCancelled,
   kInvalid,
   kExplicit,
-  kShutdown
+  kShutdown,
+  kPredictionByteCapacity,
+  kPredictionRecordCapacity,
+  kDuplicate
 };
 struct RetentionEvent {
   std::uint64_t sequence{};
@@ -109,6 +116,11 @@ struct RetentionRequest {
   // Frontier actually reused by this turn, before its new prefill. This
   // distinguishes a short retry tail from a larger continuation/compaction.
   Rows reused_tokens{};
+  // Optional predictions never evict, including pre-publication reclaim,
+  // exact replacement and allocation failure. Carry through every stage.
+  AdmissionPolicy admission{AdmissionPolicy::kRanked};
+  // Nonzero cache-local request/acquisition ID required for predictions.
+  std::uint64_t prediction_owner{};
 };
 // Caller serializes policy, index and history operations. Ledger and index
 // outlive this object; sink, if present, does too. Callbacks/sinks cannot
@@ -147,6 +159,23 @@ public:
   // Reclaim one eligible record for a caller that captures outside its index
   // lock. The caller retries the same frozen frontier before publication.
   [[nodiscard]] bool Reclaim(const RetentionRequest&);
+  // Publication quota, not new backing or an allocation promise: one twelfth
+  // of effective ledger RAM, at most four records (also bounded by the bytes
+  // needed for their prediction metadata). Full payload capacities, including
+  // shared chunks, and checkpoint/prediction metadata are charged per record.
+  // This conservative charge cannot shrink merely because other owners exist.
+  // Observed predictions stay charged until removal. Ordinary admissions do
+  // not allocate prediction metadata or use this quota.
+  [[nodiscard]] PredictionBudget PredictionLimits() const;
+  [[nodiscard]] PredictionBudget PredictionUsage() const;
+  // Caller holds the publication mutex and first drops its temporary handles.
+  // Refuse wrong/zero owner, observed/forked records or external readers/pins.
+  // Successful removal is logical only; never credit unreleased physical RAM.
+  [[nodiscard]] bool WithdrawUnprovenPrediction(CheckpointId,
+                                                std::uint64_t owner);
+  // Only after successful ACTUAL reuse by a different nonzero request ID.
+  // Lookup/failed restore/self-use do not qualify. Does not invent fork/rank.
+  [[nodiscard]] bool ObservePrediction(CheckpointId, std::uint64_t observer);
   // External execution pressure: remove at most one eligible RAM record in
   // byte-pressure order, with no incoming capture rank/source exceptions.
   // True means logical removal ONLY; trim backing and measure physical release
@@ -173,18 +202,27 @@ public:
   [[nodiscard]] std::size_t RetainedPayloadBytes() const noexcept;
 
 private:
+  struct Prediction {
+    ResourceCharge metadata;
+    std::uint64_t owner{};
+    std::size_t bytes{};
+    bool observed{false};
+  };
   struct Record {
     std::shared_ptr<const Checkpoint> checkpoint;
     IndexEntryId entry;
-    RetentionPurpose purpose{};
     Rows stable{};
     std::uint64_t last_used{};
     // admitted_bytes_ at the last reuse of this record's conversation.
     std::optional<std::uint64_t> reused_at;
+    RetentionPurpose purpose{};
     // Two continuations once extended this record directly.
     bool forked{false};
     // Retained records extending this one, by slot.
     std::bitset<kRecordLimit> below;
+    // Reordered fields reuse old padding: ordinary record size stays unchanged.
+    // Additional metadata is allocated/charged only for an admitted prediction.
+    std::unique_ptr<Prediction> prediction;
   };
   std::size_t Find(CheckpointId) const;
   bool Branch(std::size_t) const;
