@@ -3830,103 +3830,162 @@ void AdaptiveSchedulingUsesRealComponentCache(bool capturing) {
 }
 }  // namespace
 #endif
-int main() {
-  if (std::getenv("GUFO_TEST_ROTATED_PROCESS_LOCAL_ONLY") != nullptr) {
+int main(int argc, char* argv[]) {
+  std::string_view suite;
+  if (argc != 1) {
+    if (argc != 3 || std::string_view(argv[1]) != "--suite") {
+      std::cerr << "usage: component_text_cache_test [--suite NAME]\n";
+      return 2;
+    }
+    suite = argv[2];
+    if (suite.empty())
+      return 2;
+  }
+  if (argc == 1 &&
+      std::getenv("GUFO_TEST_ROTATED_PROCESS_LOCAL_ONLY") != nullptr) {
     packed_ingress_cpu::RotatedWithoutFingerprintDisk();
     std::cout << "CPU fingerprint-absent rotated disk admission PASS; native "
                  "NOT RUN\n";
     return 0;
   }
-  if (std::getenv("GUFO_TEST_PACKED_INGRESS_ONLY") != nullptr) {
+  if (argc == 1 && std::getenv("GUFO_TEST_PACKED_INGRESS_ONLY") != nullptr) {
     packed_ingress_cpu::CorruptedDisk();
     packed_ingress_cpu::AdmissionFailuresPreserveDisk();
     packed_ingress_cpu::MalformedDisk();
     std::cout << "CPU packed disk admission PASS\n";
     return 0;
   }
+  // CTest runs bounded suites; direct no-argument execution retains every case.
+  bool selected = false;
+  const auto run = [&](std::string_view name, auto body) {
+    if (suite.empty() || suite == name) {
+      selected = true;
+      body();
+    }
+  };
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
-  PreparedSerialCutKeepsRealComponentBoundaries();
-  AdaptiveSchedulingUsesRealComponentCache(false);
-  AdaptiveSchedulingUsesRealComponentCache(true);
+  run("prerequisites", [] {
+    PreparedSerialCutKeepsRealComponentBoundaries();
+    AdaptiveSchedulingUsesRealComponentCache(false);
+    AdaptiveSchedulingUsesRealComponentCache(true);
+  });
 #endif
-  packed_transfer_cpu::MalformedImportsAndDisk();
-  packed_transfer_cpu::RotatedWithoutFingerprintImport();
+  run("transfer_plain_identity", [] {
+    packed_transfer_cpu::MalformedImportsAndDisk(
+        models::qwen38_flash_next::KvCacheType::kQ8_0, true);
+  });
+  run("transfer_plain_process_local", [] {
+    packed_transfer_cpu::MalformedImportsAndDisk(
+        models::qwen38_flash_next::KvCacheType::kQ8_0, false);
+  });
+  run("transfer_rotated_identity", [] {
+    packed_transfer_cpu::MalformedImportsAndDisk(
+        models::qwen38_flash_next::KvCacheType::kQ8_0Rotated, true);
+  });
+  run("transfer_rotated_process_local", [] {
+    packed_transfer_cpu::MalformedImportsAndDisk(
+        models::qwen38_flash_next::KvCacheType::kQ8_0Rotated, false);
+  });
+  run("transfer_layout", [] {
+    packed_transfer_cpu::IncompatibleDiskLayouts();
+    packed_transfer_cpu::RotatedWithoutFingerprintImport();
+  });
+  run("packed_pins", [] {
 #if defined(__linux__)
-  packed_transfer_cpu::RotatedExistingPinsBeforeReady();
-#endif
-  LookupRuntimeDefaultsAndDisabled();
-  CheckpointTransferRoundTripAndConcurrentServing();
-  CheckpointImportRespectsRamOff();
-  LookupIsReadOnlyAndMatchesAcquire();
-  LookupRespectsRamOffWithoutDisablingLiveReuse();
-  LookupDoesNotWaitForAdmission();
-  LookupWhileAllSlotsPrefillAndDecode();
-  LookupInvalidatesBeforeLiveRetirement();
-  LookupPublicationDisabled();
-  LookupPublicationStress();
-  LookupMeasuredRatesAndEpoch();
-  LookupR3BarrierFixtures();
-#if defined(__linux__)
-  MultiplePinsChooseLongestAndRestart();
-  MultiplePinsAggregateDiskBudget();
-  MultiplePinsAggregateRamAndIndependentLazyWarming();
-  MultiplePinsExplicitReplacementAndValidation();
-  MultiplePinsLazyCorruptionPreservesOtherRegistrations();
-  PinnedPrefixRestartReplayAndNoRewrite();
-  PinnedPrefixesRespectOffAndAutomaticRam();
-  PinnedPrefixPressureIdentityAndAccounting();
-  PinnedPrefixPressureIdentityAndAccounting(true);
-  PinnedPrefixIdentityReplacementAndBudgets();
-  PinnedPrefixCorruptionFailsClosed();
-  PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk();
-  PinnedPrefixLazySurvivesRamRefusal();
+    packed_transfer_cpu::RotatedExistingPinsBeforeReady();
 #else
-  std::cout << "SKIP: registered pins require strict Linux fingerprinting\n";
+    std::cout << "SKIP: registered pins require strict Linux fingerprinting\n";
 #endif
-  PublishedResidentCheckpointKeepsDiskStep();
-  CancelledPrefillKeepsCompletedSteps();
-  SharedPeerReusesTheCurrentStableCapture();
-  BackingPreparationFollowsCaptures();
-  PrefillLookaheadReachesTheNextFrontier();
-  PartialFrontierDoesNotServeAnEqualPrompt();
-  CompletedCancelledPromptGetsARetrySnapshot();
-  BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
-  InPassCapturePreservesBoundaryAndLiveTail();
-  ColdAcquireResetsOnce();
-  ColdAssignmentAvoidsDrainingCancelledSlot();
-  ColdAssignmentAvoidsDrainingCancelledSlot(true);
-  ColdAssignmentKeepsOneDuplicateDeepFrontier();
-  FailedRestoreResetsOnce();
-  RestoreFromBusyBorrowedSource();
-  ImageAfterCachedTextPrefixCaptures();
-  ColdAssignmentPrefersPreservedSlot();
-  ColdAssignmentKeepsLiveFrontiers();
-  ColdSideRequestsKeepPreservedDeepFrontier();
-  ReuseAndBranches();
-  EditBoundariesSurviveActualBackingPressure();
-  ReusedConversationOutlivesOneUseRequests();
-  RestartAndCorruption();
-  FailedCaptureKeepsPublishedBoundary();
-  BackingPressureKeepsSharedPrefix();
-  BackingPressureKeepsSharedPrefix(true);
-  FragmentedBackingKeepsCompletePrompt();
-  RotatedDiskAdmissionFinishesBeforePublication();
-  packed_ingress_cpu::CorruptedDisk();
-  packed_ingress_cpu::AdmissionFailuresPreserveDisk();
-  DiskBudgetEvictsAnUnpinnedConversation();
-  LoweredDiskBudgetEvictsOldestAtStartup();
-  OrphansLeaveBeforeCheckpoints();
-  StagingIsInternal();
-  StagingCountsAgainstRamCeiling();
-  PinnedSlotBytesCountOnce();
-  UnpinnedRunnersKeepTheirLimit();
-  DiskDirectoryHasOneOwner();
-  GridDoesNotSuppressFirstDiskPrompt();
-  NearTailDiskBranchSurvivesRestart();
-  UnbackedDeepRowsSurviveDiskRestart();
-  OverRamCaptureStagesPrivateStateUnderPressure(false);
-  OverRamCaptureStagesPrivateStateUnderPressure(true);
-  RamCacheOffCommitsNoBackingAndKeepsLiveFrontiers();
-  RamCacheOffWithDiskCommitsOnlyStagingBacking();
-  RamCacheOffRefusesCapturesWithinTheDiskStep();
+  });
+  run("lookup", [] {
+    LookupRuntimeDefaultsAndDisabled();
+    CheckpointTransferRoundTripAndConcurrentServing();
+    CheckpointImportRespectsRamOff();
+    LookupIsReadOnlyAndMatchesAcquire();
+    LookupRespectsRamOffWithoutDisablingLiveReuse();
+    LookupDoesNotWaitForAdmission();
+    LookupWhileAllSlotsPrefillAndDecode();
+    LookupInvalidatesBeforeLiveRetirement();
+    LookupPublicationDisabled();
+    LookupPublicationStress();
+    LookupMeasuredRatesAndEpoch();
+    LookupR3BarrierFixtures();
+  });
+  run("pins", [] {
+#if defined(__linux__)
+    MultiplePinsChooseLongestAndRestart();
+    MultiplePinsAggregateDiskBudget();
+    MultiplePinsAggregateRamAndIndependentLazyWarming();
+    MultiplePinsExplicitReplacementAndValidation();
+    MultiplePinsLazyCorruptionPreservesOtherRegistrations();
+    PinnedPrefixRestartReplayAndNoRewrite();
+    PinnedPrefixesRespectOffAndAutomaticRam();
+    PinnedPrefixPressureIdentityAndAccounting();
+    PinnedPrefixPressureIdentityAndAccounting(true);
+    PinnedPrefixIdentityReplacementAndBudgets();
+    PinnedPrefixCorruptionFailsClosed();
+    PinnedPrefixCorruptionCannotHideBehindOrdinaryDisk();
+    PinnedPrefixLazySurvivesRamRefusal();
+#else
+    std::cout << "SKIP: registered pins require strict Linux fingerprinting\n";
+#endif
+  });
+  run("lifecycle", [] {
+    PublishedResidentCheckpointKeepsDiskStep();
+    CancelledPrefillKeepsCompletedSteps();
+    SharedPeerReusesTheCurrentStableCapture();
+    BackingPreparationFollowsCaptures();
+    PrefillLookaheadReachesTheNextFrontier();
+    PartialFrontierDoesNotServeAnEqualPrompt();
+    CompletedCancelledPromptGetsARetrySnapshot();
+    BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
+    InPassCapturePreservesBoundaryAndLiveTail();
+    ColdAcquireResetsOnce();
+    ColdAssignmentAvoidsDrainingCancelledSlot();
+    ColdAssignmentAvoidsDrainingCancelledSlot(true);
+    ColdAssignmentKeepsOneDuplicateDeepFrontier();
+    FailedRestoreResetsOnce();
+    RestoreFromBusyBorrowedSource();
+    ImageAfterCachedTextPrefixCaptures();
+  });
+  run("reuse", [] {
+    ColdAssignmentPrefersPreservedSlot();
+    ColdAssignmentKeepsLiveFrontiers();
+    ColdSideRequestsKeepPreservedDeepFrontier();
+    ReuseAndBranches();
+    EditBoundariesSurviveActualBackingPressure();
+    ReusedConversationOutlivesOneUseRequests();
+    RestartAndCorruption();
+    FailedCaptureKeepsPublishedBoundary();
+    BackingPressureKeepsSharedPrefix();
+    BackingPressureKeepsSharedPrefix(true);
+    FragmentedBackingKeepsCompletePrompt();
+  });
+  run("disk", [] {
+    RotatedDiskAdmissionFinishesBeforePublication();
+    packed_ingress_cpu::CorruptedDisk();
+    packed_ingress_cpu::AdmissionFailuresPreserveDisk();
+    DiskBudgetEvictsAnUnpinnedConversation();
+    LoweredDiskBudgetEvictsOldestAtStartup();
+    OrphansLeaveBeforeCheckpoints();
+    StagingIsInternal();
+    StagingCountsAgainstRamCeiling();
+    PinnedSlotBytesCountOnce();
+    UnpinnedRunnersKeepTheirLimit();
+    DiskDirectoryHasOneOwner();
+    GridDoesNotSuppressFirstDiskPrompt();
+    NearTailDiskBranchSurvivesRestart();
+    UnbackedDeepRowsSurviveDiskRestart();
+  });
+  run("ram", [] {
+    OverRamCaptureStagesPrivateStateUnderPressure(false);
+    OverRamCaptureStagesPrivateStateUnderPressure(true);
+    RamCacheOffCommitsNoBackingAndKeepsLiveFrontiers();
+    RamCacheOffWithDiskCommitsOnlyStagingBacking();
+    RamCacheOffRefusesCapturesWithinTheDiskStep();
+  });
+  if (!selected) {
+    std::cerr << "unknown component cache suite: " << suite << '\n';
+    return 2;
+  }
 }

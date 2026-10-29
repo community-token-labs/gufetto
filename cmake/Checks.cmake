@@ -42,6 +42,7 @@ set(gufo_pr_targets
   video_api_test minimax_h3_sampling_test minimax_h3_runtime_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
+  component_text_cache_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_rope_scaling_test
@@ -49,6 +50,7 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
+  ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
@@ -69,7 +71,8 @@ if (WIN32)
     gguf_reader_test gguf_identity_test platform_publish_test
     platform_prefault_test trace_test http_server_signals_test
     http_server_test audio_websocket_test continuation_disk_store_test
-    component_text_cache_test eval_http_client_test cache_disk_faults_test
+    component_text_cache_test ${gufo_component_text_cache_tests}
+    eval_http_client_test cache_disk_faults_test
     cache_boundary_test cache_adapter_test cache_slot_test cache_disk_test
     cache_streaming_test cache_tiered_test cache_disk_publication_test)
   list(REMOVE_ITEM gufo_pr_targets ${gufo_pr_linux_only})

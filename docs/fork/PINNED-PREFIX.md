@@ -199,7 +199,7 @@ Run the deterministic CPU fixture without a model or device:
 ```sh
 cmake --preset cpu-test
 cmake --build --preset cpu-test --target component_text_cache_test --parallel 2
-ctest --preset cpu-test -R '^component_text_cache_test$' --output-on-failure
+ctest --preset cpu-test -R '^component_text_cache_test_' --output-on-failure
 ```
 
 Registered pins currently require Linux's strict executable/runtime fingerprint
