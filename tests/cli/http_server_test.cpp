@@ -553,6 +553,12 @@ void TestLlamaProps() {
   assert(!bare.contains("model_path"));
   assert(!bare.contains("build_info"));
   assert(!bare.contains("total_slots"));
+  const auto* reuse = bare.find("cache_reuse_acquisitions");
+  assert(reuse && reuse->is_object());
+  assert(reuse->contains("no_indexed_prefix"));
+  assert(reuse->contains("boundary_gap"));
+  assert(reuse->contains("restore_failed"));
+  assert(!reuse->contains("not_acquired"));
   const auto* generation = bare.find("default_generation_settings");
   assert(generation != nullptr && generation->member_size("n_ctx") == 65536);
   const auto* params = generation->find("params");

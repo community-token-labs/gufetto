@@ -1569,11 +1569,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (impl_->catalog)
       impl_->catalog->Reconcile();
     found = impl_->Plan(prompt, input, stable, reuse);
-    // A miss reports how far a stored prompt agreed, so an empty cache can
-    // be told apart from one holding only incompatible boundaries.
-    if (reuse && !found.selected)
-      common =
-          impl_->index.CommonPrefixTokens({impl_->identity, prompt, input});
+    // Capture resident agreement before retiring a live frontier. Partial hits
+    // need the same diagnostic as full misses; this is not an all-history LCP.
+    if (reuse)
+      common = found.selected && found.selected->boundary == prompt.size()
+                   ? prompt.size()
+                   : impl_->index.CommonPrefixTokens(
+                         {impl_->identity, prompt, input});
     if (found.selected && found.selected->live) {
       const auto location = *found.selected->live;
       auto& selected_entry = *impl_->entries.at(location.slot.value - 1);
@@ -1711,17 +1713,25 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
              impl_->runner->HasDecodeFrontier(*request.state);
     };
     if (live && !decodable(found.selected->boundary)) {
+      ++request.metrics.unready_frontiers;
       live.reset();
       const std::lock_guard lock(impl_->mutex);
       entry->branch = std::make_shared<const std::uint8_t>(0);
       entry->durable.reset();
     }
     bool restored = bool(live);
-    if (live)
+    if (live) {
       request.cached = found.selected->boundary;
+      request.metrics.used_entry_id = found.selected->entry.value;
+    }
+    bool restore_cancelled = false;
     for (const auto& candidate : found.candidates) {
-      if (restored || (cancelled && cancelled()))
+      if (restored)
         break;
+      if (cancelled && cancelled()) {
+        restore_cancelled = true;
+        break;
+      }
       if (candidate.live)
         continue;
       ++request.metrics.restore_attempts;
@@ -1928,6 +1938,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           }
         }
         if (restored && !decodable(candidate.boundary)) {
+          ++request.metrics.unready_frontiers;
           // Intentional conservative full-boundary fallback, not a failed
           // transfer/restore. Lookup omits the same unready boundary.
           if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
@@ -1942,6 +1953,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
         }
         if (restored) {
           request.cached = candidate.boundary;
+          request.metrics.used_entry_id = candidate.entry.value;
           const std::lock_guard lock(impl_->mutex);
           entry->durable = candidate.durable;
         }
@@ -2035,6 +2047,46 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                                : "none";
     request.metrics.selection_reason = static_cast<std::uint32_t>(found.reason);
     request.metrics.selected = request.cached;
+    request.metrics.indexed_common_tokens = std::max(common, request.cached);
+    request.metrics.indexed_gap_tokens =
+        request.metrics.indexed_common_tokens - request.cached;
+    auto& reason = request.metrics.reuse_reason;
+    if (!reuse) {
+      reason = CacheReuseReason::kDisabled;
+    } else if (restore_cancelled) {
+      reason = CacheReuseReason::kCancelled;
+    } else if (request.metrics.restore_failures) {
+      reason = CacheReuseReason::kRestoreFailed;
+    } else if (request.metrics.unready_frontiers) {
+      reason = CacheReuseReason::kFrontierNotReady;
+    } else if (request.cached) {
+      reason = request.metrics.indexed_gap_tokens
+                   ? CacheReuseReason::kBoundaryGap
+               : live             ? CacheReuseReason::kLive
+               : request.disk_hit ? CacheReuseReason::kDisk
+                                  : CacheReuseReason::kRam;
+    } else {
+      switch (found.reason) {
+        case cache::SelectionReason::kUnknownCompatibility:
+          reason = CacheReuseReason::kUnknownCompatibility;
+          break;
+        case cache::SelectionReason::kInputIdentity:
+          reason = CacheReuseReason::kInputIdentity;
+          break;
+        case cache::SelectionReason::kMissingComponent:
+          reason = CacheReuseReason::kMissingComponent;
+          break;
+        case cache::SelectionReason::kStablePrefixBoundary:
+          reason = CacheReuseReason::kStablePrefixBoundary;
+          break;
+        default:
+          reason = common ? CacheReuseReason::kNoCompatibleBoundary
+                          : CacheReuseReason::kNoIndexedPrefix;
+          break;
+      }
+    }
+    CacheReuseReasonCounts()[static_cast<std::size_t>(reason)].fetch_add(
+        1, std::memory_order_relaxed);
     request.metrics.restored_bytes = request.restored;
     for (const auto& candidate : found.candidates) {
       auto& deepest = candidate.live         ? request.metrics.deepest_live
@@ -2051,24 +2103,33 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                                                  : "no_checkpoint",
                              request.cached ? 0 : common,
                              request.cached ? request.cached : nearest};
-    Logger::Info("cache",
-                 "schema=component-cache-v1 event=acquire reuse=" +
-                     std::string(live               ? "live"
-                                 : request.disk_hit ? "disk"
-                                 : request.cached   ? "ram"
-                                                    : "none") +
-                     " selected_tokens=" + std::to_string(request.cached) +
-                     " restored_bytes=" + std::to_string(request.restored) +
-                     " acquisition_id=" + std::to_string(acquisition_id) +
-                     " admission_index_version=" +
-                     std::to_string(admission_version) + " selected_entry_id=" +
-                     std::to_string(request.metrics.selected_entry_id) +
-                     " restore_attempts=" +
-                     std::to_string(request.metrics.restore_attempts) +
-                     " restore_failures=" +
-                     std::to_string(request.metrics.restore_failures) +
-                     " restore_failure_reason=" +
-                     request.metrics.restore_failure_reason);
+    Logger::Info(
+        "cache",
+        "schema=component-cache-v1 event=acquire reuse=" +
+            std::string(live               ? "live"
+                        : request.disk_hit ? "disk"
+                        : request.cached   ? "ram"
+                                           : "none") +
+            " selected_tokens=" + std::to_string(request.cached) +
+            " restored_bytes=" + std::to_string(request.restored) +
+            " acquisition_id=" + std::to_string(acquisition_id) +
+            " admission_index_version=" + std::to_string(admission_version) +
+            " selected_entry_id=" +
+            std::to_string(request.metrics.selected_entry_id) +
+            " restore_attempts=" +
+            std::to_string(request.metrics.restore_attempts) +
+            " restore_failures=" +
+            std::to_string(request.metrics.restore_failures) +
+            " restore_failure_reason=" +
+            request.metrics.restore_failure_reason +
+            " reuse_reason=" + std::string(CacheReuseReasonName(reason)) +
+            " indexed_common_tokens=" +
+            std::to_string(request.metrics.indexed_common_tokens) +
+            " indexed_gap_tokens=" +
+            std::to_string(request.metrics.indexed_gap_tokens) +
+            " unready_frontiers=" +
+            std::to_string(request.metrics.unready_frontiers) +
+            " used_entry_id=" + std::to_string(request.metrics.used_entry_id));
     return lease;
   } catch (...) {
     if (lease)
