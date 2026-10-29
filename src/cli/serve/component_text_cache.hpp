@@ -13,6 +13,7 @@
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/pinned_prefix.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
+#include "src/core/startup_admission.hpp"
 
 namespace gufo::server {
 class TextModelRunner;
@@ -34,9 +35,32 @@ struct ComponentCaptureBuffer {
   std::function<cache::Payload(cache::SlotLease&, std::span<const std::byte>)>
       borrow;
 };
+// Startup-only pending bytes. Keep shared and accumulated per-slot claims
+// separate: materializing shared storage must not hide a new slot's liability.
+struct ComponentStartupPending {
+  std::size_t shared_execution{}, slot_execution{};
+  std::size_t shared_images{}, slot_images{};
+};
+
+// Opt-in contract for homogeneous pools: every slot of one trial has identical
+// model/mode/context/format settings. Mixed configurations must not opt in.
+// Probe adapters share the loaded model, but NOT production pending counters.
+// They never bind a second backend or publish cache state.
+struct ComponentStartupAdmission {
+  std::size_t context{};
+  std::function<core::ExecutionCapacityObservation()> observe;
+  std::function<ComponentStartupPending(const cache::Adapter&, std::size_t)>
+      pending;
+  std::function<std::unique_ptr<cache::Adapter>(std::size_t)> make_probe;
+  // Supplies the exact successful observation to the provider's final guard.
+  // Runtime backing growth must continue to remeasure, not use this snapshot.
+  std::function<void(core::ExecutionCapacityObservation)> freeze_capacity;
+};
+
 struct ComponentCacheResources {
   std::shared_ptr<void> owner;
   std::unique_ptr<cache::Adapter> adapter;
+  std::unique_ptr<ComponentStartupAdmission> startup_admission;
   cache::StreamLease stream;
   std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;

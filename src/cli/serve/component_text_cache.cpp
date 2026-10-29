@@ -563,6 +563,155 @@ struct ComponentTextCache::Impl {
     }
   }
 
+  std::unique_ptr<Entry> CreateStartupEntry(cache::Adapter& adapter,
+                                            std::size_t ordinal) {
+    auto entry = std::make_unique<Entry>();
+    entry->preservation = Stream();
+    entry->slot = std::make_unique<cache::LeasedSlot>(
+        ledger, adapter, *entry->preservation, cache::SlotId{ordinal + 1},
+        cache::IdleSpillConfig{1ULL << 20, resources->stream,
+                               [this] {
+                                 const std::lock_guard lock(mutex.native);
+                                 return std::ranges::none_of(
+                                     entries,
+                                     [](const auto& e) { return e->busy; });
+                               },
+                               resources->reassignment_batch_size});
+    return entry;
+  }
+
+  struct StagedExecution {
+    core::ExecutionCapacityObservation capacity;
+    std::size_t pending_execution;
+  };
+
+  // The requested pool and every recommendation use exactly this construction
+  // and guard. Slot one stays in the real pool on success. Failed trial owners
+  // destroy slots/idle workers before their context-specific adapter.
+  std::optional<StagedExecution> StageExecution(
+      cache::Adapter& adapter, std::size_t context, std::size_t count,
+      std::size_t permanent_bytes, std::vector<std::unique_ptr<Entry>>& staged,
+      Clock::time_point deadline = Clock::time_point::max()) {
+    if (Clock::now() >= deadline)
+      return std::nullopt;
+    const auto& startup = *resources->startup_admission;
+    auto pending = startup.pending(adapter, context);
+    auto capacity = startup.observe();
+    core::ExecutionDebit maximum{};
+    std::size_t max_slot_execution{}, max_slot_images{};
+    const auto fixed =
+        core::AddMemoryBytes(ledger.Limits().staging_bytes, permanent_bytes);
+    const auto fits = [&](std::size_t remaining) {
+      // Pending slot counters are independent of the shared counters: shared
+      // materialization may lower the latter during construction.
+      std::size_t required = core::AddMemoryBytes(
+          core::AddMemoryBytes(pending.shared_execution,
+                               pending.slot_execution),
+          core::AddMemoryBytes(pending.shared_images, pending.slot_images));
+      required = core::AddMemoryBytes(required, fixed);
+      const auto per_slot =
+          core::AddMemoryBytes(max_slot_execution, max_slot_images);
+      if (per_slot &&
+          remaining >
+              (std::numeric_limits<std::size_t>::max() - required) / per_slot)
+        return false;
+      required += remaining * per_slot;
+      const bool accepted =
+          core::FitsMeasuredExecution(capacity, maximum, remaining, required);
+      Logger::Info(
+          "cache",
+          "event=measured_startup context=" + std::to_string(context) +
+              " slots=" + std::to_string(staged.size()) +
+              " remaining_slots=" + std::to_string(remaining) +
+              " host_capacity_bytes=" + std::to_string(capacity.host) +
+              " device_capacity_bytes=" + std::to_string(capacity.device) +
+              " max_host_debit_bytes=" + std::to_string(maximum.host) +
+              " max_device_debit_bytes=" + std::to_string(maximum.device) +
+              " pending_bytes=" + std::to_string(required) +
+              " fits=" + (accepted ? "1" : "0"));
+      return accepted;
+    };
+    // Shared obligations alone may already rule out even the first slot.
+    if (!fits(0))
+      return std::nullopt;
+    for (std::size_t i = 0; i < count; ++i) {
+      if (Clock::now() >= deadline)
+        return std::nullopt;
+      staged.push_back(CreateStartupEntry(adapter, i));
+      if (Clock::now() >= deadline)
+        return std::nullopt;
+      const auto next_pending = startup.pending(adapter, context);
+      const auto after = startup.observe();
+      maximum = core::MaxExecutionDebit(
+          maximum, core::MeasuredExecutionDebit(capacity, after));
+      max_slot_execution =
+          std::max(max_slot_execution,
+                   core::PendingMemoryBytes(next_pending.slot_execution,
+                                            pending.slot_execution));
+      max_slot_images = std::max(
+          max_slot_images, core::PendingMemoryBytes(next_pending.slot_images,
+                                                    pending.slot_images));
+      pending = next_pending;
+      capacity = after;
+      if (Clock::now() >= deadline || !fits(count - i - 1))
+        return std::nullopt;
+    }
+    return StagedExecution{
+        capacity,
+        core::AddMemoryBytes(pending.shared_execution, pending.slot_execution)};
+  }
+
+  StagedExecution AdmitMeasuredExecution(std::size_t count,
+                                         std::size_t permanent_bytes) {
+    const auto& startup = *resources->startup_admission;
+    if (!count || startup.context != runner->Descriptor().max_context ||
+        !startup.observe || !startup.pending || !startup.make_probe ||
+        !startup.freeze_capacity || !resources->freeze_execution_liability)
+      throw std::logic_error("incomplete measured startup admission provider");
+    if (const auto admitted =
+            StageExecution(*resources->adapter, startup.context, count,
+                           permanent_bytes, entries))
+      return *admitted;
+
+    // No production slot survives a refusal. Probes neither touch the original
+    // adapter's cumulative counters nor bind another backend to the Model.
+    entries.clear();
+    const core::ContextSearchLimits limits;
+    const auto search = core::SearchVerifiedContext(
+        startup.context,
+        [&](std::size_t context, Clock::time_point deadline) {
+          auto adapter = startup.make_probe(context);
+          if (!adapter)
+            throw std::logic_error("startup probe adapter is null");
+          std::vector<std::unique_ptr<Entry>> trial;
+          return StageExecution(*adapter, context, count, permanent_bytes,
+                                trial, deadline)
+              .has_value();
+        },
+        limits);
+    Logger::Info(
+        "cache",
+        "event=startup_context_search probes=" + std::to_string(search.probes) +
+            " probe_limit=" + std::to_string(limits.max_probes) +
+            " time_limit_ms=30000 elapsed_ms=" +
+            std::to_string(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    search.elapsed)
+                    .count()) +
+            " step_limit_hit=" + std::to_string(search.step_limit_hit) +
+            " time_limit_hit=" + std::to_string(search.time_limit_hit));
+    std::string message =
+        "measured startup execution exceeds capacity for --context " +
+        std::to_string(startup.context) + "; ";
+    if (search.verified_context)
+      message += "verified to fit: --context " +
+                 std::to_string(*search.verified_context) +
+                 " (staged execution pool, not a maximum)";
+    else
+      message += "no fitting context found within the search limits";
+    throw std::invalid_argument(message);
+  }
+
   Impl(std::shared_ptr<TextModelRunner> runner, std::size_t count,
        std::size_t ram, std::size_t slot_ceiling,
        const std::optional<TextRunnerDiskCacheOptions>& options,
@@ -642,34 +791,38 @@ struct ComponentTextCache::Impl {
       pin_disk = std::make_unique<cache::DiskStore>(ledger, pins.directory,
                                                     pins.capacity_bytes);
     }
-    for (std::size_t i = 0; i < count; ++i) {
-      auto entry = std::make_unique<Entry>();
-      entry->preservation = Stream();
-      entry->slot = std::make_unique<cache::LeasedSlot>(
-          ledger, *resources->adapter, *entry->preservation,
-          cache::SlotId{i + 1},
-          cache::IdleSpillConfig{1ULL << 20, resources->stream,
-                                 [this] {
-                                   const std::lock_guard lock(mutex.native);
-                                   return std::ranges::none_of(
-                                       entries,
-                                       [](const auto& e) { return e->busy; });
-                                 },
-                                 resources->reassignment_batch_size});
-      entries.push_back(std::move(entry));
+    std::optional<StagedExecution> admitted;
+    if (bool(resources->startup_admission) !=
+        this->runner->UsesMeasuredStartupAdmission())
+      throw std::logic_error("measured startup capability/provider mismatch");
+    if (resources->startup_admission) {
+      admitted = AdmitMeasuredExecution(
+          count, !ram_enabled && options ? kDiskOnlyBackingBytes : 0);
+      resources->startup_admission->freeze_capacity(admitted->capacity);
+    } else {
+      for (std::size_t i = 0; i < count; ++i)
+        entries.push_back(CreateStartupEntry(*resources->adapter, i));
     }
     // Freeze only after every slot allocated, before any backing or staging.
     // Resident weights/slot bytes already reduced the provider's free sample.
     const auto pending_execution = resources->freeze_execution_liability
                                        ? resources->freeze_execution_liability()
                                        : 0;
-    const auto claim = resources->freeze_execution_liability ||
-                               (ram_enabled && resources->commit_backing)
+    if (admitted && pending_execution != admitted->pending_execution)
+      throw std::logic_error(
+          "startup execution obligations changed while freezing");
+    const auto claim = !admitted && (resources->freeze_execution_liability ||
+                                     (ram_enabled && resources->commit_backing))
                            ? this->runner->ResourceClaim()
                            : TextRunnerResourceClaim{};
     const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
-    auto headroom = core::ProtectedCacheHeadroom{
-        measured, claim.retained_snapshot_ceiling_bytes.value_or(measured)};
+    auto headroom =
+        admitted
+            ? core::ProtectedCacheHeadroom{admitted->capacity.automatic,
+                                           admitted->capacity.Capacity()}
+            : core::ProtectedCacheHeadroom{
+                  measured,
+                  claim.retained_snapshot_ceiling_bytes.value_or(measured)};
     if (resources->freeze_execution_liability) {
       Logger::Info("cache", "event=execution_liability pending_bytes=" +
                                 std::to_string(pending_execution) +

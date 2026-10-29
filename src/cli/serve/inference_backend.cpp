@@ -955,13 +955,14 @@ private:
   mutable bool probe_pending_{false};
 };
 
-std::size_t ExecutionCapacityBytes() {
+core::ExecutionCapacityObservation ObserveExecutionCapacity() {
   std::size_t free = 0, total = 0;
   if (hipMemGetInfo(&free, &total) != hipSuccess)
     throw std::runtime_error("cannot query device execution memory capacity");
   const auto heap =
       free > hip::kDispatchReserve ? free - hip::kDispatchReserve : 0;
-  return std::min<std::size_t>(heap, HostSnapshotCeilingBytes());
+  const auto host = ObserveHostSnapshotHeadroom();
+  return {host.ceiling, heap, std::min({host.automatic, host.ceiling, heap})};
 }
 
 template<typename AdapterType>
@@ -969,7 +970,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
     std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger,
     std::function<std::size_t()> shared_pending = {},
     std::shared_ptr<core::ReclaimableMemory> memory = {},
-    std::function<std::size_t(const AdapterType&)> image_pending = {}) {
+    std::function<std::size_t(const AdapterType&)> image_pending = {},
+    bool measured_startup = false) {
   const bool protect_execution = static_cast<bool>(shared_pending);
   struct Backing {
     hip::TransferPool streams{64};
@@ -977,11 +979,32 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
     std::map<std::uint32_t, std::size_t> component_classes;
     std::size_t execution_liability{};
     std::size_t permanent_pin_cushion{};
+    std::optional<core::ExecutionCapacityObservation> startup_capacity;
     bool frozen{};
   };
   auto result = std::make_unique<ComponentCacheResources>();
   result->adapter = std::move(adapter);
+  const auto before_resources = measured_startup
+                                    ? std::optional{ObserveExecutionCapacity()}
+                                    : std::nullopt;
   auto backing = std::make_shared<Backing>();
+  if (measured_startup) {
+    const auto after = ObserveExecutionCapacity();
+    const auto debit = core::MeasuredExecutionDebit(*before_resources, after);
+    Logger::Info("cache",
+                 "event=startup_resources host_debit_bytes=" +
+                     std::to_string(debit.host) +
+                     " device_debit_bytes=" + std::to_string(debit.device) +
+                     " host_capacity_bytes=" + std::to_string(after.host) +
+                     " device_capacity_bytes=" + std::to_string(after.device));
+    result->startup_admission = std::make_unique<ComponentStartupAdmission>();
+    result->startup_admission->observe = ObserveExecutionCapacity;
+    result->startup_admission->freeze_capacity = [backing](auto capacity) {
+      if (backing->frozen || backing->startup_capacity)
+        throw std::logic_error("startup capacity already frozen");
+      backing->startup_capacity = capacity;
+    };
+  }
   if (protect_execution)
     result->freeze_execution_liability =
         [backing, native = static_cast<AdapterType*>(result->adapter.get()),
@@ -1011,7 +1034,14 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
             // No cache exists yet. A demand that cannot fit even after all
             // reclaimable backing is gone must refuse startup, not wait
             // forever later in the request queue.
-            if (images > headroom())
+            const auto initial_headroom =
+                backing->startup_capacity
+                    ? (backing->startup_capacity->Capacity() > protected_bytes
+                           ? backing->startup_capacity->Capacity() -
+                                 protected_bytes
+                           : 0)
+                    : headroom();
+            if (images > initial_headroom)
               throw std::invalid_argument(
                   "image obligations exceed remaining execution capacity");
             memory->Configure(images, headroom);
@@ -2758,7 +2788,33 @@ public:
                                    models::qwen::vision::EncoderWorkspaceBytes(
                                        context)))
                          : 0;
-        });
+        },
+        true);
+    auto& startup = *resources->startup_admission;
+    startup.context = max_context_;
+    startup.pending = [model = model_](const cache::Adapter& base,
+                                       std::size_t context) {
+      const auto& adapter =
+          static_cast<const models::qwen38_flash_next::ContinuationAdapter&>(
+              base);
+      const auto encoder = model->VisionEncoder();
+      return ComponentStartupPending{
+          model->ComponentDeferredScratchBytes(),
+          adapter.InitialPendingExecutionBytes(),
+          encoder ? core::AddMemoryBytes(
+                        encoder->OutputBudgetBytes(),
+                        models::qwen::vision::EncoderWorkspaceBytes(context))
+                  : 0,
+          adapter.InitialPendingImageBytes()};
+    };
+    startup.make_probe = [model = model_, mtp = use_mtp_,
+                          identity = component_identity_](std::size_t context) {
+      return std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
+          model,
+          mtp ? core::SessionMode::kSpeculative
+              : core::SessionMode::kAutoregressive,
+          context, identity);
+    };
     struct BoundResources {
       std::shared_ptr<void> backing;
       std::shared_ptr<void> binding;
@@ -2808,8 +2864,12 @@ public:
     };
   }
 
+  [[nodiscard]] bool UsesMeasuredStartupAdmission() const override {
+    return true;
+  }
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-    const auto capacity = ExecutionCapacityBytes();
+    const auto observation = ObserveExecutionCapacity();
+    const auto capacity = observation.Capacity();
     const auto shared = core::AddMemoryBytes(
         model_->ComponentDeferredScratchBytes(),
         model_->VisionEncoder()
@@ -2829,10 +2889,8 @@ public:
         // Eager model scratch is already reflected in free memory. Remaining
         // shared scratch and encoder workspace are charged once, below.
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes =
-            std::min(HostSnapshotBudgetBytes(), capacity),
-        .retained_snapshot_ceiling_bytes =
-            std::min(HostSnapshotCeilingBytes(), capacity),
+        .retained_snapshot_capacity_bytes = observation.automatic,
+        .retained_snapshot_ceiling_bytes = capacity,
         .requires_device_runtime_lock = true,
         .shared_execution_bytes = shared,
     };
