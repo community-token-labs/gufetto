@@ -43,6 +43,14 @@ not met the original strict quality gates. Shared-Q4 MTP requires an explicit
 compatible model and speculative selection. Our standard development profile
 explicitly enables **shared-Q8 MTP at C1–C4** (`--speculative mtp --mtp-model …`);
 the generic CLI defaults to speculation off, not implicit Q8 draft loading.
+Vision defaults to automatic discovery of `mmproj-BF16.gguf` beside the model
+or in its parent directory. For text-only serving, `gufo serve llm --no-vision`
+skips both projector loading (about 0.9 GB for the current Flash-Next sidecar)
+and per-slot vision-input reservation. At 262144 context that reservation is
+about 2.50 GiB per Flash-Next slot; four 524288-context slots reserve about
+20.02 GiB. These are reservation savings, not guaranteed extra usable RAM.
+Image requests are rejected when vision is disabled. `--no-vision` conflicts
+with an explicit `--mmproj`; it does not silently ignore that file.
 RAM caching defaults to AUTO (`--cache-ram-bytes 0`); `off` disables retention.
 Disk caching, pins, `--cache-lookup-api`, `--cache-transfer-api` and `--trace`
 require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and
