@@ -45,7 +45,23 @@ EXPECTED = (
     ("dashboard-1536", 1536, 1024,
      "Read the three summary metrics and their values. Which labeled bar "
      "is tallest, and what is the status of batch C?"),
+    ("code-dense-1920", 1920, 1088,
+     "Read the active file name. Explain how BUILD_REPORT handles failed tiles. "
+     "Which two cells failed, what is the pass count, and which report file "
+     "appears in the test panel?"),
 )
+
+
+# Original six RGB identities are retained; seventh was frozen before kernel data.
+RGB_HASHES = {
+    "shapes-1024": "c70b6efa828fe96f8239430c8ead5fd5da61914dedd02c2d2712f552dbaff427",
+    "skyline-2048": "c4cf01c642b967ff5e8f68a5f1b91b661193fb164ca6eed46b8bc925353f5694",
+    "board-4096": "57e526a0ab1ec2d08662840cbefa102e29ca5a0c83da6e57b2bbe3bd019a715b",
+    "editor-1280": "4ab6ca80050eff4dd5e2018a9c6d38845ec9ffa1ea5057eba8f72bfe65a75796",
+    "terminal-1920": "f2a3d49b0691f3bece2ab125f886612bd226973dc16c47fba184559bd09902f3",
+    "dashboard-1536": "2a4f58fd4449ae0ccec2c402e33a8f61cfb5fd47cfda791837fee7b37d9a81b3",
+    "code-dense-1920": "a0d7ce8face315b8c39417ef0785ac018b7b032886d4232782faac53ce541638",
+}
 
 
 class VisionImagesTest(unittest.TestCase):
@@ -66,7 +82,7 @@ class VisionImagesTest(unittest.TestCase):
     def test_frozen_cases_and_provenance(self):
         manifest = self.manifest
         self.assertEqual(manifest["schema"], "gufo-vision-images-v1")
-        self.assertEqual(len(manifest["cases"]), 6)
+        self.assertEqual(len(manifest["cases"]), 7)
         source_hash = hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
         for case, (case_id, width, height, prompt) in zip(manifest["cases"], EXPECTED):
             with self.subTest(case=case_id):
@@ -86,7 +102,7 @@ class VisionImagesTest(unittest.TestCase):
                 self.assertEqual(provenance["source_sha256"], source_hash)
                 self.assertIn("no captures or external assets", provenance["description"])
                 self.assertRegex(case["sha256"], r"^[0-9a-f]{64}$")
-                self.assertRegex(case["rgb_sha256"], r"^[0-9a-f]{64}$")
+                self.assertEqual(case["rgb_sha256"], RGB_HASHES[case_id])
         encoded = (self.output / "manifest.json").read_text(encoding="utf-8")
         self.assertEqual(json.loads(encoded), manifest)
         self.assertNotIn(str(self.root), encoded)
@@ -144,6 +160,33 @@ class VisionImagesTest(unittest.TestCase):
                     digest.update(view[start + 1:start + stride])
                 self.assertEqual(digest.hexdigest(), case["rgb_sha256"])
                 del view, raw
+
+    def test_dense_code_content_and_text_size(self):
+        calls = []
+        original = vision_images._Canvas.text
+
+        def record(canvas, x, y, value, color=vision_images.INK, scale=2):
+            calls.append((x, y, value, scale))
+            return original(canvas, x, y, value, color, scale)
+
+        with patch.object(vision_images._Canvas, "text", record):
+            vision_images._dense_code(1920, 1088)
+        code = [value for x, y, value, scale in calls if x == 312]
+        logs = [value for x, y, value, scale in calls if x == 1160 and y >= 116]
+        self.assertEqual(len(code), 40)
+        self.assertEqual(len(logs), 35)
+        self.assertIn("      BAD_CELLS.APPEND(TILE.CELL)", code)
+        self.assertIn("FAILED CELL B3: EAST EDGE MISMATCH", logs)
+        self.assertIn("FAILED CELL D5: NORTH EDGE MISMATCH", logs)
+        self.assertIn("TILES: 42 / PASSED: 40 / FAILED: 2", logs)
+        self.assertIn("OUTPUT: DEMO-REPORT.TXT", logs)
+        for x, y, value, scale in calls:
+            self.assertEqual(scale, 2)  # 10x14 glyphs, 12px character pitch.
+            if value:
+                self.assertLessEqual(x + (len(value) * 6 - 1) * scale, 1920)
+                self.assertLessEqual(y + 7 * scale, 1088)
+        for value in code:
+            self.assertLessEqual(312 + len(value) * 12, 1136)
 
     def test_determinism_and_cli(self):
         self.assertEqual(self.cli.stdout.strip(), str(self.repeat / "manifest.json"))
