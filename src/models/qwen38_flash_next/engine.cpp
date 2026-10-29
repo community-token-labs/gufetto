@@ -1,4 +1,7 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
+
+#include "src/core/memory_budget.hpp"
+#include "src/models/qwen/vision/input_budget.hpp"
 #if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
 #include "src/models/qwen38_flash_next/pd_profile.hpp"
 #endif
@@ -140,7 +143,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   try {
     m->vision_ = qwen::vision::Encoder::Open(
-        model_path, options.vision_model_path, c.hidden_size);
+        model_path, options.vision_model_path, c.hidden_size,
+        options.enable_vision, options.vision_pool_tokens);
   } catch (const std::exception& e) {
     AssignError(error_msg, e.what());
     return nullptr;
@@ -319,12 +323,9 @@ std::size_t Model::ResidentBytes() const noexcept {
 }
 
 std::size_t Model::SessionBytes(core::SessionMode mode,
-                                std::uint32_t context) const noexcept {
+                                std::uint32_t context) const {
   const std::size_t vision =
-      vision_ ? std::size_t{context} * (config().hidden_size * sizeof(float) +
-                                        3 * sizeof(std::int32_t)) +
-                    64
-              : 0;
+      vision_ ? qwen::vision::InputPositionBytes(context) : 0;
   return executor_->SessionBytes(mode, context,
                                  mode == core::SessionMode::kSpeculative
                                      ? executor_->max_speculative() - 1
@@ -333,7 +334,36 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
 }
 
 std::size_t Model::DeferredScratchBytes() const {
-  return executor_->DeferredScratchBytes();
+  return core::AddMemoryBytes(executor_->DeferredScratchBytes(),
+                              vision_ ? vision_->OutputBudgetBytes() : 0);
+}
+
+bool Model::HasComponentBackend() const noexcept {
+  return static_cast<bool>(executor_->ComponentMemoryBudget());
+}
+
+std::shared_ptr<void> Model::BindComponentMemoryBudget(
+    std::shared_ptr<core::ReclaimableMemory> memory) {
+  return core::ReclaimableMemoryBinding::Bind(
+      executor_->ComponentMemoryBudget(), std::move(memory),
+      [model = shared_from_this()](auto budget) noexcept {
+        model->SetComponentMemoryBudget(std::move(budget));
+      });
+}
+
+void Model::SetComponentMemoryBudget(
+    std::shared_ptr<core::ReclaimableMemory> memory) noexcept {
+  executor_->SetComponentMemoryBudget(memory);
+  if (vision_)
+    vision_->SetMemoryBudget(std::move(memory));
+}
+
+std::size_t Model::ComponentDeferredScratchBytes() const {
+  return executor_->DeferredScratchBytes(SnapshotRoute::kComponentServing);
+}
+
+std::size_t Session::AllocatedVisionBytes() const noexcept {
+  return session_->AllocatedVisionBytes();
 }
 
 std::size_t Session::AllocatedBytes() const noexcept {
@@ -427,6 +457,12 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
 
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
+  qwen::vision::ImageTokenBudget budget(qwen::vision::ImageTokenLimit(
+      ContextSize(), model_->VisionMaxTokensPerSlot()));
+  if (prompt) {
+    for (const auto& image : prompt->images)
+      budget.Add(std::uint64_t{image.grid.height} * image.grid.width);
+  }
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   const auto identity = prompt ? prompt->IdentityForPrefix(tokens_.size())
@@ -793,6 +829,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
                    double* capture_ms, std::span<const std::int32_t> after,
                    const PrefillCapture& consume) {
+  if (perf::current && perf::execution_roster.size() == 1)
+    perf::BindNative(0, reinterpret_cast<std::uintptr_t>(session_.get()));
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
@@ -1427,6 +1465,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
   pd::AssociationScope association(provenance);
 #endif
   const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  if (perf::current && perf::execution_roster.size() == 1)
+    perf::BindNative(0, reinterpret_cast<std::uintptr_t>(session_.get()));
   PendingDecode pending;
   if (!PrepareDecode(request, &pending, error_msg, false, std::nullopt,
                      occupancy)) {
@@ -1460,6 +1500,12 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
     AssignError(error_msg, "batch must contain 1..8 sessions");
     return false;
   }
+  // Bind BEFORE model filtering: a filtered singleton is not roster index 0.
+  if (perf::current && perf::execution_roster.size() == requests.size())
+    for (std::size_t i = 0; i < requests.size(); ++i)
+      if (requests[i].session)
+        perf::BindNative(i, reinterpret_cast<std::uintptr_t>(
+                                requests[i].session->session_.get()));
   std::array<BatchOutcome, 8> outcomes{};
   std::array<std::uint64_t, 8> epochs{};
   std::array<sampling::SamplerState::DrawState, 8> draws{};

@@ -43,6 +43,7 @@ public:
   [[nodiscard]] std::size_t Bytes() const noexcept {
     std::size_t bytes = capacity_ * 3 * sizeof(std::int32_t) +
                         (descriptor_ == nullptr ? 0 : sizeof(DeviceRope));
+    // Legacy Qwen retains independent embeddings in each session.
     for (const auto& embedding : embeddings_) {
       if (embedding)
         bytes +=
@@ -57,7 +58,13 @@ private:
   RopeLayout layout_;
   std::shared_ptr<const Prompt> prompt_;
   std::shared_ptr<Encoder> encoder_;
+  std::shared_ptr<OutputPool::Owner> output_owner_;
   std::vector<std::shared_ptr<const Encoder::Embedding>> embeddings_;
+  // The configured budget survives text-only Configure calls. The resident
+  // positions keep their original owner even when a different encoder binds.
+  std::shared_ptr<core::ReclaimableMemory> memory_budget_;
+  std::shared_ptr<core::ReclaimableMemory> positions_budget_;
+  hipError_t ReleasePositions() noexcept;
   DeviceRope* descriptor_{nullptr};
   std::int32_t* positions_{nullptr};
   std::size_t capacity_{0};

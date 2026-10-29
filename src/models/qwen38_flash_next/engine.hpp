@@ -61,6 +61,12 @@ struct ModelOptions {
   /// Ordinary trunk and MTP K/V only; indexer and recurrent state are
   /// unchanged.
   KvCacheType kv_cache_type = KvCacheType::kF16;
+  /// Disable both explicit and automatic vision projector loading.
+  bool enable_vision = true;
+  /// Aggregate image rows per session; zero keeps the full-context bound.
+  std::uint32_t vision_max_tokens_per_slot = 0;
+  /// Whole-model retained image-output rows, independent of per-slot caps.
+  std::uint32_t vision_pool_tokens = qwen::vision::kDefaultOutputPoolRows;
 };
 
 class Session;
@@ -93,6 +99,9 @@ public:
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }
+  [[nodiscard]] std::uint32_t VisionMaxTokensPerSlot() const noexcept {
+    return options_.vision_max_tokens_per_slot;
+  }
   [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] KvCacheType CacheType() const noexcept {
     return options_.kv_cache_type;
@@ -108,14 +117,21 @@ public:
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
-                                         std::uint32_t context) const noexcept;
+                                         std::uint32_t context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  // Hard scratch only: no image pool and no unused native snapshot spares.
+  [[nodiscard]] std::size_t ComponentDeferredScratchBytes() const;
+  [[nodiscard]] bool HasComponentBackend() const noexcept;
+  [[nodiscard]] std::shared_ptr<void> BindComponentMemoryBudget(
+      std::shared_ptr<core::ReclaimableMemory>);
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
   }
 
 private:
+  void SetComponentMemoryBudget(
+      std::shared_ptr<core::ReclaimableMemory>) noexcept;
   Model() = default;
 
   ModelOptions options_;
@@ -227,6 +243,7 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  [[nodiscard]] std::size_t AllocatedVisionBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();

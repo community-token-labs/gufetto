@@ -13,6 +13,8 @@
 #include <locale>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -66,12 +68,31 @@ public:
     }
   }
 
+  std::uint64_t AgentId(std::string_view client) noexcept {
+    try {
+      if (client.size() > 256)
+        return 0;
+      const std::lock_guard<std::mutex> lock(mutex_);
+      for (const auto& [name, id] : agents_)
+        if (name == client)
+          return id;
+      if (agents_.size() >= 4096)
+        return 0;
+      const auto id = agents_.size() + 1;
+      agents_.emplace_back(client, id);
+      return id;
+    } catch (...) {
+      return 0;
+    }
+  }
+
   bool enabled{false};
   std::uint64_t moe_every{0}, run_id{0}, process_id{0};
 
 private:
   std::mutex mutex_;
   std::ofstream stream_;
+  std::vector<std::pair<std::string, std::uint64_t>> agents_;
 };
 
 inline Writer& Sink() {
@@ -84,11 +105,12 @@ inline bool Enabled() {
 
 struct Session {
   std::uint64_t slot, request_id, context_depth;
-  std::uint64_t rows{0}, accepted_tokens{0};
+  std::uint64_t rows{0}, accepted_tokens{0}, attribution_request_id{0};
 };
 struct Phase {
   const char* name;
   std::uint64_t start_ns, end_ns;
+  std::uint64_t request_id{0}, forward{0};
 };
 struct Layer {
   std::uint64_t forward, layer, rows;
@@ -101,10 +123,23 @@ struct Wait {
 struct Gpu {
   std::uint64_t forward, host_start_ns, host_end_ns, stream_elapsed_ns;
 };
+// A trace generation is unique within the process/run, not a cache-state proof.
+struct Lineage {
+  std::uint64_t request_id{0}, slot{0}, slot_generation{0}, logical_agent{0};
+  std::uint64_t native_session{0}, native_request_id{0};
+};
+struct Publication {
+  const char* event;
+  Lineage lineage;
+  std::uint64_t ordinal, time_ns, burst_id;
+};
+struct ForwardRows {
+  std::uint64_t depth, rows, request_id, native_session;
+};
 struct Shape {
   std::uint64_t forward;
   bool prefill;
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> sessions;
+  std::vector<ForwardRows> sessions;
 };
 // Vocabulary rows are weight-matrix rows per projection, not output elements.
 struct Projection {
@@ -124,6 +159,15 @@ struct MtpCycle {
 struct DraftTable {
   std::uint64_t context_depth, used_rows, capacity;
 };
+// Internal identifiers only: file is the 16 numeric bytes of a disk file ID,
+// never a path, pointer, prompt or payload. One record covers one staging
+// piece.
+struct CachePersistPiece {
+  std::uint64_t checkpoint;
+  std::array<std::uint8_t, 16> file;
+  std::uint64_t offset, bytes;
+  bool private_file;
+};
 struct Record {
   const char* kind;
   std::uint64_t start_ns{Now()}, thread_id{0};
@@ -139,7 +183,38 @@ struct Record {
   std::vector<MtpHead> mtp_heads;
   std::vector<MtpCycle> mtp_cycles;
   std::vector<DraftTable> draft_tables;
+  std::optional<CachePersistPiece> cache_persist_piece;
+  std::uint64_t work_id{0}, dropped{0};
+  std::vector<Lineage> ready, execution;
+  std::vector<Publication> publications;
 };
+// Bound NEW attribution storage per work unit; overflow is missing evidence.
+inline constexpr std::size_t kAttributionLimit = 4096;
+inline std::uint64_t NextTraceId() noexcept {
+  static std::atomic<std::uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+template<typename T>
+inline void Collect(Record& r, std::vector<T>& values, T value) noexcept {
+  try {
+    if (values.size() < kAttributionLimit) {
+      values.push_back(std::move(value));
+      return;
+    }
+  } catch (...) {
+  }
+  ++r.dropped;
+}
+inline void SerializeLineage(std::ostream& o, const Lineage& l) {
+  o << "\"request_id\":" << l.request_id << ",\"slot\":" << l.slot
+    << ",\"slot_generation\":" << l.slot_generation
+    << ",\"native_request_id\":" << l.native_request_id
+    << ",\"logical_agent\":" << l.logical_agent << ",\"native_session\":";
+  if (l.native_session)
+    o << l.native_session;
+  else
+    o << "null";
+}
 inline thread_local Record* current = nullptr;
 inline thread_local std::uint64_t forward_counter = 0;
 inline thread_local std::uint64_t forward_id = 0;
@@ -169,7 +244,13 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
   for (const auto& s : r.sessions) {
     o << sep << "{\"slot\":" << s.slot << ",\"request_id\":" << s.request_id
       << ",\"context_depth\":" << s.context_depth << ",\"rows\":" << s.rows
-      << ",\"accepted_tokens\":" << s.accepted_tokens << '}';
+      << ",\"accepted_tokens\":" << s.accepted_tokens
+      << ",\"attribution_request_id\":";
+    if (s.attribution_request_id)
+      o << s.attribution_request_id;
+    else
+      o << "null";
+    o << '}';
     sep = ",";
   }
   o << "],\"forwards\":[";
@@ -178,9 +259,19 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
     o << sep << "{\"forward\":" << f.forward
       << ",\"prefill\":" << (f.prefill ? "true" : "false") << ",\"sessions\":[";
     const char* row_sep = "";
-    for (const auto& [depth, rows] : f.sessions) {
-      o << row_sep << "{\"context_depth\":" << depth << ",\"rows\":" << rows
-        << '}';
+    for (const auto& row : f.sessions) {
+      o << row_sep << "{\"context_depth\":" << row.depth
+        << ",\"rows\":" << row.rows << ",\"request_id\":";
+      if (row.request_id)
+        o << row.request_id;
+      else
+        o << "null";
+      o << ",\"native_session\":";
+      if (row.native_session)
+        o << row.native_session;
+      else
+        o << "null";
+      o << '}';
       row_sep = ",";
     }
     o << "]}";
@@ -190,7 +281,8 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
   sep = "";
   for (const auto& p : r.phases) {
     o << sep << "{\"name\":\"" << p.name << "\",\"start_ns\":" << p.start_ns
-      << ",\"end_ns\":" << p.end_ns << '}';
+      << ",\"end_ns\":" << p.end_ns << ",\"request_id\":" << p.request_id
+      << ",\"forward\":" << p.forward << '}';
     sep = ",";
   }
   o << "],\"gpu\":[";
@@ -270,7 +362,45 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
     }
     o << ']';
   }
-  o << '}';
+  if (r.cache_persist_piece) {
+    const auto& p = *r.cache_persist_piece;
+    o << ",\"cache_persist_piece\":{\"checkpoint\":" << p.checkpoint
+      << ",\"file\":[";
+    sep = "";
+    for (const auto byte : p.file) {
+      o << sep << static_cast<unsigned>(byte);
+      sep = ",";
+    }
+    o << "],\"offset\":" << p.offset << ",\"bytes\":" << p.bytes
+      << ",\"private_file\":" << (p.private_file ? "true" : "false") << '}';
+  }
+  o << ",\"attribution\":{\"version\":1,\"work_id\":" << r.work_id
+    << ",\"dropped\":" << r.dropped << ",\"ready\":[";
+  sep = "";
+  for (const auto& l : r.ready) {
+    o << sep << '{';
+    SerializeLineage(o, l);
+    o << '}';
+    sep = ",";
+  }
+  o << "],\"execution\":[";
+  sep = "";
+  for (const auto& l : r.execution) {
+    o << sep << '{';
+    SerializeLineage(o, l);
+    o << '}';
+    sep = ",";
+  }
+  o << "],\"events\":[";
+  sep = "";
+  for (const auto& p : r.publications) {
+    o << sep << "{\"event\":\"" << p.event << "\",";
+    SerializeLineage(o, p.lineage);
+    o << ",\"ordinal\":" << p.ordinal << ",\"time_ns\":" << p.time_ns
+      << ",\"burst_id\":" << p.burst_id << '}';
+    sep = ",";
+  }
+  o << " ]}}";
   return o.str();
 }
 
@@ -279,13 +409,18 @@ public:
   explicit Work(const char* kind) {
     if (!Enabled())
       return;
-    record_ = std::make_unique<Record>();
-    record_->kind = kind;
-    static std::atomic<std::uint64_t> next_thread{0};
-    static thread_local const auto thread =
-        next_thread.fetch_add(1, std::memory_order_relaxed);
-    record_->thread_id = thread;
-    previous_ = std::exchange(current, record_.get());
+    try {
+      record_ = std::make_unique<Record>();
+      record_->kind = kind;
+      record_->work_id = NextTraceId();
+      static std::atomic<std::uint64_t> next_thread{0};
+      static thread_local const auto thread =
+          next_thread.fetch_add(1, std::memory_order_relaxed);
+      record_->thread_id = thread;
+      previous_ = std::exchange(current, record_.get());
+    } catch (...) {
+      record_.reset();
+    }
   }
   ~Work() {
     if (!record_)
@@ -304,6 +439,55 @@ private:
   std::unique_ptr<Record> record_;
   Record* previous_{nullptr};
 };
+
+inline void Publish(const char* event, Lineage lineage, std::uint64_t ordinal,
+                    std::uint64_t time_ns,
+                    std::uint64_t burst_id = 0) noexcept {
+  if (current && lineage.request_id)
+    Collect(*current, current->publications,
+            Publication{event, lineage, ordinal, time_ns, burst_id});
+}
+
+// Actual runner invocation roster, after scheduler filtering. Nested scalar
+// fallbacks replace it temporarily; backend/model hooks bind native sessions by
+// this order, never by equal context depths or adjacent timing.
+inline thread_local std::span<Lineage> execution_roster;
+class ExecutionScope {
+public:
+  explicit ExecutionScope(std::span<Lineage> roster) noexcept
+      : previous_(std::exchange(execution_roster, roster)) {
+    if (current)
+      for (const auto& l : roster) {
+        bool seen = false;
+        for (const auto& prior : current->execution)
+          seen |= prior.request_id == l.request_id;
+        if (!seen)
+          Collect(*current, current->execution, l);
+      }
+  }
+  ~ExecutionScope() { execution_roster = previous_; }
+  ExecutionScope(const ExecutionScope&) = delete;
+  ExecutionScope& operator=(const ExecutionScope&) = delete;
+
+private:
+  std::span<Lineage> previous_;
+};
+inline void BindNative(std::size_t index, std::uint64_t native) noexcept {
+  if (!current || index >= execution_roster.size())
+    return;
+  auto& l = execution_roster[index];
+  l.native_session = native;
+  for (auto& item : current->execution)
+    if (item.request_id == l.request_id)
+      item.native_session = native;
+}
+inline std::uint64_t RequestForNative(std::uint64_t native) noexcept {
+  if (native)
+    for (const auto& l : execution_roster)
+      if (l.native_session == native)
+        return l.request_id;
+  return 0;
+}
 
 inline void Decode(std::uint64_t slot, std::uint64_t rows,
                    std::uint64_t accepted) {
@@ -364,7 +548,8 @@ inline void TraceMtpCycle(std::uint64_t depth, std::uint64_t proposed,
 
 class HostPhase {
 public:
-  explicit HostPhase(const char* name) : name_(name) {
+  explicit HostPhase(const char* name, std::uint64_t request_id = 0)
+      : name_(name), request_id_(request_id), forward_(forward_id) {
     if (current != nullptr)
       start_ = Now();
   }
@@ -372,7 +557,8 @@ public:
     if (start_ != 0) {
       const auto start = std::exchange(start_, 0);
       try {
-        current->phases.push_back({name_, start, Now()});
+        Collect(*current, current->phases,
+                Phase{name_, start, Now(), request_id_, forward_});
       } catch (...) {
       }
     }
@@ -381,7 +567,7 @@ public:
 
 private:
   const char* name_;
-  std::uint64_t start_{0};
+  std::uint64_t request_id_, forward_, start_{0};
 };
 
 // Only target forwards count toward sampling; predictor layers are excluded.
@@ -398,9 +584,10 @@ public:
     current->forwards.push_back({forward_id, prefill, {}});
     active_ = true;
   }
-  void Rows(std::uint64_t depth, std::uint64_t rows) {
+  void Rows(std::uint64_t depth, std::uint64_t rows, std::uint64_t native = 0) {
     if (active_)
-      current->forwards.back().sessions.emplace_back(depth, rows);
+      Collect(*current, current->forwards.back().sessions,
+              ForwardRows{depth, rows, RequestForNative(native), native});
   }
   ~Forward() { Finish(); }
   void Finish() {

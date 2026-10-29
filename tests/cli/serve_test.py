@@ -80,6 +80,39 @@ def main():
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
+    assert "--no-vision" in help_text
+    for args in (["llm", "--no-vision"], ["--no-vision"]):
+        check(["serve", *args, "--model", "missing.gguf"], 1,
+              "Error loading model 'missing.gguf'")
+        check(["serve", *args, "--mmproj", "missing-mmproj.gguf"], 2,
+              "--no-vision cannot be combined with --mmproj")
+        check(["serve", *args, "--mmproj="], 2,
+              "--no-vision cannot be combined with --mmproj")
+    # Integration: neither trailing load argument may displace the other.
+    for args in (["--no-vision", "--vision-max-tokens-per-slot", "16384"],
+                 ["--vision-max-tokens-per-slot", "16384", "--no-vision"]):
+        check(["serve", "llm", *args, "--model", "missing.gguf"], 1,
+              "Error loading model")
+        check(["serve", "llm", *args, "--mmproj="], 2,
+              "--no-vision cannot be combined with --mmproj")
+    assert "--vision-max-tokens-per-slot" in help_text
+    for value in ("0", "16384", "65536"):
+        check(["serve", "llm", "--vision-max-tokens-per-slot", value,
+               "--model", "missing.gguf"], 1, "Error loading model")
+    for value in ("-1", "4294967296", "invalid"):
+        check(["serve", "llm", "--vision-max-tokens-per-slot", value], 2,
+              "--vision-max-tokens-per-slot")
+    assert "--vision-pool-tokens" in help_text
+    assert "Qwen27 default: independent" in help_text
+    assert "Qwen27 opt-in unqualified" in help_text
+    assert "does not enable pooling" in help_text
+    for value in ("1", "128", "65536", "4294967295"):
+        check(["serve", "llm", "--vision-pool-tokens", value,
+               "--vision-max-tokens-per-slot", "64", "--no-vision",
+               "--model", "missing.gguf"], 1, "Error loading model")
+    for value in ("0", "-1", "4294967296", "invalid"):
+        check(["serve", "llm", "--vision-pool-tokens", value], 2,
+              "--vision-pool-tokens")
     assert "--cache-ram-bytes <N|off>" in help_text
     for value in ("off", "0", "536870912"):
         check(["serve", "llm", "--cache-ram-bytes", value,

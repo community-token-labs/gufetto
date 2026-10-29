@@ -4,6 +4,7 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <limits>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -18,8 +19,11 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/host_allocations.hpp"
 #include "src/core/hip/managed_alloc.hpp"
+#include "src/core/reclaimable_memory.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/model_path.hpp"
+#include "src/models/qwen/vision/memory_budget.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -45,8 +49,18 @@ void CheckBlas(hipblasStatus_t status) {
 
 struct Allocation {
   void* data{nullptr};
+  std::shared_ptr<core::ReclaimableMemory> memory_budget;
+  std::size_t bytes{0};
   Allocation() = default;
-  explicit Allocation(std::size_t bytes) { Check(hipMalloc(&data, bytes)); }
+  explicit Allocation(std::size_t size,
+                      std::shared_ptr<core::ReclaimableMemory> budget = {})
+      : memory_budget(std::move(budget)), bytes(size) {
+    const auto allocate = [&] { Check(hipMalloc(&data, bytes)); };
+    if (memory_budget)
+      memory_budget->AllocateImage(bytes, allocate);
+    else
+      allocate();
+  }
   static Allocation Weight(std::size_t bytes) {
     // Keep the copied weights in the device heap when its reserve permits.
     // Movable managed pages can evict text inference queues even when no
@@ -55,19 +69,29 @@ struct Allocation {
     Check(gufo::hip::AllocateDevice(&allocation.data, bytes));
     return allocation;
   }
-  ~Allocation() {
-    if (data != nullptr)
-      (void)hipFree(data);
+  ~Allocation() { Reset(); }
+  void Reset() noexcept {
+    if (data != nullptr) {
+      if (memory_budget)
+        memory_budget->RetireImage(
+            bytes, [&] { return hipFree(data) == hipSuccess; });
+      else
+        (void)hipFree(data);
+      data = nullptr;
+    }
   }
   Allocation(const Allocation&) = delete;
   Allocation& operator=(const Allocation&) = delete;
   Allocation(Allocation&& other) noexcept
-      : data(std::exchange(other.data, nullptr)) {}
+      : data(std::exchange(other.data, nullptr)),
+        memory_budget(std::move(other.memory_budget)),
+        bytes(std::exchange(other.bytes, 0)) {}
   Allocation& operator=(Allocation&& other) noexcept {
     if (this != &other) {
-      if (data != nullptr)
-        (void)hipFree(data);
+      Reset();
       data = std::exchange(other.data, nullptr);
+      memory_budget = std::move(other.memory_budget);
+      bytes = std::exchange(other.bytes, 0);
     }
     return *this;
   }
@@ -81,10 +105,86 @@ struct Allocation {
 // cache. Moving those file/heap pages can then evict unrelated text queues
 // long after upload. Copy through one bounded, explicitly owned host buffer.
 class PinnedUpload {
+  struct BoundAllocation {
+    gufo::hip::HostAllocations allocations;
+    std::shared_ptr<core::ReclaimableMemory> budget;
+    std::size_t bytes;
+    BoundAllocation* next{nullptr};
+
+    BoundAllocation(std::shared_ptr<core::ReclaimableMemory> owner,
+                    std::size_t size)
+        : budget(std::move(owner)), bytes(size) {}
+    bool TryReset() noexcept {
+      bool released = false;
+      budget->RetireImage(bytes, [&] {
+        released = allocations.TryReset();
+        return released;
+      });
+      return released;
+    }
+  };
+  struct Retirements {
+    std::mutex mutex;
+    BoundAllocation* head{nullptr};
+  };
+  static Retirements& PendingRetirements() {
+    // Failed physical frees must not fall through to HostAllocations' unchecked
+    // destructor. Keep their owners/charges for a later bound upload to retry;
+    // any still failing at process exit remain resident until process teardown.
+    static Retirements retirements;
+    return retirements;
+  }
+
 public:
-  explicit PinnedUpload(hipStream_t stream, std::size_t bytes = kBytes)
-      : capacity_(std::min(bytes, kBytes)), stream_(stream) {
-    Check(allocations_.Allocate(&data_, capacity_));
+  static void RetryRetirements() {
+    auto& pending = PendingRetirements();
+    const std::lock_guard lock(pending.mutex);
+    for (auto** item = &pending.head; *item != nullptr;) {
+      auto* allocation = *item;
+      if (allocation->TryReset()) {
+        *item = allocation->next;
+        delete allocation;
+      } else {
+        item = &allocation->next;
+      }
+    }
+  }
+
+  explicit PinnedUpload(hipStream_t stream, std::size_t bytes = kBytes,
+                        std::shared_ptr<core::ReclaimableMemory> budget = {})
+      : capacity_(std::min(bytes, kBytes)),
+        stream_(stream),
+        bound_(budget ? std::make_unique<BoundAllocation>(std::move(budget),
+                                                         capacity_)
+                      : nullptr) {
+    if (bound_) {
+      bound_->budget->AllocateImage(capacity_, [&] {
+        Check(bound_->allocations.Allocate(&data_, capacity_));
+      });
+    } else {
+      Check(allocations_.Allocate(&data_, capacity_));
+    }
+  }
+  ~PinnedUpload() {
+    Reset();
+    if (bound_) {
+      auto& pending = PendingRetirements();
+      const std::lock_guard lock(pending.mutex);
+      bound_->next = pending.head;
+      pending.head = bound_.release();
+    }
+  }
+  void Reset() noexcept {
+    if (data_ == nullptr)
+      return;
+    if (bound_) {
+      if (!bound_->TryReset())
+        return;
+      bound_.reset();
+    } else {
+      allocations_.Reset();
+    }
+    data_ = nullptr;
   }
   PinnedUpload(const PinnedUpload&) = delete;
   PinnedUpload& operator=(const PinnedUpload&) = delete;
@@ -109,6 +209,7 @@ private:
   void* data_{nullptr};
   std::size_t capacity_;
   hipStream_t stream_;
+  std::unique_ptr<BoundAllocation> bound_;
 };
 
 __device__ __forceinline__ float Round(float x) {
@@ -362,6 +463,7 @@ struct Encoder::Impl {
   std::uint32_t output_width;
   std::string identity;
   std::once_flag identity_once;
+  SerializedEncoderWorkspace workspace;
   std::atomic<std::size_t> resident_bytes{0};
   std::unordered_map<std::string, Allocation> weights;
   hipStream_t stream{nullptr};
@@ -554,22 +656,20 @@ struct Encoder::Impl {
   }
 };
 
-Encoder::Encoder(const std::filesystem::path& path, std::uint32_t width)
-    : impl_(std::make_unique<Impl>(path, width)) {}
+Encoder::Encoder(const std::filesystem::path& path, std::uint32_t width,
+                 std::optional<std::uint32_t> pool_rows)
+    : policy_(ResolvePolicy(width, pool_rows)),
+      outputs_(policy_.pool_rows ? std::make_shared<OutputPool>(*policy_.pool_rows)
+                                : nullptr), output_width_(width),
+      impl_(std::make_unique<Impl>(path, width)) {}
 Encoder::~Encoder() = default;
 std::shared_ptr<Encoder> Encoder::Open(const std::filesystem::path& target,
                                        const std::filesystem::path& sidecar,
-                                       std::uint32_t width) {
-  if (!sidecar.empty())
-    return std::make_shared<Encoder>(sidecar, width);
-  auto directory = target.parent_path();
-  for (unsigned level = 0; level < 2; ++level) {
-    const auto path = directory / "mmproj-BF16.gguf";
-    if (std::filesystem::is_regular_file(path))
-      return std::make_shared<Encoder>(path, width);
-    directory = directory.parent_path();
-  }
-  return {};
+                                       std::uint32_t width, bool enabled,
+                                       std::optional<std::uint32_t> pool_rows) {
+  const auto policy = ResolvePolicy(width, pool_rows, 0, enabled);
+  const auto path = ResolveModelPath(target, sidecar, policy.enabled);
+  return path.empty() ? nullptr : std::make_shared<Encoder>(path, width, pool_rows);
 }
 const std::string& Encoder::identity() const {
   std::call_once(impl_->identity_once, [&] {
@@ -600,17 +700,32 @@ const std::string& Encoder::identity() const {
 std::size_t Encoder::ResidentBytes() const noexcept {
   return impl_->resident_bytes.load();
 }
+std::size_t Encoder::OutputBudgetBytes() const {
+  return outputs_ ? OutputReservationBytes(outputs_->Capacity(), output_width_) : 0;
+}
+void Encoder::SetMemoryBudget(std::shared_ptr<core::ReclaimableMemory> budget) {
+  memory_budget_ = std::move(budget);
+}
 void Encoder::Upload() {
+  const auto lease = outputs_ ? impl_->workspace.Acquire()
+                              : std::unique_lock<std::mutex>{};
   impl_->Upload();
 }
 Encoder::Embedding::~Embedding() {
-  if (data_ != nullptr)
-    (void)hipFree(data_);
+  if (data_ != nullptr) {
+    if (memory_budget_)
+      memory_budget_->RetireImage(
+          bytes_, [&] { return hipFree(data_) == hipSuccess; });
+    else
+      (void)hipFree(data_);
+  }
 }
 
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     const core::Image& image, const Observer& observer,
     const CancellationCheck& is_cancelled) {
+  const auto lease = outputs_ ? impl_->workspace.Acquire()
+                              : std::unique_lock<std::mutex>{};
   const auto check_cancelled = [&] {
     if (is_cancelled && is_cancelled())
       throw std::runtime_error("vision encoding cancelled");
@@ -623,28 +738,38 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
     throw std::invalid_argument("vision encoder requires a resized RGB32 grid");
   }
   impl_->Upload();
+  // Retry before scratch allocation: a retained failed upload must not prevent
+  // us from reaching its retirement by consuming the admitted image capacity.
+  if (memory_budget_)
+    PinnedUpload::RetryRetirements();
   const auto stream = impl_->stream;
   const unsigned count = (image.width / 16) * (image.height / 16);
   const unsigned merged = count / 4;
-  Allocation pixels(image.pixels.size());
-  Allocation hidden(std::size_t{count} * kHidden * sizeof(float));
-  Allocation work(std::size_t{count} * std::max(kFfn, 3 * kHidden) *
-                  sizeof(float));
-  Allocation normalized(std::size_t{count} * std::max(kFfn, kPatchDim) *
-                        sizeof(Bf16));
-  Allocation qkv(std::size_t{3} * count * kHidden * sizeof(Bf16));
-  Allocation attention(std::size_t{count} * kHidden * sizeof(Bf16));
+  Allocation pixels(image.pixels.size(), memory_budget_);
+  Allocation hidden(std::size_t{count} * kHidden * sizeof(float),
+                    memory_budget_);
+  Allocation work(std::size_t{count} * std::max(kFfn, 3 * kHidden) * sizeof(float),
+                  memory_budget_);
+  Allocation normalized(
+      std::size_t{count} * std::max(kFfn, kPatchDim) * sizeof(Bf16),
+      memory_budget_);
+  Allocation qkv(std::size_t{3} * count * kHidden * sizeof(Bf16), memory_budget_);
+  Allocation attention(std::size_t{count} * kHidden * sizeof(Bf16),
+                       memory_budget_);
   // Smaller attention tiles reduce scratch traffic for the 4096-patch
   // shape while preserving its BLAS reductions. Ragged tails require
   // their existing GEMM shapes to preserve rounding.
   const unsigned tile = std::min(count, count == 4096 ? 64U : 128U);
-  Allocation scores(std::size_t{kHeads} * tile * count * sizeof(float));
-  Allocation probabilities(std::size_t{kHeads} * tile * count * sizeof(Bf16));
-  Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float));
+  Allocation scores(std::size_t{kHeads} * tile * count * sizeof(float),
+                    memory_budget_);
+  Allocation probabilities(std::size_t{kHeads} * tile * count * sizeof(Bf16),
+                           memory_budget_);
+  Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float),
+                         memory_budget_);
   {
     // The input image can outlive encoding as part of a cached prompt.
     // Do not leave its pageable vector in ROCr's implicit SVM copy cache.
-    PinnedUpload upload(stream, image.pixels.size());
+    PinnedUpload upload(stream, image.pixels.size(), memory_budget_);
     upload.Copy(pixels.data, image.pixels.data(), image.pixels.size());
   }
   Patchify<<<(count * kPatchDim + kThreads - 1) / kThreads, kThreads, 0,
@@ -756,8 +881,17 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
   auto embedding = std::shared_ptr<Embedding>(new Embedding);
   embedding->rows_ = merged;
   embedding->width_ = impl_->output_width;
-  Check(hipMalloc(&embedding->data_,
-                  std::size_t{merged} * embedding->width_ * sizeof(float)));
+  const auto bytes = std::size_t{merged} * embedding->width_ * sizeof(float);
+  // Publish ownership only after admission and physical allocation succeed.
+  float* data = nullptr;
+  const auto allocate = [&] { Check(hipMalloc(&data, bytes)); };
+  if (memory_budget_)
+    memory_budget_->AllocateImage(bytes, allocate);
+  else
+    allocate();
+  embedding->data_ = data;
+  embedding->memory_budget_ = memory_budget_;
+  embedding->bytes_ = bytes;
   impl_->Gemm("mm.2.weight", normalized.As<Bf16>(), embedding->data_, merged,
               embedding->width_, kMergeHidden);
   Finish<<<(merged * embedding->width_ + kThreads - 1) / kThreads, kThreads, 0,

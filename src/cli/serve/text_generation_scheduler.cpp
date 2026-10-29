@@ -86,6 +86,9 @@ struct SessionTable {
 
 struct ScheduledRequest {
   std::uint64_t id{0};
+  perf::Lineage lineage;
+  std::uint64_t trace_burst{0};
+  bool trace_admitted{false};
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
   std::shared_ptr<const TextPromptContext> prompt_context;
@@ -178,8 +181,22 @@ void TraceRequest(const std::shared_ptr<ScheduledRequest>& request,
                                request->result.tokens.size() -
                                (request->preview_token.has_value() ? 1 : 0) -
                                (request->advance_pending ? 1 : 0);
-  perf::current->sessions.push_back({request->session, request->id, depth});
+  perf::current->sessions.push_back({request->session, request->id, depth, 0, 0,
+                                     request->lineage.request_id});
 }
+
+// The actual runner invocation roster, not every resident slot.
+class TraceExecution {
+public:
+  explicit TraceExecution(const std::shared_ptr<ScheduledRequest>& request)
+      : single_{request->lineage},
+        scope_(perf::current ? std::span(single_)
+                             : std::span<perf::Lineage>{}) {}
+
+private:
+  std::array<perf::Lineage, 1> single_;
+  perf::ExecutionScope scope_;
+};
 
 struct PendingClient {
   std::string client_id;
@@ -233,6 +250,10 @@ void ReleaseBufferedOutputLocked(
 void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
                      std::exception_ptr failure = {},
                      bool discard_pending_output = false) noexcept {
+  perf::Work terminal_trace("request_terminal");
+  if (terminal_trace.get())
+    perf::Publish("terminal", request->lineage, request->result.tokens.size(),
+                  perf::Now());
   {
     const std::lock_guard<std::mutex> lock(request->output_mutex);
     if (discard_pending_output) {
@@ -414,6 +435,7 @@ GenerationTrace StartGenerationTrace(const ScheduledRequest& request,
     prompt_ids.push_back(static_cast<std::size_t>(token));
   trace.record["prompt_token_ids"] = std::move(prompt_ids);
   trace.record["generation"] = request.id;
+  trace.record["attribution_request_id"] = request.lineage.request_id;
   trace.record["max_tokens"] = request.token_limit;
   json::Value sampling = json::Value::object();
   sampling["temperature"] = TraceFloat(request.sampling.temperature);
@@ -729,6 +751,10 @@ struct TextGenerationScheduler::Impl {
         request->session =
             static_cast<std::size_t>(free - sessions->requests.begin());
         *free = request;
+        if (request->lineage.request_id) {
+          request->lineage.slot = request->session;
+          request->lineage.slot_generation = request->lineage.request_id;
+        }
       }
     }
     request->counted_processing = true;
@@ -1240,9 +1266,12 @@ struct TextGenerationScheduler::Impl {
                           [](const auto& r) { return r->decode_due; }));
         trace->capturing = capturing.size();
         trace->waiting = waiting.size();
+        if (!std::exchange(request->trace_admitted, true))
+          perf::Publish("admit", request->lineage, 0, perf::Now());
         // The runner lease is not acquired yet; admission may restore it.
         if (request->session != kNoSession)
-          trace->sessions.push_back({request->session, request->id, 0});
+          trace->sessions.push_back({request->session, request->id, 0, 0, 0,
+                                     request->lineage.request_id});
       }
       try {
         if (CompleteIfStopped(request)) {
@@ -1268,7 +1297,19 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        // A whole-prompt reservation must precede runner acquisition. Keep
+        // this lease until transferring it to Acquire, so the worker can
+        // never block waiting for credits it just observed.
+        auto resources = request->prompt_context
+                             ? request->prompt_context->TryAdmit()
+                             : TextPromptAdmission{};
+        if (!resources.ready) {
+          waiting.push_back(std::move(request));
+          return;  // active requests still get their next execution step
+        }
         const std::weak_ptr<ScheduledRequest> weak_request = request;
+        perf::HostPhase acquisition("admission_acquire",
+                                    request->lineage.request_id);
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
             [weak_request, stop_token] {
@@ -1279,7 +1320,8 @@ struct TextGenerationScheduler::Impl {
             },
             std::move(request->prompt_context), request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->cache_persist);
+            request->cache_persist, std::move(resources));
+        acquisition.Finish();
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
         if (!request->runner_request) {
@@ -1377,8 +1419,12 @@ struct TextGenerationScheduler::Impl {
         perf::current->tokens_budget = budget;
         perf::current->tokens_requested = budget;
       }
+      TraceExecution execution(request);
+      perf::HostPhase prefill_phase("prefill_service",
+                                    request->lineage.request_id);
       const auto start = Clock::now();
       const auto step = request->runner_request.Prefill(budget);
+      prefill_phase.Finish();
       if (perf::current != nullptr)
         perf::current->tokens_processed = step.consumed_tokens;
       const double step_ms =
@@ -1430,8 +1476,10 @@ struct TextGenerationScheduler::Impl {
     }
 
     if (request->advance_pending) {
+      perf::HostPhase snapshot("snapshot_prepare", request->lineage.request_id);
       if (!request->runner_request.PreparePromptSnapshot())
         return std::nullopt;
+      snapshot.Finish();
       request->advance_pending = false;
       if (!final_token_advance_required &&
           request->result.tokens.size() >= request->token_limit) {
@@ -1453,6 +1501,8 @@ struct TextGenerationScheduler::Impl {
       return std::nullopt;
     }
 
+    if (perf::current)
+      request->trace_burst = perf::NextTraceId();
     if (!PublishSelection(request, selection)) {
       return std::nullopt;
     }
@@ -1495,6 +1545,12 @@ struct TextGenerationScheduler::Impl {
     }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
+    if (perf::current)
+      perf::Publish("token", request->lineage, request->result.tokens.size(),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        now.time_since_epoch())
+                        .count(),
+                    request->trace_burst);
     request->live_generated_tokens.store(request->result.tokens.size(),
                                          std::memory_order_relaxed);
     detail::TotalGenTokens().fetch_add(1, std::memory_order_relaxed);
@@ -1546,6 +1602,7 @@ struct TextGenerationScheduler::Impl {
       if (!decode_start.has_value()) {
         return;
       }
+      TraceExecution execution(request);
       request->runner_request.Advance();
       FinishAdvanced(request, *decode_start);
     } catch (...) {
@@ -1571,6 +1628,7 @@ struct TextGenerationScheduler::Impl {
       const std::size_t remaining =
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
+      TraceExecution execution(request);
       const auto step = request->runner_request.DecodeStep(remaining);
       perf::Decode(request->session,
                    step.selections.empty() ? 0 : step.draft_tokens + 1,
@@ -1582,6 +1640,8 @@ struct TextGenerationScheduler::Impl {
       request->result.lookup_accepted_tokens += step.lookup_accepted_tokens;
 
       CheckPreviewResult(request, step);
+      if (perf::current)
+        request->trace_burst = perf::NextTraceId();
       for (const auto& selection : step.selections) {
         if (!PublishDecodedSelection(request, selection)) {
           return;
@@ -1619,6 +1679,8 @@ struct TextGenerationScheduler::Impl {
       const auto preview_start = Clock::now();
       const auto preview = request->runner_request.PreviewFirstToken();
       if (preview && !preview->stop) {
+        if (perf::current)
+          request->trace_burst = perf::NextTraceId();
         if (!PublishSelection(request, *preview))
           return false;
         request->preview_token = preview->token;
@@ -1634,8 +1696,10 @@ struct TextGenerationScheduler::Impl {
                       TextGenerationBackend::FinishReason::kStopSequence);
       return false;
     }
+    perf::HostPhase snapshot("snapshot_prepare", request->lineage.request_id);
     if (!request->runner_request.PreparePromptSnapshot())
       return false;
+    snapshot.Finish();
     if (request->preview_stops) {
       CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
       return false;
@@ -1707,6 +1771,7 @@ struct TextGenerationScheduler::Impl {
     }
     if (prepared.size() == 1) {
       try {
+        TraceExecution execution(prepared.front().request);
         prepared.front().request->runner_request.Advance();
         FinishAdvanced(prepared.front().request, prepared.front().decode_start);
       } catch (...) {
@@ -1721,6 +1786,7 @@ struct TextGenerationScheduler::Impl {
         if (CompleteIfStopped(item.request))
           continue;
         try {
+          TraceExecution execution(item.request);
           item.request->runner_request.Advance();
           FinishAdvanced(item.request, item.decode_start);
         } catch (...) {
@@ -1737,6 +1803,17 @@ struct TextGenerationScheduler::Impl {
     }
     std::vector<std::exception_ptr> failures;
     try {
+      std::array<perf::Lineage, 64> roster{};
+      std::size_t count = 0;
+      if (perf::current) {
+        if (prepared.size() <= roster.size()) {
+          for (const auto& item : prepared)
+            roster[count++] = item.request->lineage;
+        } else {
+          ++perf::current->dropped;
+        }
+      }
+      perf::ExecutionScope execution{std::span(roster).first(count)};
       failures = runner_pool->AdvanceBatch(runner_requests, plan);
     } catch (...) {
       const auto failure = std::current_exception();
@@ -1841,6 +1918,17 @@ struct TextGenerationScheduler::Impl {
 
     std::vector<TextDecodeStep> steps;
     try {
+      std::array<perf::Lineage, 64> roster{};
+      std::size_t count = 0;
+      if (perf::current) {
+        if (prepared.size() <= roster.size()) {
+          for (const auto& item : prepared)
+            roster[count++] = item.request->lineage;
+        } else {
+          ++perf::current->dropped;
+        }
+      }
+      perf::ExecutionScope execution{std::span(roster).first(count)};
       steps = runner_pool->DecodeBatch(runner_requests, max_tokens, plan);
     } catch (...) {
       const auto failure = std::current_exception();
@@ -1899,6 +1987,8 @@ struct TextGenerationScheduler::Impl {
         CompleteFailure(item.request, std::current_exception());
         continue;
       }
+      if (perf::current)
+        item.request->trace_burst = perf::NextTraceId();
       for (const auto& selection : step.selections) {
         if (!PublishDecodedSelection(item.request, selection)) {
           published = false;
@@ -2158,6 +2248,8 @@ struct TextGenerationScheduler::Impl {
                           [](const auto& r) { return r->decode_due; }));
         trace->capturing = capturing.size();
         trace->waiting = waiting.size();
+        for (const auto& request : decoding)
+          perf::Collect(*trace, trace->ready, request->lineage);
       }
     };
     while (!stop_token.stop_requested()) {
@@ -2609,6 +2701,18 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->client_id =
       metadata.client_id.empty() ? "anonymous" : std::move(metadata.client_id);
+  if (perf::Enabled()) {
+    request->lineage.request_id = perf::NextTraceId();
+    request->lineage.native_request_id = request->id;
+    request->lineage.logical_agent = perf::Sink().AgentId(request->client_id);
+    perf::Work submitted("request_submit");
+    if (submitted.get() && !request->lineage.logical_agent)
+      ++submitted.get()->dropped;
+    perf::Publish("submit", request->lineage, 0,
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      metadata.request_start.time_since_epoch())
+                      .count());
+  }
   request->result.prompt_tokens = prompt.size();
   request->result.token_metrics_recorded = true;
   request->result.client_id = request->client_id;

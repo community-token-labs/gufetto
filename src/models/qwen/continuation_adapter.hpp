@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN_CONTINUATION_ADAPTER_HPP_
 
 #include <atomic>
+#include <optional>
 
 #include "src/cache/adapter.hpp"
 #include "src/core/hip/transfer_pool.hpp"
@@ -29,8 +30,13 @@ public:
       hip::QwenExecutionPolicy = hip::QwenExecutionPolicy::Production(),
       std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model = nullptr,
       hip::QwenDFlashGpuDraftConfig draft_config = {},
-      cache::ResourceLedger* ledger = nullptr);
+      cache::ResourceLedger* ledger = nullptr,
+      std::optional<std::size_t> execution_claim_bytes = std::nullopt);
   ~ContinuationAdapter() override;
+  // Read once after startup creates all slots; never sampled by growth threads.
+  [[nodiscard]] std::size_t InitialPendingExecutionBytes() const noexcept {
+    return initial_pending_execution_bytes_;
+  }
   [[nodiscard]] hip::QwenGpuExecutor& GetExecutor(cache::Slot&);
   [[nodiscard]] hip::QwenDFlashGpuDraftBackend* GetDraftBackend(cache::Slot&);
   [[nodiscard]] ContinuationFrontier& GetFrontier(cache::Slot&);
@@ -112,6 +118,8 @@ private:
   // Charged for each slot's pinned prompt capture; outlives the slots.
   cache::ResourceLedger* ledger_;
   std::atomic<std::size_t> pinned_capture_bytes_{};
+  std::optional<std::size_t> execution_claim_bytes_;
+  std::size_t initial_pending_execution_bytes_{};
   hip::QwenExecutionPolicy policy_;
   std::uint32_t context_;
   ContinuationLayout layout_;

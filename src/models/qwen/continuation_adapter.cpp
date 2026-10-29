@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "src/core/hip/snapshot_copy.hpp"
+#include "src/core/memory_budget.hpp"
 #include "src/models/qwen/cache_capabilities.hpp"
 
 namespace gufo::models::qwen {
@@ -262,11 +263,13 @@ ContinuationAdapter::ContinuationAdapter(
     std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t context,
     cache::Identity identity, hip::QwenExecutionPolicy policy,
     std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model,
-    hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger)
+    hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger,
+    std::optional<std::size_t> execution_claim_bytes)
     : model_(std::move(model)),
       draft_model_(std::move(draft_model)),
       draft_config_(draft_config),
       ledger_(ledger),
+      execution_claim_bytes_(execution_claim_bytes),
       policy_(policy),
       context_(context),
       layout_(model_ ? model_->GetConfig() : core::ModelConfig{}, policy,
@@ -413,6 +416,20 @@ std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
       throw std::runtime_error("cannot create component draft: " + error);
     executor->ReservePromptHiddenCapture(draft->TargetHiddenLayerIds().size(),
                                          ledger_);
+  }
+  if (execution_claim_bytes_) {
+    const auto usage = executor->GetMemoryUsage();
+    auto allocated = core::AddMemoryBytes(usage.request_state_bytes,
+                                          usage.temporary_scratch_bytes);
+    if (draft) {
+      const auto draft_usage = draft->GetMemoryUsage();
+      allocated = core::AddMemoryBytes(
+          allocated, core::AddMemoryBytes(draft_usage.request_state_bytes,
+                                          draft_usage.temporary_scratch_bytes));
+    }
+    initial_pending_execution_bytes_ = core::AddMemoryBytes(
+        initial_pending_execution_bytes_,
+        core::PendingMemoryBytes(*execution_claim_bytes_, allocated));
   }
   return std::make_unique<State>(*this, guard, std::move(executor),
                                  std::move(draft));

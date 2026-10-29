@@ -19,12 +19,22 @@ struct SharedTempMapping {
 /// of transparent huge pages and touching every page before returning, so
 /// later promotions cannot invalidate device mappings. Returns nullptr on
 /// failure. Pair with ReleaseCommittedPages(); registration with a device
-/// runtime stays with the caller.
+/// runtime stays with the caller. If failed page setup/population cannot
+/// release its mapping during rollback, terminates rather than returning
+/// unowned storage.
 void* CommitZeroedPages(std::size_t bytes) noexcept;
 
 /// Releases memory obtained from CommitZeroedPages() or
 /// CloneMappedWeightsToAnonymousPages(). `bytes` must match the commit call.
 void ReleaseCommittedPages(void* base, std::size_t bytes) noexcept;
+
+/// Checked release for physical-capacity accounting. A nonnull base must own
+/// exactly the range returned by the commit/clone call, with nonzero bytes.
+/// True means the mapping was released (or base was null). False preserves the
+/// mapping for retry; callers must retain its ownership and accounting.
+/// Device registration and long-term pins must be released successfully first.
+[[nodiscard]] bool TryReleaseCommittedPages(void* base,
+                                            std::size_t bytes) noexcept;
 
 /// Clones a read-only file mapping range into anonymous pages populated in
 /// parallel and drops the source page-cache pages as chunks complete. Returns

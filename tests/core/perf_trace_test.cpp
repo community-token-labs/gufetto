@@ -16,6 +16,98 @@ void RemoveTrace() {
   std::error_code ec;
   std::filesystem::remove(trace_path, ec);
 }
+void TestAttribution() {
+  using namespace gufo;
+  perf::Record record{};
+  record.kind = "decode_batch";
+  auto* previous = std::exchange(perf::current, &record);
+  std::array<perf::Lineage, 2> roster{{{41, 0, 41, 9}, {42, 1, 42, 9}}};
+  {
+    perf::ExecutionScope scope(roster);
+    perf::BindNative(0, 111);
+    perf::BindNative(1, 222);
+    // Equal context depths and model filtering must not alias requests.
+    perf::Forward forward(false);
+    forward.Rows(4096, 3, 222);
+    assert(record.forwards.back().sessions[0].request_id == 42);
+    assert(perf::RequestForNative(333) == 0);
+    std::array<perf::Lineage, 1> next{{{43, 0, 43, 9}}};
+    {
+      perf::ExecutionScope nested(next);
+      perf::BindNative(0, 111);
+      assert(perf::RequestForNative(111) == 43);
+      assert(perf::RequestForNative(222) == 0);
+    }
+    assert(perf::RequestForNative(111) == 41);
+    for (std::size_t i = 0; i < perf::kAttributionLimit + 2; ++i)
+      perf::Publish("token", roster[0], i + 1, 100 + i, 7);
+    assert(record.publications.size() == perf::kAttributionLimit);
+    assert(record.dropped == 2);
+  }
+  assert(perf::execution_roster.empty());
+  const auto value = json::parse(perf::Serialize(record, 5000));
+  const auto* attr = value.find("attribution");
+  assert(attr->member_size("dropped") == 2);
+  assert(attr->find("events")->items()[0].member_size("burst_id") == 7);
+  assert(attr->find("execution")->items()[1].member_size("native_session") ==
+         222);
+  assert(value.find("forwards")
+             ->items()[0]
+             .find("sessions")
+             ->items()[0]
+             .member_size("request_id") == 42);
+  perf::current = previous;
+}
+void TestCachePersistPiece() {
+  using namespace gufo;
+  perf::Record record{};
+  record.kind = "cache_persist_piece";
+  assert(json::parse(perf::Serialize(record, 1)).find("cache_persist_piece") ==
+         nullptr);
+  record.cache_persist_piece = perf::CachePersistPiece{
+      9007199254740993ULL, {}, 9007199254740995ULL, 1048576, true};
+  auto& file = record.cache_persist_piece->file;
+  for (std::size_t i = 0; i < file.size(); ++i)
+    file[i] = static_cast<std::uint8_t>(240 + i);
+  auto* previous = std::exchange(perf::current, &record);
+  for (const auto* label :
+       {"cache_persist_source", "hip_transfer_owned_d2h_enqueue",
+        "hip_transfer_owned_event_record", "cache_persist_completion_wait",
+        "hip_transfer_owned_event_wait", "hip_transfer_owned_wait_drain",
+        "cache_persist_stream_teardown",
+        "hip_transfer_owned_stream_destructor_drain",
+        "hip_transfer_owned_lease_destructor_drain"}) {
+    perf::HostPhase phase(label);
+    phase.Finish();
+    phase.Finish();  // Explicit finish plus destruction records only once.
+  }
+  perf::current = previous;
+  const auto serialized = perf::Serialize(record, perf::Now());
+  const auto value = json::parse(serialized);
+  const auto* piece = value.find("cache_persist_piece");
+  assert(piece && piece->members().size() == 5);
+  assert(serialized.find("\"checkpoint\":9007199254740993") !=
+         std::string::npos);
+  assert(serialized.find("\"offset\":9007199254740995") != std::string::npos);
+  assert(piece->member_size("bytes") == 1048576);
+  assert(piece->find("private_file")->as_bool());
+  const auto& bytes = piece->find("file")->items();
+  assert(bytes.size() == 16);
+  for (std::size_t i = 0; i < bytes.size(); ++i)
+    assert(bytes[i].is_number() && bytes[i].as_size() == 240 + i);
+  const auto& phases = value.find("phases")->items();
+  assert(phases.size() == 9);
+  for (const auto& phase : phases) {
+    assert(!phase.member_str("name").empty());
+    assert(phase.member_size("end_ns") >= phase.member_size("start_ns"));
+  }
+  // No source contents or identifiers other than the numeric internal IDs.
+  for (const auto* key : {"path", "pointer", "source", "payload", "tokens",
+                          "prompt", "prompt_text", "input"}) {
+    assert(piece->find(key) == nullptr);
+    assert(value.find(key) == nullptr);
+  }
+}
 void TestMtpCounters() {
   using namespace gufo;
   perf::Record record{};
@@ -108,6 +200,19 @@ int main(int argc, char**) {
     assert(!perf::sample_moe);
     perf::TraceMtpHead(4, 4, 4, 98304, 248320, 1024);
     perf::TraceMtpCycle(4096, 5, 4, 3, 5);
+    perf::Publish("token", {1, 0, 1, 1}, 1, 0, 1);
+    assert(perf::execution_roster.empty());
+    assert(perf::current == nullptr);
+    {
+      perf::Work piece("cache_persist_piece");
+      if (auto* record = piece.get())
+        record->cache_persist_piece =
+            perf::CachePersistPiece{1, {}, 0, 16, false};
+      perf::HostPhase enqueue("hip_transfer_owned_d2h_enqueue");
+      perf::HostPhase wait("hip_transfer_owned_event_wait");
+      perf::HostPhase drain("hip_transfer_owned_wait_drain");
+      assert(piece.get() == nullptr && perf::current == nullptr);
+    }
     assert(perf::current == nullptr);
     return 0;
   }
@@ -123,6 +228,11 @@ int main(int argc, char**) {
   assert(platform::SetEnv("GUFO_PERF_TRACE_MOE", "2"));
   assert(perf::Enabled());
   TestMtpCounters();
+  TestAttribution();
+  // TestAttribution consumed a diagnostic forward; reset only this fixture's
+  // thread-local sampling counter before the original every-second test.
+  perf::forward_counter = 0;
+  TestCachePersistPiece();
   {
     perf::Work work("prefill");
     auto* record = work.get();

@@ -657,6 +657,10 @@ void PrintServeHelp(std::string_view program_name,
   if (subcommand == "llm") {
     std::string model;
     std::string served_model_name;
+    std::uint32_t vision_pool_tokens =
+        models::qwen::vision::kDefaultOutputPoolRows;
+    bool no_vision = false;
+    std::uint32_t vision_max_tokens_per_slot = 0;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -710,6 +714,20 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--mmproj", "PATH",
                      "Qwen BF16 vision sidecar (auto-discovered beside model)",
                      "Model", &vision_model_path);
+    parser.AddFlag("", "--no-vision",
+                   "Disable vision loading and image inputs (default: auto; "
+                   "Qwen27 opt-in unqualified)",
+                   "Model", &no_vision);
+    parser.AddOption(
+        "", "--vision-pool-tokens", "N",
+        "Shared retained image rows (positive; Flash-Next default: "
+        "65536; Qwen27 default: independent; Qwen27 opt-in unqualified)",
+        "Model", &vision_pool_tokens);
+    parser.AddOption("", "--vision-max-tokens-per-slot", "N",
+                     "Aggregate image cap (0 = model default; Qwen27 opt-in "
+                     "unqualified; does not enable pooling; count is uncapped "
+                     "by context for legacy Qwen27)",
+                     "Model", &vision_max_tokens_per_slot);
     parser.AddOption("", "--served-model-name", "ID",
                      "Model identifier exposed by the OpenAI API (repeatable; "
                      "the first is primary)",
@@ -1296,6 +1314,10 @@ int RunServe(std::span<const char* const> args) {
     // Default to LLM server
     std::string model;
     std::vector<std::string> served_model_names;
+    std::uint32_t vision_pool_tokens =
+        models::qwen::vision::kDefaultOutputPoolRows;
+    bool no_vision = false;
+    std::uint32_t vision_max_tokens_per_slot = 0;
     std::uint32_t max_context = 0;
     std::int64_t max_tokens = -1;
     sampling::SamplingConfig sampling_config;
@@ -1349,6 +1371,22 @@ int RunServe(std::span<const char* const> args) {
         "", "--mmproj", "PATH",
         "Qwen BF16 vision sidecar (auto-discovered beside model)", "Model",
         &vision_model_path);
+    llm_parser.AddFlag(
+        "", "--no-vision",
+        "Disable vision loading and image inputs (default: auto; "
+        "Qwen27 opt-in unqualified)",
+        "Model", &no_vision);
+    llm_parser.AddOption(
+        "", "--vision-pool-tokens", "N",
+        "Shared retained image rows (positive; Flash-Next default: "
+        "65536; Qwen27 default: independent; Qwen27 opt-in unqualified)",
+        "Model", &vision_pool_tokens);
+    llm_parser.AddOption(
+        "", "--vision-max-tokens-per-slot", "N",
+        "Aggregate image cap (0 = model default; Qwen27 opt-in "
+        "unqualified; does not enable pooling; count is uncapped "
+        "by context for legacy Qwen27)",
+        "Model", &vision_max_tokens_per_slot);
     llm_parser.AddCustomOption(
         "", "--served-model-name", "ID",
         "Model identifier exposed by the OpenAI API (repeatable; the first "
@@ -1503,6 +1541,14 @@ int RunServe(std::span<const char* const> args) {
     if (llm_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "llm");
       return 0;
+    }
+    if (vision_pool_tokens == 0) {
+      std::cerr << "Error: --vision-pool-tokens must be positive\n";
+      return 2;
+    }
+    if (no_vision && llm_parser.WasSupplied("--mmproj")) {
+      std::cerr << "Error: --no-vision cannot be combined with --mmproj\n";
+      return 2;
     }
     const auto disk_option = cache_disk_directory;
     const bool automatic_disk = disk_option == "auto";
@@ -1781,7 +1827,10 @@ int RunServe(std::span<const char* const> args) {
             .publish_lookup = cache_lookup_api,
             .transfer_api = cache_transfer_api,
         },
-        enable_yarn, kv_cache_type);
+        enable_yarn, kv_cache_type, !no_vision, vision_max_tokens_per_slot,
+        llm_parser.WasSupplied("--vision-pool-tokens")
+            ? std::optional{vision_pool_tokens}
+            : std::nullopt);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

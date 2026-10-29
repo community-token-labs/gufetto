@@ -44,6 +44,40 @@ not met the original strict quality gates. Shared-Q4 MTP requires an explicit
 compatible model and speculative selection. Our standard development profile
 explicitly enables **shared-Q8 MTP at C1–C4** (`--speculative mtp --mtp-model …`);
 the generic CLI defaults to speculation off, not implicit Q8 draft loading.
+Vision defaults to automatic discovery of `mmproj-BF16.gguf` beside the model
+or in its parent directory. `gufo serve llm --no-vision` skips the projector
+(about0.9GB for the current Flash-Next sidecar), shared image-output pool,
+encoder workspace and per-slot image positions. Image requests then get4xx;
+`--no-vision` conflicts with an explicit `--mmproj`.
+
+`--vision-pool-tokens N` sets one shared retained image-output budget, default
+65536 rows (640MiB for Flash-Next), and must be positive. Whole-history requests
+larger than the pool get HTTP400 before GPU encoding. Otherwise fitting requests
+wait for credits before acquiring a runner. Idle outputs are evicted in LRU order;
+active requests and unfinished GPU readers remain protected. Replay re-encodes
+from the same pixels. Debug `event=vision_pool` reports cumulative total
+encodes, re-encodes, reserved/encoded row peaks, evictions and waits when a
+request context is retired. A hard reader-fence failure retains its credits and
+reports an error rather than recycling storage of unknown completion.
+
+`--vision-max-tokens-per-slot N` remains an independent whole-history request
+cap;0 keeps the context bound. Both limits count images before a cache hit.
+This cap does not shrink the shared pool reservation. CPU decoding/preprocessing
+still occurs to determine dimensions. Position storage spans text before the
+last image and retains its context-sized allowance, not merely the image count.
+
+Vision admission reserves `10240 * pool_rows + slots * (context * 12 + 64)`
+bytes for Flash-Next inputs, plus one conservative3471376384-byte encoder
+workspace. At S4/context524288, default P64K plus workspace is about3.881GiB,
+versus23.256GiB for independently reserved full-context inputs plus the same
+workspace. These are reservation figures, not measured RAM or latency gains.
+
+After slot allocation, cache budgeting protects outstanding lazy execution and
+shared scratch without charging eager state again. AUTO halves the protected
+headroom; explicit and disk-only backing retain execution/OS reserves too. The
+frozen growth guard stays conservative after lazy buffers materialize. CPU
+pixels, processor caches, queued bodies, runtime overhead and other processes
+remain separate pressure sources; this is not an unconditional OOM guarantee.
 RAM caching defaults to AUTO (`--cache-ram-bytes 0`); `off` disables retention.
 Disk caching, pins, `--cache-lookup-api`, `--cache-transfer-api` and `--trace`
 require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and
@@ -111,6 +145,26 @@ limitations are retained in the private `gufo-agent-concurrency` repository,
 `docs/kv-q4-r1.md` and `bench/kv-q4-r1/`.
 
 ## Known limits
+
+- Under heavy image load (several sessions each sending maximum-size images at
+  once), image requests wait their turn for the shared image pool instead of
+  reserving memory per session; they can queue for minutes. Raise the pool with
+  `--vision-pool-tokens` if you need more concurrent large images (each extra
+  64K rows ≈ 640 MiB).
+- A long image encode pauses other sessions' generation until it finishes
+  (also true before; more frequent under maximum image load). These image-load
+  observations use host ROCm/HIP 7.2.4 with patched ROCr 7.2.3, not the production
+  Nix ROCm 10.1 / HIP-Clang 24 package.
+
+- **Development/API:** a Flash-Next `Model` supports one component-serving
+  `InferenceBackend` at a time. A second backend using the same shared Model
+  fails early without disturbing the first. Finish/release its requests and
+  release the first backend before creating another; use separately loaded
+  Models for simultaneous backends. Sequential AR/MTP backends may reuse one
+  Model. Native use is restored after component teardown or failed startup.
+  Shared per-Model multi-backend reservation accounting remains follow-up work
+  (`shared-model-component-authority`); this does not restrict sessions within
+  one server or its MTP sidecar.
 
 very large conversations may not be saved to SSD while earlier saves are still being written; they are still served correctly.
 

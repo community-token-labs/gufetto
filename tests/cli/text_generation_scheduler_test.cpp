@@ -13,6 +13,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,8 +33,10 @@
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/json.hpp"
+#include "src/core/perf_trace.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "src/models/qwen/vision/output_pool.hpp"
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
 #include "src/core/perf_trace.hpp"
 #include "src/models/qwen38_flash_next/pd_profile.hpp"
@@ -269,10 +272,33 @@ const FakeState& RequireFakeState(const TextRunnerState& state) {
   return *fake;
 }
 
+struct BudgetContext final : gufo::server::TextPromptContext {
+  using Pool = gufo::models::qwen::vision::OutputPool;
+  BudgetContext(std::shared_ptr<Pool> pool, std::string identity)
+      : pool(std::move(pool)), owner(this->pool->GetOwner(identity, 64)) {
+    cache_identity.assign(identity.begin(), identity.end());
+  }
+  gufo::server::TextPromptAdmission TryAdmit() const override {
+    ++attempts;
+    auto lease = pool->TryAcquire(owner);
+    return {lease != nullptr, std::move(lease)};
+  }
+  std::shared_ptr<Pool> pool;
+  std::shared_ptr<Pool::Owner> owner;
+  mutable std::atomic<unsigned> attempts{};
+};
+
 class FakeRunner final : public TextModelRunner {
 public:
   explicit FakeRunner(std::shared_ptr<FakeControl> control)
       : control_(std::move(control)) {}
+
+  void SetPromptContext(TextRunnerState&,
+                        std::shared_ptr<const gufo::server::TextPromptContext>
+                            context) const override {
+    if (context && !dynamic_cast<const BudgetContext*>(context.get()))
+      throw std::invalid_argument("unexpected fake prompt context");
+  }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -679,6 +705,77 @@ std::shared_ptr<FakeControl> SharedPrefixControl(bool snapshots) {
   if (snapshots)
     control->snapshot_callback = [] {};
   return control;
+}
+
+void TestPromptResourceAdmissionMakesProgress() {
+  auto budget = std::make_shared<BudgetContext::Pool>(64);
+  auto control = std::make_shared<FakeControl>();
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2});
+  TextGenerationScheduler::RequestMetadata a_meta, b_meta;
+  a_meta.prompt_context = std::make_shared<BudgetContext>(budget, "a");
+  b_meta.prompt_context = std::make_shared<BudgetContext>(budget, "b");
+  a_meta.deadline = b_meta.deadline =
+      TextGenerationScheduler::Clock::now() + kTestTimeout;
+  auto a = scheduler->Submit({1, 10, 11, 12}, 4, 0.0F, {}, false, a_meta);
+  control->WaitForPrefill(1);
+  auto b = scheduler->Submit({2, 20, 21, 22}, 4, 0.0F, {}, false, b_meta);
+  control->ReleasePrefill();
+  Expect(a.Wait().tokens == ExpectedTokens(1, 4),
+         "active resource owner finishes");
+  Expect(b.Wait().tokens == ExpectedTokens(2, 4),
+         "queued resource owner resumes");
+  const auto stats = budget->GetStats();
+  Expect(
+      stats.waits > 0 && stats.peak_rows == 64,
+      "resource pressure queues before runner acquisition, without overcommit");
+
+  auto external = budget->TryAcquire(budget->GetOwner("held", 64));
+  Expect(external != nullptr, "completed requests release resource pins");
+  auto blocked_context = std::make_shared<BudgetContext>(budget, "cancelled");
+  TextGenerationScheduler::RequestMetadata blocked_meta;
+  blocked_meta.prompt_context = blocked_context;
+  blocked_meta.deadline = TextGenerationScheduler::Clock::now() + kTestTimeout;
+  auto blocked = scheduler->Submit({3, 30}, 2, 0.0F, {}, false, blocked_meta);
+  const auto deadline = std::chrono::steady_clock::now() + kTestTimeout;
+  while (blocked_context->attempts == 0 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  Expect(blocked_context->attempts != 0,
+         "budget-blocked request reached admission");
+  blocked.Cancel();
+  Expect(blocked.Wait().finish_reason ==
+             gufo::server::TextGenerationBackend::FinishReason::kCancelled,
+         "resource waiter can be cancelled without acquiring a runner");
+  external.reset();
+  auto recovered = scheduler->Submit({4, 40}, 2, 0.0F, {}, false, blocked_meta);
+  Expect(recovered.Wait().tokens == ExpectedTokens(4, 2),
+         "queue recovers after cancellation");
+  control->throw_advance_label = 5;
+  auto failed = scheduler->Submit({5, 50}, 2, 0.0F, {}, false, blocked_meta);
+  bool threw = false;
+  try {
+    (void)failed.Wait();
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  Expect(threw, "fixture exercises an active model failure");
+  auto probe = budget->TryAcquire(budget->GetOwner("failure-recovery", 64));
+  Expect(probe != nullptr,
+         "active model failure releases prompt resource pins");
+  probe.reset();
+  control->block_advance_label = 7;
+  auto cancelled_active =
+      scheduler->Submit({7, 70}, 2, 0.0F, {}, false, blocked_meta);
+  control->WaitForAdvance(7);
+  cancelled_active.Cancel();
+  control->ReleaseAdvance();
+  Expect(cancelled_active.Wait().finish_reason ==
+             gufo::server::TextGenerationBackend::FinishReason::kCancelled,
+         "active resource owner can be cancelled");
+  auto final = scheduler->Submit({8, 80}, 2, 0.0F, {}, false, blocked_meta);
+  Expect(final.Wait().tokens == ExpectedTokens(8, 2),
+         "resources recover after active cancellation");
 }
 
 void TestConcurrentSharedPrefixesPrefillOnce() {
@@ -3557,7 +3654,80 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
+std::filesystem::path attribution_path;
+void RemoveAttributionTrace() {
+  std::error_code error;
+  std::filesystem::remove(attribution_path, error);
+}
+
+void TestAttributionTrace(const char* retained_path = nullptr) {
+  attribution_path =
+      retained_path
+          ? std::filesystem::path(retained_path)
+          : std::filesystem::temp_directory_path() /
+                ("gufo-attribution-" +
+                 std::to_string(gufo::platform::ProcessId()) + ".jsonl");
+  std::filesystem::remove(attribution_path);
+  if (!retained_path)
+    Expect(std::atexit(RemoveAttributionTrace) == 0,
+           "trace cleanup registered");
+  Expect(gufo::platform::SetEnv("GUFO_PERF_TRACE", attribution_path.string()),
+         "trace enabled before first scheduler");
+  {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = true;
+    control->preview_first_token = true;
+    auto scheduler = MakeScheduler(control, 1);
+    for (int i = 0; i < 2; ++i)
+      Expect(scheduler->Submit({1, 10}, 7, 0.0F).Wait().tokens ==
+                 ExpectedTokens(1, 7),
+             "trace preserves native output on recycled slot");
+  }
+  std::map<std::size_t, std::vector<gufo::json::Value>> events;
+  std::ifstream input(attribution_path);
+  for (std::string line; std::getline(input, line);) {
+    const auto record = gufo::json::parse(line);
+    const auto* attr = record.find("attribution");
+    Expect(attr && attr->member_size("dropped") == 0,
+           "complete attribution record");
+    for (const auto& event : attr->find("events")->items())
+      events[event.member_size("request_id")].push_back(event);
+  }
+  Expect(events.size() == 2, "two unique request generations on one slot");
+  for (const auto& [id, request] : events) {
+    std::size_t tokens = 0, terminal = 0, submit = 0, admit = 0,
+                previous_burst = 0;
+    bool separate_burst = false;
+    for (const auto& event : request) {
+      const auto name = event.member_str("event");
+      if (name == "token") {
+        ++tokens;
+        Expect(event.member_size("ordinal") == tokens,
+               "native ordinals contiguous");
+        Expect(event.member_size("slot_generation") == id,
+               "generation follows request");
+        const auto burst = event.member_size("burst_id");
+        Expect(burst != 0, "publication has explicit burst");
+        separate_burst |= previous_burst != 0 && previous_burst != burst;
+        previous_burst = burst;
+      }
+      terminal += name == "terminal";
+      submit += name == "submit";
+      admit += name == "admit";
+    }
+    Expect(tokens == 7 && terminal == 1 && submit == 1 && admit == 1,
+           "full request lifecycle and native token counts");
+    Expect(separate_burst,
+           "preview and target publications remain distinct bursts");
+  }
+}
+
 int main(int argc, char** argv) {
+  if ((argc == 2 || argc == 3) &&
+      std::string_view(argv[1]) == "--attribution") {
+    TestAttributionTrace(argc == 3 ? argv[2] : nullptr);
+    return 0;
+  }
   const bool trace_only =
       argc == 2 && std::string_view(argv[1]) == "--prerequisite-trace-only";
   Expect(argc == 1 || trace_only,
@@ -3574,6 +3744,7 @@ int main(int argc, char** argv) {
 #else
   Expect(!trace_only, "trace-only mode requires prefill prerequisites ON");
 #endif
+  TestPromptResourceAdmissionMakesProgress();
   TestPublicationWaitUsesRecentSubstantialPrefill();
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals();

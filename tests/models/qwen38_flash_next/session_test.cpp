@@ -1767,23 +1767,22 @@ void CheckServingEos(const std::shared_ptr<qfn::Model>& model) {
 void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   namespace server = gufo::server;
   using Backend = server::InferenceBackend;
-  Backend ar, mtp;
   std::string error;
-  Require(ar.load(model, &error, 6145, 2), error);
   server::TextSpeculativeConfig options;
   options.backend = server::TextSpeculativeBackend::kMtp;
-  Require(mtp.load(model, &error, 6145, 2, {}, {}, options), error);
   struct Reference {
     gufo::test::SamplingCase test;
     std::string prompt;
     Backend::Result ar, mtp;
+    std::vector<sampling::TokenId> direct;
+    std::uint64_t drafted{}, accepted{};
   };
   std::vector<Reference> references;
+  // Independent native references run before any component backend binds the
+  // Model. AR and MTP then reuse that same Model in sequential lifetimes.
   for (const auto& test : gufo::test::QwenSamplingCases()) {
     const std::string prompt = "Sampling " + std::string(test.name) +
                                ": Continue red, blue, blue, red,";
-    auto ordinary = ar.complete(prompt, 8, test.config);
-    auto speculative = mtp.complete(prompt, 8, test.config);
     // Exercise the serving handoff against the model session directly.
     // Replaying HTTP alone would not detect a consistently dropped residual.
     auto direct = model->CreateSession(
@@ -1809,38 +1808,47 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
               "direct serving reference made no progress");
     }
     const auto direct_stats = direct->Statistics();
-    Require(direct_tokens == speculative.tokens &&
-                direct_stats.drafted == speculative.draft_tokens &&
-                direct_stats.accepted == speculative.draft_accepted_tokens,
-            "serving lost sampling state: " + std::string(test.name));
-    Require(!ordinary.tokens.empty() && ordinary.draft_tokens == 0 &&
-                speculative.draft_tokens > 0,
-            "sampling strategy did not exercise AR and MTP");
-    Require(ordinary.physical_execution_width == 1 &&
-                speculative.physical_execution_width == 1,
-            "serial completion reported a batched execution");
-    if (!test.config.uses_random_sampling()) {
-      Require(ordinary.tokens == speculative.tokens,
-              "serving greedy AR/MTP mismatch: " + std::string(test.name));
-    }
-    for (const bool use_mtp : {false, true}) {
-      auto& backend = use_mtp ? mtp : ar;
-      const auto& expected = use_mtp ? speculative : ordinary;
-      const auto replay = backend.complete(prompt, 8, test.config);
-      Require(
-          replay.tokens == expected.tokens &&
-              replay.draft_tokens == expected.draft_tokens &&
-              replay.draft_accepted_tokens == expected.draft_accepted_tokens,
-          "serving replay changed sampling or draft acceptance");
-    }
-    references.push_back(
-        {test, prompt, std::move(ordinary), std::move(speculative)});
-    std::cout << "serving sampling=" << test.name << " replay_exact=1\n"
-              << std::flush;
+    references.push_back({test,
+                          prompt,
+                          {},
+                          {},
+                          std::move(direct_tokens),
+                          direct_stats.drafted,
+                          direct_stats.accepted});
   }
-  // Every strategy also runs with shared projections in a concurrent pair.
   for (const bool use_mtp : {false, true}) {
-    auto& backend = use_mtp ? mtp : ar;
+    Backend backend;
+    Require(backend.load(model, &error, 6145, 2, {}, {},
+                         use_mtp ? options : server::TextSpeculativeConfig{}),
+            error);
+    for (auto& saved : references) {
+      auto& actual = use_mtp ? saved.mtp : saved.ar;
+      actual = backend.complete(saved.prompt, 8, saved.test.config);
+      Require(!actual.tokens.empty() && (use_mtp ? actual.draft_tokens > 0
+                                                 : actual.draft_tokens == 0),
+              "sampling strategy did not exercise AR and MTP");
+      Require(actual.physical_execution_width == 1,
+              "serial completion reported a batched execution");
+      if (use_mtp) {
+        Require(saved.direct == actual.tokens &&
+                    saved.drafted == actual.draft_tokens &&
+                    saved.accepted == actual.draft_accepted_tokens,
+                "serving lost sampling state: " + std::string(saved.test.name));
+        if (!saved.test.config.uses_random_sampling())
+          Require(saved.ar.tokens == actual.tokens,
+                  "serving greedy AR/MTP mismatch: " +
+                      std::string(saved.test.name));
+      }
+      const auto replay = backend.complete(saved.prompt, 8, saved.test.config);
+      Require(replay.tokens == actual.tokens &&
+                  replay.draft_tokens == actual.draft_tokens &&
+                  replay.draft_accepted_tokens == actual.draft_accepted_tokens,
+              "serving replay changed sampling or draft acceptance");
+      std::cout << "serving sampling=" << saved.test.name << " mtp=" << use_mtp
+                << " replay_exact=1\n"
+                << std::flush;
+    }
+    // Every strategy still runs with shared projections in a concurrent pair.
     std::size_t batched_requests = 0;
     for (std::size_t offset = 0; offset < references.size(); offset += 2) {
       std::array<std::future<Backend::Result>, 2> pending;
