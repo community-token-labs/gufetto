@@ -96,19 +96,23 @@ def main():
           "Error loading model 'missing.gguf'")
     check(["serve", "image", "--cache-lookup-api"], 2, "Unknown option")
     assert "--kv-cache-type" in help_text
-    assert "q8_0-rotated" in help_text
     assert "experimental and lossy" in help_text
-    types = ("f16", "q8_0", "q8_0-rotated")
-    type_error = "--kv-cache-type must be f16, q8_0 or q8_0-rotated"
+    types = ("f16", "q8_0", "q8_0-rotated", "q4_0", "q8_0/q4_0",
+             "q4_0-rotated", "q8_0/q4_0-rotated")
+    for value in types:
+        assert value in help_text
+    type_error = ("--kv-cache-type must be f16, q8_0, q4_0, q8_0/q4_0, "
+                  "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated")
     for value in types:
         check(["serve", "llm", "--kv-cache-type", value, "--model",
                "missing.gguf"], 1, "Error loading model 'missing.gguf'")
-    invalid_types = ("", "q8", "Q8_0", "bf16", "q4_0", "q8_0_rotated", "q8_0-plain")
+    invalid_types = ("", "q8", "Q8_0", "bf16", "q4_1", "q4_0/q8_0",
+                     "q8_0_rotated", "q8_0-plain")
     for value in invalid_types:
         check(["serve", "llm", "--kv-cache-type", value], 2, type_error)
     for command in ("prompt", "chat", "bench"):
         check([command, "--help"], 0, "--kv-cache-type")
-        check([command, "--kv-cache-type", "q4_0"], 2, type_error)
+        check([command, "--kv-cache-type", "q4_1"], 2, type_error)
     assert "it applies to every request" in help_text
     # Architecture-only GGUF fixtures prove unsupported families fail before
     # tokenizer/weight/device loading, including in a CPU-only CLI build.

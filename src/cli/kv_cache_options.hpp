@@ -13,9 +13,9 @@ inline void RegisterKvCacheTypeOption(
     ArgParser& parser, models::qwen38_flash_next::KvCacheType* type) {
   parser.AddCustomOption(
       "", "--kv-cache-type", "TYPE",
-      "Ordinary K/V storage: f16 (default), q8_0, q4_0, q8_0/q4_0 "
-      "(quantized modes also accept -rotated; experimental, lossy; Flash-Next "
-      "only)",
+      "Ordinary K/V storage: f16 (default), q8_0, q4_0, q8_0/q4_0, "
+      "q8_0-rotated, q4_0-rotated or q8_0/q4_0-rotated "
+      "(quantized modes are experimental and lossy; Flash-Next only)",
       "Model",
       [type](std::string_view, std::string_view value, std::string* error) {
         using models::qwen38_flash_next::KvCacheType;
