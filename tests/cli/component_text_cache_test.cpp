@@ -2612,6 +2612,106 @@ void DiskDirectoryHasOneOwner() {
   }
   std::filesystem::remove_all(directory);
 }
+void PredictedSnapshotsRemainRamOnly() {
+  const TemporaryDirectory temp("gufo-predicted-ram-only");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    // Use an otherwise durable purpose: origin, not the grid-purpose filter,
+    // must prevent publication. No producer plans predictions in this slice.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt, SnapshotOrigin::kPredicted));
+    auto predicted = lease->Capture();
+    assert(predicted);
+    // A later ordinary reservation must not upgrade the captured origin.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    assert(lease->PublishSnapshot(prompt, std::move(predicted), false) > 0);
+    assert(lease->HasSnapshotFor(prompt));
+    const auto before = lease->Metrics();
+    assert(before.disk_queued_bytes == 0 && before.persistence &&
+           before.persistence->accepted == 0 &&
+           before.persistence->timing.private_write_bytes == 0 &&
+           before.persistence->timing.shared_write_bytes == 0 &&
+           before.persistence->timing.manifest_write_bytes == 0);
+    assert(ManagedBytes(temp.path()) == 0);
+    auto ordinary = lease->Capture();
+    assert(ordinary);
+    // Nor may a later prediction downgrade an already ordinary payload.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt, SnapshotOrigin::kPredicted));
+    assert(lease->PublishSnapshot(prompt, std::move(ordinary), false) > 0);
+    const auto after = lease->Metrics();
+    assert(after.disk_queued_bytes > 0 && after.persistence &&
+           after.persistence->accepted == 1);
+    lease->Invalidate();
+  }
+  // Positive control: the ordinary payload really persisted, not just queued.
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache restarted(runner, 1, 1 << 22, disk);
+  const auto lease = restarted.Acquire(prompt, {}, {}, true, 0, true);
+  assert(lease->restored_from_disk() &&
+         lease->cached_tokens() == prompt.size());
+}
+
+void PredictedCaptureRefusesBothDurableFallbacks() {
+  for (const bool over_budget : {false, true}) {
+    const TemporaryDirectory temp("gufo-predicted-no-fallback");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                          .capacity_bytes = 1 << 20,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<Runner>();
+    runner->row_blocks = 0;
+    runner->private_blocks = 2;
+    runner->rows_per_chunk = over_budget ? 4096 : 256;
+    const std::size_t budget = over_budget ? 448 << 10 : 1 << 20;
+    ComponentTextCache cache(runner, 1, budget, disk);
+    std::vector<TextRunnerToken> prompt(over_budget ? 65536 : 4096);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    assert((lease->CaptureBytes() > budget) == over_budget);
+    if (over_budget)
+      assert(!lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                        false, SnapshotPurpose::kContinuation,
+                                        prompt, SnapshotOrigin::kPredicted));
+    // Reservation is intent, not final geometry. Force a stale low estimate
+    // to exercise Capture's own over-budget defense as well as allocation fail.
+    assert(lease->TryReserveSnapshot(0, prompt.size(), false,
+                                     SnapshotPurpose::kContinuation, prompt,
+                                     SnapshotOrigin::kPredicted));
+    bool refused = false;
+    try {
+      (void)lease->Capture();
+    } catch (const cache::ResourceExhausted&) {
+      refused = true;
+    }
+    assert(refused);
+    const auto metrics = lease->Metrics();
+    assert(metrics.captures == 0 && metrics.disk_queued_bytes == 0 &&
+           metrics.persistence && metrics.persistence->accepted == 0 &&
+           metrics.persistence->timing.private_write_bytes == 0 &&
+           metrics.persistence->timing.shared_write_bytes == 0 &&
+           metrics.persistence->timing.manifest_write_bytes == 0);
+    const auto report = ComponentCacheJson(metrics);
+    assert(report.find("last_capture_refusal")->member_str("route") == "ram");
+    assert(ManagedBytes(temp.path()) == 0);
+    lease->Invalidate();
+  }
+}
+
 void GridDoesNotSuppressFirstDiskPrompt() {
   const TemporaryDirectory temp("gufo-component-spacing-test");
   const std::filesystem::path directory = temp.path();
@@ -4700,6 +4800,12 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
     auto& state = dynamic_cast<State&>(lease->state());
     runner->adapter->Append(state.slot, prompt, prompt);
     hash = runner->adapter->RecurrentHash(state.slot);
+    for (const auto purpose :
+         {SnapshotPurpose::kContinuation, SnapshotPurpose::kHistory,
+          SnapshotPurpose::kBranchPoint})
+      assert(!lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                        false, purpose, prompt,
+                                        SnapshotOrigin::kPredicted));
     assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
                                      false, SnapshotPurpose::kContinuation,
                                      prompt));
@@ -5126,6 +5232,8 @@ int main(int argc, char* argv[]) {
     PinnedSlotBytesCountOnce();
     UnpinnedRunnersKeepTheirLimit();
     DiskDirectoryHasOneOwner();
+    PredictedSnapshotsRemainRamOnly();
+    PredictedCaptureRefusesBothDurableFallbacks();
     GridDoesNotSuppressFirstDiskPrompt();
     NearTailDiskBranchSurvivesRestart();
     UnbackedDeepRowsSurviveDiskRestart();
