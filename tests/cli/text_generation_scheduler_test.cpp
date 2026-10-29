@@ -998,8 +998,30 @@ void TestGenerationTraceRecordsPromptAndOutput() {
       failed = true;
     }
   }
-  Trace::Close();
   Expect(failed, "the injected runner failure reaches the consumer");
+  bool callback_failed = false;
+  {
+    const Trace::RequestScope scope("r44");
+    auto completed = scheduler->Submit({10}, 2, sampling, {}, true);
+    // Let execution commit before consuming its queued output. The callback
+    // failure must not serialize that successful retained frontier.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (completed.phase() != TextRequestPhase::kTerminal) {
+      Expect(std::chrono::steady_clock::now() < deadline,
+             "callback fixture reaches terminal state");
+      std::this_thread::yield();
+    }
+    try {
+      (void)completed.Wait([](std::string_view) -> bool {
+        throw std::runtime_error("injected consumer failure");
+      });
+    } catch (const std::runtime_error&) {
+      callback_failed = true;
+    }
+  }
+  Trace::Close();
+  Expect(callback_failed, "the injected consumer failure reaches the caller");
 
   std::vector<gufo::json::Value> records;
   {
@@ -1009,7 +1031,7 @@ void TestGenerationTraceRecordsPromptAndOutput() {
     }
   }
   fs::remove(path);
-  Expect(records.size() == 2, "one generation record per request");
+  Expect(records.size() == 3, "one generation record per request");
   const auto& record = records.front();
   Expect(record.member_str("event") == "generation" &&
              record.member_str("request") == "r42",
@@ -1045,7 +1067,7 @@ void TestGenerationTraceRecordsPromptAndOutput() {
              record.member_str("finish") == "length" &&
              record.find("error") == nullptr,
          "the record carries the cache outcome and finish");
-  const auto& failure = records.back();
+  const auto& failure = records[1];
   Expect(failure.member_str("request") == "r43" &&
              failure.member_str("prompt") == "9" &&
              failure.member_str("error") == "injected scheduler runner failure",
@@ -1053,6 +1075,13 @@ void TestGenerationTraceRecordsPromptAndOutput() {
   Expect(failure.find("committed_tokens") &&
              failure.find("committed_tokens")->is_null(),
          "failed retention is unknown, never fabricated as zero tokens");
+  const auto& callback_failure = records.back();
+  Expect(
+      callback_failure.member_str("request") == "r44" &&
+          callback_failure.member_str("error") == "injected consumer failure" &&
+          callback_failure.find("committed_tokens") &&
+          callback_failure.find("committed_tokens")->is_null(),
+      "consumer failure must not attest a successful execution frontier");
 }
 
 void TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse() {

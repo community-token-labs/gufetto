@@ -469,7 +469,7 @@ void WriteGenerationTrace(GenerationTrace trace,
   for (const auto token : result.tokens)
     generated_ids.push_back(static_cast<std::size_t>(token));
   record["generated_token_ids"] = std::move(generated_ids);
-  record["committed_tokens"] = result.committed_tokens
+  record["committed_tokens"] = result.committed_tokens && failure == nullptr
                                    ? json::Value(*result.committed_tokens)
                                    : json::Value();
   record["finish"] = FinishName(result);

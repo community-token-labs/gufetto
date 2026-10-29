@@ -1562,7 +1562,8 @@ Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   `generated_token_ids`, executed `prefill_tokens`, and `committed_tokens`:
   the exact prompt-plus-generated prefix retained at completion, or JSON null
   if unavailable. IDs include hidden framing, not retokenized visible text;
-  terminal stop IDs are excluded. A sampled final token need not have advanced
+  terminal stop IDs are excluded from generated IDs, while historical stop
+  and framing IDs remain in native prompt IDs. A sampled final token need not have advanced
   state, so do not equate generated count with committed length. The existing
   `component_cache` object distinguishes actual live/RAM/disk reuse.
 - `response`: `status`, `outcome`, whether the reply was a `stream`, and the
