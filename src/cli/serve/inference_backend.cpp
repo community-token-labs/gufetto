@@ -35,6 +35,7 @@
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
+#include "src/models/qwen/vision/input_budget.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
@@ -110,7 +111,8 @@ std::optional<std::string> RenderQwenPrompt(const ChatRequest& request,
 std::optional<std::size_t> CountQwenPromptTokens(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache) {
+    std::uint32_t max_context, models::qwen::vision::ImageCache& image_cache,
+    std::uint32_t max_image_tokens) {
   const auto options = QwenChatOptions(request, max_context);
   const auto tools =
       request.tool_choice == ChatRequest::ToolChoice::kNone
@@ -127,19 +129,23 @@ std::optional<std::size_t> CountQwenPromptTokens(
   // Reuse generation's CPU image preparation, including resize, token
   // expansion and projector validation. Counting does not encode images on
   // the GPU or admit the prompt to an execution context. Keep only the shared
-  // layout's signed position limit so oversized prompts can still be sized.
+  // layout's signed position limit so oversized text prompts can still be
+  // sized, while enforcing the configured aggregate image bound.
   return models::qwen::vision::Prepare(
              tokenizer, request.messages, tools, options,
              encoder ? encoder->identity() : std::string_view{},
              std::numeric_limits<std::int32_t>::max(),
-             request.cache_prompt ? &image_cache : nullptr)
+             request.cache_prompt ? &image_cache : nullptr,
+             models::qwen::vision::ImageTokenLimit(max_context,
+                                                   max_image_tokens))
       .tokens.size();
 }
 
 TextPreparedPrompt PrepareQwenPrompt(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
-    std::uint32_t max_context, models::qwen::vision::ImageCache* image_cache) {
+    std::uint32_t max_context, models::qwen::vision::ImageCache* image_cache,
+    std::uint32_t max_image_tokens) {
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
   const auto options = QwenChatOptions(request, max_context);
@@ -151,7 +157,8 @@ TextPreparedPrompt PrepareQwenPrompt(
               : std::span<const tokenization::ChatTool>{request.tools},
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
-          max_context, request.cache_prompt ? image_cache : nullptr));
+          max_context, request.cache_prompt ? image_cache : nullptr,
+          max_image_tokens));
   if (image_cache && has_images && Logger::Enabled(LogLevel::kDebug)) {
     const auto stats = image_cache->GetStats();
     Logger::LogFormatted(LogLevel::kDebug, "vision",
@@ -1057,10 +1064,12 @@ public:
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
       speculative::SpeculativeOptions speculative_options = {},
       std::string artifact_fingerprint = {},
-      std::string draft_artifact_fingerprint = {})
+      std::string draft_artifact_fingerprint = {},
+      std::uint32_t vision_max_tokens_per_slot = 0)
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
+        vision_max_tokens_per_slot_(vision_max_tokens_per_slot),
         speculative_options_(speculative_options),
         execution_policy_(hip::QwenExecutionPolicy::Production()) {
     if (!artifact_fingerprint.empty()) {
@@ -1255,20 +1264,21 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             &image_cache_);
+                             &image_cache_, vision_max_tokens_per_slot_);
   }
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PrepareLookupPrompt(
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->GetTokenizer(),
-                             model_->VisionEncoder(), max_context_, nullptr);
+                             model_->VisionEncoder(), max_context_, nullptr,
+                             vision_max_tokens_per_slot_);
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
     return CountQwenPromptTokens(request, model_->GetTokenizer(),
                                  model_->VisionEncoder(), max_context_,
-                                 image_cache_);
+                                 image_cache_, vision_max_tokens_per_slot_);
   }
 
   [[nodiscard]] std::optional<std::string> RenderPrompt(
@@ -1522,6 +1532,7 @@ private:
   std::shared_ptr<const hip::QwenGpuModel> model_;
   std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   std::uint32_t max_context_;
+  std::uint32_t vision_max_tokens_per_slot_;
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
@@ -2610,20 +2621,21 @@ public:
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->tokenizer(),
                              model_->VisionEncoder(), max_context_,
-                             &image_cache_);
+                             &image_cache_, model_->VisionMaxTokensPerSlot());
   }
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PrepareLookupPrompt(
       const ChatRequest& request) const override {
     return PrepareQwenPrompt(request, model_->tokenizer(),
-                             model_->VisionEncoder(), max_context_, nullptr);
+                             model_->VisionEncoder(), max_context_, nullptr,
+                             model_->VisionMaxTokensPerSlot());
   }
 
   [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
       const ChatRequest& request) const override {
-    return CountQwenPromptTokens(request, model_->tokenizer(),
-                                 model_->VisionEncoder(), max_context_,
-                                 image_cache_);
+    return CountQwenPromptTokens(
+        request, model_->tokenizer(), model_->VisionEncoder(), max_context_,
+        image_cache_, model_->VisionMaxTokensPerSlot());
   }
 
   [[nodiscard]] std::optional<std::string> RenderPrompt(
@@ -3149,7 +3161,8 @@ bool InferenceBackend::load(
     const TextDiskCacheConfig& disk_cache_config,
     const std::string& vision_model_path,
     TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
-    models::qwen38_flash_next::KvCacheType kv_cache_type, bool enable_vision) {
+    models::qwen38_flash_next::KvCacheType kv_cache_type, bool enable_vision,
+    std::uint32_t vision_max_tokens_per_slot) {
   if (!enable_vision && !vision_model_path.empty()) {
     SetError(error, "--no-vision cannot be combined with --mmproj");
     return false;
@@ -3313,6 +3326,7 @@ bool InferenceBackend::load(
             .rope_scaling = rope_scaling,
             .kv_cache_type = kv_cache_type,
             .enable_vision = enable_vision,
+            .vision_max_tokens_per_slot = vision_max_tokens_per_slot,
         },
         &load_error);
     if (model == nullptr) {
@@ -3383,7 +3397,8 @@ bool InferenceBackend::load(
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), ram_cache_config);
+              std::move(resolved_disk_cache_config), ram_cache_config,
+              vision_max_tokens_per_slot);
 #else
   (void)model_path;
   (void)max_context;
@@ -3396,6 +3411,7 @@ bool InferenceBackend::load(
   (void)ram_cache_config;
   (void)enable_yarn;
   (void)kv_cache_type;
+  (void)vision_max_tokens_per_slot;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3409,7 +3425,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            std::uint32_t vision_max_tokens_per_slot) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -3524,7 +3541,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint,
+        vision_max_tokens_per_slot);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

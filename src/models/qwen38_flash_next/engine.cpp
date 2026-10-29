@@ -1,4 +1,6 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
+
+#include "src/models/qwen/vision/input_budget.hpp"
 #if defined(GUFO_ENABLE_PD_PROFILING) && GUFO_ENABLE_PD_PROFILING
 #include "src/models/qwen38_flash_next/pd_profile.hpp"
 #endif
@@ -319,12 +321,11 @@ std::size_t Model::ResidentBytes() const noexcept {
 }
 
 std::size_t Model::SessionBytes(core::SessionMode mode,
-                                std::uint32_t context) const noexcept {
-  const std::size_t vision =
-      vision_ ? std::size_t{context} * (config().hidden_size * sizeof(float) +
-                                        3 * sizeof(std::int32_t)) +
-                    64
-              : 0;
+                                std::uint32_t context) const {
+  const std::size_t vision = vision_ ? qwen::vision::InputReservationBytes(
+                                           context, config().hidden_size,
+                                           options_.vision_max_tokens_per_slot)
+                                     : 0;
   return executor_->SessionBytes(mode, context,
                                  mode == core::SessionMode::kSpeculative
                                      ? executor_->max_speculative() - 1
@@ -427,6 +428,12 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
 
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
+  qwen::vision::ImageTokenBudget budget(qwen::vision::ImageTokenLimit(
+      ContextSize(), model_->VisionMaxTokensPerSlot()));
+  if (prompt) {
+    for (const auto& image : prompt->images)
+      budget.Add(std::uint64_t{image.grid.height} * image.grid.width);
+  }
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   const auto identity = prompt ? prompt->IdentityForPrefix(tokens_.size())

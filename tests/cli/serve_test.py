@@ -87,6 +87,20 @@ def main():
               "--no-vision cannot be combined with --mmproj")
         check(["serve", *args, "--mmproj="], 2,
               "--no-vision cannot be combined with --mmproj")
+    # Integration: neither trailing load argument may displace the other.
+    for args in (["--no-vision", "--vision-max-tokens-per-slot", "16384"],
+                 ["--vision-max-tokens-per-slot", "16384", "--no-vision"]):
+        check(["serve", "llm", *args, "--model", "missing.gguf"], 1,
+              "Error loading model")
+        check(["serve", "llm", *args, "--mmproj="], 2,
+              "--no-vision cannot be combined with --mmproj")
+    assert "--vision-max-tokens-per-slot" in help_text
+    for value in ("0", "16384", "65536"):
+        check(["serve", "llm", "--vision-max-tokens-per-slot", value,
+               "--model", "missing.gguf"], 1, "Error loading model")
+    for value in ("-1", "4294967296", "invalid"):
+        check(["serve", "llm", "--vision-max-tokens-per-slot", value], 2,
+              "--vision-max-tokens-per-slot")
     assert "--cache-ram-bytes <N|off>" in help_text
     for value in ("off", "0", "536870912"):
         check(["serve", "llm", "--cache-ram-bytes", value,

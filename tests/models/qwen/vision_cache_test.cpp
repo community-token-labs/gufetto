@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/models/qwen/vision/image_cache.hpp"
+#include "src/models/qwen/vision/input_budget.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 
 namespace {
@@ -250,6 +251,68 @@ void TestDetailPrompts() {
   const auto small_auto = prepare(small, kAuto, &cache);
   EqualPrompts(small_low, small_auto);
 }
+void TestAggregateImageBudget() {
+  using namespace gufo::tokenization;
+  const auto tokenizer = MakeTokenizer();
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  std::vector<ChatMessage> messages{
+      {ChatRole::kSystem, std::string(32768, 'a')}, {ChatRole::kUser, "image"}};
+  messages.back().images = {{5, Encoded(19)}};
+  ImageCache cache;
+  const auto prepare = [&](ImageCache* reuse, std::uint32_t cap) {
+    return Prepare(*tokenizer, messages, {}, options, "encoder", 131072, reuse,
+                   cap);
+  };
+  const auto late = prepare(&cache, 64);
+  EqualPrompts(late, prepare(nullptr, 0));
+  assert(late.images.size() == 1);
+  assert(late.images[0].grid.height * late.images[0].grid.width == 64);
+  assert(late.images[0].grid.offset > 32768);
+  const auto bytes = InputReservationBytes(131072, 2560, 64);
+  assert(bytes == 2228288);
+  // The position array spans preceding text: 12*N would under-reserve it.
+  assert(late.rope.PrefixLength() > 64);
+  assert(bytes - 64 * 10240 - 64 >= late.rope.PrefixLength() * 12);
+  messages.emplace_back(ChatRole::kAssistant, "Seen.");
+  messages.emplace_back(ChatRole::kUser, "another image");
+  messages.back().images = {{13, Encoded(23)}};
+  for (auto* reuse : {&cache, static_cast<ImageCache*>(nullptr)}) {
+    bool rejected = false;
+    try {
+      (void)prepare(reuse, 127);
+    } catch (const std::length_error& error) {
+      rejected =
+          std::string_view(error.what())
+              .find(
+                  "aggregate image tokens exceed --vision-max-tokens-per-slot "
+                  "(127)") != std::string_view::npos;
+    }
+    assert(rejected);  // Includes the historical image, cached or not.
+    EqualPrompts(prepare(reuse, 128), prepare(nullptr, 0));
+  }
+  assert(ImageTokenLimit(4096) == 4096);
+  assert(ImageTokenLimit(4096, 8192) == 4096);
+  assert(InputReservationBytes(524288, 2560, 16384) == 174063680);
+  assert(InputReservationBytes(262144, 2560) == 2687500352ULL);
+  ImageTokenBudget budget(128);
+  budget.Add(64);
+  budget.Add(64);
+  bool rejected = false;
+  try {
+    budget.Add(UINT64_MAX);
+  } catch (const std::length_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  bool overflow = false;
+  try {
+    (void)InputReservationBytes(UINT32_MAX, UINT32_MAX);
+  } catch (const std::overflow_error&) {
+    overflow = true;
+  }
+  assert(overflow);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -258,6 +321,7 @@ int main(int argc, char** argv) {
   TestPromptIdentities();
   TestDetailKeysCache();
   TestDetailPrompts();
+  TestAggregateImageBudget();
   if (argc == 2 && std::string_view(argv[1]) == "--capacity-probe") {
     ImageCache cache;
     for (std::uint8_t i = 0; i < 22; ++i)

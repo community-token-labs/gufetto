@@ -4,11 +4,31 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "src/cli/serve/inference_backend.hpp"
+#include "src/models/qwen/vision/input_budget.hpp"
 #include "src/models/qwen/vision/model_path.hpp"
+#include "src/models/qwen38_flash_next/engine.hpp"
 #include "tests/support/temporary_directory.hpp"
+
+// A CPU-only signature check: both arguments must be independently present.
+static_assert(requires(gufo::server::InferenceBackend& backend,
+                       std::string& error) {
+  backend.load("missing.gguf", &error, 262144, 1, {}, {}, {}, {}, {}, {}, false,
+               gufo::models::qwen38_flash_next::KvCacheType::kF16, false,
+               16384U);
+});
 
 int main() {
   using gufo::models::qwen::vision::ResolveModelPath;
+  const gufo::models::qwen38_flash_next::ModelOptions options{
+      .max_context = 262144,
+      .enable_vision = false,
+      .vision_max_tokens_per_slot = 16384,
+  };
+  assert(!options.enable_vision && options.vision_max_tokens_per_slot == 16384);
+  assert(gufo::models::qwen::vision::InputReservationBytes(
+             options.max_context, 2560, options.vision_max_tokens_per_slot) ==
+         170917952);
   const TemporaryDirectory directory("gufo-vision-model-path");
   const auto root = directory.path();
   const auto quant = root / "quant";
@@ -17,6 +37,7 @@ int main() {
   const auto parent_sidecar = root / "mmproj-BF16.gguf";
   const auto local_sidecar = quant / "mmproj-BF16.gguf";
   assert(ResolveModelPath(model, {}).empty());
+  assert(ResolveModelPath(model, {}, options.enable_vision).empty());
   std::ofstream(parent_sidecar) << "not a real projector";
   assert(ResolveModelPath(model, {}) == parent_sidecar);
   assert(ResolveModelPath(model, {}, false).empty());
