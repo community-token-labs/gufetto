@@ -185,6 +185,8 @@ struct TextRunnerResourceClaim {
   /// retained_snapshot_capacity_bytes is also the ceiling.
   std::optional<std::size_t> retained_snapshot_ceiling_bytes;
   bool requires_device_runtime_lock{false};
+  /// Outstanding shared execution storage, charged once, not per slot.
+  std::size_t shared_execution_bytes{0};
 };
 
 struct TextRunnerMeasuredResources {

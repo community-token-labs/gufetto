@@ -30,12 +30,14 @@
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
+#include "src/core/memory_budget.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/vision/image_cache.hpp"
 #include "src/models/qwen/vision/input_budget.hpp"
+#include "src/models/qwen/vision/memory_budget.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
@@ -874,17 +876,39 @@ private:
   mutable bool probe_pending_{false};
 };
 
+std::size_t ExecutionCapacityBytes() {
+  std::size_t free = 0, total = 0;
+  if (hipMemGetInfo(&free, &total) != hipSuccess)
+    throw std::runtime_error("cannot query device execution memory capacity");
+  const auto heap =
+      free > hip::kDispatchReserve ? free - hip::kDispatchReserve : 0;
+  return std::min<std::size_t>(heap, HostSnapshotCeilingBytes());
+}
+
 template<typename AdapterType>
 std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
-    std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger) {
+    std::unique_ptr<AdapterType> adapter, cache::ResourceLedger& ledger,
+    std::function<std::size_t()> shared_pending) {
   struct Backing {
     hip::TransferPool streams{64};
     std::unique_ptr<hip::CommittedBackingPool> pool;
     std::map<std::uint32_t, std::size_t> component_classes;
+    std::size_t execution_liability{};
+    bool frozen{};
   };
   auto result = std::make_unique<ComponentCacheResources>();
   result->adapter = std::move(adapter);
   auto backing = std::make_shared<Backing>();
+  result->freeze_execution_liability =
+      [backing, native = static_cast<AdapterType*>(result->adapter.get()),
+       shared_pending = std::move(shared_pending)] {
+        if (backing->frozen)
+          throw std::logic_error("execution liability already frozen");
+        backing->execution_liability = core::AddMemoryBytes(
+            native->InitialPendingExecutionBytes(), shared_pending());
+        backing->frozen = true;
+        return backing->execution_liability;
+      };
   result->transfer_batch_size = 16;
   const auto rounded = [](std::size_t bytes) {
     return (bytes + 4095) / 4096 * 4096;
@@ -899,6 +923,10 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
   // metadata. The pools charge their own per-block allocator headroom.
   result->commit_backing = [backing, &ledger, adapter = result->adapter.get()](
                                std::size_t budget) {
+    if (!backing->frozen)
+      throw std::logic_error("backing requires frozen execution reservations");
+    const auto protected_bytes = core::AddMemoryBytes(
+        backing->execution_liability, ledger.Limits().staging_bytes);
     const auto plan = static_cast<AdapterType*>(adapter)->BackingPlan(budget);
     if (plan.size() != 1)
       throw std::invalid_argument("insufficient component backing budget");
@@ -928,7 +956,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
             allocation.blocks * allocation.block_bytes +
                 allocation.metadata_bytes,
             allocation.block_bytes, allocation.metadata_bytes, segment,
-            [limited = std::make_shared<Limited>()](std::size_t bytes) {
+            [limited = std::make_shared<Limited>(),
+             protected_bytes](std::size_t bytes) {
               const std::lock_guard lock(limited->mutex);
               const auto now = std::chrono::steady_clock::now();
               // Pressure retries ask once per capture; recheck at most
@@ -943,8 +972,11 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               std::size_t heap_free = 0, heap_total = 0;
               const bool heap_fits =
                   hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
-                  hip::HeapFitsAboveReserve(heap_free, bytes);
-              if (ceiling >= bytes && heap_fits) {
+                  heap_free >= hip::kDispatchReserve &&
+                  core::FitsMemoryBudget(heap_free - hip::kDispatchReserve,
+                                         bytes, protected_bytes);
+              if (core::FitsMemoryBudget(ceiling, bytes, protected_bytes) &&
+                  heap_fits) {
                 limited->active = false;
                 return true;
               }
@@ -956,6 +988,8 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                         std::string(heap_fits ? "host_reserve "
                                               : "device_heap_reserve ") +
                         "segment_bytes=" + std::to_string(bytes) +
+                        " protected_execution_and_staging_bytes=" +
+                        std::to_string(protected_bytes) +
                         " host_headroom_bytes=" + std::to_string(ceiling) +
                         " device_heap_free_bytes=" + std::to_string(heap_free));
               limited->active = true;
@@ -1097,6 +1131,9 @@ public:
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
     (void)ram;
+    const auto claim = ResourceClaim();
+    const auto per_slot = core::AddMemoryBytes(*claim.per_request_state_bytes,
+                                               *claim.temporary_scratch_bytes);
     auto resources = CreateHipComponentCacheResources(
         std::make_unique<models::qwen::ContinuationAdapter>(
             model_, max_context_, component_identity_, execution_policy_,
@@ -1105,8 +1142,8 @@ public:
                 .max_context = max_context_,
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
                 .policy = speculative_options_.dflash_policy},
-            &ledger),
-        ledger);
+            &ledger, per_slot),
+        ledger, [shared = claim.shared_execution_bytes] { return shared; });
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
     resources->reassignment_batch_size = 16;
@@ -1174,6 +1211,16 @@ public:
         model_->GetConfig(), max_context_, execution_policy_);
     usage.request_state_bytes += hip::QwenGpuArena::RecurrentStateBytes(
         model_->GetConfig(), execution_policy_);
+    if (model_->VisionEncoder())
+      usage.temporary_scratch_bytes = core::AddMemoryBytes(
+          usage.temporary_scratch_bytes,
+          models::qwen::vision::InputReservationBytes(
+              max_context_, model_->GetConfig().hidden_size,
+              vision_max_tokens_per_slot_));
+    const auto shared =
+        model_->VisionEncoder()
+            ? models::qwen::vision::EncoderWorkspaceBytes(max_context_)
+            : 0;
     std::size_t resident_weights = model_->GetResidentBytes();
     if (dflash_model_ != nullptr) {
       const auto draft = hip::QwenDFlashGpuExecutor::EstimateMemoryUsage(
@@ -1182,21 +1229,14 @@ public:
       usage.temporary_scratch_bytes += draft.temporary_scratch_bytes;
       resident_weights += dflash_model_->GetPackedWeightBytes();
     }
-    std::size_t free_bytes = 0;
-    std::size_t total_bytes = 0;
-    std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-      capacity = free_bytes;
-    }
+    const auto capacity = ExecutionCapacityBytes();
     // Snapshot buffers are device allocations, but on a unified-memory APU
     // they are carved from the same RAM as every host allocation, and HIP's
     // free figure does not see host pressure. Cap them by the host budget too.
     std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
     std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
-    if (capacity.has_value()) {
-      snapshot_capacity = std::min(snapshot_capacity, *capacity);
-      snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
-    }
+    snapshot_capacity = std::min(snapshot_capacity, capacity);
+    snapshot_ceiling = std::min(snapshot_ceiling, capacity);
     return {
         .resident_weights_bytes = resident_weights,
         .state_capacity_bytes = capacity,
@@ -1205,6 +1245,7 @@ public:
         .retained_snapshot_capacity_bytes = snapshot_capacity,
         .retained_snapshot_ceiling_bytes = snapshot_ceiling,
         .requires_device_runtime_lock = true,
+        .shared_execution_bytes = shared,
     };
   }
 
@@ -2506,7 +2547,13 @@ public:
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_),
-        ledger);
+        ledger, [model = model_, context = max_context_] {
+          return core::AddMemoryBytes(
+              model->DeferredScratchBytes(),
+              model->VisionEncoder()
+                  ? models::qwen::vision::EncoderWorkspaceBytes(context)
+                  : 0);
+        });
     detail::InstallQfnPackedKvIngressValidation(*resources, model_->config(),
                                                 use_mtp_, max_context_,
                                                 model_->CacheType());
@@ -2548,13 +2595,12 @@ public:
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-    std::size_t free_bytes = 0;
-    std::size_t total_bytes = 0;
-    std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-      const auto deferred = model_->DeferredScratchBytes();
-      capacity = free_bytes > deferred ? free_bytes - deferred : 0;
-    }
+    const auto capacity = ExecutionCapacityBytes();
+    const auto shared = core::AddMemoryBytes(
+        model_->DeferredScratchBytes(),
+        model_->VisionEncoder()
+            ? models::qwen::vision::EncoderWorkspaceBytes(max_context_)
+            : 0);
     // Admission charges complete snapshot payloads. Flash-Next can retain
     // mutable state and protected K/V rows in private device storage.
     return {
@@ -2564,12 +2610,15 @@ public:
             use_mtp_ ? gufo::core::SessionMode::kSpeculative
                      : gufo::core::SessionMode::kAutoregressive,
             max_context_),
-        // Runtime scratch is shared and already allocated at model load;
-        // reserve its remaining lazy buffers once from aggregate capacity.
+        // Eager model scratch is already reflected in free memory. Remaining
+        // shared scratch and encoder workspace are charged once, below.
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
-        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .retained_snapshot_capacity_bytes =
+            std::min(HostSnapshotBudgetBytes(), capacity),
+        .retained_snapshot_ceiling_bytes =
+            std::min(HostSnapshotCeilingBytes(), capacity),
         .requires_device_runtime_lock = true,
+        .shared_execution_bytes = shared,
     };
   }
 

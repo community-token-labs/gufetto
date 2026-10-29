@@ -28,6 +28,7 @@ set(gufo_pr_targets
   qwen_tokenizer_test qwen_chat_template_test
   qwen_vision_model_path_test
   qwen_vision_cache_test
+  qwen_vision_memory_budget_test
   qwen27b_continuation_layout_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test

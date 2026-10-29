@@ -61,6 +61,15 @@ slot (using the effective cap). Position rows span preceding text through the
 last image, so only the embedding term shrinks. At 262144 context, a 16384 cap
 reduces the input reservation by 2.34375 GiB/slot, not measured physical RAM.
 Encoder workspace and shared-pool accounting are separate concerns.
+Vision-enabled startup charges one shared encoder workspace in addition to
+per-slot input storage. After allocating slots, cache budgeting protects their
+still-unallocated execution storage and deferred shared scratch; resident
+weights and eager state are not charged twice. AUTO halves the remaining
+protected headroom, so correcting formerly unprotected promises can reduce the
+cache budget. Explicit and disk-only backing retain execution/OS reserves too.
+The frozen growth guard is conservative after lazy buffers materialize. CPU
+image preprocessing, other processes and runtime overhead remain separate
+pressure sources; this is not an unconditional OOM guarantee.
 RAM caching defaults to AUTO (`--cache-ram-bytes 0`); `off` disables retention.
 Disk caching, pins, `--cache-lookup-api`, `--cache-transfer-api` and `--trace`
 require opt-in. `GUFO_ENABLE_NPU`, `GUFO_ENABLE_PREFILL_PREREQUISITES` and

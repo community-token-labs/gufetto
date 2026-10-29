@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/hip/snapshot_copy.hpp"
+#include "src/core/memory_budget.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 
@@ -347,6 +348,10 @@ std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
   auto session = model_->CreateSession(mode_, context_, &error);
   if (!session)
     throw std::runtime_error(error);
+  initial_pending_execution_bytes_ = core::AddMemoryBytes(
+      initial_pending_execution_bytes_,
+      core::PendingMemoryBytes(model_->SessionBytes(mode_, context_),
+                               session->AllocatedBytes()));
   return std::make_unique<State>(*this, guard, std::move(session));
 }
 std::vector<cache::ComponentPosition> ContinuationAdapter::Positions(
