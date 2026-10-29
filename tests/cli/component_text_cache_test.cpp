@@ -2972,6 +2972,51 @@ void PinnedWriterAndProtectedGridRefuseDurableCapture() {
       }
       assert(refused == protect);
       assert((lease->Metrics().disk_queued_bytes == 0) == protect);
+      const auto report = ComponentCacheJson(lease->Metrics());
+      const auto* counts = report.find("capture_refusals");
+      const auto* last = report.find("last_capture_refusal");
+      assert(counts && counts->is_object() && last);
+      if (protect) {
+        const auto stage = mode == 2 ? "can_capture" : "allocate";
+        const auto* durable = counts->find("durable");
+        assert(durable && durable->size() == 1);
+        const auto* reasons = durable->find(stage);
+        assert(reasons && reasons->member_size("byte_capacity") == 1);
+        assert(counts->size() == 1);  // no RAM retry double-counting
+        assert(last->member_str("route") == "durable");
+        assert(last->member_str("stage") == stage);
+        assert(last->member_str("reason") == "byte_capacity");
+        assert(last->member_size("requested_bytes") == 32);
+        // Both 64-byte private blocks and four 16-byte row/tail blocks are
+        // retained. Free row bytes do not mean a private allocation can fit.
+        assert(last->member_size("available_bytes") == 32704);
+      } else {
+        assert(counts->empty() && last->is_null());
+      }
+      // Serialization/observation never increments these lease-local counts.
+      const auto repeated = ComponentCacheJson(lease->Metrics());
+      assert(repeated.find("capture_refusals")->dump() == counts->dump());
+      assert(repeated.find("last_capture_refusal")->dump() == last->dump());
+      const auto other_report = ComponentCacheJson(pinned->Metrics());
+      assert(other_report.find("capture_refusals")->empty());
+      assert(other_report.find("last_capture_refusal")->is_null());
+      if (mode == 2) {
+        // A second terminal attempt increments once; it is not a retry inside
+        // the first attempt. The last refusal still describes this failure.
+        bool again{};
+        try {
+          (void)lease->Capture();
+        } catch (const cache::ResourceExhausted&) {
+          again = true;
+        }
+        assert(again);
+        const auto twice = ComponentCacheJson(lease->Metrics());
+        assert(twice.find("capture_refusals")
+                   ->find("durable")
+                   ->find("can_capture")
+                   ->member_size("byte_capacity") == 2);
+        assert(twice.find("last_capture_refusal")->dump() == last->dump());
+      }
       // The held write remains intact; a refusal never claims D durable.
       assert(lease->Metrics().persistence->completed == 0);
       release_writer.Release();
@@ -3359,6 +3404,24 @@ void RamRefusalDiskDirectRestartContract() {
                                   test == Case::kPrivateBacking;
       assert(refused == capture_denied);
       assert((lease->Metrics().disk_queued_bytes == 0) == capture_denied);
+      const auto report = ComponentCacheJson(lease->Metrics());
+      const auto* counts = report.find("capture_refusals");
+      const auto* last = report.find("last_capture_refusal");
+      assert(counts && last);
+      if (capture_denied) {
+        const auto route = test == Case::kRamOnly ? "ram" : "durable";
+        const auto stage = test == Case::kOptOut ? "eligibility" : "allocate";
+        const auto* routes = counts->find(route);
+        assert(routes && routes->size() == 1 && counts->size() == 1);
+        const auto* reasons = routes->find(stage);
+        assert(reasons && reasons->member_size("byte_capacity") == 1);
+        assert(last->member_str("route") == route);
+        assert(last->member_str("stage") == stage);
+      } else {
+        // Successful durable fallback and later publication failures are not
+        // terminal capture refusals, despite failed RAM allocation attempts.
+        assert(counts->empty() && last->is_null());
+      }
       (void)lease->Commit(prompt, {}, prompt);
       if (!capture_denied) {
         // Submission is not durability. Wait for the actual completion result.

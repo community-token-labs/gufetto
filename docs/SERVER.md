@@ -1597,6 +1597,23 @@ Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   and framing IDs remain in native prompt IDs. A sampled final token need not have advanced
   state, so do not equate generated count with committed length. The existing
   `component_cache` object distinguishes actual live/RAM/disk reuse.
+  Its `capture_refusals` object contains request-local counts nested by
+  route (`ram` or `durable`), stage (the static capture-attempt log label), and
+  reason (`byte_capacity`). Only nonzero counts are emitted; `{}` means no
+  terminal `capture_refused` event for this lease. Reclaim/allocation retries,
+  successful durable fallback, standalone successful disk-spacing skips and later
+  persistence failures are not counted. However, after RAM capture fails, a
+  durable fallback returning null at `min_step` reaches the existing terminal
+  refusal and counts as `durable` / `min_step` / `byte_capacity`.
+  `last_capture_refusal` is null until a refusal, then contains
+  `route`, `stage`, `reason`, `requested_bytes` and `available_bytes`.
+  Requested bytes are the last attempt's logical request; available bytes are
+  ledger `backing_free` at the terminal refusal, after partial allocations have
+  unwound, not budget headroom or a guarantee of page/contiguous fit. Observing
+  or serializing metrics never increments counts. These same fields appear in
+  response `usage.gufo.component_cache` and `timings.component_cache`.
+  Maintainers must keep future capture route/stage labels synchronized with the
+  metrics label tables: recording uses bounds-checked `array.at` indexing.
 - `response`: `status`, `outcome`, whether the reply was a `stream`, and the
   `body` the client received. For a stream this is the event stream as
   written, `: ping` keepalives included, so a difference between streaming and
