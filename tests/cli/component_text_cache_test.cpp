@@ -1117,26 +1117,63 @@ void StaticDiagnosticClaim() {
     assert(runner->committed == 36 * kMiB);
   }
   runner->Released();
-  for (const bool fits : {false, true}) {
-    auto off = std::make_shared<MeasuredRunner>();
-    off->configure = [fits](Trial& trial) {
-      trial.capacity = {Capacity(100, 100, 50), Capacity(90, 90, 45),
-                        Capacity(80, 80, 40), Capacity(4, 4, 2)};
-      if (!fits)
-        --trial.capacity.back().host;
-      trial.pending.assign(4, Pending(0, 0, 0, 0));
-    };
-    if (fits) {
-      TextRunnerPool pool(off, 3, {}, {.enabled = false});
-      assert(off->commits == 0 && off->probes.empty());
-    } else {
-      assert(Refuse(off, {}, false) ==
-             "measured startup execution exceeds capacity for --context 32768; "
-             "no fitting context found within the search limits");
+  for (const int delta : {-1, 0, 1}) {
+    const auto ceiling = envelope + delta;
+    const std::string expected =
+        "--full-logits-api needs 4194304 bytes; snapshot ceiling is " +
+        std::to_string(ceiling) +
+        " bytes; lower --context or --sessions, free memory, or restart "
+        "without --full-logits-api";
+    for (const bool device_limits : {false, true}) {
+      for (const bool initial : {false, true}) {
+        auto off = std::make_shared<MeasuredRunner>();
+        off->configure = [=](Trial& trial) {
+          trial.capacity = {Capacity(100, 100, 50), Capacity(90, 90, 45),
+                            Capacity(80, 80, 40), Capacity(8, 8, 4)};
+          auto& sample = trial.capacity[initial ? 0 : 3];
+          (device_limits ? sample.device : sample.host) = ceiling;
+          assert(sample.Capacity() == ceiling);
+          // The initial observation must also fit slot one's ordinary logical
+          // bytes. Use zero only for this diagnostic-only boundary fixture.
+          trial.pending.assign(4, Pending(0, 0, 0, 0));
+        };
+        off->logical_slot = [](std::size_t) { return std::size_t{0}; };
+        bool refused = false;
+        try {
+          TextRunnerPool pool(off, 3, {}, {.enabled = false});
+        } catch (const std::invalid_argument& error) {
+          refused = true;
+          assert(delta < 0 && std::string_view(error.what()) == expected);
+        }
+        assert(refused == (delta < 0));
+        assert(off->commits == 0 && off->probes.empty());
+        if (refused)
+          assert(off->freezes == 0 && off->bound_slots.empty());
+        for (const auto& trial : off->trials)
+          assert(trial->created == trial->destroyed &&
+                 trial->created == (refused && initial ? 0 : 3));
+        off->Released();
+      }
     }
-    for (const auto& trial : off->trials)
-      assert(trial->created == 3 && trial->destroyed == 3);
-    off->Released();
+    struct LegacyCeilingRunner final : Runner {
+      std::size_t ceiling;
+      explicit LegacyCeilingRunner(std::size_t bytes) : ceiling(bytes) {}
+      TextRunnerResourceClaim ResourceClaim() const override {
+        auto result = Runner::ResourceClaim();
+        result.retained_snapshot_capacity_bytes = ceiling / 2;
+        result.retained_snapshot_ceiling_bytes = ceiling;
+        return result;
+      }
+    };
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<LegacyCeilingRunner>(ceiling), 1, {},
+                          {.enabled = false});
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      assert(delta < 0 && std::string_view(error.what()) == expected);
+    }
+    assert(refused == (delta < 0));
   }
   {
     // Legacy/nonmeasured cache-off still samples capacity for the hard claim,
