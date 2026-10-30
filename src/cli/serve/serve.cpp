@@ -69,7 +69,11 @@ public:
         std::string message = "event=load_failed kind=" + kind_ + " " +
                               server::Logger::MemoryStatus();
         if (failure_reason_ != nullptr && !failure_reason_->empty()) {
-          message += " reason=" + *failure_reason_;
+          message += " reason=";
+          std::transform(failure_reason_->begin(), failure_reason_->end(),
+                         std::back_inserter(message), [](char c) {
+                           return c == '\n' || c == '\r' ? ' ' : c;
+                         });
         }
         server::Logger::Error("loader", message);
       } catch (...) {
