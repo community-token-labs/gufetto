@@ -655,6 +655,11 @@ if (BUILD_TESTING)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
 
+  add_executable(memory_reservations_test tests/core/memory_reservations_test.cpp)
+  target_link_libraries(memory_reservations_test PRIVATE gufo_core)
+  add_test(NAME memory_reservations_test COMMAND memory_reservations_test)
+  set_tests_properties(memory_reservations_test PROPERTIES LABELS "cpu;core")
+
   add_executable(startup_admission_test tests/core/startup_admission_test.cpp)
   target_link_libraries(startup_admission_test PRIVATE gufo_core)
   add_test(NAME startup_admission_test COMMAND startup_admission_test)
