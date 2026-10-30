@@ -1006,6 +1006,8 @@ nested, fractional and out-of-range arrays return HTTP 400 with error code
 `invalid_prompt` and message
 `'prompt' must be a nonempty array of in-vocabulary integer token IDs`.
 Mixed string/token arrays, string arrays and batched prompts are not supported.
+Gufo stores JSON numbers as doubles, so integral forms such as `1.0`, `1e2`
+and `-0` are accepted as IDs (unlike llama.cpp); fractional values are rejected.
 
 Set `return_tokens: true` to return generated IDs in `tokens`, for either
 prompt form; `return_tokens: false` returns `tokens: []`. This implements the
@@ -1014,7 +1016,8 @@ numeric-prompt and raw-output subset of llama.cpp commit
 (`tools/server/README.md`, `server-task.cpp`, `server-context.cpp`).
 **Compatibility exception:** when `return_tokens` is absent, Gufo omits
 `tokens` rather than returning llama.cpp's empty array, preserving existing
-string-prompt response bytes. `return_tokens` must be a boolean.
+string-prompt response bytes. `return_tokens` must be a boolean or null;
+null is treated as absent.
 
 Both prompt forms use the same token-prefix cache and stop-sequence processing.
 `cache_prompt: false` bypasses prefix reuse for this request; it does not disable
