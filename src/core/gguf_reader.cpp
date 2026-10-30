@@ -20,6 +20,7 @@
 #include <variant>
 #include <vector>
 
+#include "src/core/checked_arithmetic.hpp"
 #include "src/core/platform/mapped_file.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
@@ -884,51 +885,65 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   config.architecture = std::string(arch_str);
   const std::string prefix = config.architecture + ".";
 
+  // A present key that is not an unsigned 32-bit integer is malformed; it must
+  // not fall back to the built-in default.
+  std::string invalid_key;
+  const auto ReadUint32 =
+      [&](std::string_view suffix) -> std::optional<std::uint32_t> {
+    const std::string key = prefix + std::string(suffix);
+    const auto value = GetMetadataUint32(key);
+    if (!value.has_value() && FindMetadata(key) != nullptr &&
+        invalid_key.empty()) {
+      invalid_key = key;
+    }
+    return value;
+  };
+
   // 2. Read standard architectural hyperparameters
   const auto total_layers =
-      GetMetadataUint32(prefix + "block_count").value_or(config.num_layers);
-  if (auto val = GetMetadataUint32(prefix + "embedding_length")) {
+      ReadUint32("block_count").value_or(config.num_layers);
+  if (auto val = ReadUint32("embedding_length")) {
     config.hidden_size = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "feed_forward_length")) {
+  if (auto val = ReadUint32("feed_forward_length")) {
     config.intermediate_size = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "attention.head_count")) {
+  if (auto val = ReadUint32("attention.head_count")) {
     config.num_attention_heads = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "attention.head_count_kv")) {
+  if (auto val = ReadUint32("attention.head_count_kv")) {
     config.num_key_value_heads = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "attention.key_length")) {
+  if (auto val = ReadUint32("attention.key_length")) {
     config.head_dim = *val;
   } else if (config.num_attention_heads > 0) {
     config.head_dim = config.hidden_size / config.num_attention_heads;
   }
-  if (auto val = GetMetadataUint32(prefix + "context_length")) {
+  if (auto val = ReadUint32("context_length")) {
     config.context_length = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "full_attention_interval")) {
+  if (auto val = ReadUint32("full_attention_interval")) {
     config.full_attention_interval = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "ssm.conv_kernel")) {
+  if (auto val = ReadUint32("ssm.conv_kernel")) {
     config.ssm_conv_kernel = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "ssm.state_size")) {
+  if (auto val = ReadUint32("ssm.state_size")) {
     config.ssm_state_size = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "ssm.group_count")) {
+  if (auto val = ReadUint32("ssm.group_count")) {
     config.ssm_group_count = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "ssm.time_step_rank")) {
+  if (auto val = ReadUint32("ssm.time_step_rank")) {
     config.ssm_time_step_rank = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "ssm.inner_size")) {
+  if (auto val = ReadUint32("ssm.inner_size")) {
     config.ssm_inner_size = *val;
   }
   if (auto val = GetMetadataFloat32(prefix + "rope.freq_base")) {
     config.rope_theta = *val;
   }
-  if (auto val = GetMetadataUint32(prefix + "rope.dimension_count")) {
+  if (auto val = ReadUint32("rope.dimension_count")) {
     config.rotary_dim = *val;
   } else {
     config.rotary_dim = config.head_dim;
@@ -936,8 +951,14 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
 
   // 3. MTP speculative layers are included in qwen35.block_count but are not
   // part of the main autoregressive transformer stack.
-  const auto embedded_mtp_layers =
-      GetMetadataUint32(prefix + "nextn_predict_layers");
+  const auto embedded_mtp_layers = ReadUint32("nextn_predict_layers");
+  if (!invalid_key.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "GGUF metadata " + invalid_key + " is not an unsigned 32-bit integer";
+    }
+    return std::nullopt;
+  }
   config.mtp_num_layers =
       embedded_mtp_layers.value_or(HasMtpTensors() ? 1U : 0U);
   const std::uint32_t layers_in_block_count = embedded_mtp_layers.value_or(0U);
@@ -968,12 +989,42 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
       token_embd != nullptr && config.hidden_size > 0) {
     const auto elements = token_embd->ElementCount();
     if ((elements % config.hidden_size) == 0) {
-      config.vocab_size =
-          static_cast<std::uint32_t>(elements / config.hidden_size);
+      const auto vocab_size = CheckedUint32(elements / config.hidden_size);
+      if (!vocab_size.has_value()) {
+        if (error_msg != nullptr) {
+          *error_msg =
+              "token_embd.weight vocabulary does not fit 32 bits for " +
+              prefix + "embedding_length";
+        }
+        return std::nullopt;
+      }
+      config.vocab_size = *vocab_size;
     }
   }
 
-  // 6. Validate configuration against Qwen3.5/3.8 structural rules
+  // 6. ModelConfig derives 32-bit widths from these fields. Refuse products
+  // that wrap, so a wrapped width can never match a small tensor.
+  const char* overflowing_width = nullptr;
+  if (!CheckedUint32(CheckedMul(config.num_attention_heads, config.head_dim))) {
+    overflowing_width = "attention.head_count * attention.key_length";
+  } else if (!CheckedUint32(
+                 CheckedMul(config.num_key_value_heads, config.head_dim))) {
+    overflowing_width = "attention.head_count_kv * attention.key_length";
+  } else if (const auto groups = CheckedProduct(
+                 {2, config.ssm_group_count, config.ssm_state_size});
+             !groups.has_value() ||
+             !CheckedUint32(CheckedAdd(*groups, config.ssm_inner_size))) {
+    overflowing_width = "2 * ssm.group_count * ssm.state_size + ssm.inner_size";
+  }
+  if (overflowing_width != nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = "GGUF metadata width " + prefix + "(" +
+                   std::string(overflowing_width) + ") overflows 32 bits";
+    }
+    return std::nullopt;
+  }
+
+  // 7. Validate configuration against Qwen3.5/3.8 structural rules
   if (!config.IsValidQwen()) {
     if (error_msg != nullptr) {
       *error_msg = "Model config failed Qwen structural validation (head_dim=" +

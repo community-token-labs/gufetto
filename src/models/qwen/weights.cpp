@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "src/core/checked_arithmetic.hpp"
 #include "src/models/qwen/state.hpp"
 
 namespace gufo::models {
@@ -281,7 +282,17 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
       const std::size_t kv_size =
           static_cast<std::size_t>(weights.config.num_key_value_heads) *
           weights.config.head_dim;
-      if (!ValidateTensor(l.attn_q, 2 * attention_size * hidden_size,
+      // The gated query projection is the one triple product of metadata.
+      const auto gated_query_elements =
+          core::CheckedProduct({2, attention_size, hidden_size});
+      if (!gated_query_elements.has_value()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Tensor element count overflows 64 bits for " + prefix +
+                       "attn_q.weight (2 * attention width * hidden size)";
+        }
+        return std::nullopt;
+      }
+      if (!ValidateTensor(l.attn_q, *gated_query_elements,
                           TensorRole::kProjection, prefix + "attn_q.weight",
                           error_msg, hidden_size) ||
           !ValidateTensor(l.attn_k, kv_size * hidden_size,
