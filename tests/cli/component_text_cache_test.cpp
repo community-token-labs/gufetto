@@ -1,6 +1,5 @@
-#include "tests/cli/component_text_cache_fixture.hpp"
-
 #include "src/cli/serve/measured_admission.hpp"
+#include "tests/cli/component_text_cache_fixture.hpp"
 namespace {
 void ExecutionReclamationWaitsForActiveSourcesAndUnbinds() {
   class ReclaimRunner final : public Runner {
