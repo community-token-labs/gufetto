@@ -8244,6 +8244,9 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        theta, eps, capacity, rope, yarn);
 }
 
+// CPU guard tests extract prefixes up to the Graph grids / KV-type markers;
+// keep those markers stable
+// (tests/models/qwen38_flash_next/extract_attention_geometry.py).
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
@@ -8251,8 +8254,9 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   std::uint32_t budget, std::uint32_t mask_words,
                   std::uint32_t max_blocks, hipStream_t stream,
                   std::uint32_t live_blocks) {
-  if (!IsSupportedIndexerGeometry(heads, dim, ratio))
+  if (!IsSupportedIndexerGeometry(heads, dim, ratio)) {
     throw std::invalid_argument(kIndexerGeometryError);
+  }
   // Graph grids are sized by max_blocks so a captured decode graph replays
   // at any position; blocks past the live range return at once. An eager
   // launch passes its live range, sparing the empty workgroups.
@@ -8278,8 +8282,9 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists, std::uint32_t* counts,
                std::uint32_t list_capacity, KvCacheType cache_type) {
-  if (!IsSupportedAttentionGeometry(heads, kv_heads, d, ratio))
+  if (!IsSupportedAttentionGeometry(heads, kv_heads, d, ratio)) {
     throw std::invalid_argument(kAttentionGeometryError);
+  }
   if (!IsKnownKvCacheType(cache_type))
     throw std::invalid_argument(
         "unknown Flash-Next attention KV representation");
