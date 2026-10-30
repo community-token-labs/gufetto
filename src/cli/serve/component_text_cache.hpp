@@ -218,6 +218,7 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t usable_capacity() const noexcept;
   // One scheduler observer; must not throw. Invoked outside publication locks.
+  // Callers settling a diagnostic lease must not hold the scheduler queue lock.
   void SetAvailabilityCallback(std::function<void()>);
 
 private:
