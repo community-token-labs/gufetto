@@ -1075,6 +1075,7 @@ void TestLlamaTokenIds() {
       post(R"({"prompt":[104,105],"return_tokens":true,"stop":["end"]})");
   assert(stopped.find("stopped_word")->as_bool());
   assert(stopped.member_str("stopping_word") == "end");
+  assert(stopped.find("tokens")->dump() == "[111,107]");
   assert(!stopped.find("stopped_eos")->as_bool());
   server.backend->forced_stop_sequence.clear();
   assert(post(R"({"prompt":[0,255],"return_tokens":false})")
@@ -1082,6 +1083,12 @@ void TestLlamaTokenIds() {
              ->dump() == "[]");
   assert(!post(R"({"prompt":[104,105]})").contains("tokens"));
   assert(!post(R"({"prompt":"hi"})").contains("tokens"));
+  assert(!post(R"({"prompt":"hi","return_tokens":null})").contains("tokens"));
+  assert(
+      !post(R"({"prompt":[104,105],"return_tokens":null})").contains("tokens"));
+  post(R"({"prompt":[1.0,1e2,-0],"return_tokens":true})");
+  assert((server.backend->LastCall().prompt_ids ==
+          std::vector<gufo::tokenization::TokenId>{1, 100, 0}));
 
   const auto exact = post(R"({"prompt":[104,105],"n_predict":4,
     "return_tokens":true,"stream":false,"cache_prompt":false,
@@ -1117,7 +1124,7 @@ void TestLlamaTokenIds() {
         "'prompt' must be a nonempty array of in-vocabulary integer token IDs");
   }
   for (const char* field : {"return_tokens", "ignore_eos"}) {
-    for (const char* value : {"null", "1", "\"true\""}) {
+    for (const char* value : {"1", "\"true\""}) {
       ExpectStatus(
           server.Post("/completion", std::string("{\"prompt\":[1],\"") + field +
                                          "\":" + value + "}"),
