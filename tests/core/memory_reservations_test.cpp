@@ -1,12 +1,16 @@
 #include "src/core/memory_reservations.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
@@ -127,10 +131,135 @@ void TestConcurrentOwnerCreation() {
   }
 }
 
+// Independent rendering of the existing component-cache RAM branch. No named
+// helper is used to calculate the zero-reservation reference.
+std::size_t LegacyBudget(gufo::core::ReservationObservation sample,
+                         gufo::core::NamedCacheBudgetOptions options) {
+  const auto sub = [](auto a, auto b) { return a > b ? a - b : 0; };
+  const auto available =
+      std::min(sample.host_available, sample.cgroup_available);
+  auto ceiling = std::min(sub(available, sample.host_reserve),
+                          sub(sample.device_available, sample.device_reserve));
+  auto automatic = std::min(available / 2, ceiling);
+  if (options.ordinary_pending > ceiling)
+    throw std::invalid_argument(
+        "outstanding execution memory exceeds remaining capacity");
+  automatic = sub(automatic,
+                  options.ordinary_pending / 2 + options.ordinary_pending % 2);
+  ceiling -= options.ordinary_pending;
+  if (options.staging > ceiling)
+    throw std::invalid_argument(
+        "cache staging exceeds capacity after execution reservations");
+  automatic += options.pinned / 2;
+  ceiling += options.pinned;
+  const auto maximum = sub(ceiling, options.staging);
+  auto ram = std::min(options.requested, maximum);
+  if (options.automatic)
+    ram = std::min(ram, automatic);
+  const auto limit =
+      std::min({ram + options.pinned, maximum, options.ledger_limit});
+  return std::min(ram, sub(limit, options.pinned));
+}
+
+void TestEmptyBudgetParity() {
+  using namespace gufo::core;
+  for (const std::size_t host : {64, 127, 256})
+    for (const auto group : {std::numeric_limits<std::size_t>::max(),
+                             std::size_t{80}, std::size_t{192}})
+      for (const std::size_t device : {48, 200, 300})
+        for (const std::size_t pending : {0, 1, 32, 70})
+          for (const std::size_t staging : {0, 8, 40})
+            for (const std::size_t pinned : {0, 1, 16})
+              for (const std::size_t requested : {16, 128})
+                for (const bool automatic : {false, true})
+                  for (const std::size_t ledger : {8, 200}) {
+                    const ReservationObservation observation{host, device,
+                                                             group, 4, 3};
+                    const NamedCacheBudgetOptions options{
+                        requested, ledger, pending, staging, pinned, automatic};
+                    std::optional<std::size_t> expected;
+                    std::string reason;
+                    try {
+                      expected = LegacyBudget(observation, options);
+                    } catch (const std::invalid_argument& error) {
+                      reason = error.what();
+                    }
+                    try {
+                      const auto result = ResolveNamedCacheBudget(
+                          observation, {}, {}, 0, options);
+                      assert(expected && result.bytes == *expected);
+                      assert(result.before_debit == result.after_debit);
+                    } catch (const std::invalid_argument& error) {
+                      assert(!expected && reason == error.what());
+                    }
+                  }
+}
+
+void TestNamedBudget() {
+  using namespace gufo::core;
+  const ReservationObservation raw{2048, 2048};
+  NamedCacheBudgetOptions options{4096, 8192, 0, 0, 0, true};
+  auto result = ResolveNamedCacheBudget(raw, {}, {128, 128}, 128, options);
+  assert(result.before_debit == 1024 && result.after_debit == 896);
+  assert(result.bytes == 896 && result.physical_ceiling == 1920);
+  const ReservationObservation partial{1984, 1984};
+  result =
+      ResolveNamedCacheBudget(partial, {64, 64, 0}, {64, 64}, 128, options);
+  assert(result.before_debit == 1024 && result.bytes == 896);
+  options.requested = 512;  // Existing AUTO cap, before the full debit.
+  result =
+      ResolveNamedCacheBudget(partial, {64, 64, 0}, {64, 64}, 128, options);
+  assert(result.before_debit == 512 && result.bytes == 384);
+  options.automatic = false;
+  options.requested = 768;
+  assert(ResolveNamedCacheBudget(partial, {64, 64, 0}, {64, 64}, 128, options)
+             .bytes == 640);
+  options.requested = 128;
+  assert(ResolveNamedCacheBudget(raw, {}, {128, 128}, 128, options).bytes == 0);
+  options.requested = 127;
+  try {
+    (void)ResolveNamedCacheBudget(raw, {}, {128, 128}, 128, options);
+    assert(false);
+  } catch (const std::invalid_argument& error) {
+    assert(std::string_view(error.what()) ==
+           "named reservations exceed cache policy budget");
+  }
+  options = {4096, 8192, 0, 0, 0, true};
+  result = ResolveNamedCacheBudget({4096, 4096, 1024}, {128, 0, 64}, {64, 0},
+                                   128, options);
+  assert(result.before_debit == 544 && result.bytes == 416);
+  // Another owner affects physical capacity, not our baseline or policy debit.
+  result = ResolveNamedCacheBudget({2048, 1024}, {64, 0, 0}, {64, 700}, 128,
+                                   options);
+  assert(result.before_debit == 1024 && result.after_debit == 896);
+  assert(result.physical_ceiling == 324 && result.bytes == 324);
+  try {
+    (void)ResolveNamedCacheBudget(raw, {}, {0, 2049}, 128, options);
+    assert(false);
+  } catch (const std::invalid_argument& error) {
+    assert(std::string_view(error.what()) ==
+           "named reservations exceed physical capacity");
+  }
+  try {
+    (void)ResolveNamedCacheBudget(raw, {129, 0, 0}, {}, 128, options);
+    assert(false);
+  } catch (const std::invalid_argument&) {
+  }
+  try {
+    (void)ResolveNamedCacheBudget(
+        {std::numeric_limits<std::size_t>::max(), 2048}, {1, 0, 0}, {}, 1,
+        options);
+    assert(false);
+  } catch (const std::overflow_error&) {
+  }
+}
+
 int main() {
   TestDomainAndIdentity();
   TestExclusiveBindingAndRebind();
   TestOwnershipOutlivesCaller();
   TestConcurrentBinding();
   TestConcurrentOwnerCreation();
+  TestEmptyBudgetParity();
+  TestNamedBudget();
 }
