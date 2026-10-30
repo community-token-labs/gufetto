@@ -282,6 +282,24 @@ void TestQwenConfigArithmeticRefusals() {
     }
   }
 
+  // Converters may store in-range values as int32 or uint64; both still load.
+  for (const bool signed_value : {false, true}) {
+    GgufBuilder builder;
+    builder.AddMetadataString("general.architecture", "qwen35");
+    if (signed_value) {
+      builder.AddMetadataInt32("qwen35.block_count", 40);
+    } else {
+      builder.AddMetadataUint64("qwen35.block_count", 40);
+    }
+    const auto binary = builder.Build(64);
+    auto reader = gufo::core::GgufReader::OpenMemory(binary.data(),
+                                                     binary.size(), &error);
+    Expect(reader != nullptr, "in-range metadata reader opens: " + error);
+    const auto config = reader->ExtractModelConfig(&error);
+    Expect(config.has_value() && config->num_layers == 40,
+           "in-range int32/uint64 block_count is accepted: " + error);
+  }
+
   static_assert(
       !gufo::core::CheckedProduct({2, std::numeric_limits<std::uint32_t>::max(),
                                    std::numeric_limits<std::uint32_t>::max()})
