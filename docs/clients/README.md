@@ -20,18 +20,20 @@ initial text-only session, a **requested** context of 32768 and output budget
 4096 are examples, not universal model limits:
 
 ```sh
-/path/to/gufo serve --host 127.0.0.1 --port 8080 --api-key "$GUFO_API_KEY" \
+# Keep the server key in a private file, not in server argv.
+mkdir -p ~/.config/gufo
+(umask 077; printf '%s\n' "$GUFO_API_KEY" > ~/.config/gufo/key)
+/path/to/gufo serve --host 127.0.0.1 --port 8080 --api-key-file ~/.config/gufo/key \
   llm --model "$MODEL" --served-model-name gufo-local --context 32768 --think off
 curl -fsS -H "Authorization: Bearer $GUFO_API_KEY" http://127.0.0.1:8080/v1/models
 ```
 
-**Known server credential caveat:** Gufo currently offers only `--api-key`,
-not an environment/file input. Expanding `$GUFO_API_KEY` in the example still
-puts the key in server argv, visible to process inspection (for example `ps`
-and `/proc/*/cmdline`) under the host's access rules. Use only a trusted host,
-avoid shell tracing/history with literal keys, and keep launch logs private.
-The later Pi proxy reads its credential from the environment without putting
-it on client argv; that does not remove the server-side limitation.
+Gufo accepts its single key as `Authorization: Bearer` (OpenAI clients) or
+`x-api-key` (Anthropic SDKs); a request sending both must send the key in
+both. `GUFO_API_KEY` is the clients' variable here; the server never reads
+it. Give the server its key with `--api-key-file`, not `--api-key`, which puts
+it in server argv, visible to process inspection (`ps`, `/proc/*/cmdline`).
+Avoid shell tracing/history with literal keys and keep launch logs private. See [authentication](../SERVER.md#authentication-and-exposure).
 
 Choose `C` from the actual loaded context reported by `/v1/models`, constrained
 by the model's supported context and memory fit; choose output `O < C`, leaving
@@ -43,12 +45,10 @@ changes model architecture/capabilities. See [context and limits](../SERVER.md).
 
 - OpenAI base: `http://127.0.0.1:8080/v1` (client appends `/chat/completions`
   or `/responses`). Anthropic SDK base: `http://127.0.0.1:8080` (appends `/v1/messages`).
-- Gufo recognizes **one shared bearer key**, not per-user keys. Anthropic SDKs
-  commonly send `x-api-key`; **that alone fails** against authenticated Gufo.
-  Use documented bearer/auth-token support. Do not fix this by disabling auth
-  on a LAN bind. Plain HTTP sends bearer credentials in cleartext; use a TLS
-  reverse proxy for LAN access, or a host-only bridge for colocated containers.
-  Native `x-api-key` support is a separate auth change.
+- Gufo recognizes **one shared key**, not per-user keys, as bearer or
+  `x-api-key`. Do not disable auth on a LAN bind. Plain HTTP sends credentials
+  in cleartext; use a TLS reverse proxy for LAN access, or a host-only bridge
+  for colocated containers.
 - Start thinking off (`--think off`). Chat `reasoning_effort: none` disables it;
   enable only a model-supported mode during explicit qualification. Responses
   uses `reasoning.effort`; Messages uses `thinking` / `output_config.effort`.

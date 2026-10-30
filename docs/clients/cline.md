@@ -17,9 +17,8 @@ In Cline's settings (gear), use:
 | Computer Use | Off for this text-only recipe |
 | Azure Identity Authentication | Off (not Gufo bearer authentication) |
 
-Anthropic SDK `x-api-key` is not accepted by authenticated Gufo; choose this
-OpenAI-compatible provider rather than assuming Anthropic API-key auth works.
-The official guide's Verify action confirms connectivity, not a tool loop.
+Gufo also accepts the Anthropic SDK's `x-api-key`, but this recipe qualifies
+only the OpenAI-compatible provider. The official guide's Verify action confirms connectivity, not a tool loop.
 
 ## Reasoning/cache and limitations
 

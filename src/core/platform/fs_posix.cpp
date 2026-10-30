@@ -429,6 +429,49 @@ bool OwnerOnly(const FileInfo& info, std::uint32_t forbidden,
          (info.permissions & required) == required;
 }
 
+SmallFileRead ReadSmallRegularFile(const std::filesystem::path& path,
+                                   std::size_t max_bytes, std::string* contents,
+                                   FileInfo* info, std::error_code& ec) {
+  ec.clear();
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+  if (fd < 0) {
+    ec = Errno();
+    return SmallFileRead::kOpenFailed;
+  }
+  const struct Closer {
+    int fd;
+    ~Closer() { ::close(fd); }
+  } closer{fd};
+  struct stat st{};
+  if (::fstat(fd, &st) != 0) {
+    ec = Errno();
+    return SmallFileRead::kOpenFailed;
+  }
+  *info = FromStat(st);
+  if (!S_ISREG(st.st_mode))
+    return SmallFileRead::kNotRegular;
+  if (static_cast<std::uint64_t>(st.st_size) > max_bytes)
+    return SmallFileRead::kTooLarge;
+  // Read one byte past the limit so a file that grew since fstat is refused.
+  contents->assign(max_bytes + 1, '\0');
+  std::size_t total = 0;
+  while (total < contents->size()) {
+    const auto n =
+        ::read(fd, contents->data() + total, contents->size() - total);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n < 0) {
+      ec = Errno();
+      return SmallFileRead::kOpenFailed;
+    }
+    if (n == 0)
+      break;
+    total += static_cast<std::size_t>(n);
+  }
+  contents->resize(total);
+  return total > max_bytes ? SmallFileRead::kTooLarge : SmallFileRead::kRead;
+}
+
 PlatformFile OpenForAppend(const std::filesystem::path& path,
                            std::error_code& ec) noexcept {
   ec.clear();

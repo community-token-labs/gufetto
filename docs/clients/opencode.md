@@ -31,7 +31,7 @@ put this in an isolated OpenCode config (no literal secrets):
 ```
 
 Use `/models` and select `gufo/gufo-local`. The API key goes as bearer
-authentication; Anthropic `x-api-key` alone would not authenticate to Gufo.
+authentication (Gufo also accepts an Anthropic provider's `x-api-key`).
 If this client version uses `/connect` for custom credentials, store the key
 there privately instead; do not check its auth store into git.
 
