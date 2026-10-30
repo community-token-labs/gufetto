@@ -62,6 +62,8 @@ list(REMOVE_ITEM gufo_pr_tests
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
+  text_model_runner_test_diagnostic_refusal_auto
+  text_model_runner_test_diagnostic_refusal_explicit
   "qwen38_flash_next\\.npu_contracts"
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"

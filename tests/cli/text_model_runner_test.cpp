@@ -2540,7 +2540,8 @@ void TestDiagnosticAdmissionAndSnapshots() {
       Expect(stats->states_created == 0, "refuse before state allocation");
     }
   }
-  for (const std::size_t ceiling : {envelope - 1, envelope, envelope + 128}) {
+  for (const std::size_t ceiling :
+       {envelope - 1, envelope, envelope + 1, envelope + 128}) {
     for (const std::size_t requested : {std::size_t{0}, envelope * 2}) {
       auto stats = std::make_shared<FakeStats>();
       auto runner = std::make_shared<SnapshotRunner>(stats, 64, envelope + 256,
@@ -2548,43 +2549,71 @@ void TestDiagnosticAdmissionAndSnapshots() {
       runner->retained_snapshot_ceiling_bytes = ceiling;
       std::ostringstream log;
       auto* previous = std::clog.rdbuf(log.rdbuf());
-      {
+      bool refused = false;
+      try {
         TextRunnerPool pool(runner, 1, {}, {.capacity_bytes = requested});
+        Expect(ceiling >= envelope, "over-ceiling must refuse pool startup");
         auto request = pool.Acquire({1, 0});
         Expect(request.Prefill(2).decode_ready, "snapshot boundary ready");
         (void)request.SelectNext();
         request.Advance();
         const auto committed = request.Commit();
-        const auto expected =
-            ceiling > envelope ? (requested ? 128U : 64U) : 0U;
-        Expect((committed.snapshot_bytes != 0) == (expected != 0),
-               "only positive protected headroom can retain this snapshot");
+        Expect((committed.snapshot_bytes != 0) == (ceiling == envelope + 128),
+               "only sufficient protected headroom can retain this snapshot");
+      } catch (const std::invalid_argument& error) {
+        refused = true;
+        Expect(ceiling == envelope - 1 &&
+                   std::string_view(error.what()) ==
+                       "--full-logits-api needs 4096 bytes; snapshot ceiling "
+                       "is 4095 bytes; "
+                       "lower --context or --sessions, free memory, or restart "
+                       "without --full-logits-api",
+               "exact diagnostic refusal propagates through pool startup");
       }
       std::clog.rdbuf(previous);
-      const auto expected = ceiling > envelope ? (requested ? 128U : 64U) : 0U;
-      Expect(log.str().find("snapshot_entries=128 capacity_bytes=" +
-                            std::to_string(expected) + " automatic_bytes=" +
-                            std::to_string(ceiling > envelope ? 64U : 0U) +
-                            " max_bytes=" +
-                            std::to_string(ceiling > envelope ? 128U : 0U) +
-                            " ram_cache=on") != std::string::npos,
-             "snapshot AUTO and ceiling protect E at E-1/E/E+128");
-      const std::string event =
-          "[ERROR] [cache] event=diagnostic_snapshots_disabled";
-      const auto position = log.str().find(event);
-      Expect((position != std::string::npos) == (ceiling < envelope),
-             "over-ceiling disables snapshots with an ERROR");
-      if (ceiling < envelope) {
-        Expect(
-            log.str().find(event, position + event.size()) == std::string::npos,
-            "disabled snapshot warning is emitted once per cache");
-        Expect(log.str().find("claim_bytes=4096 ceiling_bytes=4095 "
-                              "reason=diagnostic_claim_exceeds_ceiling") !=
+      Expect(refused == (ceiling < envelope), "E-1/E/E+1 startup boundary");
+      if (refused) {
+        Expect(log.str().find("event=snapshot_cache_configured") ==
                    std::string::npos,
-               "disabled snapshot log gives the exact bound");
+               "refused startup never publishes a configured snapshot cache");
+        Expect(stats->snapshot_captures == 0, "refused startup cannot capture");
+        continue;
       }
+      const auto extra = ceiling - envelope;
+      const auto expected = requested ? extra : extra / 2;
+      Expect(log.str().find("snapshot_entries=128 capacity_bytes=" +
+                            std::to_string(expected) +
+                            " automatic_bytes=" + std::to_string(extra / 2) +
+                            " max_bytes=" + std::to_string(extra) +
+                            " ram_cache=on") != std::string::npos,
+             "snapshot AUTO and ceiling protect E at E/E+1/E+128");
     }
   }
+}
+
+// Expected-failure CTest driver: a swallowed or altered error returns success
+// and therefore fails WILL_FAIL. This exercises the startup exception boundary,
+// not a native Model::Load (the consumer integration owns that qualification).
+int DiagnosticSnapshotStartupExit(bool explicit_limit) {
+  auto& claim = gufo::server::DiagnosticMemoryClaim::Process();
+  Expect(claim.Activate(4096, {4096, 4096, 4096}, nullptr),
+         "fresh startup claim");
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SnapshotRunner>(stats, 64, 8192, 2047);
+  runner->retained_snapshot_ceiling_bytes = 4095;
+  try {
+    TextRunnerPool pool(runner, 1, {},
+                        {.capacity_bytes = explicit_limit ? 8192U : 0U});
+  } catch (const std::invalid_argument& error) {
+    if (std::string_view(error.what()) ==
+        "--full-logits-api needs 4096 bytes; snapshot ceiling is 4095 bytes; "
+        "lower --context or --sessions, free memory, or restart without "
+        "--full-logits-api") {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
+  return 0;
 }
 
 void TestSnapshotCacheCapacityIsReportedAtStartup() {
@@ -3245,6 +3274,10 @@ void TestLookupRuntimeDefaultsAndDisabled() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--diagnostic-refusal-auto")
+    return DiagnosticSnapshotStartupExit(false);
+  if (argc == 2 && std::string_view(argv[1]) == "--diagnostic-refusal-explicit")
+    return DiagnosticSnapshotStartupExit(true);
   if (argc == 2 && std::string_view(argv[1]) == "--diagnostic-memory") {
     TestDiagnosticAdmissionAndSnapshots();
     return 0;

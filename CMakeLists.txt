@@ -864,6 +864,12 @@ if (BUILD_TESTING)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
   add_test(NAME text_model_runner_test_diagnostic_memory COMMAND text_model_runner_test --diagnostic-memory)
   set_tests_properties(text_model_runner_test_diagnostic_memory PROPERTIES LABELS "cpu;server;runner;memory")
+  foreach(mode auto explicit)
+    add_test(NAME text_model_runner_test_diagnostic_refusal_${mode}
+      COMMAND text_model_runner_test --diagnostic-refusal-${mode})
+    set_tests_properties(text_model_runner_test_diagnostic_refusal_${mode} PROPERTIES
+      WILL_FAIL TRUE LABELS "cpu;server;runner;memory")
+  endforeach()
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
 
