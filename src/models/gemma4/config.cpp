@@ -81,6 +81,8 @@ struct Reader {
   }
 
   /// Per-layer values stored either as one scalar or as one entry per layer.
+  /// A scalar is validated exactly like an array entry, so no caller can
+  /// divide by a zero width or head count.
   std::vector<std::uint32_t> PerLayer(std::string_view suffix,
                                       std::uint32_t layers) {
     const std::string key = Key(suffix);
@@ -89,12 +91,14 @@ struct Reader {
       Fail("missing GGUF value " + key);
       return {};
     }
+    std::vector<std::uint64_t> values;
     if (const auto scalar = gguf.GetMetadataUint32(key)) {
-      return std::vector<std::uint32_t>(layers, *scalar);
-    }
-    const auto values = U64Array(suffix);
-    if (!ok) {
-      return {};
+      values.assign(layers, *scalar);
+    } else {
+      values = U64Array(suffix);
+      if (!ok) {
+        return {};
+      }
     }
     if (values.size() != layers) {
       Fail(key + " must describe every layer");
@@ -285,6 +289,13 @@ std::optional<Config> Config::DraftFromGguf(const core::GgufReader& gguf,
   }
   Config c = ReadCommon(r);
   if (!r.ok) {
+    return std::nullopt;
+  }
+  // The drafter runs a dense MLP; expert metadata, even a zero width, is a
+  // variant this runtime does not implement.
+  if (r.U32("expert_count", false, 0) != 0 ||
+      gguf.FindMetadata(r.Key("expert_feed_forward_length")) != nullptr) {
+    r.Fail("gemma4-assistant drafts with routed experts are not supported");
     return std::nullopt;
   }
   c.target_hidden_size = r.U32("embedding_length_out");

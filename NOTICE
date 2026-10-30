@@ -21,7 +21,10 @@ Adapted code includes:
 - Gemma 4 config contract (src/models/gemma4/config.{hpp,cpp}) and its tests
   (tests/models/gemma4/{config_test.cpp,gguf_builder.hpp,check.hpp}): adapted
   from gufo-org/gufo PR #426 (franzmoca/gufo feat/gemma 25ba634f6cc4),
-  Copyright (c) 2026 gufo contributors (MIT).
+  Copyright (c) 2026 gufo contributors (MIT). config.cpp rejects scalar zero
+  per-layer values (the donor divided by a zero KV head count) and drafter
+  expert metadata; config_test.cpp drops the weights cases and adds drafter
+  and zero-value cases.
 
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp

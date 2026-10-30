@@ -117,6 +117,15 @@ void CheckRejections() {
          "KV heads not dividing query heads");
   reject("gemma4.attention.head_count_kv", I32Array{{-2, 1}},
          "negative KV heads");
+  // Scalars are validated like array entries; zero KV heads used to reach a
+  // modulo by zero.
+  reject("gemma4.attention.head_count_kv", std::uint32_t{0},
+         "scalar zero KV heads");
+  reject("gemma4.attention.head_count_kv", I32Array{{2, 0}},
+         "zero KV heads in one layer");
+  reject("gemma4.feed_forward_length", std::uint32_t{0}, "scalar zero FFN");
+  reject("gemma4.feed_forward_length", I32Array{{128, 0}},
+         "zero FFN in one layer");
   reject("gemma4.attention.sliding_window_pattern", BoolArray{{true}},
          "short pattern");
   reject("gemma4.attention.sliding_window_pattern", BoolArray{{true, true}},
@@ -174,6 +183,10 @@ void CheckExpertConfig() {
          "more routed experts than the kernels support");
   reject("gemma4.expert_used_count", std::uint32_t{0}, "no routed experts");
   reject("gemma4.expert_count", std::uint32_t{512}, "too many experts");
+  reject("gemma4.expert_feed_forward_length", std::uint32_t{0},
+         "scalar zero expert width");
+  reject("gemma4.expert_feed_forward_length", I32Array{{32, 0}},
+         "zero expert width in one layer");
   Metadata missing = MoeMetadata();
   missing.erase("gemma4.expert_feed_forward_length");
   Require(!Parse(missing).has_value(), "missing expert width");
@@ -250,6 +263,18 @@ void CheckDraft() {
   reject(p + "rope.freq_base_swa", 20000.0F, "draft rope base differs");
   reject(p + "attention.sliding_window", std::uint32_t{32},
          "draft window differs");
+  reject(p + "attention.head_count_kv", std::uint32_t{0},
+         "draft scalar zero KV heads");
+  reject(p + "attention.head_count_kv", I32Array{{2, 0}},
+         "draft zero KV heads in one layer");
+  reject(p + "feed_forward_length", std::uint32_t{0}, "draft scalar zero FFN");
+  reject(p + "feed_forward_length", I32Array{{64, 0}},
+         "draft zero FFN in one layer");
+  reject(p + "expert_feed_forward_length", std::uint32_t{0},
+         "draft zero expert width");
+  reject(p + "expert_feed_forward_length", I32Array{{32, 0}},
+         "draft zero expert width in one layer");
+  reject(p + "expert_count", std::uint32_t{8}, "draft with routed experts");
   Metadata missing = DraftMetadata();
   missing.erase(p + "embedding_length_out");
   Require(!ParseDraft(missing, *target).has_value(),
