@@ -3545,7 +3545,7 @@ bool InferenceBackend::load(
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
   if (startup_mode_ == StartupMode::kAdmissionOnly &&
-      architecture != "qwen4exp") {
+      !models::qwen::IsQwen4PreviewArch(architecture)) {
     SetError(error, "measured admission-only requires Flash-Next (qwen4exp)");
     return false;
   }

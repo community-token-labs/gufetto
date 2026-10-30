@@ -62,8 +62,18 @@ def main():
         result = run("--plan", "--model", str(missing_context), "--no-gpu")
         assert result.returncode == 0 and "UNPROVEN:" in result.stdout, result.stderr
         assert "no native context" in result.stdout
+        # Independent spelling fixtures: reject aliases and trailing bytes.
+        unsupported = model.parent / "unsupported.gguf"
+        for architecture in ("qwen4", "Qwen4exp", "qwen4exp-next", "qwen4exp ", "qwen4exp\0", "llama"):
+            metadata = string("general.architecture") + struct.pack("<I", 8) + string(architecture)
+            metadata += string(architecture + ".context_length") + struct.pack("<II", 4, 32768)
+            fixture = b"GGUF" + struct.pack("<IQQ", 3, 0, 2) + metadata
+            unsupported.write_bytes(fixture + b"\0" * (-len(fixture) % 32))
+            result = run("--plan", "--model", str(unsupported), "--no-gpu", "--enable-yarn")
+            assert result.returncode == 2, (architecture, result.stdout, result.stderr)
+            assert "--enable-yarn family" in result.stderr, (architecture, result.stderr)
         assert model.read_bytes() == raw
-        assert {p.name for p in model.parent.iterdir()} <= {"metadata.gguf", "no-context.gguf", "identity-cache"}
+        assert {p.name for p in model.parent.iterdir()} <= {"metadata.gguf", "no-context.gguf", "unsupported.gguf", "identity-cache"}
     print("model_admission_cli_test passed")
 
 

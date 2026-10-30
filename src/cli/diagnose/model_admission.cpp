@@ -9,6 +9,7 @@
 #include "src/core/diagnostics/model_plan.h"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/architecture.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -85,12 +86,13 @@ int RunModelAdmission(std::span<const char* const> args) {
                    "context; specify --context\n";
       return 0;
     }
-    if (context < 2 || (yarn && architecture != "qwen4exp"))
+    if (context < 2 ||
+        (yarn && !models::qwen::IsQwen4PreviewArch(architecture)))
       throw std::invalid_argument(
           "invalid native/requested context or --enable-yarn family");
     bool gpu = false;
 #if defined(ENGINE_ENABLE_HIP)
-    if (!no_gpu && architecture == "qwen4exp") {
+    if (!no_gpu && models::qwen::IsQwen4PreviewArch(architecture)) {
       int devices = 0;
       const auto status = hipGetDeviceCount(&devices);
       if (status != hipSuccess && status != hipErrorNoDevice)
@@ -101,7 +103,7 @@ int RunModelAdmission(std::span<const char* const> args) {
     (void)no_gpu;
 #endif
     const auto identity = core::GgufIdentityHex(*reader);
-    if (!gpu || architecture != "qwen4exp") {
+    if (!gpu || !models::qwen::IsQwen4PreviewArch(architecture)) {
       std::cout << "UNPROVEN: native measured admission not run (no GPU, "
                    "disabled, or unsupported provider)\n"
                 << diagnostics::DescribeModelLowerBound(model, context)
