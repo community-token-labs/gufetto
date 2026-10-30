@@ -181,6 +181,29 @@ void CheckNumberOverflow() {
           "fraction and exponent literals round like any double");
 }
 
+/// A plain `-0` keeps its sign in both parsers, at any chunk split.
+void CheckNegativeZero() {
+  Require(ParseToJson("call:f{a:1,x:-0}") == R"({"a":1,"x":-0})" &&
+              ParseToJson("call:f{x: -0 ,y:[-00, 0],z:{w:-0}}") ==
+                  R"({"x":-0,"y":[-0,0],"z":{"w":-0}})",
+          "complete parse keeps -0");
+  const std::string body = "call:f{a:1,x:-0,b:2}";
+  for (std::size_t size = 0; size <= body.size(); ++size) {
+    const auto call = g4::ParsePartialToolCall(body.substr(0, size));
+    if (call == std::nullopt) {
+      continue;
+    }
+    const std::string settled = call->arguments.dump();
+    Require(settled == "{}" || settled == R"({"a":1})" ||
+                settled == R"({"a":1,"x":-0})" ||
+                settled == R"({"a":1,"x":-0,"b":2})",
+            "partial keeps -0 at " + std::to_string(size) + ": " + settled);
+  }
+  Require(Partial("call:f{a:1,x:-0,") == R"(f{"a":1,"x":-0})" &&
+              Partial("call:f{a:1,x: -0 ,") == R"(f{"a":1,"x":-0})",
+          "partial settles -0 at its delimiter");
+}
+
 /// Every prefix of a call whose overflowing integer is still arriving
 /// settles only the members before it, never the integer as text.
 void CheckPartialNumberOverflow() {
@@ -385,6 +408,7 @@ int main() {
     CheckRejections();
     CheckPartial();
     CheckNumberOverflow();
+    CheckNegativeZero();
     CheckPartialNumberOverflow();
     CheckWideObject();
     CheckGrammar();

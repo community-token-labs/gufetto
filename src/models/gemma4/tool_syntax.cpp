@@ -116,7 +116,10 @@ struct Parser {
         return Fail("integer " + std::string(raw) +
                     " exceeds 2^53 and cannot be held exactly");
       }
-      *out = json::Value(static_cast<double>(integer));
+      // A negative zero keeps its sign, as a double conversion would.
+      *out = json::Value(integer == 0 && raw.starts_with('-')
+                             ? -0.0
+                             : static_cast<double>(integer));
       return true;
     }
     double number = 0.0;
