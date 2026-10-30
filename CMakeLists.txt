@@ -1065,7 +1065,7 @@ if (BUILD_TESTING)
     LABELS "cpu;tools;profiling")
 
   if (ENGINE_ENABLE_HIP)
-    add_executable(admission_native_test EXCLUDE_FROM_ALL
+    add_executable(admission_native_test
       tests/diagnostics/admission_native_test.cpp
       src/cli/serve/inference_backend.cpp src/cli/serve/text_model_runner.cpp
       src/cli/serve/text_generation_scheduler.cpp src/cli/serve/component_text_cache.cpp

@@ -71,8 +71,8 @@ struct ClearHook {
 };
 
 void RealPoolCase(
-    const std::shared_ptr<models::qwen38_flash_next::Model>& model,
-    Fault fault) {
+    const std::shared_ptr<models::qwen38_flash_next::Model>& model, Fault fault,
+    bool check_recovery) {
   const auto before = Sample();
   auto trace = std::make_shared<Trace>();
   ClearHook clear;
@@ -166,9 +166,10 @@ void RealPoolCase(
                 trace->probe_threads >= before.threads + required,
             "test did not stage real probe adapter/slots/workers");
   }
-  Require(after.threads <= before.threads, "idle workers survived teardown");
+  if (check_recovery)
+    Require(after.threads <= before.threads, "idle workers survived teardown");
 }
-RecoverySample FullCycle(const char* path) {
+RecoverySample FullCycle(const char* path, bool check_recovery = true) {
   {
     std::string error;
     auto model = models::qwen38_flash_next::Model::Load(
@@ -179,7 +180,7 @@ RecoverySample FullCycle(const char* path) {
     for (const auto fault :
          {Fault::kNone, Fault::kRefuse, Fault::kRequestedThrow,
           Fault::kProbeThrow, Fault::kProbeTimeout})
-      RealPoolCase(model, fault);
+      RealPoolCase(model, fault, check_recovery);
   }
   return Sample();
 }
@@ -196,8 +197,9 @@ int main() {
     Hip(hipFree(nullptr));
     const auto cold = Sample();
     Print("cold_runtime_only", cold);
-    Print("primed_load_unload",
-          FullCycle(path));  // Prime ALL real paths, not just HIP init.
+    Print(
+        "primed_load_unload",
+        FullCycle(path, false));  // Prime ALL paths before recovery assertions.
     std::vector<RecoverySample> controls;
     for (int sample = 0; sample < 8; ++sample) {
       controls.push_back(Sample());

@@ -68,11 +68,11 @@ int RunModelAdmission(std::span<const char* const> args) {
     return 2;
   }
   try {
-    const auto reader = core::GgufReader::OpenFile(model, &error);
+    auto reader = core::GgufReader::OpenFile(model, &error);
     if (!reader)
       throw std::invalid_argument("cannot open model: " + error);
-    const auto architecture =
-        reader->GetMetadataString("general.architecture").value_or("");
+    const std::string architecture(
+        reader->GetMetadataString("general.architecture").value_or(""));
     if (!ValidateKvCacheTypeForArchitecture(kv, architecture, &error))
       throw std::invalid_argument(error);
     if (!context)
@@ -109,6 +109,8 @@ int RunModelAdmission(std::span<const char* const> args) {
                 << " gguf_identity_sha256=" << identity << "\n";
       return 0;
     }
+    reader.reset();  // Release identity-scan mappings before loading native
+                     // weights.
     bool accepted = false, refused = false;
     std::string result;
     {
