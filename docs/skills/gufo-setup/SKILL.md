@@ -149,14 +149,20 @@ projector options. For Qwen3.8 27B Q4 without a draft:
 echo "gufo serve PID $!"
 ```
 
-If the user wants authentication, start the server with
-`--api-key-file PATH`, naming a file the user created with the key. Do not
-read or write that file. The server takes the key only from that file or
-from `--api-key`. Clients and the verify script read it from `GUFO_API_KEY`,
-which the user exports in their own shell; that variable does not configure
-the server. If `"$GUFO" serve llm --help` does not list `--api-key-file`,
-this build predates it: tell the user that `--api-key` would show the key in
-the process list (see `docs/clients/README.md`), and let them decide. Use `--speculative dflash2 --dflash-model "$DRAFT"`
+If the user wants authentication, they create a private key file
+themselves (`docs/clients/README.md` shows how); do not read or write it.
+Start the server with `--api-key-file` naming that file:
+
+```sh
+"$GUFO" serve --host 127.0.0.1 --port 8080 --api-key-file "$KEY_FILE" \
+  llm --model "$MODEL" --served-model-name gufo-local \
+  --context 32768 --think off > gufo-serve.log 2>&1 &
+```
+
+Do not use `--api-key`: it puts the key in the process list, and the two
+options cannot be combined. The server never reads `GUFO_API_KEY`; that
+variable is only for clients and the verify script, and the user exports it
+in their own shell. Use `--speculative dflash2 --dflash-model "$DRAFT"`
 (Qwen3.8 27B), `--speculative mtp --mtp-model "$MTP"` (Flash-Next) or
 `--dspark-model "$DSPARK"` (DeepSeek) only as the model README shows.
 `--mmproj` is auto-discovered beside the model; `--no-vision` disables it.
@@ -209,7 +215,7 @@ qualification; `docs/clients/QUALIFICATION.md` covers that separately.
 | `... pass --enable-yarn` | Flash-Next `--context` above the native 262144 needs `--enable-yarn`; it changes every request, so prefer a smaller context |
 | 503 `loading` | Model still loading; wait |
 | Connection refused | The server is not running; read `gufo-serve.log` |
-| 401 | The server has a key; the client must send it as a bearer token (`x-api-key` alone fails) |
+| 401 | The server has a key; the client must send it as `Authorization: Bearer` or `x-api-key` (the same key in both if it sends both) |
 | 404 `model_not_found` | Client sends a model ID that is not served; use `gufo-local` |
 | 503 `device_lost`, exit status 75 | GPU context lost; restart `gufo serve` |
 | 429 | Admission queue full (`--max-pending`); retry |

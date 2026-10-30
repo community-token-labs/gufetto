@@ -547,7 +547,7 @@ class SkillDocumentTest(unittest.TestCase):
         "--port": {"serve"},
         "--sessions": {"serve"},
         "--api-key": {"serve"},
-        "--api-key-file": {"serve llm"},
+        "--api-key-file": {"serve"},
         "--model": {"serve llm", "verify"},
         "--served-model-name": {"serve llm"},
         "--context": {"serve llm"},
@@ -567,9 +567,6 @@ class SkillDocumentTest(unittest.TestCase):
         "--build": {"cmake"},
         "--parallel": {"cmake"},
     }
-    # The separately decided server key file; the skill checks `--help`
-    # before using it, so builds without it stay correct.
-    PENDING = {"--api-key-file"}
     CMAKE = {"--preset", "--build", "--parallel"}
     # Quoted messages and the source file that emits each one.
     MESSAGES = {
@@ -617,17 +614,9 @@ class SkillDocumentTest(unittest.TestCase):
         for option, commands in self.OWNERS.items():
             for command in commands - {"cmake"}:
                 with self.subTest(option=option, command=command):
-                    if option in self.PENDING and \
-                            option not in self.help[command]:
-                        continue
                     self.assertIn(option, self.help[command])
             if "cmake" in commands:
                 self.assertIn(option, self.CMAKE)
-
-    def test_pending_option_is_gated_by_help(self):
-        for option in self.PENDING:
-            self.assertIn(f"`\"$GUFO\" serve llm --help` does not list "
-                          f"`{option}`", self.text)
 
     def commands(self) -> Iterator[list[str]]:
         for block in re.findall(r"```sh\n(.*?)```", self.text, re.DOTALL):

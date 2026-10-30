@@ -63,8 +63,7 @@ at the file in the Gufo repository; its first step obtains the checkout.
   the skill against the `--help` of the command it belongs to (built
   `gufo diagnose`, `gufo serve`, `gufo serve llm`, or the verify script). It
   also checks that each quoted Gufo message still exists in the sources, and
-  that every repository path the skill names exists. Its single pending
-  option, `--api-key-file`, is used only after the skill checks `--help`.
+  that every repository path the skill names exists.
 - **Read-only or confirmed steps.** Diagnostics, `--plan`, `--help` and
   `GET` requests run freely. Cloning, building, downloads, manifests, client
   configuration and starting a server need the user's agreement and stay
