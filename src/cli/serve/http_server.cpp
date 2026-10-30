@@ -1677,6 +1677,7 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
          "tokens over sessions times context; excludes retained cache\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
       << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
+  WriteCacheAndSpeedMetrics(out);
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),

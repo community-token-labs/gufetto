@@ -2385,6 +2385,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (live) {
       request.cached = found.selected->boundary;
       request.metrics.used_entry_id = found.selected->entry.value;
+      request.metrics.hit_tier = CacheHitTier::kLive;
     }
     bool restore_cancelled = false;
     cache::CheckpointId used_prediction{};
@@ -2619,6 +2620,17 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           request.metrics.used_entry_id = candidate.entry.value;
           const std::lock_guard lock(impl_->mutex);
           entry->durable = candidate.durable;
+          // Provenance outranks storage: a registered pin from RAM or disk,
+          // then a predicted system/tool root, then the tier restored from.
+          const bool pinned =
+              request.pin_hit != nullptr ||
+              (candidate.checkpoint &&
+               std::ranges::any_of(impl_->pins, [&](const auto& pin) {
+                 return pin.ram && pin.ram->Id() == candidate.checkpoint->Id();
+               }));
+          request.metrics.hit_tier = pinned             ? CacheHitTier::kPinned
+                                     : request.disk_hit ? CacheHitTier::kDisk
+                                                        : CacheHitTier::kRam;
           // Latch the actual validated source before demand-warm can replace
           // request.source. A failed earlier prediction cannot taint fallback.
           if (candidate.checkpoint && !request.pin_hit) {
@@ -2626,9 +2638,13 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
                 std::ranges::find_if(impl_->readiness, [&](const auto& r) {
                   return r.checkpoint.lock() == candidate.checkpoint;
                 });
-            if (ready != impl_->readiness.end() && !ready->observed &&
-                ready->capture_origin == SnapshotOrigin::kPredicted)
-              used_prediction = candidate.checkpoint->Id();
+            if (ready != impl_->readiness.end() &&
+                ready->capture_origin == SnapshotOrigin::kPredicted) {
+              if (!pinned)
+                request.metrics.hit_tier = CacheHitTier::kRoot;
+              if (!ready->observed)
+                used_prediction = candidate.checkpoint->Id();
+            }
           }
         }
       } catch (...) {

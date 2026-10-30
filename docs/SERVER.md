@@ -1541,6 +1541,39 @@ even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
 over sessions times context; retained cache entries are not counted.
+
+Gufo adds cache outcome counters and speed histograms after the llama.cpp
+block. Each finished or cancelled text request that reached a cache lookup
+counts once:
+
+- `gufo_cache_hits_total{tier}` counts requests that reused a cached prefix,
+  by where it came from. Provenance outranks storage: `pinned` is a
+  [registered pinned prefix](fork/PINNED-PREFIX.md) restored from RAM or disk,
+  and `root` a predicted system/tool root checkpoint. Otherwise `live` is a
+  session that still held the prefix, `ram` a RAM checkpoint and `disk` a
+  `--cache-disk` restore.
+- `gufo_cache_misses_total{reason}` counts requests that reused nothing, by
+  the same `usage.gufo.cache_miss_reason` values: `disabled`, `no_checkpoint`,
+  `no_compatible_boundary`, `prefix_changed`, `input_changed`, and `unknown`
+  for any other. A request cancelled before its lookup counts as neither.
+- `gufo_cache_acquisitions_total{reason}` counts component cache acquisitions,
+  including later cancelled ones, by the `reuse_reason` of
+  `usage.gufo.component_cache`; it matches `cache_reuse_acquisitions` in
+  `/props`.
+- `gufo_prefill_tokens_per_second` and `gufo_decode_tokens_per_second` are
+  histograms of per-request speed (`timings.prompt_per_second`,
+  `timings.predicted_per_second`) labelled by `context`, the prompt's band of
+  total tokens: `0_1k` (at most 1024), `1k_4k`, `4k_16k`, `16k_64k`,
+  `64k_256k` (at most 262144) and `256k_plus`. Prefill buckets run from 50 to
+  20000 tokens/s and count requests that prefilled at least 64 tokens, since
+  shorter prefills mostly measure launch latency; decode buckets run from 1 to
+  200 tokens/s and count requests that generated tokens. A scrape can see one
+  request's sample partly added.
+
+For example, `rate(gufo_cache_hits_total[5m])` over all tiers divided by the
+same rate plus `rate(gufo_cache_misses_total[5m])` is the request hit rate, and
+`histogram_quantile(0.5, rate(gufo_decode_tokens_per_second_bucket{context="16k_64k"}[1h]))`
+is the median decode speed at 16k-64k context.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 
