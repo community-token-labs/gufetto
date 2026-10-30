@@ -2,7 +2,10 @@
 // against fixtures/reference_tiny.json, the logits of an independent float64
 // port of llama.cpp's gemma4 graph (tools/gemma4/reference_oracle.py). The
 // tokens run past the sliding window, so window masking, K=V on the global
-// layer, rope frequency divisors, routing and the softcap all matter.
+// layer, rope frequency divisors, routing and the softcap all matter. Expert
+// choice and relative weights are observable (top-1 instead of top-2 moves
+// the logits by 5.5); the renormalizing denominator alone is not, since the
+// following RMSNorm cancels a uniform scale.
 //
 // TODO(G4-12, nimo): compare the reference with the device runtime on the
 // real 26B-A4B artifact; this host test only pins the operator semantics.

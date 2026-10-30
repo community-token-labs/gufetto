@@ -183,7 +183,10 @@ void Reference::Experts(const LayerWeights& w, const float* x, std::size_t rows,
   std::vector<float> down(d);
   for (std::size_t r = 0; r < rows; ++r) {
     // Softmax over every expert, the top experts_used by probability (ties
-    // to the lower index), renormalized over the chosen ones.
+    // to the lower index), renormalized over the chosen ones. The
+    // renormalization scales the whole mixture by one factor, which the
+    // post_ffw_norm_2 RMSNorm cancels (up to eps), so it is not observable in
+    // the logits; which experts are chosen, and their relative weights, are.
     const float* l = &logits[r * experts];
     std::vector<std::size_t> order(experts);
     for (std::size_t e = 0; e < experts; ++e) {
