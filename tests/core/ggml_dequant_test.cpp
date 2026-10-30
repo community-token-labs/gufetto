@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <numeric>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/ggml_gemm.hpp"
 
 namespace {
 
@@ -265,6 +267,37 @@ void TestQ8_0() {
              expected_dot, "Q8_0 dot product");
 }
 
+// Hand-checked Q5_1 block: d = 0.5, m = -2, quant nibbles i (low) and 15 - i
+// (high), and fifth bits set for element 1 and for element 17 (the high
+// nibble of byte 1): value = d * q + m.
+void TestQ5_1() {
+  gufo::quant::block_q5_1 block{};
+  block.d = 0x3800;  // fp16 0.5
+  block.m = 0xC000;  // fp16 -2
+  const std::uint32_t qh = (1U << 1) | (1U << 17);
+  std::memcpy(block.qh, &qh, sizeof(qh));
+  for (std::size_t i = 0; i < 16; ++i) {
+    block.qs[i] = static_cast<std::uint8_t>(i | ((15 - i) << 4));
+  }
+  std::array<float, 32> actual{};
+  gufo::quant::Dequantize(gufo::core::GgmlType::kQ5_1, &block, actual.data(),
+                          actual.size());
+  for (std::size_t i = 0; i < 16; ++i) {
+    const float low = static_cast<float>(i + (i == 1 ? 16 : 0));
+    const float high = static_cast<float>(15 - i + (i == 1 ? 16 : 0));
+    ExpectNear(actual[i], 0.5F * low - 2.0F, "Q5_1 low nibble");
+    ExpectNear(actual[i + 16], 0.5F * high - 2.0F, "Q5_1 high nibble");
+  }
+  ExpectNear(actual[1], 6.5F, "Q5_1 fifth bit of element 1");
+  ExpectNear(actual[17], 13.0F, "Q5_1 fifth bit of element 17");
+  std::array<float, 32> vector{};
+  std::iota(vector.begin(), vector.end(), -0.75F);
+  const float expected_dot =
+      std::inner_product(actual.begin(), actual.end(), vector.begin(), 0.0F);
+  ExpectNear(gufo::quant::Dot(gufo::core::GgmlType::kQ5_1, &block, vector, 32),
+             expected_dot, "Q5_1 dot product");
+}
+
 void TestQ5_K() {
   constexpr std::size_t kQ5Elements = 256;
   struct Q5Block {
@@ -456,6 +489,7 @@ int main() {
   TestQ8();
   TestQ8_0();
   TestQ5_K();
+  TestQ5_1();
   if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {
     TestModelRows(model);

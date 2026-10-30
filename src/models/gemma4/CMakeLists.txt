@@ -10,3 +10,10 @@ add_library(gufo_gemma4 STATIC
 
 target_include_directories(gufo_gemma4 PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(gufo_gemma4 PUBLIC gufo_core)
+
+# Scalar CPU reference, the judge for the device runtime. It decodes every
+# weight on the fly, so it keeps -O2 in every configuration; tests and
+# validation tools link it explicitly.
+add_library(gufo_gemma4_reference STATIC EXCLUDE_FROM_ALL reference.cpp)
+target_link_libraries(gufo_gemma4_reference PUBLIC gufo_gemma4)
+set_source_files_properties(reference.cpp PROPERTIES COMPILE_OPTIONS "-O2")

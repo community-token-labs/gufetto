@@ -19,9 +19,11 @@ Adapted code includes:
 - Flash-Next GDN row reuse and SSM stride optimization: adapted from
   mikealanni/gufo f450218743bc, Copyright (c) 2026 gufo contributors (MIT).
 - Gemma 4 config, weight-binding, tokenizer, chat-template and tool-call
-  contracts (src/models/gemma4/{config,weights,tokenizer,chat_template,
-  tool_syntax}.{hpp,cpp}), the Gemma 4 tool format and reasoning markers in
-  src/core/json_constraint.{hpp,cpp}, and their tests
+  contracts and scalar reference (src/models/gemma4/{config,weights,
+  tokenizer,chat_template,tool_syntax,reference}.{hpp,cpp}), the Gemma 4
+  tool format and reasoning markers in src/core/json_constraint.{hpp,cpp},
+  Q5_1 dequantization in src/core/quant/ggml_dequant.{hpp,cpp}, and their
+  tests
   (tests/models/gemma4/{config_test.cpp,tokenizer_contract_test.cpp,
   tool_syntax_test.cpp,gguf_builder.hpp,check.hpp} and the media-free
   cases and tool definitions of fixtures/template_cases.json): adapted
@@ -40,6 +42,8 @@ Adapted code includes:
   <channel|>, and a string `const` is not shown as a one-value `enum` (the
   donor changed both); media is left to the vision topics. The
   json_constraint change omits the donor's unrelated untyped-array fix.
+  reference.cpp keeps the float32 text path only (no image rows, no
+  binary16 K/V or Q8_1 activation modes).
 
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp

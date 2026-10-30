@@ -12,6 +12,7 @@ drafter. The hosted PR suite runs every test below except those marked
 | `gemma4.tokenizer_goldens` | Token ids of the library vocabulary (`external-model`). |
 | `gemma4.template` | Chat template against Jinja2 goldens of the artifact's template. |
 | `gemma4.tool_syntax` | Tool-call parsing and the Gemma 4 tool grammar. |
+| `gemma4.reference` | The scalar CPU reference (the device runtime's judge) on a tiny synthetic model. |
 
 ## Library files
 
@@ -42,6 +43,9 @@ file's sha256 from the manifest. None of them are needed to run the tests.
 - `fixtures/template_goldens.json`: `tools/gemma4/template_goldens.py`, which
   renders `fixtures/template_cases.json` with Jinja2 (Hugging Face settings)
   from the artifact's own template. The template text is not committed.
+- `fixtures/reference_tiny.json`: `tools/gemma4/reference_oracle.py`, an
+  independent float64 numpy port of llama.cpp 6d5ac3c8's gemma4 graph run on
+  the synthetic model that `tiny_model.hpp` specifies (no library file).
 
 ```sh
 python3 -I tools/gemma4/tokenizer_goldens.py --model $M/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
