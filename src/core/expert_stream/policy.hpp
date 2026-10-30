@@ -108,6 +108,7 @@ enum class PlanError : std::uint8_t {
   kBadRange,  // overflow, size mismatch, or metadata conflicting with an
               // earlier plan for the same expert
   kUnknownPlan,
+  kTooManyReads,  // more than 2^20 read tasks at this max_read_bytes
 };
 
 struct Stats {

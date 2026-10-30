@@ -14,6 +14,8 @@ namespace {
 // decay horizon in layer prepares (about 40 tokens of a 40-layer model).
 constexpr std::uint64_t kRecentRows = 16;
 constexpr double kDecayTicks = 1600.0;
+// Upper bound on one plan's read tasks, checked before any state changes.
+constexpr std::uint64_t kMaxReadTasks = 1ull << 20;
 
 bool AddChecked(std::uint64_t a, std::uint64_t b, std::uint64_t* sum) {
   if (a > std::numeric_limits<std::uint64_t>::max() - b) {
@@ -165,16 +167,26 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     ++use.count;
     use.recent |= tokens > kRecentRows && last - route.step < kRecentRows;
   }
+  std::uint64_t task_bound = 0;
   for (const auto& [expert, use] : uses) {
     const auto it = entries_.find(Key(layer, expert));
     if (it != entries_.end() && it->second.source &&
         !SameSource(*it->second.source, *use.route)) {
       return PlanError::kBadRange;
     }
+    for (const SourceRange& range : use.route->source) {
+      const std::uint64_t max_read = config_.max_read_bytes;
+      task_bound += range.bytes / max_read + (range.bytes % max_read ? 1 : 0);
+      if (task_bound > kMaxReadTasks) {
+        return PlanError::kTooManyReads;
+      }
+    }
   }
+  std::vector<ReadTask> reads;
+  reads.reserve(task_bound);  // the only unbounded allocation, before mutation
 
   ++tick_;
-  *plan = Plan{next_plan_++, layer, optional, {}, {}, {}};
+  *plan = Plan{next_plan_++, layer, optional, {}, std::move(reads), {}};
   Open open{{}, layer, 0};
   for (const auto& [expert, use] : uses) {
     const std::uint64_t key = Key(layer, expert);
@@ -278,13 +290,15 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
         continue;
       }
     }
-    for (std::uint64_t skip = 0; skip < piece.range.bytes; skip += max_read) {
+    // Advance by the emitted length: skip never passes the projection size.
+    for (std::uint64_t skip = 0; skip < piece.range.bytes;) {
       const std::uint64_t bytes = std::min(max_read, piece.range.bytes - skip);
       plan->reads.push_back(
           {piece.projection,
            {piece.range.shard, piece.range.offset + skip, bytes},
            {piece.lease},
            skip});
+      skip += bytes;
     }
   }
   (optional ? stats_.optional_read_bytes : stats_.demand_read_bytes) +=

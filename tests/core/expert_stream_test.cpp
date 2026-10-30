@@ -438,22 +438,45 @@ void TestNoMergeAcrossShards() {
   Done(pool, plan);
 }
 
-// R2: every task respects max_read_bytes, merged or split.
+// R2: every task respects max_read_bytes, merged or split, and reads the
+// right file bytes: shard, offset = projection offset + skip, full coverage.
 void ExpectBoundedSplit(const Plan& plan, std::uint64_t max_read,
-                        std::uint64_t projection_bytes) {
+                        const std::vector<ExpertRoute>& routes) {
+  auto source = [&](std::uint32_t lease, std::uint32_t p) {
+    for (const ExpertRoute& route : routes) {
+      if (route.expert == plan.leases[lease].expert) {
+        return route.source[p];
+      }
+    }
+    Expect(false, "lease has a route");
+    return SourceRange{};
+  };
   std::vector<std::uint64_t> covered(plan.leases.size() * kProjections, 0);
   for (const ReadTask& read : plan.reads) {
     Expect(read.range.bytes > 0 && read.range.bytes <= max_read,
            "every task within max_read_bytes");
+    const SourceRange first = source(read.leases[0], read.projection);
+    Expect(read.range.shard == first.shard &&
+               read.range.offset == first.offset + read.skip,
+           "task reads from projection offset + skip");
     if (read.leases.size() == 1) {
       std::uint64_t& seen =
           covered[read.leases[0] * kProjections + read.projection];
       Expect(read.skip == seen, "split pieces are contiguous");
       seen += read.range.bytes;
+    } else {
+      Expect(read.skip == 0, "merged tasks start at a projection");
+      for (const std::uint32_t lease : read.leases) {
+        covered[lease * kProjections + read.projection] +=
+            source(lease, read.projection).bytes;
+      }
     }
   }
-  for (const std::uint64_t bytes : covered) {
-    Expect(bytes == projection_bytes, "split pieces cover the projection");
+  for (std::uint32_t lease = 0; lease < plan.leases.size(); ++lease) {
+    for (std::uint32_t p = 0; p < kProjections; ++p) {
+      Expect(covered[lease * kProjections + p] == source(lease, p).bytes,
+             "split pieces cover the projection");
+    }
   }
 }
 
@@ -464,28 +487,86 @@ void TestReadSplit() {
   config.chunk_bytes = 400;
   config.max_read_bytes = 100;
   ExpertPool exact(config);
-  const Plan at = Prepare(exact, {Route(4, 300), Route(5, 300)});
+  const std::vector<ExpertRoute> pair = {Route(4, 300), Route(5, 300)};
+  const Plan at = Prepare(exact, pair);
   Expect(at.reads.size() == 6, "exact boundary: one task each, no merge");
-  ExpectBoundedSplit(at, 100, 100);
+  ExpectBoundedSplit(at, 100, pair);
   Done(exact, at);
 
   ExpertPool over(config);
-  const Plan split = Prepare(over, {Route(4, 303)});
+  const std::vector<ExpertRoute> odd = {Route(4, 303)};
+  const Plan split = Prepare(over, odd);
   Expect(split.reads.size() == 6, "101-byte projections split in two");
-  ExpectBoundedSplit(split, 100, 101);
+  ExpectBoundedSplit(split, 100, odd);
   Done(over, split);
+
+  config.max_read_bytes = 1000;
+  ExpertPool merged(config);
+  const std::vector<ExpertRoute> adjacent = {Route(4, 300), Route(5, 300)};
+  const Plan joined = Prepare(merged, adjacent);
+  Expect(joined.reads.size() == 3, "adjacent projections merge");
+  ExpectBoundedSplit(joined, 1000, adjacent);
+  Done(merged, joined);
 
   config.class_bytes = {120ull << 20};
   config.cap_bytes = 240ull << 20;
   config.chunk_bytes = 120ull << 20;
   config.max_read_bytes = 32ull << 20;
   ExpertPool big(config);
-  const Plan large = Prepare(big, {Route(1, 120ull << 20)});
+  const std::vector<ExpertRoute> large_routes = {Route(1, 120ull << 20)};
+  const Plan large = Prepare(big, large_routes);
   Expect(large.reads.size() == 6, "40 MiB projections: 32 + 8 MiB");
-  ExpectBoundedSplit(large, 32ull << 20, 40ull << 20);
+  ExpectBoundedSplit(large, 32ull << 20, large_routes);
   Expect(big.stats().demand_read_bytes == 120ull << 20,
          "split does not change bytes");
   Done(big, large);
+}
+
+// F1: a final short chunk must not advance skip past the projection; at
+// max_read_bytes = 2^63 that wrapped and emitted tasks forever.
+void TestSplitNearMaxRead() {
+  constexpr std::uint64_t kHalf = 1ull << 63;
+  PoolConfig config;
+  config.class_bytes = {kHalf + 3};
+  config.cap_bytes = kHalf + 3;
+  config.chunk_bytes = kHalf + 3;
+  config.max_read_bytes = kHalf;
+  ExpertPool pool(config);
+  ExpertRoute route;
+  route.expert = 1;
+  route.encoded_bytes = kHalf + 3;
+  route.source = {SourceRange{0, 0, kHalf + 1}, SourceRange{1, 0, 1},
+                  SourceRange{2, 0, 1}};
+  const Plan plan = Prepare(pool, {route});
+  Expect(plan.reads.size() == 4, "four tasks, no wrap");
+  ExpectBoundedSplit(plan, kHalf, {route});
+  Expect(plan.reads[0].range.bytes == kHalf && plan.reads[1].skip == kHalf &&
+             plan.reads[1].range.offset == kHalf &&
+             plan.reads[1].range.bytes == 1,
+         "2^63 + 1 splits into 2^63 and 1");
+  Done(pool, plan);
+
+  // A plan needing more than 2^20 tasks is refused before any mutation.
+  PoolConfig tiny = TwoSlots();
+  tiny.class_bytes = {3ull << 20};
+  tiny.cap_bytes = 6ull << 20;
+  tiny.chunk_bytes = 3ull << 20;
+  tiny.max_read_bytes = 1;
+  ExpertPool refuse(tiny);
+  const Plan first = Prepare(refuse, {Route(1, 3)});
+  Done(refuse, first);
+  const Stats before = refuse.stats();
+  Plan untouched;
+  untouched.id = 777;
+  Expect(refuse.Prepare(std::vector{Route(2, 3ull << 20)}, false, &untouched) ==
+             PlanError::kTooManyReads,
+         "too many read tasks refused");
+  Expect(untouched.id == 777 && SameStats(before, refuse.stats()) &&
+             !refuse.Resident(0, 2),
+         "task-count refusal is atomic");
+  const Plan next = Prepare(refuse, {Route(3, 3)});
+  Expect(next.id == first.id + 1, "refusal consumes no plan id");
+  Done(refuse, next);
 }
 
 void TestMoreNegatives() {
@@ -557,6 +638,7 @@ int main() {
   TestConcurrentStageDedupe(false);
   TestNoMergeAcrossShards();
   TestReadSplit();
+  TestSplitNearMaxRead();
   TestMoreNegatives();
   std::cout << "expert_stream_test: PASS\n";
   return 0;
