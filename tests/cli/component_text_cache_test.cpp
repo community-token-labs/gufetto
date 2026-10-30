@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -44,7 +45,10 @@ struct State final : TextRunnerState {
   State(FakeAdapter& adapter, cache::Slot& slot)
       : adapter(adapter), slot(slot) {}
   CancellationCheck* native_cancel{};
+  std::size_t* destructions{};
   ~State() override {
+    if (destructions)
+      ++*destructions;
     if (native_cancel)
       *native_cancel = {};
   }
@@ -2297,11 +2301,24 @@ public:
   bool ready{true}, pending{}, failed{}, throws{}, lost_ready{}, bad_reset{};
   mutable std::size_t resets{}, grows{};
   int bind_failure{};
+  mutable std::size_t binds{}, facade_destructions{}, ready_calls{};
+  mutable bool dirty_bind{};
+  std::size_t fail_ready_at{};
   mutable std::map<cache::Slot*, TextRunnerState::CancellationCheck>
       cancellation;
   mutable std::function<bool()> reclaim;
   std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
+    ++binds;
+    if (bind_failure == 4 || bind_failure == 5) {
+      if (bind_failure == 4) {
+        const std::array<cache::Token, 1> tokens{99};
+        this->adapter->Append(slot, tokens, tokens);
+      } else {
+        dirty_bind = true;  // Native positions alone cannot prove quiescence.
+      }
+      throw std::runtime_error("bind mutated before failure");
+    }
     if (bind_failure == 1)
       throw std::bad_alloc();
     if (bind_failure == 2)
@@ -2310,6 +2327,7 @@ public:
       return {};
     auto state = Base::BindComponentState(adapter, slot);
     dynamic_cast<State&>(*state).native_cancel = &cancellation[&slot];
+    dynamic_cast<State&>(*state).destructions = &facade_destructions;
     return state;
   }
   std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
@@ -2317,7 +2335,9 @@ public:
     auto resources = Base::CreateComponentCacheResources(ledger, ram);
     if (witnesses & 1)
       resources->diagnostic_ready = [this](const cache::Slot&) {
-        return ready && (!lost_ready || resets == 0);
+        ++ready_calls;
+        return ready && !dirty_bind && ready_calls != fail_ready_at &&
+               (!lost_ready || resets == 0);
       };
     if (witnesses & 2)
       resources->diagnostic_reset = [this](cache::Slot& slot,
@@ -2440,7 +2460,7 @@ void DiagnosticColdNoRetention() {
       auto retry = AcquireDiagnostic(pool);
       assert(retry && retry->Discard() == R::kComplete);
     } else {
-      assert(pool.capacity() == 0);
+      assert(pool.capacity() == 1 && pool.usable_capacity() == 0);
       assert(!pool.TryAcquireDiagnostic() && runner->resets == 1);
     }
   }
@@ -2500,7 +2520,9 @@ void DiagnosticFailuresKeepUsableSlots() {
     assert(diagnostic->Discard() == R::kQuarantined);
     diagnostic.reset();
     runner->failed = false;
-    assert(pool->capacity() == slots - 1 && scheduler.capacity() == slots - 1);
+    assert(pool->capacity() == slots && scheduler.capacity() == slots);
+    assert(pool->usable_capacity() == slots - 1);
+    assert(scheduler.SessionStates().size() == slots);
     if (slots == 1) {
       for (bool scheduled : {false, true}) {
         bool refused{};
@@ -2512,7 +2534,7 @@ void DiagnosticFailuresKeepUsableSlots() {
         } catch (const TextGenerationError& error) {
           refused =
               error.code() == TextGenerationErrorCode::kCacheUnavailable &&
-              error.http_status() == 503 && error.retryable();
+              error.http_status() == 503 && !error.retryable();
         }
         assert(refused);
       }
@@ -2531,6 +2553,71 @@ void DiagnosticFailuresKeepUsableSlots() {
                           // idle/reclaim work.
     }
   }
+}
+class DiagnosticProbeGateRunner : public Runner {
+public:
+  mutable std::binary_semaphore probing{0}, resume{0};
+  mutable std::atomic<bool> block_probe{true};
+  DeviceProbeStatus PollDevice() const override {
+    if (block_probe.exchange(false)) {
+      probing.release();
+      resume.acquire();
+    }
+    return DeviceProbeStatus::kUsable;
+  }
+};
+void DiagnosticQueuedBeforeQuarantineSettles() {
+  // The reviewer's 20/20 stranded-request reproducer. Hold the worker in its
+  // idle probe to deterministically enqueue BEFORE the last slot is lost.
+  for (int trial = 0; trial < 20; ++trial) {
+    auto runner =
+        std::make_shared<DiagnosticRunner<DiagnosticProbeGateRunner>>();
+    auto pool = std::make_shared<TextRunnerPool>(runner, 1);
+    auto diagnostic = AcquireDiagnostic(*pool);
+    TextGenerationScheduler scheduler(
+        pool, {}, {.device_probe_interval = std::chrono::milliseconds(1)});
+    assert(runner->probing.try_acquire_for(std::chrono::seconds(2)));
+    auto request = scheduler.Submit({1, 2, 3}, 1, 0.0f);
+    runner->failed = true;
+    assert(diagnostic->Discard() ==
+           cache::DiagnosticDiscardResult::kQuarantined);
+    assert(pool->capacity() == 1 && pool->usable_capacity() == 0);
+    auto result = std::async(std::launch::async, [&] {
+      try {
+        (void)request.Wait();
+      } catch (const TextGenerationError& error) {
+        return error.code() == TextGenerationErrorCode::kCacheUnavailable &&
+               !error.retryable();
+      }
+      return false;
+    });
+    runner->resume.release();
+    assert(result.wait_for(std::chrono::seconds(2)) ==
+           std::future_status::ready);
+    assert(result.get());
+  }
+}
+void DiagnosticFinalVerificationKeepsFacade() {
+  for (int failure : {4, 5}) {
+    auto runner = std::make_shared<DiagnosticRunner<>>();
+    runner->bind_failure = failure;
+    TextRunnerPool pool(runner, 1);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    do {
+      assert(!pool.TryAcquireDiagnostic());
+    } while (!runner->binds && std::chrono::steady_clock::now() < deadline);
+    assert(runner->binds == 1 && pool.usable_capacity() == 0);
+    assert(runner->resets == 0 && runner->adapter->Invalidations() == 0);
+  }
+  auto runner = std::make_shared<DiagnosticRunner<>>();
+  TextRunnerPool pool(runner, 1);
+  auto diagnostic = AcquireDiagnostic(pool);
+  runner->fail_ready_at =
+      runner->ready_calls + 2;  // Only the FINAL recheck fails.
+  assert(diagnostic->Discard() == cache::DiagnosticDiscardResult::kQuarantined);
+  diagnostic.reset();
+  assert(pool.usable_capacity() == 0 && runner->facade_destructions == 0);
 }
 void DiagnosticPrefillPreservesOtherInventory() {
   using R = cache::DiagnosticDiscardResult;
@@ -5738,6 +5825,8 @@ int main(int argc, char* argv[]) {
   run("lifecycle", [] {
     DiagnosticColdNoRetention();
     DiagnosticFailuresKeepUsableSlots();
+    DiagnosticQueuedBeforeQuarantineSettles();
+    DiagnosticFinalVerificationKeepsFacade();
     DiagnosticPrefillPreservesOtherInventory();
     completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
