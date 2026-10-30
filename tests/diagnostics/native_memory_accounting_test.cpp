@@ -22,6 +22,14 @@ void Reject(const std::string& text) {
 }
 }  // namespace
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string(argv[1]) == "--loop") {
+    PrintNativeAccounting(std::cout, "prime", 0);
+    for (int i = 0; i < 3; ++i)
+      PrintNativeAccounting(std::cout, "warm", i);
+    for (int i = 0; i < 20; ++i)
+      PrintNativeAccounting(std::cout, "measured", i);
+    return 0;
+  }
   if (argc == 2 && std::string(argv[1]) == "--sample") {
     PrintNativeAccounting(std::cout, "cpu_fixture", 0);
     return 0;
