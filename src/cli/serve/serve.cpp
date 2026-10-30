@@ -53,8 +53,12 @@ namespace {
 
 class ModelLoadLog {
 public:
-  ModelLoadLog(std::string kind, const std::filesystem::path& artifact)
-      : kind_(std::move(kind)), start_(std::chrono::steady_clock::now()) {
+  // A supplied failure reason must outlive this scope logger.
+  ModelLoadLog(std::string kind, const std::filesystem::path& artifact,
+               const std::string* failure_reason = nullptr)
+      : kind_(std::move(kind)),
+        failure_reason_(failure_reason),
+        start_(std::chrono::steady_clock::now()) {
     server::Logger::Info("loader", "event=load_started kind=" + kind_ +
                                        " artifact=" + artifact.string() + " " +
                                        server::Logger::MemoryStatus());
@@ -62,9 +66,12 @@ public:
   ~ModelLoadLog() {
     if (!completed_) {
       try {
-        server::Logger::Error("loader", "event=load_failed kind=" + kind_ +
-                                            " " +
-                                            server::Logger::MemoryStatus());
+        std::string message = "event=load_failed kind=" + kind_ + " " +
+                              server::Logger::MemoryStatus();
+        if (failure_reason_ != nullptr && !failure_reason_->empty()) {
+          message += " reason=" + *failure_reason_;
+        }
+        server::Logger::Error("loader", message);
       } catch (...) {
       }
     }
@@ -95,6 +102,7 @@ public:
 
 private:
   std::string kind_;
+  const std::string* failure_reason_;
   std::chrono::steady_clock::time_point start_;
   bool completed_{false};
 };
@@ -1810,7 +1818,7 @@ int RunServe(std::span<const char* const> args) {
     }
 #endif
     std::string err;
-    ModelLoadLog load_log("text", model);
+    ModelLoadLog load_log("text", model, &err);
     backend = std::make_shared<server::InferenceBackend>();
     // The disk snapshot tier is walked during load, which can take minutes.
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
