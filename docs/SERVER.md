@@ -89,6 +89,34 @@ context; exhaustion reports `length` or `incomplete`, without discarding earlier
 conversation tokens. Reduce `--context` or `--sessions` if their state exceeds
 available memory.
 
+Flash-Next component serving creates its resource/stream pool before measuring
+execution capacity. Before allocating its first slot it checks that the logical
+slot claim plus pending obligations fits both lanes. It then measures that real
+slot, keeps it on success, and checks
+the remaining homogeneous slots using the largest observed host/HIP debit.
+Pending execution/image storage and staging remain protected; the final
+admission guard and cache sizing share one post-slot observation.
+
+Only a measured startup refusal triggers a search for a smaller context. A
+suggestion `verified to fit: --context X` means that this probe constructed the
+full staged execution pool and passed an equivalent final pending-obligation
+check, not that X is a maximum. No
+verified probe reports `no fitting context found within the search limits`.
+Gufo never silently changes `--context`. Search uses positive multiples of 4096
+tokens, at most 8 probes, and stops starting work at 30 s. One in-flight
+allocation/free plus cleanup can overrun that deadline; the
+`event=startup_context_search` log reports elapsed time and limit hits.
+On Windows the HIP free-memory query is process-only and optimistic. Other GPU
+activity and allocator history, including the just-freed refused pool, can skew
+startup observations on any platform; a recommendation is evidence from this
+startup, not a guarantee for a later launch.
+
+The probe does not initialize cache backing or warm pinned prefixes. A very small
+RAM-cache budget can still fail later with `insufficient component backing budget`.
+Use `--cache-ram-bytes off` if RAM checkpoints are not needed, or free memory/reduce
+context or sessions. An explicitly tiny RAM-cache cap must also be increased if
+caching is needed.
+
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit

@@ -348,6 +348,743 @@ void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
     assert(refused && runner->committed == 0 && runner->frozen == 1);
   }
 }
+namespace measured_startup {
+constexpr std::size_t kMiB = 1ULL << 20;
+using Observation = core::ExecutionCapacityObservation;
+
+Observation Capacity(std::size_t host, std::size_t device,
+                     std::size_t automatic) {
+  return {host * kMiB, device * kMiB, automatic * kMiB};
+}
+ComponentStartupPending Pending(std::size_t shared, std::size_t slot,
+                                std::size_t shared_images,
+                                std::size_t slot_images) {
+  return {shared * kMiB, slot * kMiB, shared_images * kMiB, slot_images * kMiB};
+}
+struct CreationFailure : std::runtime_error {
+  CreationFailure() : std::runtime_error("unknown startup creation failure") {}
+};
+struct Trial {
+  std::size_t context{}, attempts{}, created{}, destroyed{}, observations{};
+  std::size_t pending_calls{}, throw_at{};
+  bool adapter_alive{true};
+  std::function<void(std::string_view)> step;
+  std::vector<const cache::Slot*> slots;
+  std::vector<Observation> capacity;
+  std::vector<ComponentStartupPending> pending;
+  std::size_t Live() const { return created - destroyed; }
+};
+
+// Wrap actual FakeAdapter slots: observations cannot advance until a real
+// CreateSlot succeeds, and every unwind must destroy that same native slot.
+class ObservedSlot final : public cache::Slot {
+public:
+  std::unique_ptr<cache::Slot> native;
+  std::shared_ptr<Trial> trial;
+  ObservedSlot(std::unique_ptr<cache::Slot> native,
+               std::shared_ptr<Trial> trial)
+      : native(std::move(native)), trial(std::move(trial)) {
+    this->trial->slots.push_back(this->native.get());
+    ++this->trial->created;
+    if (this->trial->step)
+      this->trial->step("created");
+  }
+  ~ObservedSlot() override {
+    assert(trial->adapter_alive);
+    native.reset();
+    ++trial->destroyed;
+  }
+  bool IsValid() const noexcept override { return native->IsValid(); }
+  bool ExecutionComplete() const noexcept override {
+    return native->ExecutionComplete();
+  }
+};
+class ObservedAdapter final : public cache::Adapter {
+public:
+  std::unique_ptr<cache::Adapter> native;
+  std::shared_ptr<Trial> trial;
+  ObservedAdapter(std::unique_ptr<cache::Adapter> native,
+                  std::shared_ptr<Trial> trial)
+      : native(std::move(native)), trial(std::move(trial)) {}
+  ~ObservedAdapter() override {
+    assert(trial->Live() == 0);
+    trial->adapter_alive = false;
+  }
+  static cache::Slot& Unwrap(cache::Slot& slot) {
+    return *dynamic_cast<ObservedSlot&>(slot).native;
+  }
+  static const cache::Slot& Unwrap(const cache::Slot& slot) {
+    return *dynamic_cast<const ObservedSlot&>(slot).native;
+  }
+  cache::Capabilities GetCapabilities() const override {
+    return native->GetCapabilities();
+  }
+  std::span<const cache::ComponentDescriptor> Components() const override {
+    return native->Components();
+  }
+  cache::Identity CompatibilityIdentity() const override {
+    return native->CompatibilityIdentity();
+  }
+  std::unique_ptr<cache::Slot> CreateSlot(
+      cache::MutationGuard& guard) override {
+    if (trial->step)
+      trial->step("creating");
+    if (++trial->attempts == trial->throw_at)
+      throw CreationFailure();
+    return std::make_unique<ObservedSlot>(native->CreateSlot(guard), trial);
+  }
+  std::vector<cache::ComponentPosition> Positions(
+      const cache::Slot& slot) const override {
+    return native->Positions(Unwrap(slot));
+  }
+  std::vector<cache::Rows> PlanPrefill(const cache::Slot& slot,
+                                       cache::Rows first,
+                                       cache::Rows end) const override {
+    return native->PlanPrefill(Unwrap(slot), first, end);
+  }
+  void BeginRestore(
+      cache::Slot& slot,
+      std::span<const cache::ComponentPosition> positions) override {
+    native->BeginRestore(Unwrap(slot), positions);
+  }
+  cache::Completion CapturePrivate(const cache::Slot& slot,
+                                   cache::ComponentId id,
+                                   std::span<std::byte> bytes,
+                                   cache::Stream& stream) override {
+    return native->CapturePrivate(Unwrap(slot), id, bytes, stream);
+  }
+  cache::Completion CopyRowsOut(const cache::Slot& slot, cache::ComponentId id,
+                                cache::Rows first, cache::Rows end,
+                                std::span<std::byte> bytes,
+                                cache::Stream& stream) override {
+    return native->CopyRowsOut(Unwrap(slot), id, first, end, bytes, stream);
+  }
+  cache::Completion CopyRowsIn(cache::Slot& slot, cache::ComponentId id,
+                               cache::Rows first, cache::Rows end,
+                               std::span<const std::byte> bytes,
+                               cache::Stream& stream) override {
+    return native->CopyRowsIn(Unwrap(slot), id, first, end, bytes, stream);
+  }
+  cache::Completion LoadPrivate(cache::Slot& slot, cache::ComponentId id,
+                                std::span<const std::byte> bytes,
+                                cache::Stream& stream) override {
+    return native->LoadPrivate(Unwrap(slot), id, bytes, stream);
+  }
+  bool Validate(cache::Slot& slot,
+                std::span<const cache::ComponentPosition> positions) override {
+    return native->Validate(Unwrap(slot), positions);
+  }
+  bool Invalidate(cache::Slot& slot) noexcept override {
+    return native->Invalidate(Unwrap(slot));
+  }
+};
+
+class MeasuredRunner final : public Runner {
+public:
+  bool measured{true}, provider{true}, logical_overclaim{}, throw_probe{};
+  mutable std::size_t factories{}, claims_after_resources{}, freezes{};
+  mutable std::size_t liability_freezes{}, commits{}, committed{};
+  mutable std::optional<Observation> frozen;
+  mutable std::vector<std::shared_ptr<Trial>> trials;
+  mutable std::vector<std::size_t> probes;
+  mutable std::vector<const cache::Slot*> bound_slots;
+  std::function<void(Trial&)> configure = [](Trial& trial) {
+    trial.capacity.assign(4, Capacity(100, 100, 50));
+    trial.pending.assign(4, Pending(0, 0, 0, 0));
+    if (trial.context < 32768) {
+      // Unless a test specifies otherwise, even shared obligations rule out
+      // every lower-context candidate. No probe slot may then be allocated.
+      trial.capacity.assign(4, Capacity(2, 2, 1));
+      trial.pending.assign(4, Pending(3, 0, 0, 0));
+    }
+  };
+  std::function<void(ComponentCacheResources&)> alter;
+  std::function<std::size_t(std::size_t)> logical_slot;
+  MeasuredRunner() { max_context = 32768; }
+  bool UsesMeasuredStartupAdmission() const override { return measured; }
+  TextRunnerResourceClaim ResourceClaim() const override {
+    auto claim = Runner::ResourceClaim();
+    claim.state_capacity_bytes = 100 * kMiB;
+    claim.per_request_state_bytes = (logical_overclaim ? 64 : 1) * kMiB;
+    claim.temporary_scratch_bytes = 0;
+    // Deliberately incompatible with the final observation. Reading this
+    // after creating resources must not determine measured startup's budget.
+    if (factories)
+      ++claims_after_resources;
+    claim.retained_snapshot_capacity_bytes = (factories ? 1 : 128) * kMiB;
+    claim.retained_snapshot_ceiling_bytes = (factories ? 2 : 256) * kMiB;
+    return claim;
+  }
+  std::shared_ptr<Trial> NewTrial(std::size_t context) const {
+    for (const auto& previous : trials)
+      assert(previous->Live() == 0);
+    auto trial = std::make_shared<Trial>();
+    trial->context = context;
+    configure(*trial);
+    assert(!trial->capacity.empty() && !trial->pending.empty());
+    trials.push_back(trial);
+    return trial;
+  }
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t ram) const override {
+    auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+    ++factories;
+    const auto production = NewTrial(max_context);
+    resources->adapter = std::make_unique<ObservedAdapter>(
+        std::move(resources->adapter), production);
+    resources->freeze_execution_liability = [this, production] {
+      ++liability_freezes;
+      const auto& pending = production->pending.at(production->Live());
+      return pending.shared_execution + pending.slot_execution;
+    };
+    resources->commit_backing = [this](std::size_t bytes) {
+      if (measured)
+        assert(frozen && freezes == 1 && liability_freezes == 1);
+      ++commits;
+      committed = bytes;
+    };
+    if (provider) {
+      resources->startup_admission =
+          std::make_unique<ComponentStartupAdmission>();
+      auto& startup = *resources->startup_admission;
+      startup.context = max_context;
+      startup.slot_bytes = [this](std::size_t context) {
+        return logical_slot ? logical_slot(context)
+                            : (logical_overclaim ? 64 : 1) * kMiB;
+      };
+      startup.observe = [this] {
+        auto& trial = *trials.back();
+        if (trial.step)
+          trial.step("observe");
+        // A fresh observation after the last slot would disagree. The last
+        // actual slot sample must be shared by freeze_capacity and AUTO.
+        if (++trial.observations > trial.capacity.size())
+          return Capacity(1, 1, 1);
+        assert(trial.observations == trial.Live() + 1);
+        return trial.capacity.at(trial.Live());
+      };
+      startup.pending = [](const cache::Adapter& adapter, std::size_t context) {
+        auto& trial = *dynamic_cast<const ObservedAdapter&>(adapter).trial;
+        assert(trial.context == context);
+        ++trial.pending_calls;
+        return trial.pending.at(trial.Live());
+      };
+      startup.make_probe = [this](std::size_t context) {
+        assert(!frozen && commits == 0 && bound_slots.empty());
+        probes.push_back(context);
+        if (throw_probe)
+          throw CreationFailure();
+        return std::make_unique<ObservedAdapter>(
+            std::make_unique<FakeAdapter>(rows_per_chunk), NewTrial(context));
+      };
+      startup.freeze_capacity = [this, production](Observation capacity) {
+        assert(trials.size() == 1 && production->Live() == 3);
+        assert(production->observations == 4);
+        ++freezes;
+        frozen = capacity;
+      };
+    }
+    if (alter)
+      alter(*resources);
+    return resources;
+  }
+  std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& observed = dynamic_cast<ObservedAdapter&>(adapter);
+    assert(observed.trial == trials.front() && probes.empty());
+    bound_slots.push_back(&ObservedAdapter::Unwrap(slot));
+    return Runner::BindComponentState(*observed.native,
+                                      ObservedAdapter::Unwrap(slot));
+  }
+  void Released() const {
+    for (const auto& trial : trials) {
+      assert(trial->Live() == 0 && trial->created == trial->destroyed);
+      assert(!trial->adapter_alive);
+    }
+  }
+};
+
+std::string Refuse(const std::shared_ptr<MeasuredRunner>& runner,
+                   const std::optional<TextRunnerDiskCacheOptions>& disk = {},
+                   bool ram = true) {
+  std::string message;
+  try {
+    TextRunnerPool pool(runner, 3, disk, {.enabled = ram});
+  } catch (const std::invalid_argument& e) {
+    message = e.what();
+  }
+  assert(
+      message.find(
+          "measured startup execution exceeds capacity for --context 32768") !=
+      std::string::npos);
+  assert(message.find("--context 0") == std::string::npos);
+  assert(runner->factories == 1 && runner->commits == 0);
+  assert(runner->freezes == 0 && runner->liability_freezes == 0);
+  assert(runner->bound_slots.empty() && runner->captures == 0);
+  assert(runner->claims_after_resources == 0);
+  runner->Released();
+  return message;
+}
+void NoFit(const std::shared_ptr<MeasuredRunner>& runner) {
+  const auto message = Refuse(runner);
+  assert(message.find("no fitting context found within the search limits") !=
+         std::string::npos);
+  assert(message.find("verified to fit:") == std::string::npos);
+  assert((runner->probes == std::vector<std::size_t>{16384, 8192, 4096}));
+}
+
+void MeasuredDebitRefusesBeforeRemainingSlots() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  const auto defaults = runner->configure;
+  runner->configure = [defaults](Trial& trial) {
+    defaults(trial);
+    if (trial.context == 32768) {
+      trial.capacity[0] = Capacity(100, 100, 50);
+      trial.capacity[1] = Capacity(20, 90, 10);
+    }
+  };
+  // Three logical 1 MiB payloads pass the old 100 MiB aggregate gate. The
+  // actual first slot debits 80 MiB on the host, so two more must not exist.
+  NoFit(runner);
+  assert(runner->trials.front()->attempts == 1);
+  assert(runner->trials.front()->destroyed == 1);
+  assert(runner->trials.front()->observations == 2);
+  for (std::size_t i = 1; i < runner->trials.size(); ++i)
+    assert(runner->trials[i]->created == 0);
+}
+
+void FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation() {
+  for (const bool device_limits : {false, true}) {
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->logical_slot = [](std::size_t context) {
+      return (context > 8192 ? 6 : 5) * kMiB;
+    };
+    runner->configure = [device_limits](Trial& trial) {
+      trial.capacity = {Capacity(8, 64, 4), Capacity(7, 63, 4),
+                        Capacity(6, 62, 3), Capacity(5, 61, 3)};
+      if (device_limits)
+        for (auto& capacity : trial.capacity)
+          std::swap(capacity.host, capacity.device);
+      trial.pending.assign(4, Pending(2, 0, 1, 0));
+    };
+    const auto message = Refuse(runner);
+    assert(message.find("verified to fit: --context 8192") !=
+           std::string::npos);
+    assert((runner->probes == std::vector<std::size_t>{16384, 8192, 12288}));
+    for (const auto& trial : runner->trials) {
+      // Six logical MiB alone and three pending MiB alone both fit, but
+      // together exceed one lane. Neither the request nor failing probes
+      // may create even their first slot. The exact 5+3 boundary is allowed.
+      assert(trial->created == (trial->context == 8192 ? 3 : 0));
+      assert(trial->attempts == trial->created);
+    }
+  }
+}
+
+void StagedProbeDeadlineStopsSlotCreation() {
+  using Clock = std::chrono::steady_clock;
+  using namespace std::chrono_literals;
+  // Expire during adapter creation, baseline observation, first allocation,
+  // or the first post-slot observation. No sleep or native GPU is involved.
+  for (const int phase : {0, 1, 2, 3}) {
+    Clock::time_point now{};
+    const auto deadline = Clock::time_point{} + 30s;
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->configure = [&](Trial& trial) {
+      trial.capacity.assign(4, Capacity(100, 100, 50));
+      trial.pending.assign(4, Pending(0, 0, 0, 0));
+      if (trial.context == 32768) {
+        trial.capacity[0] = Capacity(0, 0, 0);
+        return;
+      }
+      trial.step = [&, current = &trial](std::string_view point) {
+        if (point == "creating")
+          assert(now < deadline);  // Must hold BEFORE every native allocation.
+        if ((phase == 1 && point == "observe" && current->Live() == 0) ||
+            (phase == 2 && point == "created") ||
+            (phase == 3 && point == "observe" && current->Live() == 1))
+          now = deadline + 1s;
+      };
+    };
+    runner->alter = [&](ComponentCacheResources& resources) {
+      auto& startup = *resources.startup_admission;
+      startup.now = [&] { return now; };
+      if (phase == 0) {
+        const auto make = startup.make_probe;
+        startup.make_probe = [&, make](std::size_t context) {
+          auto adapter = make(context);
+          now = deadline + 1s;
+          return adapter;
+        };
+      }
+    };
+    const auto message = Refuse(runner);
+    assert(message.find("no fitting context found within the search limits") !=
+           std::string::npos);
+    assert(message.find("verified to fit:") == std::string::npos);
+    assert(runner->trials.front()->created == 0);
+    assert(runner->probes.size() == 1 && runner->trials.size() == 2);
+    const auto& probe = *runner->trials.back();
+    assert(probe.created == (phase >= 2 ? 1 : 0));
+    assert(probe.observations == (phase == 0 ? 0 : phase == 3 ? 2 : 1));
+    assert(now == deadline + 1s);
+  }
+}
+
+void SuccessRetainsAllSlotsAndOneFrozenObservation() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  runner->logical_overclaim = true;  // Opt-in must skip the old aggregate gate.
+  runner->configure = [](Trial& trial) {
+    assert(trial.context == 32768);
+    trial.capacity = {Capacity(100, 100, 50), Capacity(92, 96, 46),
+                      Capacity(84, 92, 42), Capacity(76, 88, 38)};
+    trial.pending.assign(4, Pending(0, 0, 0, 0));
+  };
+  {
+    TextRunnerPool pool(runner, 3);
+    assert(runner->factories == 1 && runner->probes.empty());
+    assert(runner->trials.size() == 1 && runner->trials.front()->created == 3);
+    assert(runner->trials.front()->Live() == 3);
+    assert(runner->trials.front()->observations == 4);
+    assert(runner->freezes == 1 && runner->liability_freezes == 1);
+    assert(runner->frozen->host == 76 * kMiB);
+    assert(runner->frozen->device == 88 * kMiB);
+    assert(runner->frozen->automatic == 38 * kMiB);
+    assert(runner->commits == 1 && runner->committed == 38 * kMiB);
+    assert(runner->claims_after_resources == 0);
+    assert(runner->bound_slots.empty());
+    // Simultaneous leases prove all three original native slots, including
+    // the first measurement slot, remain the production pool's real slots.
+    auto a = pool.Acquire(std::vector<TextRunnerToken>{10});
+    auto b = pool.Acquire(std::vector<TextRunnerToken>{20});
+    auto c = pool.Acquire(std::vector<TextRunnerToken>{30});
+    assert(runner->bound_slots.size() == 3);
+    for (const auto* slot : runner->trials.front()->slots)
+      assert(std::ranges::count(runner->bound_slots, slot) == 1);
+    a.Invalidate();
+    b.Invalidate();
+    c.Invalidate();
+    assert(runner->trials.front()->destroyed == 0);
+    assert(runner->trials.front()->observations == 4);
+  }
+  runner->Released();
+}
+
+void LaterPressureSwitchesTheLimitingLane() {
+  for (const bool device_limits : {false, true}) {
+    auto runner = std::make_shared<MeasuredRunner>();
+    const auto defaults = runner->configure;
+    runner->configure = [defaults, device_limits](Trial& trial) {
+      defaults(trial);
+      if (trial.context != 32768)
+        return;
+      // Initially the opposite lane is tighter. The second slot/pressure
+      // sample is much larger than slot one's debit and switches the limiter.
+      trial.capacity = {Capacity(100, 80, 40), Capacity(95, 78, 39),
+                        Capacity(40, 76, 20), Capacity(1, 1, 1)};
+      if (device_limits)
+        for (auto& capacity : trial.capacity)
+          std::swap(capacity.host, capacity.device);
+    };
+    NoFit(runner);
+    const auto& production = *runner->trials.front();
+    assert(production.created == 2 && production.destroyed == 2);
+    assert(production.observations == 3);
+  }
+}
+
+void EarlierMaximumDebitSurvivesASmallerLatestSlot() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  const auto defaults = runner->configure;
+  runner->configure = [defaults](Trial& trial) {
+    defaults(trial);
+    if (trial.context != 32768)
+      return;
+    trial.capacity = {Capacity(100, 100, 50), Capacity(70, 70, 35),
+                      Capacity(60, 60, 30), Capacity(50, 50, 25)};
+    trial.pending = {Pending(0, 0, 0, 0), Pending(0, 0, 0, 0),
+                     Pending(0, 0, 35, 0), Pending(0, 0, 35, 0)};
+  };
+  // Slot two debits only 10 MiB, but slot one's 30 MiB maximum plus the
+  // newly reported shared image pressure still requires 65 MiB, not 45.
+  NoFit(runner);
+  assert(runner->trials.front()->created == 2);
+}
+
+void PendingObligationsCountOnceAndAutoProtectsOnlyHardBytes() {
+  for (const bool staging : {false, true}) {
+    const TemporaryDirectory directory("gufo-measured-startup-pending");
+    auto runner = std::make_shared<MeasuredRunner>();
+    const auto defaults = runner->configure;
+    runner->configure = [defaults](Trial& trial) {
+      defaults(trial);
+      if (trial.context != 32768)
+        return;
+      trial.capacity = {Capacity(27, 27, 14), Capacity(25, 25, 13),
+                        Capacity(23, 23, 12), Capacity(21, 21, 11)};
+      trial.pending = {Pending(8, 0, 4, 0), Pending(8, 2, 4, 1),
+                       Pending(8, 4, 4, 2), Pending(8, 6, 4, 3)};
+    };
+    if (staging) {
+      // With a 1 MiB staging liability the first slot's projected 25 MiB
+      // pool no longer fits; staging must be charged before the next slot.
+      const TextRunnerDiskCacheOptions disk{
+          .directory = directory.path().string(), .capacity_bytes = kMiB};
+      const auto message = Refuse(runner, disk);
+      assert(
+          message.find("no fitting context found within the search limits") !=
+          std::string::npos);
+      assert(runner->trials.front()->created == 1);
+    } else {
+      {
+        TextRunnerPool pool(runner, 3);
+        assert(runner->trials.front()->Live() == 3 && runner->probes.empty());
+        // Final 21 MiB is exactly shared/per-slot hard (14) plus images (7).
+        // Resident 6 MiB was already measured. AUTO loses half the hard
+        // liability only: 11 - 14/2 = 4 MiB, not another image deduction.
+        assert(runner->frozen->host == 21 * kMiB);
+        assert(runner->committed == 4 * kMiB && runner->commits == 1);
+        assert(runner->claims_after_resources == 0);
+      }
+      runner->Released();
+    }
+  }
+}
+
+void SharedMaterializationDoesNotHidePerSlotPending() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  const auto defaults = runner->configure;
+  runner->configure = [defaults](Trial& trial) {
+    defaults(trial);
+    if (trial.context != 32768)
+      return;
+    trial.capacity = {Capacity(31, 31, 16), Capacity(30, 30, 15),
+                      Capacity(29, 29, 15), Capacity(28, 28, 14)};
+    trial.pending = {Pending(20, 0, 10, 0), Pending(0, 8, 0, 4),
+                     Pending(0, 16, 0, 8), Pending(0, 24, 0, 12)};
+  };
+  // The aggregate pending total drops 30 -> 12, but every remaining slot
+  // still owes 8 MiB hard + 4 MiB lazy image storage. Projection is 38 > 30.
+  NoFit(runner);
+  assert(runner->trials.front()->created == 1);
+}
+
+void LargerLaterPendingRefusesAndReleases() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  const auto defaults = runner->configure;
+  runner->configure = [defaults](Trial& trial) {
+    defaults(trial);
+    if (trial.context != 32768)
+      return;
+    trial.capacity = {Capacity(30, 30, 15), Capacity(29, 29, 15),
+                      Capacity(28, 28, 14), Capacity(27, 27, 14)};
+    trial.pending = {Pending(8, 0, 4, 0), Pending(8, 2, 4, 1),
+                     Pending(8, 8, 4, 4), Pending(8, 14, 4, 7)};
+  };
+  NoFit(runner);
+  assert(runner->trials.front()->created == 2);
+  assert(runner->trials.front()->destroyed == 2);
+}
+
+void HardAndImagePendingKeepIndependentMaximums() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  const auto defaults = runner->configure;
+  runner->configure = [defaults](Trial& trial) {
+    defaults(trial);
+    if (trial.context != 32768)
+      return;
+    trial.capacity.assign(4, Capacity(30, 30, 15));
+    trial.pending = {Pending(0, 0, 0, 0), Pending(0, 8, 0, 0),
+                     Pending(0, 8, 0, 8), Pending(0, 8, 0, 16)};
+  };
+  // Each slot added only 8 MiB in total, but different pending lanes grew.
+  // The independent maxima project 16 + (8 hard + 8 images) = 32 > 30.
+  NoFit(runner);
+  assert(runner->trials.front()->created == 2);
+}
+
+void DiskOnlyPermanentBackingParticipatesInAdmission() {
+  const TemporaryDirectory directory("gufo-measured-startup-disk-only");
+  const TextRunnerDiskCacheOptions disk{.directory = directory.path().string(),
+                                        .capacity_bytes = kMiB};
+  auto runner = std::make_shared<MeasuredRunner>();
+  const auto defaults = runner->configure;
+  runner->configure = [defaults](Trial& trial) {
+    defaults(trial);
+    if (trial.context == 32768)
+      trial.capacity.assign(4, Capacity(512, 512, 256));
+  };
+  // Disk-only captures need 512 MiB permanent backing plus 1 MiB staging.
+  // Even zero resident slots cannot fit that fixed obligation in 512 MiB.
+  (void)Refuse(runner, disk, false);
+  assert(runner->trials.front()->created == 0);
+}
+
+void SuggestionsRequireFullPoolsAndIsolateProbeCounters() {
+  auto runner = std::make_shared<MeasuredRunner>();
+  runner->configure = [](Trial& trial) {
+    trial.pending.assign(4, Pending(1, 0, 0, 0));
+    trial.capacity = {Capacity(100, 100, 50), Capacity(90, 90, 45),
+                      Capacity(80, 80, 40), Capacity(70, 70, 35)};
+    if (trial.context == 32768)
+      trial.capacity[1] = Capacity(20, 20, 10);
+    else if (trial.context > 24576)
+      trial.capacity[3] = Capacity(0, 0, 0);
+  };
+  const auto message = Refuse(runner);
+  assert(message.find("verified to fit: --context 24576 (staged execution "
+                      "pool, not a maximum)") != std::string::npos);
+  assert((runner->probes == std::vector<std::size_t>{16384, 24576, 28672}));
+  assert(runner->trials.front()->created == 1);
+  assert(runner->trials.front()->pending_calls == 2);
+  for (std::size_t i = 1; i < runner->trials.size(); ++i) {
+    const auto& trial = *runner->trials[i];
+    // The final candidate passes both early projections but fails its final
+    // observation. It must never be recommended based on just one slot.
+    assert(trial.created == 3 && trial.destroyed == 3);
+    assert(trial.observations == 4 && trial.pending_calls == 4);
+  }
+}
+
+void UnknownCreationExceptionsPropagateWithoutSuggestions() {
+  for (const int fault : {0, 1, 2}) {
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->throw_probe = fault == 2;
+    runner->configure = [fault](Trial& trial) {
+      trial.capacity.assign(4, Capacity(100, 100, 50));
+      trial.pending.assign(4, Pending(0, 0, 0, 0));
+      if (fault == 0 || trial.context < 32768)
+        trial.throw_at = 2;
+      else
+        trial.capacity[1] = Capacity(20, 20, 10);
+    };
+    bool caught = false;
+    try {
+      TextRunnerPool pool(runner, 3);
+    } catch (const CreationFailure& e) {
+      caught = std::string_view(e.what()) == "unknown startup creation failure";
+    }
+    assert(caught && runner->commits == 0 && runner->freezes == 0);
+    assert(runner->liability_freezes == 0 && runner->bound_slots.empty());
+    assert(runner->factories == 1 && runner->claims_after_resources == 0);
+    assert(runner->probes.size() == (fault == 0 ? 0 : 1));
+    assert(runner->trials.front()->created == 1);
+    if (fault == 1) {
+      assert(runner->trials.size() == 2);
+      assert(runner->trials.back()->attempts == 2);
+      assert(runner->trials.back()->created == 1);
+    }
+    runner->Released();
+  }
+}
+
+void MissingProvidersCannotBypassAdmission() {
+  for (const int missing : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->logical_overclaim = true;
+    runner->alter = [missing](ComponentCacheResources& resources) {
+      auto& startup = *resources.startup_admission;
+      switch (missing) {
+        case 0:
+          resources.startup_admission.reset();
+          break;
+        case 1:
+          startup.context = 0;
+          break;
+        case 2:
+          startup.context = 16384;
+          break;
+        case 3:
+          startup.observe = {};
+          break;
+        case 4:
+          startup.pending = {};
+          break;
+        case 5:
+          startup.make_probe = {};
+          break;
+        case 6:
+          startup.freeze_capacity = {};
+          break;
+        case 7:
+          resources.freeze_execution_liability = {};
+          break;
+        case 8:
+          break;  // A provider without the opt-in is a mismatch, too.
+        case 9:
+          startup.slot_bytes = {};
+          break;
+        case 10:
+          startup.now = {};
+          break;
+      }
+    };
+    if (missing == 8) {
+      runner->measured = false;
+      runner->logical_overclaim = false;
+    }
+    std::string message;
+    try {
+      TextRunnerPool pool(runner, 3);
+    } catch (const std::logic_error& e) {
+      message = e.what();
+    }
+    assert(
+        message.find(missing == 0 || missing == 8
+                         ? "measured startup capability/provider mismatch"
+                         : "incomplete measured startup admission provider") !=
+        std::string::npos);
+    assert(runner->factories == 1 && runner->trials.front()->created == 0);
+    assert(runner->commits == 0 && runner->probes.empty());
+    runner->Released();
+  }
+}
+
+void DefaultDisabledKeepsTheOriginalGateAndBudget() {
+  assert(!Runner().UsesMeasuredStartupAdmission());
+  for (const bool overclaim : {false, true}) {
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->measured = runner->provider = false;
+    runner->logical_overclaim = overclaim;
+    bool refused = false;
+    try {
+      TextRunnerPool pool(runner, 3);
+      assert(!overclaim);
+      assert(runner->trials.front()->Live() == 3);
+      assert(runner->trials.front()->observations == 0);
+      assert(runner->claims_after_resources == 1);
+      assert(runner->commits == 1 && runner->committed == kMiB);
+    } catch (const std::invalid_argument& e) {
+      assert(std::string_view(e.what()) ==
+             "text runner request-state claim exceeds state capacity");
+      refused = true;
+    }
+    assert(refused == overclaim);
+    assert(runner->factories == (overclaim ? 0 : 1));
+    assert(runner->probes.empty() && runner->freezes == 0);
+    runner->Released();
+  }
+}
+
+void Check() {
+  MeasuredDebitRefusesBeforeRemainingSlots();
+  FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation();
+  StagedProbeDeadlineStopsSlotCreation();
+  SuccessRetainsAllSlotsAndOneFrozenObservation();
+  LaterPressureSwitchesTheLimitingLane();
+  EarlierMaximumDebitSurvivesASmallerLatestSlot();
+  PendingObligationsCountOnceAndAutoProtectsOnlyHardBytes();
+  SharedMaterializationDoesNotHidePerSlotPending();
+  LargerLaterPendingRefusesAndReleases();
+  HardAndImagePendingKeepIndependentMaximums();
+  DiskOnlyPermanentBackingParticipatesInAdmission();
+  SuggestionsRequireFullPoolsAndIsolateProbeCounters();
+  UnknownCreationExceptionsPropagateWithoutSuggestions();
+  MissingProvidersCannotBypassAdmission();
+  DefaultDisabledKeepsTheOriginalGateAndBudget();
+}
+}  // namespace measured_startup
+
 void Prefill(TextRunnerPool::Request& request) {
   while (!request.prefill_complete())
     (void)request.Prefill(8);
@@ -5436,6 +6173,7 @@ int main(int argc, char* argv[]) {
     PartialFrontierDoesNotServeAnEqualPrompt();
     CompletedCancelledPromptGetsARetrySnapshot();
     BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
+    measured_startup::Check();
     ExecutionReclamationWaitsForActiveSourcesAndUnbinds();
     InPassCapturePreservesBoundaryAndLiveTail();
     ColdAcquireResetsOnce();

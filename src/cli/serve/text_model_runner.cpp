@@ -203,6 +203,14 @@ std::size_t HostSnapshotCeilingBytes() {
                          : 0);
 }
 
+core::ProtectedCacheHeadroom ObserveHostSnapshotHeadroom() {
+  const auto available = HostAvailableBytes();
+  return {ClampToSize(available / 2),
+          ClampToSize(available > kHostSnapshotHeadroomBytes
+                          ? available - kHostSnapshotHeadroomBytes
+                          : 0)};
+}
+
 std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
     std::string_view text, std::string* error) {
   if (text == "off")
@@ -288,7 +296,10 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
 
   auto resources = runner->ResourceClaim();
   const auto per_state_reservation = PerStateReservationBytes(resources);
-  if (resources.state_capacity_bytes.has_value()) {
+  if (runner->UsesMeasuredStartupAdmission() && !runner->UsesComponentCache())
+    throw std::logic_error("measured startup requires a component cache");
+  if (!runner->UsesMeasuredStartupAdmission() &&
+      resources.state_capacity_bytes.has_value()) {
     const std::size_t capacity = *resources.state_capacity_bytes;
     if (resources.shared_execution_bytes > capacity)
       throw std::invalid_argument(
