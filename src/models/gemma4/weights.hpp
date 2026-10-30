@@ -13,6 +13,10 @@
 
 namespace gufo::models::gemma4 {
 
+/// Lifetime: TensorRef, ModelWeights and DraftWeights point into the
+/// GgufReader's mapping and must not outlive the reader they were bound
+/// from; ReadHostValues dereferences those pointers.
+///
 /// Non-owning view of one GGUF tensor. `cols` (ne[0]) is the contiguous
 /// reduction dimension, `rows` (ne[1]) the output dimension and `experts`
 /// (ne[2]) the number of stacked expert matrices.
@@ -29,6 +33,7 @@ struct TensorRef {
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   /// Encoded bytes of one row (`cols` elements) in this format.
   [[nodiscard]] std::size_t RowBytes() const noexcept;
+  /// Bind checks that this product neither wraps nor leaves the file.
   [[nodiscard]] std::size_t SizeBytes() const noexcept {
     return RowBytes() * rows * experts;
   }

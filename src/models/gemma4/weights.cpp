@@ -1,6 +1,7 @@
 #include "src/models/gemma4/weights.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
 #include <string>
@@ -53,6 +54,16 @@ constexpr std::initializer_list<GgmlType> kExpertGateUp = {GgmlType::kQ4_K,
 constexpr std::initializer_list<GgmlType> kExpertDown = {GgmlType::kQ5_1,
                                                          GgmlType::kQ8_0};
 
+/// `*value *= factor`, false (value unchanged) when the product wraps.
+[[nodiscard]] bool MulChecked(std::uint64_t* value,
+                              std::uint64_t factor) noexcept {
+  if (factor != 0 && *value > UINT64_MAX / factor) {
+    return false;
+  }
+  *value *= factor;
+  return true;
+}
+
 struct Binder {
   const core::GgufReader& reader;
   std::string* error;
@@ -92,13 +103,30 @@ struct Binder {
       return t;
     }
     bool type_ok = false;
+    std::string accepted;
     for (auto type : types) {
       type_ok = type_ok || info->type == type;
+      accepted +=
+          (accepted.empty() ? "" : ", ") + std::string(core::ToString(type));
     }
     const Format format = FormatOf(info->type);
-    if (!type_ok || format.block == 0 || cols % format.block != 0) {
-      Fail("tensor " + name + " has unsupported format " +
-           std::string(core::ToString(info->type)));
+    if (!type_ok || format.block == 0) {
+      Fail("tensor " + name + " has format " +
+           std::string(core::ToString(info->type)) + "; accepted: " + accepted);
+      return t;
+    }
+    if (cols % format.block != 0) {
+      Fail("tensor " + name + " has " + std::to_string(cols) +
+           " columns, not a multiple of the " +
+           std::string(core::ToString(info->type)) + " block of " +
+           std::to_string(format.block));
+      return t;
+    }
+    // The extent must not wrap, and must be what the reader indexed.
+    std::uint64_t bytes = cols / format.block * format.bytes;
+    if (!MulChecked(&bytes, rows) || !MulChecked(&bytes, experts) ||
+        bytes != info->size_bytes) {
+      Fail("tensor " + name + " has an inconsistent payload size");
       return t;
     }
     t.data = info->data;
@@ -112,18 +140,24 @@ struct Binder {
     // a payload running past its shard is caught here, not as a fault later.
     const auto regions = reader.GetMappedRegions();
     const auto address = reinterpret_cast<std::uintptr_t>(info->data);
-    bool inside = false;
+    bool mapped = false;
     for (std::uint32_t i = 0; i < regions.size(); ++i) {
       const auto base = reinterpret_cast<std::uintptr_t>(regions[i].data);
       if (address >= base && address < base + regions[i].size) {
         t.shard = i;
         t.file_offset = address - base;
-        inside = t.SizeBytes() <= regions[i].size - t.file_offset;
+        mapped = true;
         break;
       }
     }
-    if (!inside) {
-      Fail("tensor " + name + " is truncated");
+    if (!mapped) {
+      Fail("tensor " + name + " lies outside the mapped file");
+      return TensorRef{};
+    }
+    if (bytes > regions[t.shard].size - t.file_offset) {
+      Fail("tensor " + name + " is truncated: " + std::to_string(bytes) +
+           " bytes at offset " + std::to_string(t.file_offset) + " of " +
+           std::to_string(regions[t.shard].size));
       return TensorRef{};
     }
     return t;
@@ -219,6 +253,9 @@ bool ReadValues(const TensorRef& rope_freqs, std::vector<LayerWeights>* layers,
     }
     return false;
   };
+  if (rope_freqs.empty()) {
+    return fail("rope_freqs.weight is not bound; call Bind first");
+  }
   for (auto& layer : *layers) {
     if (layer.layer_output_scale.empty()) {
       continue;

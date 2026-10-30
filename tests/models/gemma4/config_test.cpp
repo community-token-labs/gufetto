@@ -316,6 +316,12 @@ void CheckExpertWeights() {
   wrong["blk.1.ffn_gate_up_exps.weight"] = {
       {256, 64, 8}, GgmlType::kQ8_0, Zeros(256 / 32 * 34 * 64 * 8)};
   rejects(wrong, MoeMetadata(), "Q8_0 gate/up experts accepted");
+  {
+    GgufImage image(MoeMetadata(), wrong);
+    Require(!g4::ModelWeights::Bind(*image.reader(), &error) &&
+                error.find("accepted: Q4_K, Q5_K") != std::string::npos,
+            "format errors list the accepted formats: " + error);
+  }
   rejects(tensors, TargetMetadata(), "experts in a dense model accepted");
 }
 
@@ -418,6 +424,12 @@ void CheckWeights() {
     Require(w.has_value(), "header-only bind read rope payload: " + error);
     Require(!w->ReadHostValues(&error) && !error.empty(),
             "non-positive rope factors accepted");
+  }
+  {
+    g4::ModelWeights unbound;
+    std::string error;
+    Require(!unbound.ReadHostValues(&error) && !error.empty(),
+            "host values read from unbound weights");
   }
   wrong = tensors;
   wrong.erase("output_norm.weight");
