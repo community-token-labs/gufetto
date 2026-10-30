@@ -29,6 +29,7 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
@@ -1548,6 +1549,12 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
 
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   std::ostringstream out;
+  const auto diagnostic = DiagnosticMemoryClaim::Process().Snapshot();
+  out << "# TYPE gufo_full_logits_memory_claim_bytes gauge\n"
+      << "gufo_full_logits_memory_claim_bytes " << diagnostic.bytes << '\n'
+      << "# TYPE gufo_full_logits_memory_unknown_total counter\n"
+      << "gufo_full_logits_memory_unknown_total " << diagnostic.unknown_outcomes
+      << '\n';
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
       << "# TYPE gufo_device_lost_total counter\n"

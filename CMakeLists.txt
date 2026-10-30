@@ -813,6 +813,7 @@ if (BUILD_TESTING)
     lookup
     pins
     lifecycle
+    diagnostic_memory
     reuse
     disk
     ram)
@@ -845,6 +846,11 @@ if (BUILD_TESTING)
   add_test(NAME qfn_kv_ingress_validation_test COMMAND qfn_kv_ingress_validation_test)
   set_tests_properties(qfn_kv_ingress_validation_test PROPERTIES
     LABELS "cpu;server;cache;qwen38_flash_next")
+
+  add_executable(diagnostic_memory_test tests/cli/diagnostic_memory_test.cpp)
+  target_link_libraries(diagnostic_memory_test PRIVATE gufo_logging gufo_platform)
+  add_test(NAME diagnostic_memory_test COMMAND diagnostic_memory_test)
+  set_tests_properties(diagnostic_memory_test PROPERTIES LABELS "cpu;server;memory")
 
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp
