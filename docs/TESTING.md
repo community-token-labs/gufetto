@@ -163,3 +163,38 @@ throughput separately. Run baseline and candidate close together; add
 repetitions only when noise or a suspected regression requires them.
 Record hardware/software identities and the exact timed scope. Use
 [profiling tools](PERFORMANCE.md) to explain a gain before retaining it.
+
+## Admission-only native recovery gate
+
+On an explicitly allocated Linux GPU host, build **before loading models**:
+
+```sh
+cmake --build <gpu-test-build> --target admission_native_test --parallel 4
+ctest --test-dir <gpu-test-build> -N -L gpu -R '^admission_native$'
+# Model execution requires a separate native GO:
+GUFO_ADMISSION_MODEL=/path/to/pinned/Flash-Next-00001-of-00004.gguf \
+  ctest --test-dir <gpu-test-build> -L gpu -R '^admission_native$' --output-on-failure
+```
+
+The test is labelled `gpu;hip;gfx1151;diagnostics;allocation;external-model;slow`,
+with timeout 600 s and skip code 77 when its model environment is absent.
+A missing-model skip is **not** a recovery/quality pass. Its link dependencies
+explicitly include the Flash-Next model, cache/HIP cache, core, logging, LLM CLI,
+HTTP and DeepSeek libraries needed by the shared backend sources.
+
+Only this test binary defines `GUFO_ADMISSION_TESTING`. It decorates the actual
+loaded-model admission callbacks **after** the real adapter and model binding
+exist. It stages real requested slots/idle workers before injecting capacity
+refusal or exception, and stages real lower-context probe adapters/slots/workers
+before injecting exception or deadline expiry. It never substitutes a fake slot
+or adapter, fabricates a positive fit, or hunts for device OOM. It asserts typed
+refusal classification and that all bindings and worker threads unwind.
+
+One full real-model load/admit/fault/unload cycle primes runtime/kernel caches.
+Eight post-prime heap/RSS/process-thread controls establish the allowed observed
+range; two later full cycles must recover inside that measured range. Cold-to-
+prime drift is retained for attribution, not treated as a leak. No fixed byte
+allowance or failure-time margin widening is permitted. RSS and thread counts
+come from read-only `/proc/self`; unavailable measurement is not a pass.
+Unexplained drift is unresolved and blocks a no-leak claim. This gate is separate
+from the five-cell serve-admission parity recipe and from workload qualification.

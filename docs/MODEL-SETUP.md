@@ -37,12 +37,21 @@ its owners before reporting:
 qualification. Native allocation/recovery and parity qualification remain required.
 With no HIP device, `--no-gpu`, a CPU build or an unsupported measured provider,
 the model form emits `UNPROVEN` and the available CPU one-session lower bound.
-No native model is loaded in that fallback. The printed `requested_file_sha256`
-is the explicitly named file, **not** a hash of all split siblings or sidecars.
+No native model is loaded in that fallback. Missing native context metadata also
+leaves the result UNPROVEN unless a usable `--context` is supplied. The printed
+`gguf_identity_sha256` is the existing memoised full-content GGUF identity of
+**all target shards**, not sidecars; see [identity trust boundaries](GGUF_IDENTITY.md).
+Memo hits still validate stat/header/index and bounded payload samples. This can
+write the ordinary identity memo cache; it does not modify model artifacts.
 
 Use serve's canonical options: `--context`, `--sessions`, `--kv-cache-type`,
 `--speculative mtp|off`, `--mtp-model`, `--draft-tokens`, `--mmproj`, `--no-vision`,
 `--enable-yarn`, vision limits, `--prefill-chunk`, and `--cache-ram-bytes`.
+Exit codes for the model form: FIT=0, UNPROVEN=0, DOES-NOT-FIT=1, ERROR=2.
+Owners are destroyed, then HIP synchronization/last-error checks must succeed
+before the release message can be printed. No null-scheduler generation backend
+is published in admission-only mode.
+
 KV parsing and RAM-cache parsing reuse serve's validators; the common loader
 validates model/mode/geometry. Defaults match serve (one session, native context,
 F16, no speculation, AUTO RAM cache). Persistence must be `--cache-disk off`;
