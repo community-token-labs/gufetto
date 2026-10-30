@@ -36,7 +36,9 @@ ClientSse ReplayClientSse(std::string_view wire, std::size_t fragment) {
         result.done = true;
       } else {
         auto event = gufo::json::parse(payload);
-        if (frame.starts_with("event: ")) {
+        if (event.find("type")) {
+          // Typed APIs dispatch by the SSE event name, not just JSON data.
+          assert(frame.starts_with("event: "));
           assert(frame.substr(7, frame.find('\n') - 7) ==
                  event.member_str("type"));
         }
@@ -45,6 +47,47 @@ ClientSse ReplayClientSse(std::string_view wire, std::size_t fragment) {
     }
   }
   assert(pending.empty());
+  return result;
+}
+
+gufo::json::Value NormalizeClientEvent(const gufo::json::Value& value) {
+  using gufo::json::Value;
+  if (value.is_object()) {
+    auto normalized = Value::object();
+    for (const auto& [key, item] : value.members()) {
+      // Only generated identifiers and creation timestamps are volatile.
+      if (key == "id" || key == "call_id" || key == "item_id")
+        normalized[key] = "<generated-id>";
+      else if (key == "created" || key == "created_at")
+        normalized[key] = 0;
+      else
+        normalized[key] = NormalizeClientEvent(item);
+    }
+    return normalized;
+  }
+  if (value.is_array()) {
+    auto normalized = Value::array();
+    for (const auto& item : value.items())
+      normalized.push_back(NormalizeClientEvent(item));
+    return normalized;
+  }
+  return value;
+}
+
+void CompareClientRecording(const ClientSse& recorded, const ClientSse& live) {
+  assert(recorded.done == live.done);
+  assert(recorded.events.size() == live.events.size());
+  for (std::size_t i = 0; i < recorded.events.size(); ++i)
+    assert(NormalizeClientEvent(recorded.events[i]).dump() ==
+           NormalizeClientEvent(live.events[i]).dump());
+}
+
+std::size_t RequiredClientSize(const gufo::json::Value& object,
+                               const std::string& key) {
+  const auto* value = object.find(key);
+  assert(value && value->is_number());
+  const auto result = value->as_size();
+  assert(value->as_double() == static_cast<double>(result));
   return result;
 }
 
@@ -68,7 +111,7 @@ void CheckClientUsage(std::string_view protocol,
     assert(usage.member_size("input_tokens") == 2);
     assert(usage.member_size("output_tokens") == 1);
     assert(usage.member_size("cache_read_input_tokens") == 8);
-    assert(usage.member_size("cache_creation_input_tokens") == 0);
+    assert(RequiredClientSize(usage, "cache_creation_input_tokens") == 0);
   }
 }
 
@@ -80,6 +123,25 @@ ClientCall CheckClientToolStream(std::string_view protocol,
   std::string complete_arguments;
   std::size_t next_sequence = 0;
   std::set<std::size_t> blocks;
+  // This bounded recording contains exactly one tool block/call.
+  const std::vector<std::string> expected =
+      protocol == "responses"
+          ? std::vector<std::string>{"response.created",
+                                     "response.in_progress",
+                                     "response.output_item.added",
+                                     "response.function_call_arguments.delta",
+                                     "response.function_call_arguments.done",
+                                     "response.output_item.done",
+                                     "response.completed"}
+          : std::vector<std::string>{
+                "message_start",       "content_block_start",
+                "content_block_delta", "content_block_stop",
+                "message_delta",       "message_stop"};
+  if (protocol != "chat") {
+    assert(sse.events.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i)
+      assert(sse.events[i].member_str("type") == expected[i]);
+  }
   for (const auto& event : sse.events) {
     if (protocol == "chat") {
       if (const auto* choices = event.find("choices")) {
@@ -90,7 +152,7 @@ ClientCall CheckClientToolStream(std::string_view protocol,
             assert(delta->member_str("content").empty());
             if (const auto* calls = delta->find("tool_calls")) {
               for (const auto& part : calls->items()) {
-                assert(part.member_size("index") == 0);
+                assert(RequiredClientSize(part, "index") == 0);
                 if (!part.member_str("id").empty()) {
                   assert(call.id.empty());
                   call.id = part.member_str("id");
@@ -111,7 +173,7 @@ ClientCall CheckClientToolStream(std::string_view protocol,
         }
       }
     } else if (protocol == "responses") {
-      assert(event.member_size("sequence_number") == next_sequence++);
+      assert(RequiredClientSize(event, "sequence_number") == next_sequence++);
       const auto type = event.member_str("type");
       if (type == "response.output_item.added") {
         const auto& item = *event.find("item");
@@ -144,7 +206,7 @@ ClientCall CheckClientToolStream(std::string_view protocol,
     } else {
       const auto type = event.member_str("type");
       if (type == "content_block_start") {
-        assert(blocks.insert(event.member_size("index")).second);
+        assert(blocks.insert(RequiredClientSize(event, "index")).second);
         const auto& block = *event.find("content_block");
         if (block.member_str("type") == "tool_use") {
           assert(call.id.empty());
@@ -152,12 +214,12 @@ ClientCall CheckClientToolStream(std::string_view protocol,
           call.name = block.member_str("name");
         }
       } else if (type == "content_block_delta") {
-        assert(blocks.contains(event.member_size("index")));
+        assert(blocks.contains(RequiredClientSize(event, "index")));
         const auto& delta = *event.find("delta");
         if (delta.member_str("type") == "input_json_delta")
           call.arguments += delta.member_str("partial_json");
       } else if (type == "content_block_stop") {
-        assert(blocks.erase(event.member_size("index")) == 1);
+        assert(blocks.erase(RequiredClientSize(event, "index")) == 1);
       } else if (type == "message_delta") {
         assert(blocks.empty());
         assert(event.find("delta")->member_str("stop_reason") == "tool_use");
@@ -236,7 +298,10 @@ void TestClientRecipeToolLoops() {
     ExpectStatus(first, 200);
     assert(first.find("text/event-stream") != std::string::npos);
     const auto wire = ChunkedBody(first);
-    const auto call = CheckClientToolStream(protocol, ReplayClientSse(wire, 1));
+    const auto live = ReplayClientSse(wire, 1);
+    CompareClientRecording(ReplayClientSse(ClientFixture(protocol + ".sse"), 7),
+                           live);
+    const auto call = CheckClientToolStream(protocol, live);
     auto next = request;
     if (protocol == "chat") {
       auto assistant = gufo::json::parse(
