@@ -191,10 +191,30 @@ or adapter, fabricates a positive fit, or hunts for device OOM. It asserts typed
 refusal classification and that all bindings and worker threads unwind.
 
 One full real-model load/admit/fault/unload cycle primes runtime/kernel caches.
-Eight post-prime heap/RSS/process-thread controls establish the allowed observed
-range; two later full cycles must recover inside that measured range. Cold-to-
-prime drift is retained for attribution, not treated as a leak. No fixed byte
-allowance or failure-time margin widening is permitted. RSS and thread counts
-come from read-only `/proc/self`; unavailable measurement is not a pass.
-Unexplained drift is unresolved and blocks a no-leak claim. This gate is separate
-from the five-cell serve-admission parity recipe and from workload qualification.
+THREE further warm full cycles provide post-unload heap/RSS/process-thread
+controls; TWO later full cycles are collected before deciding the recovery-band
+verdict. The band is the warm post-cycle range plus FOUR system pages for RSS
+and free-heap accounting (16 KiB on the pinned 4 KiB-page Linux host), with no
+thread allowance. This preregistered page-level slack covers small allocator/
+logger tails, not a measured leak allowance; it must not be widened on retry.
+Cold-to-prime drift, each cycle's wall time, total time and monotonic RSS-growth/
+heap-loss trends across all six cycles are printed. Test bookkeeping is reserved
+before collection. Structural/HIP/ownership failures still stop safely as ERROR
+(exit1); a band miss retains BOTH measured cycles and reports INCONCLUSIVE
+(exit3), not an ownership failure. PASS is exit0; missing-model SKIP is exit77.
+RSS and thread counts come from read-only `/proc/self`; unavailable measurement
+is not a pass. An in-band result does not establish leak freedom or workload
+qualification.
+
+Budget estimate, NOT native timing evidence: six model loads (prime + three
+controls + two measured), each with five fault cases, replace the former three
+loads/15 cases. Allow50 s per model load/unload,5 s per case (including up to
+32 GiB AUTO RAM commit at an assumed8 GiB/s for its touch), plus30 s total
+bookkeeping/sampling: `6*50 + 30*5 + 30 = 480 s`, leaving120 s under CTest's
+600 s timeout. The roughly104 GiB target requires about35 s of read time at an
+assumed3 GiB/s; the50 s load allowance leaves15 s for upload/teardown. These are
+planning assumptions, not measured lower bounds. The driver phase also allows
+up to135 s for its separate CLI/hash/load check:615 s projected <840 s owned
+wrapper <900 s loan. Retain actual per-cycle times on the first native run;
+if assumptions fail, stop/investigate and preregister split phases rather than
+extend ceilings or treat a timeout as a recovery/ownership verdict.
