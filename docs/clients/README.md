@@ -20,19 +20,20 @@ initial text-only session, a **requested** context of 32768 and output budget
 4096 are examples, not universal model limits:
 
 ```sh
-# The server reads GUFO_API_KEY from its environment: no key in argv.
-/path/to/gufo serve --host 127.0.0.1 --port 8080 \
+# Keep the server key in a private file, not in server argv.
+mkdir -p ~/.config/gufo
+(umask 077; printf '%s\n' "$GUFO_API_KEY" > ~/.config/gufo/key)
+/path/to/gufo serve --host 127.0.0.1 --port 8080 --api-key-file ~/.config/gufo/key \
   llm --model "$MODEL" --served-model-name gufo-local --context 32768 --think off
 curl -fsS -H "Authorization: Bearer $GUFO_API_KEY" http://127.0.0.1:8080/v1/models
 ```
 
 Gufo accepts its single key as `Authorization: Bearer` (OpenAI clients) or
 `x-api-key` (Anthropic SDKs); a request sending both must send the key in
-both. Supply the server key through `GUFO_API_KEY` or `--api-key-file`, not
-`--api-key`, which puts it in server argv, visible to process inspection (`ps`,
-`/proc/*/cmdline`). Use exactly one source: the server refuses to start when
-`GUFO_API_KEY` is set alongside either option. Avoid shell tracing/history with literal keys and keep
-launch logs private. See [authentication](../SERVER.md#authentication-and-exposure).
+both. `GUFO_API_KEY` is the clients' variable here; the server never reads
+it. Give the server its key with `--api-key-file`, not `--api-key`, which puts
+it in server argv, visible to process inspection (`ps`, `/proc/*/cmdline`).
+Avoid shell tracing/history with literal keys and keep launch logs private. See [authentication](../SERVER.md#authentication-and-exposure).
 
 Choose `C` from the actual loaded context reported by `/v1/models`, constrained
 by the model's supported context and memory fit; choose output `O < C`, leaving

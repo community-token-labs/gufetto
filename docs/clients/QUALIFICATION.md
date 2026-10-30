@@ -22,8 +22,7 @@ Check `/v1/models` using the single bearer key, including context and modalities
 Disable all unqualified hosted tools, extra providers and automatic cloud
 fallback. Run a bearer-auth smoke request before giving the client tools.
 Do not log auth headers. Never put client credentials in argv, project config
-or git. Start the server with `GUFO_API_KEY` or `--api-key-file`, not
-`--api-key`, which exposes the key in server argv (see [the common
+or git. Start the server with `--api-key-file`, not `--api-key`, which exposes the key in server argv (see [the common
 contract](README.md)). Plain HTTP on a LAN exposes bearer keys;
 use a TLS reverse proxy for LAN access, not an unauthenticated bind.
 

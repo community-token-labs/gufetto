@@ -238,8 +238,8 @@ def main():
     assert "api_key=set" in keyed.stderr
     assert "super-secret-value" not in keyed.stderr
     assert "api_key=unset" in run(load + ["-v"]).stderr
-    # The key can stay out of the process list: from a file, or from
-    # GUFO_API_KEY. Each key has exactly one source; several are an error.
+    # The key can stay out of the process list in a file. GUFO_API_KEY is
+    # the clients' variable: the server ignores it and it never conflicts.
     keyed_env = {**env, "GUFO_API_KEY": "fake-env-key"}
 
     def run_env(args, environment):
@@ -266,19 +266,13 @@ def main():
                 readable.stderr, readable.stderr
             assert "api_key=set" in readable.stderr
         key_file.chmod(0o600)
-        for args, environment, sources in (
-                (["--api-key", "x", "--api-key-file", str(key_file)], env,
-                 "--api-key, --api-key-file"),
-                (["--api-key", "x"], keyed_env, "--api-key, GUFO_API_KEY"),
-                (["--api-key-file", str(key_file)], keyed_env,
-                 "--api-key-file, GUFO_API_KEY"),
-                (["--api-key", "x", "--api-key-file", str(key_file)],
-                 keyed_env, "--api-key, --api-key-file, GUFO_API_KEY")):
-            result = run_env(load + args, environment)
-            assert result.returncode == 2, result.stderr
-            assert ("the API key has more than one source (" + sources +
-                    "); use exactly one") in result.stderr, result.stderr
-            assert "fake-env-key" not in result.stderr
+        check(load + ["--api-key", "x", "--api-key-file", str(key_file)], 2,
+              "the API key has more than one source (--api-key, "
+              "--api-key-file); use exactly one")
+        with_env = run_env(load + ["-v", "--api-key-file", str(key_file)],
+                           keyed_env)
+        assert with_env.returncode == 1, with_env.stderr
+        assert "api_key=set" in with_env.stderr
         # Exactly one line ending is trimmed: an empty key, a second line or
         # a doubled newline is refused rather than silently reshaped.
         for content, reason in (("", "holds an empty key"),
@@ -293,11 +287,7 @@ def main():
         check(load + ["--api-key-file", directory], 2, "not a regular file")
         check(load + ["--api-key-file", str(Path(directory) / "missing")], 2,
               "cannot be opened")
-    from_env = run_env(load + ["-v"], keyed_env)
-    assert "api_key=set" in from_env.stderr
-    assert "fake-env-key" not in from_env.stderr
-    assert "api_key=unset" in run_env(load + ["-v"],
-                                      {**env, "GUFO_API_KEY": ""}).stderr
+    assert "api_key=unset" in run_env(load + ["-v"], keyed_env).stderr
     origins = run(load + ["-v", "--cors-origin", "http://webui.lan:3000",
                           "--cors-origin", "https://chat.test"])
     assert "cors_origins=2" in origins.stderr, origins.stderr

@@ -236,9 +236,10 @@ struct ServerLogOptions {
   std::optional<server::LogLevel> level;
 };
 
-/// Who may call the server. `--api-key`, `--api-key-file` and `GUFO_API_KEY`
-/// each supply the key; `ResolveApiKey` refuses more than one, since a silent
-/// precedence between credentials hides which key is in force.
+/// Who may call the server. `--api-key` and `--api-key-file` each supply the
+/// key; `ResolveApiKey` refuses both, since a silent precedence between
+/// credentials hides which key is in force. The server reads no key from the
+/// environment: `GUFO_API_KEY` is the clients' convention.
 struct ServerAccessOptions {
   std::string api_key;
   std::string api_key_file;
@@ -249,8 +250,7 @@ struct ServerAccessOptions {
 // hand while every modality help registers them through the parser, so both
 // readings share one source for the wording.
 constexpr std::string_view kApiKeyHelp =
-    "Require this key as Authorization: Bearer or x-api-key (or set "
-    "GUFO_API_KEY)";
+    "Require this key as Authorization: Bearer or x-api-key";
 constexpr std::string_view kApiKeyFileHelp =
     "Read the API key from this file (one line; keep it chmod 600)";
 constexpr std::string_view kCorsOriginHelp =
@@ -396,29 +396,17 @@ bool ReadApiKeyFile(const std::string& path, std::string* key) {
   return true;
 }
 
-// Settles the key from its one configured source. Empty values count as
-// unset, as an empty `--api-key` always has.
+// Settles the key from its one configured source. An empty `--api-key` counts
+// as unset, as it always has.
 bool ResolveApiKey(ServerAccessOptions* access) {
-  const char* env_key = std::getenv("GUFO_API_KEY");
-  std::vector<std::string_view> sources;
-  if (!access->api_key.empty())
-    sources.emplace_back("--api-key");
-  if (!access->api_key_file.empty())
-    sources.emplace_back("--api-key-file");
-  if (env_key != nullptr && *env_key != '\0')
-    sources.emplace_back("GUFO_API_KEY");
-  if (sources.size() > 1) {
-    std::cerr << "Error: the API key has more than one source (";
-    for (std::size_t i = 0; i < sources.size(); ++i)
-      std::cerr << (i == 0 ? "" : ", ") << sources[i];
-    std::cerr << "); use exactly one\n";
+  if (access->api_key_file.empty())
+    return true;
+  if (!access->api_key.empty()) {
+    std::cerr << "Error: the API key has more than one source (--api-key, "
+                 "--api-key-file); use exactly one\n";
     return false;
   }
-  if (!access->api_key_file.empty())
-    return ReadApiKeyFile(access->api_key_file, &access->api_key);
-  if (env_key != nullptr)
-    access->api_key = env_key;
-  return true;
+  return ReadApiKeyFile(access->api_key_file, &access->api_key);
 }
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.

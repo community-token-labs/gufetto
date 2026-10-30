@@ -1371,19 +1371,20 @@ OpenAI clients send the first, Anthropic SDKs the second. Every credential
 header a request carries must name the key: a request with both is accepted
 only when both match, so a valid `x-api-key` never excuses a wrong or
 non-Bearer `Authorization`, and a repeated header is refused. Keys are compared
-by SHA-256 digest. Supply the key from exactly one source; naming more than
-one is a startup error that lists the conflicting sources, never a silent
-precedence:
+by SHA-256 digest. Supply the key from exactly one option; naming both is a
+startup error, never a silent precedence:
 
 - `--api-key KEY`: on the command line, visible in the process list
   (`ps`, `/proc/*/cmdline`).
 - `--api-key-file PATH`: the file's contents less exactly one trailing `\n` or
   `\r\n`, at most 4096 bytes, on one line. An empty key is an error. Keep the
   file private (`chmod 600`): a group- or world-readable file loads but logs
-  the warning `event=api_key_file_readable`.
-- `GUFO_API_KEY`: the environment, which only the same user (and root) can
-  read. An empty value counts as unset. Unset it in the server's environment
-  when using either option, even if clients in the same shell read it.
+  the warning `event=api_key_file_readable`. For containers, mount the key as
+  a file (for example a secret) and pass `--api-key-file`.
+
+The server reads no key from its environment. `GUFO_API_KEY` is only the
+client-side convention used by the [client recipes](clients/README.md), so
+exporting it for clients does not change the server.
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
@@ -1395,8 +1396,8 @@ only IPv6 loopback clients. TLS termination belongs in a reverse proxy.
 **A server bound to a LAN address with no key can be driven by any web page.**
 The default `Access-Control-Allow-Origin: *` lets a page opened in any browser
 on the network send it requests and read the replies, with no credential to
-steal. Before binding beyond loopback, set a key (`--api-key-file` or
-`GUFO_API_KEY`) and/or restrict browsers with `--cors-origin`.
+steal. Before binding beyond loopback, set a key with `--api-key-file` and/or
+restrict browsers with `--cors-origin`.
 
 Request bodies, prompts, generated text and credentials are not logged.
 
