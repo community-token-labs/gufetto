@@ -14,6 +14,7 @@ import http.client
 import ipaddress
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -77,14 +78,33 @@ def is_numeric_loopback(host: str) -> bool:
         return False
 
 
-def valid_header_value(value: str) -> bool:
-    return bool(value) and all(0x21 <= ord(c) <= 0x7E for c in value)
+def valid_token68(value: str) -> bool:
+    """RFC 7235 token68: letters, digits, - . _ ~ + /, then optional =."""
+    return re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", value) is not None
 
 
-def error_details(body: bytes) -> tuple[str, str]:
+def scrub(value: Any, secret: str | None) -> Any:
+    """Replaces the secret in every string, before truncation or output."""
+    if not secret:
+        return value
+    if isinstance(value, str):
+        return value.replace(secret, "<redacted>")
+    if isinstance(value, list):
+        return [scrub(item, secret) for item in value]
+    if isinstance(value, dict):
+        return {scrub(k, secret): scrub(v, secret) for k, v in value.items()}
+    return value
+
+
+def load_json(body: bytes, secret: str | None) -> Any:
+    """Decodes a body and scrubs it, so no later step sees the secret."""
+    return scrub(json.loads(body), secret)
+
+
+def error_details(body: bytes, secret: str | None) -> tuple[str, str]:
     """Returns (code, message) from an OpenAI-style error body."""
     try:
-        error = json.loads(body).get("error", {})
+        error = load_json(body, secret).get("error", {})
     except (ValueError, AttributeError):
         return "", ""
     if not isinstance(error, dict):
@@ -146,16 +166,17 @@ class Client:
                 from None
 
 
-def fail_for(what: str, status: int, body: bytes) -> CheckError:
-    code, message = error_details(body)
+def fail_for(what: str, status: int, body: bytes,
+             secret: str | None) -> CheckError:
+    code, message = error_details(body, secret)
     hint = CODE_HINTS.get(code) or STATUS_HINTS.get(status, "")
     label = f"{status} {code}".strip()
     return CheckError(f"{what} returned {label}: {message}".rstrip(": "), hint)
 
 
-def parse_json(what: str, body: bytes) -> Any:
+def parse_json(what: str, body: bytes, secret: str | None) -> Any:
     try:
-        return json.loads(body)
+        return load_json(body, secret)
     except ValueError:
         raise CheckError(f"{what} returned a body that is not JSON") from None
 
@@ -169,13 +190,13 @@ def list_models(client: Client, wait: float) -> list[dict[str, Any]]:
     deadline = time.monotonic() + wait
     while True:
         status, body = client.request("GET", "/v1/models")
-        if status == 503 and error_details(body)[0] == "loading" and \
+        if status == 503 and error_details(body, client.key)[0] == "loading" and \
                 time.monotonic() < deadline:
             time.sleep(1.0)
             continue
         if status != 200:
-            raise fail_for("GET /v1/models", status, body)
-        listing = parse_json("GET /v1/models", body)
+            raise fail_for("GET /v1/models", status, body, client.key)
+        listing = parse_json("GET /v1/models", body, client.key)
         models = listing.get("data") if isinstance(listing, dict) else None
         if not isinstance(models, list) or not models:
             raise CheckError("GET /v1/models returned no model list")
@@ -231,8 +252,8 @@ def chat(client: Client, model: str, max_tokens: int,
     status, body = client.request("POST", "/v1/chat/completions", payload)
     elapsed = time.monotonic() - started
     if status != 200:
-        raise fail_for(what, status, body)
-    response = parse_json(what, body)
+        raise fail_for(what, status, body, client.key)
+    response = parse_json(what, body, client.key)
     malformed = CheckError(f"{what} returned a malformed Chat Completions "
                            "object")
     choices = response.get("choices") if isinstance(response, dict) else None
@@ -330,10 +351,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     key = os.environ.get(args.api_key_env) or None
-    if key is not None and not valid_header_value(key):
+    if key is not None and not valid_token68(key):
         raise CheckError(
             f"the value of {args.api_key_env} is not a valid bearer token",
-            "it must be printable ASCII without spaces or line breaks")
+            "use only letters, digits and - . _ ~ + /, optionally ending "
+            "in =")
     if key and args.scheme == "http" and not is_numeric_loopback(args.host) \
             and not args.allow_cleartext_key:
         raise CheckError(
@@ -355,14 +377,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def redact(text: str, secret: str | None) -> str:
-    return text.replace(secret, "<redacted>") if secret else text
-
-
 def report(as_json: bool, ok: bool, fields: dict[str, Any],
            lines: list[str], secret: str | None) -> None:
-    text = json.dumps({"ok": ok, **fields}) if as_json else "\n".join(lines)
-    print(redact(text, secret))
+    # Scrub values before serialisation, so escaping cannot hide the secret.
+    if as_json:
+        print(json.dumps(scrub({"ok": ok, **fields}, secret)))
+    else:
+        print("\n".join(scrub(lines, secret)))
 
 
 def main(argv: list[str] | None = None) -> int:

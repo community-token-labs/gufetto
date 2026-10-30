@@ -291,16 +291,88 @@ class VerifyServerTest(unittest.TestCase):
                                          "http://gufo.example/v1/models")
             self.assertNotIn(KEY, str(raised.exception))
 
+    def assert_single_object(self, stdout: str) -> dict[str, Any]:
+        lines = stdout.splitlines()
+        self.assertEqual(len(lines), 1, stdout)
+        result = json.loads(lines[0])
+        self.assertIsInstance(result, dict)
+        self.assertIsInstance(result["ok"], bool)
+        return result
+
+    def assert_no_leak(self, key: str, text: str):
+        self.assertNotIn(key, text)
+        for start in range(0, len(key) - 15, 8):
+            self.assertNotIn(key[start:start + 16], text)
+
     def test_malformed_key_is_rejected_without_echo(self):
-        for key in (KEY + "\nX-Injected: 1", "two words", "café"):
+        for key in (KEY + "\nX-Injected: 1", "two words", "café",
+                    'quote"key', "back\\slash", "a=b", "=", "%41"):
             with self.subTest(key=key):
                 with serve(FakeServer()) as url:
-                    done = run_script(["--base-url", url],
+                    done = run_script(["--base-url", url, "--json"],
                                       {"GUFO_API_KEY": key})
                 self.assertEqual(done.returncode, 1)
-                self.assertIn("not a valid bearer token", done.stdout)
+                result = self.assert_single_object(done.stdout)
+                self.assertIn("not a valid bearer token", result["error"])
                 self.assertNotIn(key, done.stdout + done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
+
+    def test_token68_keys_are_accepted(self):
+        for key in ("abc", "A-Z.a_z~0+9/", "dG9rZW4=", "dG9r=="):
+            with self.subTest(key=key):
+                self.assertTrue(VERIFY.valid_token68(key))
+
+    def test_long_key_echoed_by_server_never_leaks(self):
+        key = ("Ab0-._~+/" * 28)[:250]
+        # JSON may escape "/" as "\/"; the script must still find the key.
+        escaped = key.replace("/", "\\/")
+
+        def echo_error(handler):
+            handler.send(401, ('{"error": {"code": "invalid_api_key", '
+                               '"message": "bad key ' + escaped +
+                               '"}}').encode())
+
+        def echo_chat(handler):
+            handler.send(200, chat_body(content="key " + key + " ready"))
+
+        def echo_models(handler):
+            handler.send(200, {"data": [dict(TEXT_MODEL, id=key)]})
+
+        for name, raw in (("error", {"/v1/models": echo_error}),
+                          ("content", {"/v1/chat/completions": echo_chat}),
+                          ("model id", {"/v1/models": echo_models})):
+            for mode in (["--json"], []):
+                with self.subTest(echo=name, mode=mode):
+                    with serve(FakeServer(raw=raw)) as url:
+                        done = run_script(["--base-url", url, *mode],
+                                          {"GUFO_API_KEY": key})
+                    output = done.stdout + done.stderr
+                    self.assert_no_leak(key, output)
+                    self.assertNotIn("Traceback", done.stderr)
+                    if mode:
+                        self.assert_single_object(done.stdout)
+                    if name == "content":
+                        self.assertEqual(done.returncode, 0, output)
+                        self.assertIn("<redacted>", output)
+
+    def test_json_is_always_one_object(self):
+        for argv, env, status in (
+                (["--base-url", "ftp://127.0.0.1"], {}, 2),
+                (["--max-tokens", "x"], {}, 2),
+                (["--base-url", "http://192.0.2.1:8080"],
+                 {"GUFO_API_KEY": KEY}, 1)):
+            with self.subTest(argv=argv):
+                done = run_script([*argv, "--json"], env)
+                self.assertEqual(done.returncode, status, done.stderr)
+                self.assert_single_object(done.stdout)
+        for state, status in ((FakeServer(), 0), (FakeServer(key=KEY), 1),
+                              (FakeServer(chat=b"not json"), 1)):
+            with self.subTest(status=status), serve(state) as url:
+                done = run_script(["--base-url", url, "--json"])
+                self.assertEqual(done.returncode, status, done.stderr)
+                self.assertEqual(
+                    self.assert_single_object(done.stdout)["ok"],
+                    status == 0)
 
     def test_missing_key_explains_401(self):
         state = FakeServer(key=KEY)
