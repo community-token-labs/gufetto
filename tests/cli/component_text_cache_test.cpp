@@ -1144,6 +1144,23 @@ void StaticDiagnosticClaim() {
     TextRunnerPool ordinary(std::make_shared<Runner>(), 1, {},
                             {.enabled = false});
   }
+  {
+    // No freeze/commit callbacks: RAM-on must use the protected headroom too.
+    std::ostringstream log;
+    auto* previous = std::clog.rdbuf(log.rdbuf());
+    struct HeadroomRunner final : Runner {
+      TextRunnerResourceClaim ResourceClaim() const override {
+        auto result = Runner::ResourceClaim();
+        result.retained_snapshot_capacity_bytes = 16ULL << 20;
+        result.retained_snapshot_ceiling_bytes = 32ULL << 20;
+        return result;
+      }
+    };
+    TextRunnerPool ordinary(std::make_shared<HeadroomRunner>(), 1);
+    std::clog.rdbuf(previous);
+    assert(log.str().find("capacity_bytes=14680064 staging_capacity_bytes=0") !=
+           std::string::npos);
+  }
   assert(claim.Snapshot().bytes == envelope);
   assert(!claim.Activate(envelope, Capacity(100, 100, 50), nullptr));
 }

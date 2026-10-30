@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
@@ -2499,6 +2500,93 @@ void TestEntryCapacityEvictionIsLogged() {
   evicted.Invalidate();
 }
 
+// Own process: the production singleton deliberately has no reset API.
+void TestDiagnosticAdmissionAndSnapshots() {
+  constexpr std::size_t envelope = 4096;
+  auto& claim = gufo::server::DiagnosticMemoryClaim::Process();
+  Expect(claim.Activate(envelope, {envelope, envelope, envelope}, nullptr),
+         "activate before the first pool");
+  class SharedRunner final : public FakeRunner {
+  public:
+    using FakeRunner::FakeRunner;
+    TextRunnerResourceClaim ResourceClaim() const override {
+      auto result = FakeRunner::ResourceClaim();
+      result.shared_execution_bytes = 32;
+      result.per_request_state_bytes = 0;
+      result.temporary_scratch_bytes = 0;
+      return result;
+    }
+    std::unique_ptr<TextRunnerState> CreateState() const override {
+      struct EmptyState final : TextRunnerState {
+        void Invalidate() noexcept override {}
+      };
+      ++stats_->states_created;
+      return std::make_unique<EmptyState>();
+    }
+  };
+  for (const bool fits : {false, true}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<SharedRunner>(
+        stats, 0, envelope + 32 - (fits ? 0 : 1));
+    try {
+      TextRunnerPool pool(runner, 1, {}, {.enabled = false});
+      Expect(fits, "shared plus E above capacity must refuse");
+    } catch (const std::invalid_argument& error) {
+      Expect(
+          !fits &&
+              std::string_view(error.what()) ==
+                  "text runner shared execution claim exceeds state capacity",
+          "E-1 boundary refuses with the shared-claim error");
+      Expect(stats->states_created == 0, "refuse before state allocation");
+    }
+  }
+  for (const std::size_t ceiling : {envelope - 1, envelope, envelope + 128}) {
+    for (const std::size_t requested : {std::size_t{0}, envelope * 2}) {
+      auto stats = std::make_shared<FakeStats>();
+      auto runner = std::make_shared<SnapshotRunner>(stats, 64, envelope + 256,
+                                                     ceiling / 2);
+      runner->retained_snapshot_ceiling_bytes = ceiling;
+      std::ostringstream log;
+      auto* previous = std::clog.rdbuf(log.rdbuf());
+      {
+        TextRunnerPool pool(runner, 1, {}, {.capacity_bytes = requested});
+        auto request = pool.Acquire({1, 0});
+        Expect(request.Prefill(2).decode_ready, "snapshot boundary ready");
+        (void)request.SelectNext();
+        request.Advance();
+        const auto committed = request.Commit();
+        const auto expected =
+            ceiling > envelope ? (requested ? 128U : 64U) : 0U;
+        Expect((committed.snapshot_bytes != 0) == (expected != 0),
+               "only positive protected headroom can retain this snapshot");
+      }
+      std::clog.rdbuf(previous);
+      const auto expected = ceiling > envelope ? (requested ? 128U : 64U) : 0U;
+      Expect(log.str().find("snapshot_entries=128 capacity_bytes=" +
+                            std::to_string(expected) + " automatic_bytes=" +
+                            std::to_string(ceiling > envelope ? 64U : 0U) +
+                            " max_bytes=" +
+                            std::to_string(ceiling > envelope ? 128U : 0U) +
+                            " ram_cache=on") != std::string::npos,
+             "snapshot AUTO and ceiling protect E at E-1/E/E+128");
+      const std::string event =
+          "[ERROR] [cache] event=diagnostic_snapshots_disabled";
+      const auto position = log.str().find(event);
+      Expect((position != std::string::npos) == (ceiling < envelope),
+             "over-ceiling disables snapshots with an ERROR");
+      if (ceiling < envelope) {
+        Expect(
+            log.str().find(event, position + event.size()) == std::string::npos,
+            "disabled snapshot warning is emitted once per cache");
+        Expect(log.str().find("claim_bytes=4096 ceiling_bytes=4095 "
+                              "reason=diagnostic_claim_exceeds_ceiling") !=
+                   std::string::npos,
+               "disabled snapshot log gives the exact bound");
+      }
+    }
+  }
+}
+
 void TestSnapshotCacheCapacityIsReportedAtStartup() {
   using gufo::server::TextRunnerRamCacheOptions;
   // Automatic sizing takes the model budget; an explicit limit may use the
@@ -3156,7 +3244,12 @@ void TestLookupRuntimeDefaultsAndDisabled() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--diagnostic-memory") {
+    TestDiagnosticAdmissionAndSnapshots();
+    return 0;
+  }
+  Expect(argc == 1, "unknown test suite");
   TestContextOverflowDiagnostics();
   TestLookupRuntimeDefaultsAndDisabled();
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)

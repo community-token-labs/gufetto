@@ -878,10 +878,7 @@ void TestLlamaSlotsAndMetrics() {
          token.member_size("n_decoded") == 3);
 
   const auto metrics = get("/metrics");
-  assert(metrics.find("gufo_full_logits_memory_claim_bytes 0\n") !=
-         std::string::npos);
-  assert(metrics.find("gufo_full_logits_memory_unknown_total 0\n") !=
-         std::string::npos);
+  assert(metrics.find("gufo_full_logits_memory_") == std::string::npos);
   assert(metrics.find("# HELP gufo_device_lost_total ") != std::string::npos);
   assert(metrics.find("# TYPE gufo_device_lost_total counter\n") !=
          std::string::npos);
@@ -909,12 +906,25 @@ void TestLlamaSlotsAndMetrics() {
   }
   assert(metrics.find("# TYPE llamacpp:kv_cache_usage_ratio gauge\n") !=
          std::string::npos);
+}
+
+void TestDiagnosticMetrics() {
+  RunningServer server;
+  const auto get = [&server] {
+    return server.Send("GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  };
+  assert(get().find("gufo_full_logits_memory_") == std::string::npos);
+  // Dedicated process: no singleton reset or diagnostics in later tests.
   // This network-only fake owns no serving cache/native resources. Exercise
   // reporting, not a claim of HIP failure/retirement qualification.
   auto& claim = gufo::server::DiagnosticMemoryClaim::Process();
   assert(claim.Activate(1048576, {2097152, 2097152, 1048576}, nullptr));
   claim.ReportUnknown("mock_retirement");
-  const auto reported = get("/metrics");
+  const auto reported = get();
+  assert(reported.find("# HELP gufo_full_logits_memory_claim_bytes ") !=
+         std::string::npos);
+  assert(reported.find("# HELP gufo_full_logits_memory_unknown_total ") !=
+         std::string::npos);
   assert(reported.find("gufo_full_logits_memory_claim_bytes 1048576\n") !=
          std::string::npos);
   assert(reported.find("gufo_full_logits_memory_unknown_total 1\n") !=
@@ -3570,7 +3580,12 @@ void TestCheckpointTransferHttp() {
   ExpectStatus(unauthorized, 401);
   assert(unauthorized.find("100 Continue") == std::string::npos);
 }
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--diagnostic-memory") {
+    TestDiagnosticMetrics();
+    return 0;
+  }
+  assert(argc == 1);
   TestCheckpointTransferHttp();
   TestCacheLookupOptIn();
   // The log assertions below match "[LEVEL] [component]" text written to a
