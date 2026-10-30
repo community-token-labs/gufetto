@@ -12,11 +12,10 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/heap_placement.hpp"
-#include "src/core/startup_admission.hpp"
+#include "src/core/memory_budget.hpp"
 #include "src/models/qwen/continuation_layout.hpp"
 #include "src/models/qwen/state.hpp"
 
@@ -85,6 +84,12 @@ std::optional<LowerBound> LocalEvidence(const std::filesystem::path& path,
   const auto reader = core::GgufReader::OpenFile(path, &error);
   if (!reader)
     return std::nullopt;
+  if (reader->GetMappedRegions().size() != 1) {
+    error =
+        "split GGUF: only this row's shard is verified; sibling shards are not "
+        "evaluated";
+    return std::nullopt;
+  }
   // This loader copies the complete mapped weight regions unchanged. Do not
   // apply its tensor-size lower bound to families with repacking/disk tables.
   if (reader->GetMetadataString("general.architecture") != "qwen35") {
@@ -139,15 +144,32 @@ ModelPlanReport PlanModels(const std::filesystem::path& manifest) {
       throw std::invalid_argument("missing manifest column: " +
                                   std::string(column));
   }
+  constexpr std::array optional = {"context",
+                                   "host_available_bytes",
+                                   "device_available_bytes",
+                                   "os_reserve_bytes",
+                                   "weights_bytes",
+                                   "kv_bytes",
+                                   "vision_bytes",
+                                   "draft_bytes",
+                                   "workspace_bytes",
+                                   "cache_bytes",
+                                   "persistence_staging_bytes"};
+  for (const auto& name : header) {
+    if (std::find(required.begin(), required.end(), name) == required.end() &&
+        std::find(optional.begin(), optional.end(), name) == optional.end())
+      throw std::invalid_argument("unknown manifest column: " + name);
+  }
   std::ostringstream out;
   out << "Model setup plan (dry run; no downloads)\n"
       << "No FIT state: calculated lower bounds are not runtime "
          "qualification.\n"
       << "UNPROVEN needs gufo serve measured startup admission (verified to "
          "fit).\n"
-      << "Each row is independent; inputs describe a single UMA scenario. "
-         "Weights/sidecars charge host RAM; only KV is a device lower bound.\n"
-      << "Reserve providers: server::kHostSnapshotHeadroomBytes / "
+      << "Each row is independent. Weights prefer the device heap, with host "
+         "registration fallback; KV needs the device heap. No shared/carve-out "
+         "topology is assumed.\n"
+      << "Reserve providers: core::kHostExecutionReserveBytes / "
          "ObserveHostSnapshotHeadroom; hip::kDispatchReserve / "
          "ObserveExecutionCapacity. Available capacity inputs are declared, "
          "not host measurements.\n"
@@ -174,8 +196,15 @@ ModelPlanReport PlanModels(const std::filesystem::path& manifest) {
     };
     any = true;
     out << "Row " << row << " " << get("group") << " / " << get("file") << ": ";
-    if (get("status").starts_with("watch-only") || !Hex(get("revision"), 40) ||
-        !Hex(get("sha256"), 64) || get("bytes") == "unknown") {
+    for (const auto* pin : {"revision", "sha256"}) {
+      if (!get("status").starts_with("watch-only") && get(pin) != "unknown" &&
+          !Hex(get(pin), std::string_view(pin) == "revision" ? 40 : 64))
+        throw std::invalid_argument("row " + std::to_string(row) + " column " +
+                                    pin + ": malformed immutable pin");
+    }
+    if (get("status").starts_with("watch-only") ||
+        get("revision") == "unknown" || get("sha256") == "unknown" ||
+        get("bytes") == "unknown") {
       out << "NOT-EVALUATED: missing immutable revision/size/SHA256 pin; "
              "local=NOT CHECKED\n";
       continue;
@@ -199,7 +228,25 @@ ModelPlanReport PlanModels(const std::filesystem::path& manifest) {
       return columns.contains(name) && !get(name).empty() &&
              get(name) != "unknown";
     };
-    const auto number = [&](const char* name) { return Bytes(get(name)); };
+    const auto number = [&](const char* name) {
+      try {
+        return Bytes(get(name));
+      } catch (const std::exception&) {
+        throw std::invalid_argument("row " + std::to_string(row) + " column " +
+                                    name + ": expected unsigned integer");
+      }
+    };
+    // Validate even unused optional inputs, so a typo cannot silently suppress
+    // evidence.
+    for (const auto* name : optional) {
+      if (present(name))
+        (void)number(name);
+    }
+    if (present("os_reserve_bytes") &&
+        number("os_reserve_bytes") < core::kHostExecutionReserveBytes)
+      throw std::invalid_argument(
+          "row " + std::to_string(row) +
+          " column os_reserve_bytes: below server reserve");
     const auto path = manifest.parent_path() / relative;
     const auto local = Verify(path, bytes, get("sha256"));
     const auto context = present("context") ? number("context") : 0;
@@ -259,29 +306,33 @@ ModelPlanReport PlanModels(const std::filesystem::path& manifest) {
       const auto device = number("device_available_bytes");
       const auto reserve = present("os_reserve_bytes")
                                ? number("os_reserve_bytes")
-                               : server::kHostSnapshotHeadroomBytes;
-      if (reserve < server::kHostSnapshotHeadroomBytes)
-        throw std::invalid_argument("OS reserve is below the server reserve");
-      const auto host_only = core::AddMemoryBytes(bound->weights, extras);
-      const auto pending = core::AddMemoryBytes(host_only, bound->kv);
-      const bool host_fits = core::FitsMemoryBudget(host, pending, reserve);
-      // Qwen weights may use registered host memory rather than the HIP heap.
-      // Charge all bytes to UMA host RAM, but only known KV to the device lane.
-      const core::ExecutionCapacityObservation capacity{
-          host_fits ? host - reserve - host_only : 0,
-          device > hip::kDispatchReserve ? device - hip::kDispatchReserve : 0,
-          0};
-      const bool within =
-          host_fits && device >= hip::kDispatchReserve &&
-          core::FitsMeasuredExecution(capacity, {0, 0}, 0, bound->kv);
+                               : core::kHostExecutionReserveBytes;
+      const auto pending = core::AddMemoryBytes(
+          core::AddMemoryBytes(bound->weights, bound->kv), extras);
+      const auto heap =
+          device > hip::kDispatchReserve ? device - hip::kDispatchReserve : 0;
+      // model_loader.cpp:206-215 tries device weights before registered host.
+      // Host reserve is post-loading execution/cache policy, NOT a loader gate:
+      // use raw host capacity for this conservative necessary weight-load test.
+      const bool kv_fits =
+          core::FitsMemoryBudget(device, bound->kv, hip::kDispatchReserve);
+      const bool either_placement =
+          core::FitsMemoryBudget(heap, bound->weights, bound->kv) ||
+          core::FitsMemoryBudget(host, bound->weights, 0);
+      // Extras have unknown lanes. Use only the aggregate necessary condition;
+      // subtract rather than adding host+heap, which could overflow.
+      const bool aggregate =
+          core::FitsMemoryBudget(host, pending > heap ? pending - heap : 0, 0);
+      const bool within = kv_fits && either_placement && aggregate;
       has_failures = has_failures || !within;
       out << (within ? "UNPROVEN" : "DOES-NOT-FIT")
           << ": lower_bound_bytes=" << pending
           << " weights_bytes=" << bound->weights << " kv_bytes=" << bound->kv
           << " context=" << context << " declared_host_available=" << host
           << " declared_device_available=" << device
-          << " OS_reserve=" << reserve
-          << " device_reserve=" << hip::kDispatchReserve << "; " << evidence;
+          << " post_load_OS_reserve=" << reserve
+          << " (not a weight-load gate) device_reserve="
+          << hip::kDispatchReserve << "; " << evidence;
       if (!within)
         out << "; lower bound alone exceeds reserved capacity";
     }
