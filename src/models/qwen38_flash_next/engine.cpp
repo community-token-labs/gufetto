@@ -659,6 +659,11 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
                            restored_policy.Choose(remaining ? remaining - 1 : 0,
                                                   header.token_count, 0, true));
   }
+  // Unplanned decoding uses the full budget whenever either eligible policy
+  // chooses to draft. Retain that depth and its verifier graphs across restore.
+  if (next_drafts != 0)
+    next_drafts = std::min<std::uint32_t>(remaining ? remaining - 1 : 0,
+                                         model_->options_.max_draft_tokens);
   bool restored = false;
   try {
     restored = model_->executor_->RestoreSnapshot(
@@ -700,6 +705,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
   draft_token_ = 0;
+  draft_confidence_ = 1.0F;
   draft_length_ = restored_policy;
   stats_ = {};
   valid_ = true;
