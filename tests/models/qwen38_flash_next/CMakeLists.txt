@@ -13,6 +13,22 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(cold_score gufo_qwen38_flash_next "cpu")
+set(cold_lifetime_body "${CMAKE_CURRENT_BINARY_DIR}/cold_score_lifetime_body.inc")
+add_custom_command(OUTPUT "${cold_lifetime_body}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_lifetime_test.py"
+    --source-root "${PROJECT_SOURCE_DIR}" --output "${cold_lifetime_body}"
+  DEPENDS cold_score_lifetime_test.py
+    "${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/engine.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/kernels/rocm/executor.cpp"
+  VERBATIM)
+add_executable(qwen38_flash_next_cold_score_lifetime_test cold_score_lifetime_test.cpp "${cold_lifetime_body}")
+target_include_directories(qwen38_flash_next_cold_score_lifetime_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(qwen38_flash_next_cold_score_lifetime_test PRIVATE gufo_logging gufo_platform)
+add_test(NAME qwen38_flash_next.cold_score_lifetime
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_lifetime_test.py"
+    --binary $<TARGET_FILE:qwen38_flash_next_cold_score_lifetime_test>)
+set_tests_properties(qwen38_flash_next.cold_score_lifetime PROPERTIES LABELS "qwen38_flash_next;cpu" TIMEOUT 30)
 add_qwen38_flash_next_test(npu_contracts gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")

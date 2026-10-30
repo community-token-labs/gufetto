@@ -1,7 +1,10 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_CONTINUATION_ADAPTER_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_CONTINUATION_ADAPTER_HPP_
 
+#include <exception>
+
 #include "src/cache/adapter.hpp"
+#include "src/cache/slot.hpp"
 #include "src/core/hip/transfer_pool.hpp"
 #include "src/models/qwen38_flash_next/continuation_layout.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
@@ -18,6 +21,9 @@ public:
                       std::uint32_t context, cache::Identity);
   ~ContinuationAdapter() override;
   [[nodiscard]] Session& GetSession(cache::Slot&);
+  [[nodiscard]] std::uint32_t VocabSize() const noexcept {
+    return model_->VocabSize();
+  }
   // Startup-only reconciliation, frozen before asynchronous backing growth.
   [[nodiscard]] std::size_t InitialPendingExecutionBytes() const noexcept {
     return initial_pending_execution_bytes_;
@@ -77,6 +83,46 @@ public:
   [[nodiscard]] bool Validate(
       cache::Slot&, std::span<const cache::ComponentPosition>) override;
   [[nodiscard]] bool Invalidate(cache::Slot&) noexcept override;
+  /// Strong, nonblocking witnesses for an exclusively claimed diagnostic slot.
+  /// Unlike ExecutionComplete(), Ready requires healthy EMPTY native state and
+  /// actual executor quiescence. Reset also accepts nonempty owned state.
+  [[nodiscard]] bool DiagnosticReady(const cache::Slot&) const noexcept;
+  /// Requires the cache owner's exclusive cold/no-borrower lease. Validates
+  /// the complete request before changing mode. No sampler/cache operations.
+  /// Input must remain immutable and both caller-owned spans must remain alive
+  /// through checked DiagnosticReset (including pending/quarantined work).
+  /// The cancellation callable is owned; its captures must also own their data.
+  /// Ordinary cache IsValid() is false while diagnostic-owned, even between
+  /// successful passes. Native Session::IsValid() still attests forward health.
+  void BeginDiagnostic(cache::Slot&, std::span<const std::int32_t> input,
+                       std::uint32_t rows, std::span<float> output,
+                       std::function<bool()> cancelled = {});
+  struct DiagnosticNonfinite final : std::exception {
+    const char* what() const noexcept override {
+      return "diagnostic logits are not finite";
+    }
+  };
+  struct DiagnosticStep {
+    std::uint32_t pass_end{};
+    std::uint32_t captured_rows{};
+    bool complete{};
+  };
+  /// Exactly one ordinary isolated-runner prefill pass. Returns only after
+  /// native success, with the observed absolute end; no synthetic cache count.
+  /// Refuses zero budget, exhausted input, >4096 passes and unsupported NPU.
+  /// Failures do not restore mode/reset: owner must retain/quarantine the
+  /// lease.
+  [[nodiscard]] DiagnosticStep DiagnosticPrefillStep(cache::Slot&,
+                                                     std::size_t budget);
+  /// Worker-only cancellation cleanup, before DiagnosticReset. Accepts a
+  /// healthy owned request (including cancellation BETWEEN passes), or a
+  /// forward whose explicit native cancellation path was observed. Collects
+  /// this request's PLE reads and fences both streams; false quarantines.
+  /// May block on disk/HIP: on an outer deadline retain the work, spans, lease
+  /// and model until the worker settles. This never resets/restores mode.
+  [[nodiscard]] bool DrainDiagnosticCancellation(cache::Slot&) noexcept;
+  [[nodiscard]] cache::DiagnosticDiscardResult DiagnosticReset(
+      cache::Slot&) noexcept;
 
 private:
   class State;

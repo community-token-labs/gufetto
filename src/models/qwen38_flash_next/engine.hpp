@@ -17,6 +17,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
+#include "src/models/qwen38_flash_next/cold_score.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kv_cache.hpp"
@@ -44,6 +45,10 @@ struct PrefillCheckpoint;
 
 struct ModelOptions {
   std::uint32_t max_context = 4096;
+  bool enable_diagnostic_logits = false;
+  // Startup-only static-claim approval, before widened executor allocation.
+  std::function<bool(const DiagnosticLogitCapacity&, std::string*)>
+      approve_diagnostic_logits;
   /// Optional MTP draft sidecar (`mtp-...-shared-*.gguf`). Empty leaves
   /// speculative decoding off.
   std::string mtp_model_path;
@@ -94,6 +99,12 @@ public:
   [[nodiscard]] std::int32_t EosToken() const noexcept;
   [[nodiscard]] bool IsStopToken(std::int32_t token) const noexcept;
   [[nodiscard]] std::uint32_t VocabSize() const noexcept;
+  [[nodiscard]] bool DiagnosticLogitsEnabled() const noexcept {
+    return diagnostic_approved_;
+  }
+  [[nodiscard]] const DiagnosticLogitCapacity& LogitCapacity() const noexcept {
+    return logit_capacity_;
+  }
   [[nodiscard]] std::uint32_t PrefillCapacity() const noexcept;
   [[nodiscard]] std::uint32_t PrefillThroughCapacity() const noexcept;
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
@@ -135,6 +146,8 @@ private:
   Model() = default;
 
   ModelOptions options_;
+  DiagnosticLogitCapacity logit_capacity_;
+  bool diagnostic_approved_{};
   std::shared_ptr<core::GgufReader> reader_;
   std::shared_ptr<core::GgufReader> mtp_reader_;
   std::unique_ptr<ModelWeights> weights_;
@@ -308,12 +321,18 @@ private:
   bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
                              const PrefillCapture&, std::string*);
 
+  struct TerminalLogits {
+    std::size_t first;
+    std::span<float> output;
+    bool* cancelled;
+  };
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false, std::uint32_t boundary = 0,
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
             double* capture_ms = nullptr,
             std::span<const std::int32_t> after = {},
-            const PrefillCapture& capture = {});
+            const PrefillCapture& capture = {},
+            const TerminalLogits* terminal = nullptr);
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
@@ -372,6 +391,9 @@ private:
   [[nodiscard]] std::span<const std::uint8_t> ImageIdentity(
       std::size_t token_count) const;
   bool valid_{true};
+  // Owned by ContinuationAdapter until a checked diagnostic discard. Native
+  // health (valid_) remains distinct from ordinary cache/snapshot eligibility.
+  bool diagnostic_owned_{false};
   ContinuationHooks* continuation_hooks_{nullptr};
   /// This request's draft vocabulary; the device table follows it.
   MtpDraftVocab draft_vocab_;

@@ -15,7 +15,7 @@ set(gufo_pr_targets
   cache_retention_test
   cache_model_capabilities_test
   arg_parser_test json_test json_constraint_test gguf_reader_test gguf_identity_test
-  heap_placement_test startup_admission_test diagnostic_memory_test model_plan_test
+  heap_placement_test startup_admission_test diagnostic_memory_test model_plan_test cold_score_control_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test
   logit_sampler_test ggml_dequant_test
@@ -33,7 +33,8 @@ set(gufo_pr_targets
   qwen_vision_memory_budget_test
   qwen_vision_output_pool_test
   qwen27b_continuation_layout_test
-  qwen38_flash_next_npu_contracts_test
+  qwen38_flash_next_cold_score_lifetime_test
+  qwen38_flash_next_npu_contracts_test qwen38_flash_next_cold_score_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
   qwen38_flash_next_rope_scaling_test
@@ -51,7 +52,8 @@ set(gufo_pr_targets
   vision_ref_math_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
-  qwen38_flash_next_npu_contracts_test
+  qwen38_flash_next_cold_score_lifetime_test
+  qwen38_flash_next_npu_contracts_test qwen38_flash_next_cold_score_test
   component_text_cache_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
@@ -64,7 +66,8 @@ list(APPEND gufo_pr_tests
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
   text_model_runner_test_diagnostic_refusal_auto
   text_model_runner_test_diagnostic_refusal_explicit
-  "qwen38_flash_next\\.npu_contracts"
+  "qwen38_flash_next\\.cold_score_lifetime"
+  "qwen38_flash_next\\.npu_contracts" "qwen38_flash_next\\.cold_score"
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"

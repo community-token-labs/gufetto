@@ -138,7 +138,7 @@ bool Executor::AllocateBatch(std::string* error) const {
          Check(hip::AllocateDevice(
                    &batch_logits_,
                    static_cast<std::size_t>(kBatchSessions) *
-                       std::min(kDecodeRows, options_.max_logit_rows) *
+                       std::min(kDecodeRows, options_.max_speculative) *
                        config().vocab_size * sizeof(float)),
                error);
 }
@@ -846,8 +846,9 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
         item.tokens.empty() || item.tokens.size() > kDecodeRows ||
-        item.tokens.size() > options_.max_logit_rows ||
-        (item.speculative && item.tokens.size() > options_.max_speculative) ||
+        // Batch decode keeps its ordinary capacity, independently of the
+        // diagnostic-only widening of the main/pinned output-head buffers.
+        item.tokens.size() > options_.max_speculative ||
         item.session->position_ + item.tokens.size() >
             item.session->max_context_) {
       return Fail(error, "invalid session or chain in decode batch");
@@ -1223,7 +1224,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
 
 bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
                                  float* logits, std::string* error) const {
-  if (rows == 0 || rows > options_.max_logit_rows || offset > batch_rows_ ||
+  if (rows == 0 || rows > options_.max_speculative || offset > batch_rows_ ||
       rows > batch_rows_ - offset) {
     return Fail(error, "logit rows outside the completed decode batch");
   }

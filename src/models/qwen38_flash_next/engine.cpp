@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -87,7 +88,12 @@ Model::~Model() = default;
 std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error_msg) {
-  std::shared_ptr<Model> m(new Model());
+  std::shared_ptr<Model> m(new Model(), [](Model* model) {
+    // Approved diagnostic models (including partial loads) intentionally stay
+    // intact until process exit. No hipFree/healthy-teardown path is entered.
+    if (!model->diagnostic_approved_)
+      delete model;
+  });
   if (!IsKnownKvCacheType(options.kv_cache_type)) {
     AssignError(error_msg, "unsupported Flash-Next KV cache type");
     return nullptr;
@@ -107,6 +113,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   m->options_ = options;
+  m->options_.approve_diagnostic_logits = {};
   m->reader_ = core::GgufReader::OpenFile(model_path, error_msg);
   if (!m->reader_) {
     return nullptr;
@@ -225,13 +232,43 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
-  exec.max_context = options.max_context;
-  exec.kv_cache_type = options.kv_cache_type;
-  m->executor_ =
-      rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
-  if (!m->executor_) {
+  const auto capacity = DiagnosticLogitCapacity::Plan(
+      c.vocab_size, exec.max_batch, exec.max_speculative,
+      options.enable_diagnostic_logits);
+  if (!capacity) {
+    AssignError(error_msg, "diagnostic logits capacity overflows");
     return nullptr;
   }
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  if (options.enable_diagnostic_logits && m->device_->npu()) {
+    AssignError(error_msg, "diagnostic logits do not support NPU routing");
+    return nullptr;
+  }
+#endif
+  if (options.enable_diagnostic_logits) {
+    if (!options.approve_diagnostic_logits) {
+      AssignError(error_msg, "diagnostic logits require startup approval");
+      return nullptr;
+    }
+    if (!options.approve_diagnostic_logits(*capacity, error_msg))
+      return nullptr;
+    m->diagnostic_approved_ = true;
+    std::fputs(
+        "diagnostic mode: the model stays loaded until the server restarts; "
+        "model switching/detach doesn't free it\n",
+        stderr);
+  }
+  m->logit_capacity_ = *capacity;
+  exec.max_logit_rows = capacity->max_logit_rows;
+  exec.max_context = options.max_context;
+  exec.kv_cache_type = options.kv_cache_type;
+  auto executor =
+      rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg,
+                             m->diagnostic_approved_ ? &m->executor_ : nullptr);
+  if (!executor) {
+    return nullptr;
+  }
+  m->executor_ = std::move(executor);
   return m;
 }
 
@@ -491,7 +528,7 @@ std::uint32_t Session::KeptHiddenRows() const noexcept {
 }
 
 std::uint64_t Session::SnapshotBytes() const {
-  if (!valid_)
+  if (!valid_ || diagnostic_owned_)
     return 0;
   return SessionSnapshotHostBytes(static_cast<std::uint32_t>(tokens_.size()),
                                   model_->VocabSize(),
@@ -500,7 +537,7 @@ std::uint64_t Session::SnapshotBytes() const {
 }
 
 std::uint64_t Session::PrefillCheckpointBytes(std::uint32_t position) const {
-  if (!session_->VisionLayout().images.empty())
+  if (diagnostic_owned_ || !session_->VisionLayout().images.empty())
     return 0;
   return SessionSnapshotHostBytes(position, model_->VocabSize(), 0) +
          model_->executor_->PrefillCheckpointBytes(*session_, position);
@@ -508,7 +545,8 @@ std::uint64_t Session::PrefillCheckpointBytes(std::uint32_t position) const {
 
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     std::string* error_msg, SnapshotMode mode) const {
-  if (!valid_ || tokens_.empty() || tokens_.size() != session_->position() ||
+  if (diagnostic_owned_ || !valid_ || tokens_.empty() ||
+      tokens_.size() != session_->position() ||
       tokens_.size() > std::numeric_limits<std::uint32_t>::max()) {
     AssignError(error_msg, "snapshot needs a synced, non-empty context");
     return nullptr;
@@ -828,7 +866,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
                    double* capture_ms, std::span<const std::int32_t> after,
-                   const PrefillCapture& consume) {
+                   const PrefillCapture& consume,
+                   const TerminalLogits* terminal) {
   if (perf::current && perf::execution_roster.size() == 1)
     perf::BindNative(0, reinterpret_cast<std::uintptr_t>(session_.get()));
   rocm::Executor& exec = *model_->executor_;
@@ -879,14 +918,34 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                                   ? model_->PrefillThroughCapacity()
                                   : model_->PrefillCapacity(),
                               rest.size()));
-    if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
-                      capture.get(), next)) {
+    // The diagnostic adapter supplies one validated ordinary pass. Earlier
+    // passes retain the ordinary one-row frontier head; suffix rows land
+    // directly in the caller's unique result, never a second row array.
+    const auto first = tokens_.size();
+    const auto end = first + n;
+    const auto rows =
+        terminal ? DiagnosticCaptureRows(first, end, terminal->first) : 0;
+    float* output = logits_.data();
+    if (rows) {
+      const auto offset = (std::max(first, terminal->first) - terminal->first) *
+                          model_->VocabSize();
+      output = terminal->output.data() + offset;
+    }
+    if (!exec.Forward(*session_, chunk,
+                      rows ? static_cast<std::uint32_t>(rows) : 1, output, mode,
+                      error_msg, capture.get(), next,
+                      terminal ? terminal->cancelled : nullptr)) {
       return false;
     }
+    if (rows)
+      std::copy_n(output + (rows - 1) * model_->VocabSize(),
+                  model_->VocabSize(), logits_.data());
     const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
-    hidden_base_ = static_cast<std::uint32_t>(
-        tokens_.size() + n -
-        std::min<std::size_t>(kept, exec.max_speculative()));
+    hidden_base_ =
+        terminal ? 0
+                 : static_cast<std::uint32_t>(
+                       tokens_.size() + n -
+                       std::min<std::size_t>(kept, exec.max_speculative()));
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
     if (capture) {
       const auto started = std::chrono::steady_clock::now();

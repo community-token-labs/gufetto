@@ -1004,6 +1004,55 @@ void Session::Reset(bool reuse_mtp) {
   }
 }
 
+hipError_t Executor::DiagnosticQuiescence() const noexcept {
+  if (model_ == nullptr || stream_ == nullptr)
+    return hipErrorInvalidValue;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+  // HIP stream completion alone does not certify external NPU work.
+  if (model_->npu() != nullptr)
+    return hipErrorNotSupported;
+#endif
+  // A completed-but-uncollected host read is still owned by its original
+  // operation. This witness never waits, collects, cancels or reuses it.
+  if (ple_pending_ || prefetch_.pending)
+    return hipErrorNotReady;
+  const auto main = hipStreamQuery(stream_);
+  if (main != hipSuccess)
+    return main;
+  if (side_stream_ != nullptr && side_stream_ != stream_)
+    return hipStreamQuery(side_stream_);
+  return hipSuccess;
+}
+
+bool Executor::DrainDiagnosticCancellation() const noexcept {
+  try {
+    if (model_ == nullptr || stream_ == nullptr)
+      return false;
+#if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
+    if (model_->npu() != nullptr)
+      return false;
+#endif
+    // Only the exclusive diagnostic owner may collect these reads. A failed
+    // read or fence is uncertainty, not a certificate allowing native reset.
+    bool ok = true;
+    if (ple_pending_)
+      ok = WaitPle(nullptr);
+    if (prefetch_.pending) {
+      FinishPrefetch();
+      ok = prefetch_.ready && ok;
+    }
+    prefetch_.ready = false;
+    const auto main = hipStreamSynchronize(stream_);
+    const auto side = side_stream_ != nullptr && side_stream_ != stream_
+                          ? hipStreamSynchronize(side_stream_)
+                          : hipSuccess;
+    return ok && main == hipSuccess && side == hipSuccess &&
+           DiagnosticQuiescence() == hipSuccess;
+  } catch (...) {
+    return false;
+  }
+}
+
 Executor::~Executor() {
 #if defined(GUFO_ENABLE_NPU) && GUFO_ENABLE_NPU
   // Runtime outlives this executor through DeviceModel. Drain its callbacks
@@ -1042,10 +1091,18 @@ Executor::~Executor() {
   }
 }
 
-std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
-                                           NgramTable* ngram, Options options,
-                                           std::string* error_msg) {
-  std::unique_ptr<Executor> e(new Executor());
+std::unique_ptr<Executor> Executor::Create(
+    const DeviceModel& model, NgramTable* ngram, Options options,
+    std::string* error_msg,
+    std::unique_ptr<Executor>* diagnostic_failure_owner) {
+  std::unique_ptr<Executor> ordinary;
+  auto& e = diagnostic_failure_owner ? *diagnostic_failure_owner : ordinary;
+  if (e) {
+    AssignError(error_msg, "diagnostic executor failure owner is not empty");
+    return nullptr;
+  }
+  // Install in the retained Model BEFORE allocation, including failure paths.
+  e.reset(new Executor());
   e->model_ = &model;
   e->ngram_ = ngram;
   e->options_ = options;
@@ -1497,7 +1554,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
   }
-  return e;
+  return std::move(e);
 }
 
 std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
@@ -1768,7 +1825,7 @@ std::size_t Executor::DeferredScratchBytes(SnapshotRoute route) const {
   const auto& c = config();
   std::size_t bytes = batch_logits_ == nullptr
                           ? std::size_t{8} *
-                                std::min(8U, options_.max_logit_rows) *
+                                std::min(8U, options_.max_speculative) *
                                 c.vocab_size * sizeof(float)
                           : 0;
   const auto linear = c.num_layers - c.num_layers / c.full_attention_interval;
@@ -3887,7 +3944,16 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg, PrefillCheckpoint* checkpoint,
-                       std::span<const std::int32_t> next) const {
+                       std::span<const std::int32_t> next,
+                       bool* diagnostic_cancelled) const {
+  if (diagnostic_cancelled) {
+    *diagnostic_cancelled = false;
+    if (mode != ForwardMode::kPrefill || session.mtp_enabled_ || checkpoint) {
+      AssignError(error_msg,
+                  "diagnostic cancellation requires target-only prefill");
+      return false;
+    }
+  }
   // Only this call's PLE layer may start the prefetch of `next`.
   struct NextHint {
     std::span<const std::int32_t>& hint;
@@ -3937,8 +4003,11 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
   }
   const std::uint32_t start_pos = session.position_;
-  if (!session.CheckCancellation(error_msg))
+  if (!session.CheckCancellation(error_msg)) {
+    if (diagnostic_cancelled)
+      *diagnostic_cancelled = true;
     return false;
+  }
   if (session.mtp_enabled_ && prefill_phase &&
       session.mtp_.position != start_pos) {
     AssignError(error_msg,
@@ -3952,12 +4021,17 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // synchronize below and need no additional wait.
   struct PinnedInputGuard {
     hipStream_t stream;
+    bool* diagnostic_cancelled;
     bool completed{false};
     ~PinnedInputGuard() {
-      if (!completed)
-        (void)hipStreamSynchronize(stream);
+      if (!completed) {
+        const auto status = hipStreamSynchronize(stream);
+        // A cancellation followed by a failed fence remains uncertain.
+        if (status != hipSuccess && diagnostic_cancelled)
+          *diagnostic_cancelled = false;
+      }
     }
-  } pinned_inputs{stream_};
+  } pinned_inputs{stream_, diagnostic_cancelled};
   if (mode == ForwardMode::kPrefill && checkpoint == nullptr && n == 8192 &&
       n_logits == 1 && logits != nullptr && CanForwardPair(session)) {
     // Once selected, any submission/consumer failure is fatal for this pass.
@@ -4050,7 +4124,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
                        sparse, start_pos, graph ? graph_pool_grid : pool_grid,
-                       first_layer, c.num_layers, error_msg, checkpoint, graph);
+                       first_layer, c.num_layers, error_msg, checkpoint, graph,
+                       true, false, nullptr, nullptr, diagnostic_cancelled);
   };
   // The prefix is already queued. Wait once before the suffix so recording
   // its graph can reuse these pinned rows while the eager pass executes.
@@ -4307,13 +4382,16 @@ bool Executor::ForwardPair(Session& session,
 #endif
 }
 
-bool Executor::ForwardBody(
-    Session& session, std::uint32_t n, std::uint32_t n_logits,
-    bool download_logits, bool speculative, bool sparse,
-    std::uint32_t start_pos, std::uint32_t pool_grid, std::uint32_t first_layer,
-    std::uint32_t end_layer, std::string* error_msg,
-    PrefillCheckpoint* checkpoint, bool embeddings_ready, bool initialize,
-    bool normed_input, bool* normed_output, const PreparedNpu* prepared) const {
+bool Executor::ForwardBody(Session& session, std::uint32_t n,
+                           std::uint32_t n_logits, bool download_logits,
+                           bool speculative, bool sparse,
+                           std::uint32_t start_pos, std::uint32_t pool_grid,
+                           std::uint32_t first_layer, std::uint32_t end_layer,
+                           std::string* error_msg,
+                           PrefillCheckpoint* checkpoint, bool embeddings_ready,
+                           bool initialize, bool normed_input,
+                           bool* normed_output, const PreparedNpu* prepared,
+                           bool* diagnostic_cancelled) const {
   const Config& c = config();
   if (first_layer == 0 && initialize) {
     if (!Check(hipMemcpyAsync(session.control_, control_host_,
@@ -4345,8 +4423,11 @@ bool Executor::ForwardBody(
                        prefill_phase || perf::sample_moe || n > kVecBatch);
 #endif
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
-    if (!session.CheckCancellation(error_msg))
+    if (!session.CheckCancellation(error_msg)) {
+      if (diagnostic_cancelled)
+        *diagnostic_cancelled = true;
       return false;
+    }
     frame.layer = il;
     const DeviceLayer& l = layers[il];
     if (perf::current != nullptr)

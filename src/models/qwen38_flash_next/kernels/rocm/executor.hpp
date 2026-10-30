@@ -262,13 +262,16 @@ public:
   };
 
   ~Executor();
+  [[nodiscard]] hipError_t DiagnosticQuiescence() const noexcept;
+  [[nodiscard]] bool DrainDiagnosticCancellation() const noexcept;
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 
   [[nodiscard]] static std::unique_ptr<Executor> Create(
       const DeviceModel& model, NgramTable* ngram, Options options,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      std::unique_ptr<Executor>* diagnostic_failure_owner = nullptr);
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       core::SessionMode mode, std::uint32_t max_context,
@@ -307,7 +310,8 @@ public:
                              std::uint32_t n_logits, float* logits,
                              ForwardMode mode, std::string* error_msg,
                              PrefillCheckpoint* checkpoint = nullptr,
-                             std::span<const std::int32_t> next = {}) const;
+                             std::span<const std::int32_t> next = {},
+                             bool* diagnostic_cancelled = nullptr) const;
 
   struct BatchItem {
     Session* session;
@@ -453,6 +457,9 @@ public:
   }
   [[nodiscard]] std::uint32_t max_batch() const noexcept {
     return options_.max_batch;
+  }
+  [[nodiscard]] std::uint32_t max_logit_rows() const noexcept {
+    return options_.max_logit_rows;
   }
   [[nodiscard]] std::uint32_t max_speculative() const noexcept {
     return options_.max_speculative;
@@ -654,7 +661,8 @@ private:
                    PrefillCheckpoint* checkpoint = nullptr,
                    bool embeddings_ready = false, bool initialize = true,
                    bool normed_input = false, bool* normed_output = nullptr,
-                   const PreparedNpu* prepared = nullptr) const;
+                   const PreparedNpu* prepared = nullptr,
+                   bool* diagnostic_cancelled = nullptr) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,

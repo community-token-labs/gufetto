@@ -23,6 +23,7 @@
 
 #include "src/cli/kv_cache_options.hpp"
 #include "src/cli/serve/cache_lookup_support.hpp"
+#include "src/cli/serve/cold_score.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
@@ -2652,11 +2653,32 @@ std::vector<std::int32_t> QwenFlashNextEngineTokens(
   return converted;
 }
 
-class QwenFlashNextTextRunnerState final : public TextRunnerState {
+class QwenFlashNextTextRunnerState final : public ColdScoreState {
 public:
   QwenFlashNextTextRunnerState(QwenFlashNextSession& session,
                                cache::Adapter& adapter, cache::Slot& slot)
       : session_(&session), adapter_(&adapter), slot_(&slot) {}
+  std::uint32_t ColdVocab() const noexcept override {
+    return adapter().VocabSize();
+  }
+  bool DrainCold() noexcept override {
+    return adapter().DrainDiagnosticCancellation(*slot_);
+  }
+  void ScoreCold(std::span<const std::int32_t> input, std::uint32_t rows,
+                 std::span<float> output, std::span<std::uint32_t> ends,
+                 std::size_t& passes, const CancellationCheck& cancel,
+                 const std::function<void()>& progress) override {
+    adapter().BeginDiagnostic(*slot_, input, rows, output, cancel);
+    models::qwen38_flash_next::CollectColdScorePasses(
+        input.size(), rows, ends, passes,
+        [&] {
+          const auto step =
+              adapter().DiagnosticPrefillStep(*slot_, input.size());
+          position_ = step.pass_end;
+          return step;
+        },
+        progress);
+  }
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
@@ -2799,6 +2821,17 @@ public:
                          : 0;
         },
         true);
+    if (model_->DiagnosticLogitsEnabled()) {
+      auto* diagnostic =
+          static_cast<models::qwen38_flash_next::ContinuationAdapter*>(
+              resources->adapter.get());
+      resources->diagnostic_ready = [diagnostic](const auto& slot) {
+        return diagnostic->DiagnosticReady(slot);
+      };
+      resources->diagnostic_reset = [diagnostic](auto& slot, TextRunnerState&) {
+        return diagnostic->DiagnosticReset(slot);
+      };
+    }
     auto& startup = *resources->startup_admission;
     startup.context = max_context_;
     startup.slot_bytes = [model = model_, mtp = use_mtp_](std::size_t context) {
@@ -3490,6 +3523,22 @@ struct InferenceBackend::Impl {
   std::shared_ptr<const State> state;
 #endif
 };
+
+bool ApproveColdScoreMemory(
+    const models::qwen38_flash_next::DiagnosticLogitCapacity& native,
+    std::size_t context, std::string* error) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto bytes = models::qwen38_flash_next::ColdScoreWorkspaceBytes(
+      native, context,
+      ColdScoreControlBytes() + ComponentTextCache::DiagnosticRequestBytes() +
+          sizeof(QwenFlashNextTextRunnerState));
+  if (bytes)
+    return DiagnosticMemoryClaim::Process().Activate(
+        *bytes, ObserveExecutionCapacity(), error);
+#endif
+  SetError(error, "cold score workspace is unsupported or overflows");
+  return false;
+}
 
 InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
 
