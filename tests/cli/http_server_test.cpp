@@ -1,5 +1,6 @@
 #include "src/cli/serve/http_server.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -3931,9 +3932,64 @@ void TestCheckpointTransferHttp() {
       "POST /v1/cache/import HTTP/1.1\r\nContent-Type: "
       "application/vnd.gufo.checkpoint\r\nContent-Length: " +
       std::to_string(wire.size()) + "\r\n";
-  ExpectStatus(server.Send(head + "\r\n" + wire), 200);
+  // The bulk-transfer client must tolerate short writes and transient socket
+  // failures. Inject those outcomes after progress, not with scheduler sleeps.
+  const auto transfer_send = [&](std::string_view pending) {
+    const auto fd = server.Connect();
+    struct SendResult {
+      std::intptr_t count;
+      bool retry;
+    };
+    int calls = 0, would_block = 0, interrupted = 0, short_writes = 0;
+    const auto send_piece = [&](std::string_view bytes) -> SendResult {
+      ++calls;
+      if (calls == 2 || calls == 6) {
+        ++would_block;
+        return {-1, true};
+      }
+      if (calls == 4) {
+        ++interrupted;
+        return {-1, true};
+      }
+      const auto count = net::SendNoSignal(
+          fd, bytes.data(), std::min(bytes.size(), std::size_t{64 * 1024}));
+      if (count > 0 && static_cast<std::size_t>(count) < bytes.size())
+        ++short_writes;
+      return {count, count < 0 && (net::IsSocketInterrupted() ||
+                                   net::IsSocketWouldBlockOrTimeout())};
+    };
+    // This deadline bounds broken peers; no expected transport latency is
+    // asserted. A socket timeout/interruption is not an EOF or a lost prefix.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!pending.empty()) {
+      assert(std::chrono::steady_clock::now() < deadline);
+      const auto result = send_piece(pending);
+      if (result.retry)
+        continue;
+      assert(result.count > 0);
+      pending.remove_prefix(static_cast<std::size_t>(result.count));
+    }
+    assert(would_block == 2 && interrupted == 1 && short_writes > 1);
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+      assert(std::chrono::steady_clock::now() < deadline);
+      const auto count = net::Receive(fd, buffer, sizeof(buffer));
+      if (count < 0 &&
+          (net::IsSocketInterrupted() || net::IsSocketWouldBlockOrTimeout()))
+        continue;
+      assert(count >= 0);
+      if (count == 0)
+        break;
+      response.append(buffer, static_cast<std::size_t>(count));
+    }
+    net::CloseSocket(fd);
+    return response;
+  };
+  ExpectStatus(transfer_send(head + "\r\n" + wire), 200);
   const auto continued =
-      server.Send(head + "Expect: 100-continue\r\n\r\n" + wire);
+      transfer_send(head + "Expect: 100-continue\r\n\r\n" + wire);
   ExpectStatus(continued, 100);
   assert(continued.find("HTTP/1.1 200 ") != std::string::npos);
   assert(server.backend->LastCall().chat.messages.empty());
@@ -3947,7 +4003,7 @@ void TestCheckpointTransferHttp() {
   ExpectStatus(server.Post("/v1/cache/import", ""), 415);
   auto corrupt = wire;
   corrupt.back() ^= 1;
-  ExpectStatus(server.Send(head + "\r\n" + corrupt), 400);
+  ExpectStatus(transfer_send(head + "\r\n" + corrupt), 400);
   ExpectStatus(server.Send(head + "\r\n" + wire.substr(0, 200), true), 400);
   // Auth rejection must not request/consume an upload or emit 100 Continue.
   RunningServer secured(
