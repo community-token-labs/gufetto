@@ -35,6 +35,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
+#include "src/cli/serve/rerank_api.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -1921,7 +1922,8 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
                        std::shared_ptr<ImageService> images,
-                       std::shared_ptr<EmbeddingService> embeddings)
+                       std::shared_ptr<EmbeddingService> embeddings,
+                       std::shared_ptr<RerankScorer> reranker)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1930,6 +1932,7 @@ HttpServer::HttpServer(std::string host, int port,
       asr_(std::move(asr)),
       images_(std::move(images)),
       embeddings_(std::move(embeddings)),
+      reranker_(std::move(reranker)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
@@ -1975,9 +1978,6 @@ void HttpServer::register_routes() {
   add("POST", "/v1/messages/count_tokens", AnthropicCountTokens);
 
   // ---- llama-server ----
-  add("POST", "/v1/rerank", NotImplemented);
-  add("POST", "/v1/reranking", NotImplemented);
-  add("POST", "/rerank", NotImplemented);
   add("POST", "/infill", NotImplemented);
   add("POST", "/completion", LlamaCompletion);
   add("POST", "/apply-template", HandleApplyTemplate);
@@ -2309,6 +2309,17 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       return DeviceLost();
     return response;
   }
+  // Every server answers the rerank routes, so a server without a reranker
+  // says so instead of reporting an unknown path.
+  if (IsRerankApiPath(req.path)) {
+    if (device_lost())
+      return DeviceLost();
+    auto response = HandleRerankApiRequest(req, reranker_.get());
+    // The request that finds the device lost runs the shutdown hook.
+    if (device_lost())
+      return DeviceLost();
+    return response;
+  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       if (req.method == "POST" && device_lost())
@@ -2322,7 +2333,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 
 bool HttpServer::device_lost() {
   const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
-                    (embeddings_ != nullptr && embeddings_->device_lost());
+                    (embeddings_ != nullptr && embeddings_->device_lost()) ||
+                    (reranker_ != nullptr && reranker_->device_lost());
   if (!lost)
     return false;
   if (options_.on_device_lost &&
