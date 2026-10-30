@@ -52,9 +52,15 @@ PYTHON_WITH_JINJA2 -I tools/gemma4/template_goldens.py --model $M/gemma-4-26B-A4
 
 ## Known limitations
 
-- Numbers are doubles (`gufo::json`). A tool-call integer beyond ±2^53 is
-  rejected by the parser rather than rounded; a template argument such as
-  `5.0` renders as `5`.
+- Numbers are doubles (`gufo::json`). The tool-call parser rejects a plain
+  integer literal beyond ±2^53 and any numeric literal outside the double
+  range instead of rounding them or keeping them as text. The guard covers
+  plain integer literals only: `9007199254740993.0` or `9007199254740993e0`
+  rounds like any other double. A template argument such as `5.0` renders
+  as `5`.
+- The tool-call parser rejects a key repeated within one object
+  (`call:f{a:1,a:2}`); it once kept the last value. This strictness is a
+  Gufo choice, not a verified match for another implementation.
 - The tool grammar does not adopt upstream #426's fix for array schemas
   without `items` (`6de3b729cb794f0a6060f4730698d9402038b09f`): in best effort
   such an array still opens the whole call's arguments.

@@ -152,6 +152,72 @@ void CheckPartial() {
   Require(Partial(body) == "edit" + full, "the full body settles");
 }
 
+/// Numbers gufo::json cannot hold are rejected, never kept as text: digits
+/// that overflow even a double were once accepted as a string.
+void CheckNumberOverflow() {
+  const std::string nines(400, '9');
+  for (const std::string& body :
+       {"call:f{x:" + nines + "}", "call:f{x:-" + nines + "}",
+        std::string("call:f{x:99999999999999999999}"),
+        std::string("call:f{o:{x:[1," + nines + "]}}")}) {
+    std::string error;
+    Require(!g4::ParseToolCall(body, &error) &&
+                error.find("exceeds 2^53") != std::string::npos,
+            "overflowing integer accepted: " + body.substr(0, 40));
+  }
+  for (const char* body : {"call:f{x:1e400}", "call:f{x:-1e400}"}) {
+    std::string error;
+    Require(!g4::ParseToolCall(body, &error) &&
+                error.find("out of range") != std::string::npos,
+            std::string("out-of-range number accepted: ") + body);
+  }
+  // Non-numeric bare text stays a string.
+  Require(ParseToJson("call:f{x:abc,y:12ab,z:-,w:1e}") ==
+              R"({"x":"abc","y":"12ab","z":"-","w":"1e"})",
+          "non-numeric bare values are strings");
+  // Documented: the 2^53 guard covers plain integer literals only.
+  Require(ParseToJson("call:f{x:9007199254740993.0,y:9007199254740993e0}") ==
+              R"({"x":9007199254740992,"y":9007199254740992})",
+          "fraction and exponent literals round like any double");
+}
+
+/// Every prefix of a call whose overflowing integer is still arriving
+/// settles only the members before it, never the integer as text.
+void CheckPartialNumberOverflow() {
+  const std::string body = "call:f{a:1,x:" + std::string(400, '9') + ",b:2}";
+  Require(!g4::ParseToolCall(body).has_value(), "complete parse rejects");
+  for (std::size_t size = 0; size <= body.size(); ++size) {
+    const auto call = g4::ParsePartialToolCall(body.substr(0, size));
+    if (!call) {
+      continue;
+    }
+    const std::string settled = call->arguments.dump();
+    Require(settled == "{}" || settled == R"({"a":1})",
+            "partial settled past the overflow at " + std::to_string(size) +
+                ": " + settled.substr(0, 40));
+    Require(!call->open_string.has_value(),
+            "no open string at " + std::to_string(size));
+  }
+}
+
+/// Duplicate detection stays correct on wide objects (a set per object).
+void CheckWideObject() {
+  std::string body = "call:f{";
+  for (int i = 0; i < 20000; ++i) {
+    body += (i == 0 ? "k" : ",k") + std::to_string(i) + ":1";
+  }
+  const auto call = g4::ParseToolCall(body + "}");
+  Require(call && call->arguments.members().size() == 20000,
+          "20000 distinct keys parse");
+  std::string error;
+  Require(!g4::ParseToolCall(body + ",k0:2}", &error) &&
+              error.find("duplicate key k0") != std::string::npos,
+          "a late duplicate in a wide object is rejected");
+  const auto partial = g4::ParsePartialToolCall(body + ",k0:2}");
+  Require(partial && partial->arguments.members().size() == 20000,
+          "the partial parse stops before the late duplicate");
+}
+
 bool Accepts(const JsonConstraint& grammar, std::string_view text) {
   auto state = grammar.Start();
   for (const unsigned char byte : text) {
@@ -318,6 +384,9 @@ int main() {
     CheckValues();
     CheckRejections();
     CheckPartial();
+    CheckNumberOverflow();
+    CheckPartialNumberOverflow();
+    CheckWideObject();
     CheckGrammar();
   });
 }

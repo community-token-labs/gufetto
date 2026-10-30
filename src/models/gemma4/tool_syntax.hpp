@@ -21,9 +21,13 @@ struct ToolCall {
 /// `{…}` objects with bare or `<|"|>`-quoted keys, and `[…]` arrays. A bare
 /// value that is not a JSON literal is kept as a string.
 ///
-/// Rejected: a key repeated within one object, and an integer literal beyond
-/// ±2^53, which gufo::json (doubles) cannot hold exactly. The name is not
-/// checked against the declared tools; callers must do that.
+/// Rejected: a key repeated within one object; a plain integer literal
+/// (optional '-' and digits) beyond ±2^53, which gufo::json (doubles) cannot
+/// hold exactly; and a numeric literal outside the double range. The 2^53
+/// guard covers plain integer literals only: an integer-valued literal with
+/// a fraction or exponent (9007199254740993.0, 9007199254740993e0) rounds
+/// like any other double. The name is not checked against the declared
+/// tools; callers must do that.
 [[nodiscard]] std::optional<ToolCall> ParseToolCall(
     std::string_view body, std::string* error_msg = nullptr);
 

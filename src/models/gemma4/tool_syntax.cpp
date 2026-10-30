@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace gufo::models::gemma4 {
@@ -78,7 +80,9 @@ struct Parser {
   }
 
   /// A bare scalar ends at the next structural delimiter. False when it is
-  /// an integer that a double cannot hold exactly.
+  /// a number gufo::json cannot hold: an integer literal beyond 2^53 (checked
+  /// on the digits, before any conversion, so overflow is caught too) or a
+  /// numeric literal outside the double range. Other text is a string.
   bool Bare(json::Value* out) {
     const std::size_t start = pos;
     while (pos < text.size() && text[pos] != ',' && text[pos] != '}' &&
@@ -98,30 +102,34 @@ struct Parser {
       *out = json::Value(nullptr);
       return true;
     }
-    double number = 0.0;
-    const auto [end, ec] =
-        std::from_chars(raw.data(), raw.data() + raw.size(), number);
-    if (ec == std::errc{} && end == raw.data() + raw.size() && !raw.empty() &&
-        std::isfinite(number)) {
-      // gufo::json keeps numbers as doubles, exact for integers up to 2^53;
-      // the literal is compared exactly, since the double has rounded.
-      const std::string_view digits =
-          raw.starts_with('-') ? raw.substr(1) : raw;
+    const char* first = raw.data();
+    const char* last = raw.data() + raw.size();
+    const std::string_view digits = raw.starts_with('-') ? raw.substr(1) : raw;
+    if (!digits.empty() &&
+        digits.find_first_not_of("0123456789") == std::string_view::npos) {
+      // A plain integer literal: exact up to 2^53, rejected beyond it.
       std::int64_t integer = 0;
-      const bool is_integer =
-          !digits.empty() &&
-          digits.find_first_not_of("0123456789") == std::string_view::npos;
-      const auto exact =
-          std::from_chars(raw.data(), raw.data() + raw.size(), integer);
-      if (is_integer &&
-          (exact.ec != std::errc{} || integer > kMaxExactInteger ||
-           integer < -kMaxExactInteger)) {
+      const auto [end, ec] = std::from_chars(first, last, integer);
+      if (ec != std::errc{} || end != last || integer > kMaxExactInteger ||
+          integer < -kMaxExactInteger) {
         pos = start;
         return Fail("integer " + std::string(raw) +
                     " exceeds 2^53 and cannot be held exactly");
       }
-      *out = json::Value(number);
+      *out = json::Value(static_cast<double>(integer));
       return true;
+    }
+    double number = 0.0;
+    const auto [end, ec] = std::from_chars(first, last, number);
+    if (end == last && !raw.empty()) {
+      if (ec == std::errc{} && std::isfinite(number)) {
+        *out = json::Value(number);
+        return true;
+      }
+      if (ec == std::errc::result_out_of_range) {
+        pos = start;
+        return Fail("number " + std::string(raw) + " is out of range");
+      }
     }
     *out = json::Value(std::string(raw));
     return true;
@@ -180,6 +188,8 @@ struct Parser {
     if (Consume("}")) {
       return true;
     }
+    // Keys seen in this object: a set keeps wide objects linear.
+    std::unordered_set<std::string> seen;
     while (true) {
       std::string key;
       if (!Key(&key)) {
@@ -189,7 +199,7 @@ struct Parser {
       if (!Consume(":")) {
         return Fail("expected ':'");
       }
-      if (out->find(key) != nullptr) {
+      if (!seen.insert(key).second) {
         return Fail("duplicate key " + key);
       }
       json::Value value;
@@ -254,6 +264,7 @@ std::optional<PartialToolCall> ParsePartialToolCall(std::string_view body) {
   PartialToolCall call{.name = std::string(body.substr(p.pos, brace - p.pos)),
                        .arguments = json::Value::object()};
   p.pos = brace + 1;
+  std::unordered_set<std::string> seen;
   while (true) {
     p.SkipSpace();
     std::string key;
@@ -261,7 +272,7 @@ std::optional<PartialToolCall> ParsePartialToolCall(std::string_view body) {
       return call;
     }
     p.SkipSpace();
-    if (!p.Consume(":") || call.arguments.find(key) != nullptr) {
+    if (!p.Consume(":") || seen.contains(key)) {
       return call;
     }
     p.SkipSpace();
@@ -288,7 +299,8 @@ std::optional<PartialToolCall> ParsePartialToolCall(std::string_view body) {
     if (p.pos >= body.size() || (body[p.pos] != ',' && body[p.pos] != '}')) {
       return call;
     }
-    call.arguments[key] = std::move(value);
+    seen.insert(key);
+    call.arguments.append_member(std::move(key), std::move(value));
     if (!p.Consume(",")) {
       return call;
     }
