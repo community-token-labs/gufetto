@@ -41,6 +41,14 @@ def observations(document):
 
 
 def render(raw: bytes, metadata: dict) -> str:
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    for key in ("quality", "stack"):
+        if not isinstance(metadata.get(key, {}), dict):
+            raise ValueError(f"metadata {key} must be an object (not null)")
+    artifacts = metadata.get("artifacts", [])
+    if not isinstance(artifacts, list) or any(not isinstance(a, dict) for a in artifacts):
+        raise ValueError("metadata artifacts must be an array of objects")
     quality = metadata.get("quality", {})
     status = quality.get("status", "INCONCLUSIVE")
     if status not in STATUSES:
@@ -129,10 +137,11 @@ def render(raw: bytes, metadata: dict) -> str:
               ("runtime", "hip", "rocr", "compiler", "commit", "build_flags", "hardware")]
     lines += ["", "## Settings", "", cell(metadata.get("settings")), "",
               "## Per-request phases (milliseconds; never averaged)", "",
-              "| Group / repetition / request | Queue | Prefill | Decode | Server TTFT | Wall |",
+              "| Group / repetition / request / case / ordinal | Queue | Prefill | Decode | Server TTFT | Wall |",
               "| --- | ---: | ---: | ---: | ---: | ---: |"]
-    for group, sample in samples:
-        identity = f"{group} / {sample['repetition']} / {sample['request_index']}"
+    for ordinal, (group, sample) in enumerate(samples):
+        identity = (f"{group} / {sample['repetition']} / {sample['request_index']} / "
+                    f"{sample.get('case_id') or 'none'} / {ordinal}")
         lines.append("| " + " | ".join([cell(identity)] + [cell(sample.get(p)) for p in PHASES]) + " |")
     if not samples:
         lines.append("| NOT RECORDED | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN |")
@@ -141,9 +150,9 @@ def render(raw: bytes, metadata: dict) -> str:
         for key in ("source", "workload", "model", "mode", "table", "warnings", "notes"):
             if key in document:
                 lines.append(f"- {key}: {cell(document[key])}")
-    for group, sample in samples:
+    for ordinal, (group, sample) in enumerate(samples):
         counters = {k: v for k, v in sample.items() if k not in PHASES}
-        lines.append(f"- {cell(group)}: {cell(counters)}")
+        lines.append(f"- {cell(group)} / {cell(sample.get('case_id'))} / {ordinal}: {cell(counters)}")
     if aggregate:
         lines += ["", "## Aggregate-only source (NOT per-request evidence)", "",
                   "Rates below cannot reconstruct request phase durations. Card remains INCONCLUSIVE.", ""]

@@ -4,6 +4,8 @@ import copy
 import json
 from pathlib import Path
 import sys
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,9 +25,34 @@ class CardTest(unittest.TestCase):
 
     def test_individual_phases(self):
         card = render(self.raw, self.meta)
-        self.assertIn("| 1 / 0 / 0 | 1 | 20 | 10 | 21 | 34 |", card)
-        self.assertIn("| 1 / 1 / 0 | 2 | 0 | 14 | 3 | 18 |", card)
+        self.assertIn("| 1 / 0 / 0 / none / 0 | 1 | 20 | 10 | 21 | 34 |", card)
+        self.assertIn("| 1 / 1 / 0 / none / 1 | 2 | 0 | 14 | 3 | 18 |", card)
         self.assertIn("Card status: **PASS**", card)
+
+    def test_corpus_case_identity(self):
+        data = json.loads(self.raw)
+        samples = data["results"]["1"]["samples"]
+        for case, sample in zip(("edit", "bugfix"), samples):
+            sample["repetition"] = 0
+            sample["case_id"] = case
+        card = render(json.dumps(data).encode(), self.meta)
+        self.assertIn("1 / 0 / 0 / edit / 0", card)
+        self.assertIn("1 / 0 / 0 / bugfix / 1", card)
+
+    def test_invalid_metadata_cli_is_clean(self):
+        for key, value in (("quality", None), ("stack", None), ("artifacts", [None])):
+            meta = copy.deepcopy(self.meta)
+            meta[key] = value
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "metadata.json"
+                path.write_text(json.dumps(meta))
+                result = subprocess.run([
+                    sys.executable, "-B", str(ROOT / "tools/bench/benchmark-card.py"),
+                    str(ROOT / "tests/fixtures/benchmark-card-serving.json"),
+                    "--metadata", str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("benchmark-card: metadata", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_unknown_stack_not_guessed(self):
         meta = copy.deepcopy(self.meta)
