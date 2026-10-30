@@ -159,8 +159,40 @@ void TestCorsOrigins() {
            {"https://webui.lan:0443", "https://webui.lan"},
            {"https://webui.lan:80", "https://webui.lan:80"},
            {"http://webui.lan:03000", "http://webui.lan:3000"},
-           {"http://192.168.1.20:65535", "http://192.168.1.20:65535"}})
+           {"http://192.168.1.20:65535", "http://192.168.1.20:65535"},
+           // IPv6 as the WHATWG URL serializer writes it: hex pieces only,
+           // the first longest zero run compressed, single zeros kept.
+           {"http://[::ffff:192.0.2.1]", "http://[::ffff:c000:201]"},
+           {"http://[::FFFF:C000:0201]:8080", "http://[::ffff:c000:201]:8080"},
+           {"http://[::1.2.3.4]", "http://[::102:304]"},
+           {"http://[2001:db8:0:0:1:0:0:1]", "http://[2001:db8::1:0:0:1]"},
+           {"http://[2001:db8:0:1:1:1:1:1]", "http://[2001:db8:0:1:1:1:1:1]"},
+           {"http://[1:0:0:2:0:0:0:3]", "http://[1:0:0:2::3]"},
+           {"http://[::]", "http://[::]"},
+           {"http://0.0.0.0", "http://0.0.0.0"}})
     assert(gufo::server::ParseCorsOrigin(configured, &error) == expected);
+  // Numeric hosts a browser would rewrite are refused, naming its spelling.
+  for (const auto& [configured, canonical] :
+       std::vector<std::pair<std::string_view, std::string_view>>{
+           {"http://127.1", "http://127.0.0.1"},
+           {"http://0177.0.0.1", "http://127.0.0.1"},
+           {"http://0x7f000001:8080", "http://127.0.0.1"},
+           {"https://0x7F.0.0.1", "https://127.0.0.1"},
+           {"http://2130706433", "http://127.0.0.1"},
+           {"http://192.168.010.1", "http://192.168.8.1"}}) {
+    error.clear();
+    assert(!gufo::server::ParseCorsOrigin(configured, &error).has_value());
+    assert(error.find("as browsers send it: '" + std::string(canonical) +
+                      "'") != std::string::npos);
+  }
+  // Numeric hosts browsers reject are invalid too.
+  for (const std::string_view bad :
+       {"http://256.0.0.1", "http://1.2.3.4.5", "http://4294967296",
+        "http://08.0.0.1", "http://example.123", "http://a.0x"}) {
+    error.clear();
+    assert(!gufo::server::ParseCorsOrigin(bad, &error).has_value());
+    assert(error.find("as the browser sends it") != std::string::npos);
+  }
   for (const std::string_view bad : {"",
                                      "*",
                                      "webui.lan",

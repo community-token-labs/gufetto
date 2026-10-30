@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -1949,12 +1950,112 @@ void LoadingResponder::serve() {
   }
 }
 
+namespace {
+
+// WHATWG URL serialization of an IPv6 host: lowercase hex pieces without
+// leading zeros, the first longest run of two or more zero pieces as "::",
+// and never a dotted IPv4 tail (so `::ffff:192.0.2.1` is `::ffff:c000:201`).
+std::string SerializeIpv6(const in6_addr& address) {
+  std::array<unsigned, 8> pieces{};
+  for (std::size_t i = 0; i < pieces.size(); ++i)
+    pieces[i] =
+        (unsigned{address.s6_addr[2 * i]} << 8) | address.s6_addr[2 * i + 1];
+  std::size_t best = pieces.size(), best_length = 1;
+  for (std::size_t i = 0; i < pieces.size();) {
+    std::size_t end = i;
+    while (end < pieces.size() && pieces[end] == 0)
+      ++end;
+    if (end - i > best_length) {
+      best = i;
+      best_length = end - i;
+    }
+    i = end == i ? i + 1 : end;
+  }
+  std::string out;
+  for (std::size_t i = 0; i < pieces.size(); ++i) {
+    if (i == best) {
+      out += i == 0 ? "::" : ":";
+      i += best_length - 1;
+      continue;
+    }
+    char piece[8];
+    (void)std::snprintf(piece, sizeof(piece), "%x", pieces[i]);
+    out += piece;
+    if (i + 1 < pieces.size())
+      out += ':';
+  }
+  return out;
+}
+
+// The WHATWG URL IPv4 parser: a host whose last label is a number is an IPv4
+// address in decimal, octal (leading 0) or hex (0x) parts, which browsers
+// serialize as dotted decimal. Returns nullopt for other hosts, and an empty
+// string for a numeric host browsers reject.
+std::optional<std::string> WhatwgIpv4(std::string_view host) {
+  const auto number =
+      [](std::string_view part) -> std::optional<std::uint64_t> {
+    int base = 10;
+    if (part.starts_with("0x")) {
+      base = 16;
+      part.remove_prefix(2);
+      if (part.empty())
+        return 0;
+    } else if (part.size() > 1 && part.starts_with('0')) {
+      base = 8;
+      part.remove_prefix(1);
+    }
+    if (part.empty() || part.size() > 16)
+      return std::nullopt;
+    std::uint64_t value = 0;
+    const auto [end, failure] =
+        std::from_chars(part.data(), part.data() + part.size(), value, base);
+    if (failure != std::errc{} || end != part.data() + part.size())
+      return std::nullopt;
+    return value;
+  };
+  const auto last = host.substr(host.rfind('.') + 1);
+  const bool ends_in_number =
+      !last.empty() &&
+      (std::ranges::all_of(last, [](char c) { return c >= '0' && c <= '9'; }) ||
+       number(last).has_value());
+  if (!ends_in_number)
+    return std::nullopt;
+  std::vector<std::uint64_t> parts;
+  for (std::size_t start = 0;;) {
+    const auto dot = host.find('.', start);
+    const auto value = number(host.substr(start, dot - start));
+    if (!value || parts.size() == 4)
+      return std::string();
+    parts.push_back(*value);
+    if (dot == std::string_view::npos)
+      break;
+    start = dot + 1;
+  }
+  std::uint64_t address = 0;
+  for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+    if (parts[i] > 255)
+      return std::string();
+    address = (address << 8) | parts[i];
+  }
+  const unsigned tail_bits = 8 * (5 - static_cast<unsigned>(parts.size()));
+  if (parts.back() >= (std::uint64_t{1} << tail_bits))
+    return std::string();
+  address = (address << tail_bits) | parts.back();
+  return std::to_string(address >> 24) + "." +
+         std::to_string((address >> 16) & 255) + "." +
+         std::to_string((address >> 8) & 255) + "." +
+         std::to_string(address & 255);
+}
+
+}  // namespace
+
 std::optional<std::string> ParseCorsOrigin(std::string_view origin,
                                            std::string* error) {
   const auto invalid = [&] {
     *error =
         "CORS origin must be http://HOST[:PORT] or https://HOST[:PORT] with "
-        "a port of 1-65535 and no path, query or credentials: '" +
+        "a port of 1-65535 and no path, query or credentials, as the browser "
+        "sends it (international names in punycode, no trailing dot): '" +
         std::string(origin) + "'";
     return std::nullopt;
   };
@@ -1974,11 +2075,9 @@ std::optional<std::string> ParseCorsOrigin(std::string_view origin,
       return invalid();
     const std::string literal(rest.substr(1, close - 1));
     in6_addr address{};
-    char text[INET6_ADDRSTRLEN]{};
-    if (::inet_pton(AF_INET6, literal.c_str(), &address) != 1 ||
-        ::inet_ntop(AF_INET6, &address, text, sizeof(text)) == nullptr)
+    if (::inet_pton(AF_INET6, literal.c_str(), &address) != 1)
       return invalid();
-    host = "[" + std::string(text) + "]";
+    host = "[" + SerializeIpv6(address) + "]";
     rest.remove_prefix(close + 1);
   } else {
     const auto colon = rest.find(':');
@@ -2000,6 +2099,18 @@ std::optional<std::string> ParseCorsOrigin(std::string_view origin,
     if (name.empty() || label_start)
       return invalid();
     host = std::string(name);
+    // Browsers rewrite numeric hosts, so `127.1` would never match their
+    // `127.0.0.1`. Ask for the spelling they send rather than guess.
+    if (const auto ipv4 = WhatwgIpv4(name)) {
+      if (ipv4->empty())
+        return invalid();
+      if (*ipv4 != name) {
+        *error = "CORS origin '" + std::string(origin) +
+                 "' must spell its IPv4 address as browsers send it: '" +
+                 scheme + "://" + *ipv4 + "'";
+        return std::nullopt;
+      }
+    }
     rest.remove_prefix(name.size());
   }
   std::string port;

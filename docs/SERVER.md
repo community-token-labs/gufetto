@@ -1461,8 +1461,15 @@ gufo serve --host 192.168.1.20 --api-key-file ~/.config/gufo/key \
   llm --model "$MODEL"
 ```
 
-An origin is `http://HOST[:PORT]` or `https://HOST[:PORT]` as the browser
-sends it: no path, trailing slash or wildcard; matching ignores case. With an
+An origin is `http://HOST[:PORT]` or `https://HOST[:PORT]`, and the
+allowlist matches the `Origin` header exactly as the browser serializes it: no
+path, trailing slash, wildcard or trailing dot on the host, and international
+domain names in punycode (`xn--...`). Matching ignores case. Startup applies
+the browser's own rewrites: it drops the scheme's default port and leading
+zeros from a port, writes IPv6 the way browsers do (`[::ffff:192.0.2.1]`
+becomes `[::ffff:c000:201]`), and refuses an IPv4 address in a spelling
+browsers would rewrite, such as `127.1`, `0177.0.0.1` or `0x7f000001`, with a
+message naming the dotted-decimal form to list instead. With an
 allowlist, responses carry `Vary: Origin`; a listed origin is echoed in
 `Access-Control-Allow-Origin` for preflights and replies, and a request whose
 `Origin` is not listed (including `null` or a repeated `Origin`) is refused
