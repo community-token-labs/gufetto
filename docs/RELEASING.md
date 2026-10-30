@@ -41,6 +41,7 @@ feat(server)!: remove the legacy completion endpoint
 Breaking changes must include `!` before the colon. Do not rely only on a pull
 request body footer: the title is the canonical release signal retained by a
 single-line squash merge.
+This includes [renames or removals of downstream-consumed response fields and metric names](SERVER.md#stability-for-downstream-consumers).
 
 ## Version policy
 

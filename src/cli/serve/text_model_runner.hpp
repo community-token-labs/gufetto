@@ -122,8 +122,8 @@ struct TextRunnerDiskCacheOptions {
 /// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
 /// RAM always left to the OS and other processes by an explicit cache limit.
-inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
-                                                            << 30;
+inline constexpr std::uint64_t kHostSnapshotHeadroomBytes =
+    core::kHostExecutionReserveBytes;
 /// Most an explicit --cache-ram-bytes may claim: available host RAM minus
 /// kHostSnapshotHeadroomBytes.
 [[nodiscard]] std::size_t HostSnapshotCeilingBytes();

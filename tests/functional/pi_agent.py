@@ -73,7 +73,7 @@ def save(path, value):
 class Recorder(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, upstream, output, *, request_timeout=180):
+    def __init__(self, upstream, output, *, request_timeout=180, api_key=None):
         super().__init__(("127.0.0.1", 0), Proxy)
         self.upstream = urllib.parse.urlsplit(upstream)
         self.output = output
@@ -81,6 +81,15 @@ class Recorder(http.server.ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.case = "startup"
         self.request_timeout = request_timeout
+        self.upstream_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def model_metadata(model, thinking, context_window, max_output_tokens, sampling):
+    if context_window <= 0 or max_output_tokens <= 0 or max_output_tokens >= context_window:
+        raise ValueError("require 0 < max-output-tokens < context-window")
+    return {"id": model, "reasoning": thinking != "off",
+            "input": ["text", "image"], "contextWindow": context_window,
+            "maxTokens": max_output_tokens, "samplingParams": sampling}
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
@@ -94,7 +103,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection(
             self.server.upstream.hostname, self.server.upstream.port, timeout=30)
         try:
-            conn.request("GET", self.path)
+            conn.request("GET", self.path, headers=self.server.upstream_headers)
             response = conn.getresponse()
             body = response.read()
             self.send_response(response.status)
@@ -121,7 +130,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         )
         start = time.monotonic()
         try:
-            conn.request("POST", self.path, body, {"Content-Type": "application/json"})
+            conn.request("POST", self.path, body,
+                         {"Content-Type": "application/json", **server.upstream_headers})
             response = conn.getresponse()
             row["status"] = response.status
             row["request_id"] = response.getheader("X-Request-ID")
@@ -394,6 +404,9 @@ def main():
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--pi", type=Path, required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--context-window", type=int, default=262144,
+                        help="Actual loaded context, not a client/cloud-model default")
+    parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--server-log", type=Path, required=True, help="Gufo informational log for request timing correlation")
     parser.add_argument("--passes", type=int, default=5)
@@ -406,6 +419,11 @@ def main():
     parser.add_argument("--api", default="openai-completions", choices=["openai-completions", "openai-responses"])
     parser.add_argument("--sampling", type=json.loads, default={}, help="Optional request overrides as JSON; otherwise server defaults")
     args = parser.parse_args()
+    try:
+        model = model_metadata(args.model, args.thinking, args.context_window,
+                               args.max_output_tokens, args.sampling)
+    except ValueError as error:
+        parser.error(str(error))
     upstream = urllib.parse.urlsplit(args.base_url)
     assert upstream.scheme == "http" and upstream.hostname in {"127.0.0.1", "localhost", "::1"}, "Loopback Gufo only"
     assert not args.output.exists(), "Use a fresh output directory; preserve previous evidence"
@@ -420,7 +438,7 @@ def main():
     }
     wire = args.output / "wire"
     wire.mkdir()
-    recorder = Recorder(args.base_url, wire)
+    recorder = Recorder(args.base_url, wire, api_key=os.environ.get("GUFO_API_KEY"))
     thread = threading.Thread(target=recorder.serve_forever, daemon=True)
     thread.start()
     config = args.output / "pi-config"
@@ -428,9 +446,7 @@ def main():
     save(config / "models.json", {"providers": {"gufo-regression": {
         "baseUrl": f"http://127.0.0.1:{recorder.server_port}/v1", "api": args.api,
         "apiKey": "local-functional-test", "compat": {"supportsStrictMode": False},
-        "models": [{"id": args.model, "reasoning": args.thinking != "off",
-                    "input": ["text", "image"], "contextWindow": 262144,
-                    "maxTokens": 8192, "samplingParams": args.sampling}],
+        "models": [model],
     }}})
     save(config / "settings.json", {"packages": [], "quietStartup": True})
     env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "SHELL", "SSL_CERT_FILE"}}

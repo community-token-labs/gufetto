@@ -16,7 +16,7 @@ set(gufo_pr_targets
   cache_model_capabilities_test
   arg_parser_test json_test json_constraint_test gguf_reader_test gguf_identity_test
   expert_stream_test
-  heap_placement_test startup_admission_test diagnostic_memory_test
+  heap_placement_test startup_admission_test diagnostic_memory_test model_plan_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test
   logit_sampler_test ggml_dequant_test
@@ -77,10 +77,10 @@ list(APPEND gufo_pr_tests
   pinned_prefix_harness_test cache_lookup_harness_test
   cache_lookup_classify_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
-  gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
+  gufo_version gufo_help model_plan_cli_test serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test
-  kernel_resources_parser_test check_docs_test check_pr_title_test
+  kernel_resources_parser_test check_docs_test check_pr_title_test benchmark_card_test
   scoring_metrics_test scoring_contract_test matched_kl_test
   vision_images_test vision_reference_test vision_compare_test vision_downstream_test
   vision_encoder_reference_test vision_encoder_capture_test)

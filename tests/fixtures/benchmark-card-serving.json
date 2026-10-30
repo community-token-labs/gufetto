@@ -1,0 +1,53 @@
+{
+  "schemaVersion": "1.0.0",
+  "artifactType": "servingBenchmark",
+  "benchmarkSchema": "gufo.serving-benchmark.v1",
+  "source": {
+    "revision": "fixture-only",
+    "dirty": false,
+    "buildMode": "fixture"
+  },
+  "model": {
+    "id": "synthetic"
+  },
+  "workload": {
+    "endpointProfile": "gufo",
+    "maxOutputTokens": 2,
+    "cachePrompt": true
+  },
+  "results": {
+    "1": {
+      "samples": [
+        {
+          "concurrency": 1,
+          "repetition": 0,
+          "request_index": 0,
+          "prompt_tokens": 12,
+          "cached_prompt_tokens": 2,
+          "completion_tokens": 2,
+          "prefill_tokens": 10,
+          "queue_ms": 1,
+          "prefill_ms": 20,
+          "decode_ms": 10,
+          "server_ttft_ms": 21,
+          "wall_ms": 34
+        },
+        {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 12,
+          "cached_prompt_tokens": 12,
+          "completion_tokens": 2,
+          "prefill_tokens": 0,
+          "queue_ms": 2,
+          "prefill_ms": 0,
+          "decode_ms": 14,
+          "server_ttft_ms": 3,
+          "wall_ms": 18
+        }
+      ]
+    }
+  },
+  "warnings": []
+}
