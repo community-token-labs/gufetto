@@ -23,6 +23,7 @@
 #include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/platform/net.hpp"
 
@@ -249,7 +250,28 @@ public:
       result.finish_reason = FinishReason::kStopSequence;
       result.stop_sequence = forced_stop_sequence;
     }
-    if (token && failure != 8) {
+    if (!pieces.empty()) {
+      // Accepted pieces pass the scheduler's stop filter before publication.
+      gufo::server::StopSequenceFilter filter(stop_sequences);
+      result.text.clear();
+      const auto publish = [&](std::string piece) {
+        result.text += piece;
+        if (token && !piece.empty())
+          (void)token(piece);
+      };
+      for (const auto& piece : pieces) {
+        publish(filter.enabled() ? filter.Push(piece) : piece);
+        if (filter.stopped())
+          break;
+      }
+      if (filter.stopped()) {
+        result.finish_reason = FinishReason::kStopSequence;
+        result.stop_sequence = filter.matched_sequence();
+      } else {
+        publish(filter.Finish());
+      }
+      result.tokens.assign(result.text.begin(), result.text.end());
+    } else if (token && failure != 8) {
       std::this_thread::sleep_for(token_delay);
       (void)token(result.text);
     }
@@ -300,6 +322,9 @@ public:
   std::atomic<int> failure{0};
   std::atomic<bool> lost{false};
   std::string forced_stop_sequence;
+  /// When set, replaces the fixed output with these pieces and applies the
+  /// request's stop sequences to them.
+  std::vector<std::string> pieces;
   gufo::ReasoningOptions reasoning;
   std::optional<InitialOutputState> initial_output_state_override;
   bool wait_for_disconnect{false};
