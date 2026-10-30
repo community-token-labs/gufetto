@@ -2876,6 +2876,102 @@ void TestPeerDisconnect() {
   assert(server.backend->disconnected);
 }
 
+// Real stop sequences through the Chat and Messages routes: the backend
+// filters split pieces, and each route reports the exact text and reason.
+void TestRouteStopSequencesAcrossSplits() {
+  RunningServer server;
+  struct Case {
+    std::vector<std::string> stops;
+    std::string raw, text, matched;
+  };
+  // Literal spellings: these are request stop strings, not EOS token IDs.
+  const std::vector<Case> cases = {
+      {{"<|im_end|>"},
+       "Nerazim | > im <|im_end|>tail",
+       "Nerazim | > im ",
+       "<|im_end|>"},
+      {{"END", "┌終"}, "hi┌終later END", "hi", "┌終"},
+      {{"<|im_end|>"}, "held <|im_end", "held <|im_end", ""},
+  };
+  const auto events = [](const std::string& wire) {
+    std::vector<gufo::json::Value> out;
+    for (auto data = wire.find("data: "); data != std::string::npos;
+         data = wire.find("data: ", data + 6)) {
+      const auto payload = std::string_view(wire).substr(
+          data + 6, wire.find("\n\n", data) - data - 6);
+      if (payload != "[DONE]")
+        out.push_back(gufo::json::parse(payload));
+    }
+    return out;
+  };
+  for (const auto& test : cases) {
+    std::vector<std::vector<std::string>> splits;
+    for (std::size_t split = 0; split <= test.raw.size(); ++split)
+      splits.push_back({test.raw.substr(0, split), test.raw.substr(split)});
+    splits.emplace_back();
+    for (const char byte : test.raw)
+      splits.back().emplace_back(1, byte);
+    for (const auto& pieces : splits)
+      for (const bool messages : {false, true})
+        for (const bool stream : {false, true}) {
+          server.backend->pieces = pieces;
+          auto body = gufo::json::parse(
+              R"({"model":"test","max_tokens":64,"messages":[{"role":"user","content":"hi"}]})");
+          body["stream"] = stream;
+          auto& stops = body[messages ? "stop_sequences" : "stop"];
+          stops = gufo::json::Value::array();
+          for (const auto& stop : test.stops)
+            stops.push_back(stop);
+          const auto response = server.Post(
+              messages ? "/v1/messages" : "/v1/chat/completions", body.dump());
+          ExpectStatus(response, 200);
+          assert(server.backend->LastCall().stop_sequences == test.stops);
+          std::string text, finish;
+          const gufo::json::Value* sequence = nullptr;
+          std::vector<gufo::json::Value> parsed;
+          if (stream)
+            parsed = events(response);
+          else
+            parsed.push_back(gufo::json::parse(
+                response.substr(response.find("\r\n\r\n") + 4)));
+          for (const auto& event : parsed) {
+            if (!messages) {
+              for (const auto& choice : event.find("choices")->items()) {
+                text += choice.find(stream ? "delta" : "message")
+                            ->member_str("content");
+                if (!choice.member_str("finish_reason").empty()) {
+                  assert(finish.empty());
+                  finish = choice.member_str("finish_reason");
+                }
+              }
+            } else if (!stream) {
+              for (const auto& block : event.find("content")->items())
+                text += block.member_str("text");
+              finish = event.member_str("stop_reason");
+              sequence = event.find("stop_sequence");
+            } else if (const auto* delta = event.find("delta")) {
+              if (delta->member_str("type") == "text_delta")
+                text += delta->member_str("text");
+              if (event.member_str("type") == "message_delta") {
+                assert(finish.empty());
+                finish = delta->member_str("stop_reason");
+                sequence = delta->find("stop_sequence");
+              }
+            }
+          }
+          assert(text == test.text);
+          if (!messages)
+            assert(finish == "stop");
+          else if (test.matched.empty())
+            assert(finish == "end_turn" && sequence && sequence->is_null());
+          else
+            assert(finish == "stop_sequence" && sequence &&
+                   sequence->get_str() == test.matched);
+        }
+  }
+  server.backend->pieces.clear();
+}
+
 void TestCompatibilityStopSequences() {
   RunningServer server;
   server.backend->forced_stop_sequence = "END";
@@ -3739,6 +3835,7 @@ int main(int argc, char** argv) {
   TestRawCompletionCachePersist();
   TestCachePersistEcho();
   TestCompatibilityStopSequences();
+  TestRouteStopSequencesAcrossSplits();
   TestCompatibilityThinkingDefaults();
   TestResponseSamplingDefaults();
   TestCompatibilityUtf8();
