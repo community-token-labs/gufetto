@@ -3988,7 +3988,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     AssignError(error_msg, "token batch is empty or exceeds the batch limit");
     return false;
   }
-  if (n_logits > n || n_logits > options_.max_logit_rows) {
+  if (n_logits > n ||
+      n_logits > (diagnostic_cancelled ? options_.max_logit_rows
+                                       : options_.max_speculative)) {
     AssignError(error_msg, "requested logit rows exceed the batch or limit");
     return false;
   }
@@ -5543,7 +5545,7 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                                     std::span<const std::int32_t> drafts,
                                     std::string* error_msg) const {
   const auto rows = predictions.size();
-  if (rows == 0 || rows > options_.max_logit_rows || rows > 7 ||
+  if (rows == 0 || rows > options_.max_speculative || rows > 7 ||
       drafts.size() != rows || s_.mtp_ids == nullptr) {
     AssignError(error_msg, "invalid greedy MTP verification request");
     return false;

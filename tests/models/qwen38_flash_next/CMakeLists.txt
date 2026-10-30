@@ -14,6 +14,9 @@ endfunction()
 
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(cold_score gufo_qwen38_flash_next "cpu")
+add_test(NAME qwen38_flash_next.cold_score_gpu_contract
+  COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_gpu_contract_test.py")
+set_tests_properties(qwen38_flash_next.cold_score_gpu_contract PROPERTIES LABELS "qwen38_flash_next;cpu" TIMEOUT 30)
 set(cold_lifetime_body "${CMAKE_CURRENT_BINARY_DIR}/cold_score_lifetime_body.inc")
 add_custom_command(OUTPUT "${cold_lifetime_body}"
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_lifetime_test.py"
@@ -78,6 +81,25 @@ target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
+  # Includes the real private serving factory; no parallel provider/forward.
+  add_executable(qwen38_flash_next_cold_score_gpu_test EXCLUDE_FROM_ALL
+    cold_score_gpu_test.cpp device_headroom_fault.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/cold_score.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp)
+  target_link_libraries(qwen38_flash_next_cold_score_gpu_test PRIVATE gufo_logging
+    gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip
+    gufo_checkpoint_transfer hip::host ${CMAKE_DL_LIBS})
+  foreach(mode IN ITEMS off capture refusal)
+    add_test(NAME qwen38_flash_next.cold_score_gpu_${mode}
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_gpu_test.py"
+        --binary $<TARGET_FILE:qwen38_flash_next_cold_score_gpu_test> --mode ${mode})
+    set_tests_properties(qwen38_flash_next.cold_score_gpu_${mode} PROPERTIES
+      LABELS "qwen38_flash_next;hip;gpu;gfx1151;full_logits" TIMEOUT 900 SKIP_RETURN_CODE 77)
+  endforeach()
   add_qwen38_flash_next_test(kv_rotation_ops gufo_qwen38_flash_next "hip;gpu;gfx1151")
   target_sources(qwen38_flash_next_kv_rotation_ops_test PRIVATE
     kv_rotation_producer_native.cpp)

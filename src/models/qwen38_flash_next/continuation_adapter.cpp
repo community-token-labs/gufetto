@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -231,8 +230,8 @@ public:
     bool previous;
   };
   bool restoring{false}, guarding{false}, invalidating{false};
-  bool diagnostic_resetting{false}, diagnostic_rejected{false};
-  bool diagnostic_cancelled{false}, diagnostic_cancelled_complete{false};
+  bool diagnostic_resetting{false};
+  bool diagnostic_stopped{false}, diagnostic_drained{false};
   std::span<const std::int32_t> diagnostic_input;
   std::span<float> diagnostic_output;
   std::uint32_t diagnostic_rows{}, diagnostic_passes{};
@@ -919,28 +918,18 @@ bool ContinuationAdapter::Validate(
   state.expected.clear();
   return true;
 }
-void ContinuationAdapter::BeginDiagnostic(cache::Slot& slot,
-                                          std::span<const std::int32_t> input,
-                                          std::uint32_t rows,
-                                          std::span<float> output,
-                                          std::function<bool()> cancelled) {
+void ContinuationAdapter::BeginDiagnostic(
+    cache::Slot& slot, std::span<const std::int32_t> input, std::uint32_t rows,
+    std::span<float> output, bool& started, std::function<bool()> cancelled) {
   auto& state = As(slot);
-  const auto vocab = model_->VocabSize();
-  if (!model_->DiagnosticLogitsEnabled())
-    throw std::logic_error("diagnostic logits are not admitted");
-  if (input.empty() || input.size() > context_ || rows == 0 || rows > 8 ||
-      rows > input.size() || rows > model_->executor_->max_logit_rows() ||
-      vocab == 0 || rows > std::numeric_limits<std::size_t>::max() / vocab ||
-      output.size() != std::size_t{rows} * vocab)
-    throw std::invalid_argument("invalid diagnostic input/output shape");
-  for (const auto token : input)
-    if (token < 0 || static_cast<std::uint32_t>(token) >= vocab)
-      throw std::invalid_argument("diagnostic token out of range");
-  if (!DiagnosticReady(slot))
+  // Immutable IDs/output shape were checked once by the cold-score owner.
+  if (input.size() > context_ || rows > model_->executor_->max_logit_rows() ||
+      !DiagnosticReady(slot))
     throw std::logic_error(
         "diagnostic slot is not healthy, empty and quiescent");
   // The lease guarantees no snapshots/borrowed rows. No global model mode or
   // admitted MTP backing changes. Only DiagnosticReset can undo ownership.
+  started = true;  // Validation refusals above have borrowed/submitted nothing.
   state.session->diagnostic_owned_ = true;
   state.diagnostic_input = input;
   state.diagnostic_output = output;
@@ -964,30 +953,18 @@ ContinuationAdapter::DiagnosticStep ContinuationAdapter::DiagnosticPrefillStep(
   const auto input = state.diagnostic_input;
   const auto output = state.diagnostic_output;
   const auto position = session.tokens_.size();
-  const auto vocab = model_->VocabSize();
   // All caller/state validation precedes mutation and any native submission.
   // Pending PLE lookahead from this request is intentional between passes;
   // do not require global quiescence here or cancel/drain that lookahead.
   if (!session.diagnostic_owned_ || state.diagnostic_resetting ||
-      state.diagnostic_rejected || state.diagnostic_cancelled || state.failed ||
-      state.pending || state.checkpoint || state.restoring || state.guarding ||
+      state.diagnostic_stopped || state.failed || state.pending ||
+      state.checkpoint || state.restoring || state.guarding ||
       state.invalidating || !session.IsValid() || native.mtp_enabled_ ||
       native.spec_tokens_ || native.mtp_.position || native.mtp_.blocks ||
       native.mtp_.residual_valid || session.image_prompt_ ||
       position != session.Position() || position >= input.size() ||
-      input.size() > session.ContextSize() || budget == 0 ||
-      state.diagnostic_passes >= 4096 || state.diagnostic_rows == 0 ||
-      state.diagnostic_rows > 8 || state.diagnostic_rows > input.size() ||
-      state.diagnostic_rows > model_->executor_->max_logit_rows() ||
-      vocab == 0 ||
-      state.diagnostic_rows > std::numeric_limits<std::size_t>::max() / vocab ||
-      output.size() != std::size_t{state.diagnostic_rows} * vocab ||
-      !std::equal(session.tokens_.begin(), session.tokens_.end(),
-                  input.begin()))
+      budget == 0 || state.diagnostic_passes >= kColdScoreMaxPasses)
     throw std::logic_error("diagnostic prefill state/input mismatch");
-  for (const auto token : input)
-    if (token < 0 || static_cast<std::uint32_t>(token) >= vocab)
-      throw std::invalid_argument("diagnostic token out of range");
   const auto count = DiagnosticPrefillCount(input.size() - position, budget,
                                             model_->PrefillCapacity(),
                                             model_->PrefillThroughCapacity());
@@ -1015,19 +992,9 @@ ContinuationAdapter::DiagnosticStep ContinuationAdapter::DiagnosticPrefillStep(
     // marker. GPU/PLE failures and hook exceptions do not. A failed cleanup
     // fence clears it in Forward. Still require the explicit owned drain
     // before resetting partially written state; no scope-exit mode changes.
-    state.diagnostic_cancelled = cancelled;
+    state.diagnostic_stopped = cancelled;
     state.failed = !cancelled;
     throw;
-  }
-  if (rows) {
-    const auto begin = (std::max(position, suffix) - suffix) * vocab;
-    for (const auto value : output.subspan(begin, rows * vocab))
-      if (!std::isfinite(value)) {
-        // Forward completed: healthy diagnostic discard remains possible,
-        // but this rejected request cannot submit another pass.
-        state.diagnostic_rejected = true;
-        throw DiagnosticNonfinite{};
-      }
   }
   return {static_cast<std::uint32_t>(end), static_cast<std::uint32_t>(rows),
           end == input.size()};
@@ -1065,7 +1032,7 @@ bool ContinuationAdapter::DrainDiagnosticCancellation(
   try {
     auto& state = As(slot);
     if (!state.session || !state.session->diagnostic_owned_ || state.failed ||
-        (!state.session->IsValid() && !state.diagnostic_cancelled) ||
+        (!state.session->IsValid() && !state.diagnostic_stopped) ||
         state.pending || state.checkpoint || state.restoring ||
         state.guarding || state.invalidating || state.diagnostic_resetting)
       return false;
@@ -1075,8 +1042,8 @@ bool ContinuationAdapter::DrainDiagnosticCancellation(
       state.failed = true;
       return false;
     }
-    state.diagnostic_cancelled = true;
-    state.diagnostic_cancelled_complete = true;
+    state.diagnostic_stopped = true;
+    state.diagnostic_drained = true;
     return true;
   } catch (...) {
     if (draining)
@@ -1092,7 +1059,7 @@ cache::DiagnosticDiscardResult ContinuationAdapter::DiagnosticReset(
   try {
     auto& state = As(slot);
     if (!state.session || !state.session->session_ || state.failed ||
-        (!state.session->IsValid() && !state.diagnostic_cancelled_complete))
+        (!state.session->IsValid() && !state.diagnostic_drained))
       return Result::kQuarantined;
     if (state.pending || state.checkpoint || state.restoring ||
         state.guarding || state.invalidating)
@@ -1120,8 +1087,7 @@ cache::DiagnosticDiscardResult ContinuationAdapter::DiagnosticReset(
     if (!reset)
       return Result::kQuarantined;
     state.session->diagnostic_owned_ = false;
-    state.diagnostic_rejected = false;
-    state.diagnostic_cancelled = state.diagnostic_cancelled_complete = false;
+    state.diagnostic_stopped = state.diagnostic_drained = false;
     state.diagnostic_input = {};
     state.diagnostic_output = {};
     state.diagnostic_rows = state.diagnostic_passes = 0;

@@ -63,9 +63,11 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
+  cold_score_control_test_pending_discard
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
   text_model_runner_test_diagnostic_refusal_auto
   text_model_runner_test_diagnostic_refusal_explicit
+  "qwen38_flash_next\\.cold_score_gpu_contract"
   "qwen38_flash_next\\.cold_score_lifetime"
   "qwen38_flash_next\\.npu_contracts" "qwen38_flash_next\\.cold_score"
   ${gufo_component_text_cache_tests}

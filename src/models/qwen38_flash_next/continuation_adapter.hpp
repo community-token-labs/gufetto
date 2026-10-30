@@ -1,8 +1,6 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_CONTINUATION_ADAPTER_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_CONTINUATION_ADAPTER_HPP_
 
-#include <exception>
-
 #include "src/cache/adapter.hpp"
 #include "src/cache/slot.hpp"
 #include "src/core/hip/transfer_pool.hpp"
@@ -87,8 +85,8 @@ public:
   /// Unlike ExecutionComplete(), Ready requires healthy EMPTY native state and
   /// actual executor quiescence. Reset also accepts nonempty owned state.
   [[nodiscard]] bool DiagnosticReady(const cache::Slot&) const noexcept;
-  /// Requires the cache owner's exclusive cold/no-borrower lease. Validates
-  /// the complete request before changing mode. No sampler/cache operations.
+  /// Requires the owner's exclusive cold lease and prevalidated IDs/shape.
+  /// Sets started only after native admission, before mutation. No sampler.
   /// Input must remain immutable and both caller-owned spans must remain alive
   /// through checked DiagnosticReset (including pending/quarantined work).
   /// The cancellation callable is owned; its captures must also own their data.
@@ -96,12 +94,7 @@ public:
   /// successful passes. Native Session::IsValid() still attests forward health.
   void BeginDiagnostic(cache::Slot&, std::span<const std::int32_t> input,
                        std::uint32_t rows, std::span<float> output,
-                       std::function<bool()> cancelled = {});
-  struct DiagnosticNonfinite final : std::exception {
-    const char* what() const noexcept override {
-      return "diagnostic logits are not finite";
-    }
-  };
+                       bool& started, std::function<bool()> cancelled = {});
   struct DiagnosticStep {
     std::uint32_t pass_end{};
     std::uint32_t captured_rows{};

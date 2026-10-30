@@ -22,15 +22,17 @@ inline constexpr std::size_t kColdScoreMaxVocab = 248320;
 // widening the two distinct head pools must not widen ordinary batch scratch.
 struct DiagnosticLogitCapacity {
   std::uint32_t vocab{}, max_batch{}, max_speculative{}, max_logit_rows{};
-  std::size_t device_bytes{}, pinned_bytes{};
-  std::size_t device_delta{}, pinned_delta{}, batch_device_bytes{};
+  std::size_t head_bytes{}, widening_bytes{}, batch_device_bytes{};
+  bool operator==(const DiagnosticLogitCapacity&) const = default;
   static constexpr std::optional<DiagnosticLogitCapacity> Plan(
       std::uint32_t vocab, std::uint32_t batch, std::uint32_t speculative,
       bool enabled) noexcept {
     if (!vocab || !batch || !speculative || speculative > batch)
       return std::nullopt;
     const auto rows =
-        enabled ? std::max(speculative, std::min(8U, batch)) : speculative;
+        enabled ? std::max(speculative,
+                           std::min<std::uint32_t>(kColdScoreMaxRows, batch))
+                : speculative;
     const std::uint64_t row = std::uint64_t{vocab} * sizeof(float);
     const auto limit = std::numeric_limits<std::size_t>::max();
     if (rows > limit / row || 8 * std::min(8U, speculative) > limit / row)
@@ -43,8 +45,6 @@ struct DiagnosticLogitCapacity {
         speculative,
         rows,
         gross,
-        gross,
-        delta,
         delta,
         static_cast<std::size_t>(row * 8 * std::min(8U, speculative))};
   }
@@ -105,18 +105,13 @@ inline std::optional<std::size_t> ColdScoreWorkspaceBytes(
   const auto checked = DiagnosticLogitCapacity::Plan(
       native.vocab, native.max_batch, native.max_speculative, true);
   if (!checked || !context || !controls || native.vocab > kColdScoreMaxVocab ||
-      checked->device_bytes != native.device_bytes ||
-      checked->pinned_bytes != native.pinned_bytes ||
-      checked->device_delta != native.device_delta ||
-      checked->pinned_delta != native.pinned_delta ||
-      checked->max_logit_rows != native.max_logit_rows ||
-      checked->batch_device_bytes != native.batch_device_bytes)
+      *checked != native)
     return std::nullopt;
   const auto rows = std::min(
       {kColdScoreMaxRows, context, std::size_t{native.max_logit_rows}});
   std::size_t bytes = controls;
   for (const auto term :
-       {native.device_delta, native.pinned_delta,
+       {native.widening_bytes, native.widening_bytes,
         std::min(context, kColdScoreMaxTokens) * sizeof(std::int32_t),
         rows * native.vocab * sizeof(float)}) {
     if (term > std::numeric_limits<std::size_t>::max() - bytes)

@@ -65,8 +65,12 @@ public:
       Logger::Error("memory", refusal);
       return false;
     }
-    Logger::Info("memory", "event=full_logits_static_claim bytes=" +
-                               std::to_string(bytes));
+    Logger::Info(
+        "memory",
+        "event=full_logits_static_claim bytes=" + std::to_string(bytes) +
+            " retention=process_lifetime; the model stays loaded "
+            "until the server restarts; model switching/detach doesn't free "
+            "it");
     stats_.bytes = bytes;
     return true;
   }

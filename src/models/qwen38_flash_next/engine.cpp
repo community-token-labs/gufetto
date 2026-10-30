@@ -10,7 +10,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -253,10 +252,6 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     if (!options.approve_diagnostic_logits(*capacity, error_msg))
       return nullptr;
     m->diagnostic_approved_ = true;
-    std::fputs(
-        "diagnostic mode: the model stays loaded until the server restarts; "
-        "model switching/detach doesn't free it\n",
-        stderr);
   }
   m->logit_capacity_ = *capacity;
   exec.max_logit_rows = capacity->max_logit_rows;
@@ -941,6 +936,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
       std::copy_n(output + (rows - 1) * model_->VocabSize(),
                   model_->VocabSize(), logits_.data());
     const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
+    // MTP-off diagnostics keep no hidden frontier; checked reset re-zeroes it.
     hidden_base_ =
         terminal ? 0
                  : static_cast<std::uint32_t>(

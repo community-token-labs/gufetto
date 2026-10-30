@@ -14,7 +14,8 @@ public:
   virtual std::uint32_t ColdVocab() const noexcept = 0;
   virtual void ScoreCold(std::span<const std::int32_t>, std::uint32_t rows,
                          std::span<float>, std::span<std::uint32_t> pass_ends,
-                         std::size_t& passes, const CancellationCheck&,
+                         std::size_t& passes, bool& started,
+                         const CancellationCheck&,
                          const std::function<void()>& progress) = 0;
   virtual bool DrainCold() noexcept = 0;
 };
@@ -25,6 +26,7 @@ public:
   ~ColdScoreResult();
   ColdScoreResult(ColdScoreResult&&) noexcept;
   ColdScoreResult& operator=(ColdScoreResult&&) noexcept;
+  // Moved-from results may only be assigned or destroyed.
   std::span<const float> logits() const;
   std::span<const std::uint32_t> pass_ends() const;
   std::uint32_t vocab() const;

@@ -851,19 +851,14 @@ if (BUILD_TESTING)
   set_tests_properties(qfn_kv_ingress_validation_test PROPERTIES
     LABELS "cpu;server;cache;qwen38_flash_next")
 
-  set(cold_fixture "${CMAKE_CURRENT_BINARY_DIR}/cold_score_fixture.inc")
-  add_custom_command(OUTPUT "${cold_fixture}"
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/extract_cold_score_fixture.py"
-      --source "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/component_text_cache_test.cpp" --output "${cold_fixture}"
-    DEPENDS tests/cli/extract_cold_score_fixture.py tests/cli/component_text_cache_test.cpp VERBATIM)
-  add_executable(cold_score_control_test tests/cli/cold_score_control_test.cpp "${cold_fixture}"
+  add_executable(cold_score_control_test tests/cli/cold_score_control_test.cpp
     src/cli/serve/cold_score.cpp
     src/cli/serve/continuation_cache.cpp src/cli/serve/continuation_disk_store.cpp
     src/cli/serve/component_text_cache.cpp src/cli/serve/text_model_runner.cpp)
-  target_include_directories(cold_score_control_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_libraries(cold_score_control_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache_fake gufo_qwen38_flash_next)
   add_test(NAME cold_score_control_test COMMAND cold_score_control_test)
-  set_tests_properties(cold_score_control_test PROPERTIES LABELS "cpu;server;cold_score" TIMEOUT 30)
+  add_test(NAME cold_score_control_test_pending_discard COMMAND cold_score_control_test --pending-discard)
+  set_tests_properties(cold_score_control_test cold_score_control_test_pending_discard PROPERTIES LABELS "cpu;server;cold_score" TIMEOUT 30)
 
   add_executable(diagnostic_memory_test tests/cli/diagnostic_memory_test.cpp)
   target_link_libraries(diagnostic_memory_test PRIVATE gufo_logging gufo_platform)

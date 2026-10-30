@@ -2666,9 +2666,10 @@ public:
   }
   void ScoreCold(std::span<const std::int32_t> input, std::uint32_t rows,
                  std::span<float> output, std::span<std::uint32_t> ends,
-                 std::size_t& passes, const CancellationCheck& cancel,
+                 std::size_t& passes, bool& started,
+                 const CancellationCheck& cancel,
                  const std::function<void()>& progress) override {
-    adapter().BeginDiagnostic(*slot_, input, rows, output, cancel);
+    adapter().BeginDiagnostic(*slot_, input, rows, output, started, cancel);
     models::qwen38_flash_next::CollectColdScorePasses(
         input.size(), rows, ends, passes,
         [&] {

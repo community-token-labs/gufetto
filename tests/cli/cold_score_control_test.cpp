@@ -1,10 +1,10 @@
-#include "cold_score_fixture.inc"
 #include "src/cli/serve/cold_score.hpp"
 #include "src/cli/serve/diagnostic_memory.hpp"
+#include "tests/cli/component_text_cache_fixture.hpp"
 
 namespace {
 struct ColdControl {
-  bool pending{}, drain_ok{true}, nonfinite{};
+  bool pending{}, drain_ok{true}, nonfinite{}, refuse_begin{}, keep_pending{};
   std::size_t drains{}, destroyed{};
 };
 struct ColdState final : ColdScoreState {
@@ -20,13 +20,17 @@ struct ColdState final : ColdScoreState {
     ++control->drains;
     if (!control->drain_ok)
       return false;
-    control->pending = false;
+    control->pending = control->keep_pending;
     return true;
   }
   void ScoreCold(std::span<const std::int32_t> input, std::uint32_t rows,
                  std::span<float> output, std::span<std::uint32_t> ends,
-                 std::size_t& passes, const CancellationCheck& cancelled,
+                 std::size_t& passes, bool& started,
+                 const CancellationCheck& cancelled,
                  const std::function<void()>& progress) override {
+    if (control->refuse_begin)
+      throw std::invalid_argument("pre-ownership native validation refusal");
+    started = true;
     struct Step {
       std::uint32_t pass_end, captured_rows;
       bool complete;
@@ -101,7 +105,8 @@ void Reject(F run) {
   assert(rejected);
 }
 }  // namespace
-int main() {
+int main(int argc, char**) {
+  const bool pending_discard = argc == 2;
   std::string error;
   const auto bytes = ColdScoreControlBytes() +
                      ComponentTextCache::DiagnosticRequestBytes() +
@@ -160,8 +165,18 @@ int main() {
   input[0] = 3;
   Reject([&] { (void)ScoreColdOnWorker(pool, input, 8); });
   input[0] = 0;
-  // Unknown drain retains actual buffers, native facade, pool and exclusion.
-  runner->control->drain_ok = false;
+  // L1: pre-ownership native refusal must not drain or poison the slot/gate.
+  runner->control->refuse_begin = true;
+  Reject([&] { (void)ScoreColdOnWorker(pool, input, 8); });
+  assert(runner->control->drains == drains && pool->usable_capacity() == 1);
+  runner->control->refuse_begin = false;
+  {
+    auto recovered = ScoreColdOnWorker(pool, input, 8);
+  }
+  // L2: successful drain followed by no-mutation Pending discard quarantines,
+  // just like an unknown drain. Each runs in its own process.
+  runner->control->drain_ok = pending_discard;
+  runner->control->keep_pending = pending_discard;
   const auto destroyed = runner->control->destroyed;
   Reject([&] { (void)ScoreColdOnWorker(pool, input, 8); });
   assert(runner->control->destroyed == destroyed &&

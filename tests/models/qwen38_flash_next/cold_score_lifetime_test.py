@@ -22,7 +22,9 @@ def main():
     if a.binary:
         for mode in ('success', 'partial'):
             run = subprocess.run([a.binary, mode], capture_output=True, text=True, timeout=10)
-            if run.returncode or run.stderr.count('diagnostic mode: the model stays loaded until the server restarts') != 1:
+            logs = run.stdout + run.stderr
+            if (run.returncode or logs.count('the model stays loaded until the server restarts') != 1
+                    or logs.count('event=full_logits_static_claim') != 1):
                 raise RuntimeError(f'{mode}: rc={run.returncode}\n{run.stdout}\n{run.stderr}')
         print('PASS: exact Model approval/deleter/Create-prefix lifetime controls; no HIP execution')
         return

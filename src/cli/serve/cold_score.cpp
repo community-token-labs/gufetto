@@ -52,7 +52,7 @@ ColdScoreResult ScoreColdOnWorker(
     if (!work->pool->usable_capacity())
       throw TextGenerationError(TextGenerationErrorCode::kCacheUnavailable,
                                 "no usable cache slots; restart required");
-    work->lease = work->pool->TryAcquireDiagnostic();
+    work->lease = work->pool->TryAcquireDiagnostic(cancelled);
     if (!work->lease || work->lease->cached_tokens())
       throw std::runtime_error("cold score requires a healthy empty slot");
     work->state = dynamic_cast<ColdScoreState*>(&work->lease->state());
@@ -70,16 +70,9 @@ ColdScoreResult ScoreColdOnWorker(
     work->output = std::make_unique_for_overwrite<float[]>(work->values);
     if (cancelled && cancelled())
       throw std::runtime_error("cold score cancelled");
-    work->started = true;
     work->state->ScoreCold({work->input.get(), input.size()}, rows,
                            {work->output.get(), work->values}, work->ends,
-                           work->passes, cancelled, progress);
-    if (!work->passes || work->passes > work->ends.size() ||
-        work->ends[work->passes - 1] != input.size())
-      throw std::runtime_error("cold score pass ledger is incomplete");
-    for (std::size_t i = 0; i < work->passes; ++i)
-      if (!work->ends[i] || (i && work->ends[i] <= work->ends[i - 1]))
-        throw std::runtime_error("cold score pass ledger is invalid");
+                           work->passes, work->started, cancelled, progress);
     for (std::size_t i = 0; i < work->values; ++i)
       if (!std::isfinite(work->output[i]))
         throw std::runtime_error("cold score logits are not finite");
@@ -90,6 +83,8 @@ ColdScoreResult ScoreColdOnWorker(
   try {
     // F2: drain ALL started runs, including non-cancel throws between passes.
     safe = !work->started || work->state->DrainCold();
+    // Pending Discard mutates nothing, but after a drain it is unexpected:
+    // fail closed and retain all owners, rather than retrying/resetting them.
     if (safe && work->lease)
       safe =
           work->lease->Discard() == cache::DiagnosticDiscardResult::kComplete;
