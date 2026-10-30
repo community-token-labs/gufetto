@@ -286,6 +286,7 @@ add_library(gufo_diagnostics STATIC
   src/core/diagnostics/compatibility.cpp
   src/core/diagnostics/fingerprint.cpp
   src/core/diagnostics/artifact_validator.cpp
+  src/core/diagnostics/model_plan.cpp
   src/core/diagnostics/allocation_benchmark.cpp
   src/core/diagnostics/bandwidth.cpp
   src/core/hip/bandwidth.cpp
@@ -293,7 +294,7 @@ add_library(gufo_diagnostics STATIC
   src/cli/diagnose/diagnose.cpp
 )
 target_include_directories(gufo_diagnostics PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(gufo_diagnostics PUBLIC gufo_platform)
+target_link_libraries(gufo_diagnostics PUBLIC gufo_platform gufo_core)
 target_compile_definitions(gufo_diagnostics PRIVATE
   GUFO_REVISION="${GUFO_REVISION}")
 
@@ -1061,6 +1062,14 @@ if (BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/prof_test.py)
   set_tests_properties(prof_test PROPERTIES
     LABELS "cpu;tools;profiling")
+
+  add_executable(model_plan_test tests/diagnostics/model_plan_test.cpp)
+  target_link_libraries(model_plan_test PRIVATE gufo_diagnostics)
+  add_test(NAME model_plan_test COMMAND model_plan_test)
+  set_tests_properties(model_plan_test PROPERTIES LABELS "cpu;diagnostics")
+  add_test(NAME model_plan_cli_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/model_plan_cli_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(model_plan_cli_test PROPERTIES LABELS "cpu;diagnostics")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
   target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)

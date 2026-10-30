@@ -16,6 +16,7 @@
 #include "src/core/diagnostics/compatibility.h"
 #include "src/core/diagnostics/fingerprint.h"
 #include "src/core/diagnostics/linux_sysfs.h"
+#include "src/core/diagnostics/model_plan.h"
 #include "src/core/diagnostics/system_inventory.h"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -32,6 +33,8 @@ void PrintDiagnoseHelp(std::string_view program_name) {
       << "Run non-interactive system, hardware, and benchmark diagnostics for "
          "Strix Halo.\n\n"
       << "Options:\n"
+      << "  --plan <manifest>            Read-only pinned TSV artifact and "
+         "memory plan\n"
       << "  --json                       Emit structured JSON output "
          "conforming "
          "to diagnostics schema v1.0.0\n"
@@ -199,6 +202,7 @@ int RunDiagnose(std::span<const char* const> args) {
   bool json_mode = false;
   bool fingerprint_mode = false;
   std::string validate_artifact_path;
+  std::string plan_path;
   std::string benchmark_name;
   std::string backends_csv = "cpu,hip";
   std::uint32_t warmup = 3;
@@ -224,7 +228,22 @@ int RunDiagnose(std::span<const char* const> args) {
 
   for (std::size_t i = start_idx; i < args.size(); ++i) {
     const std::string_view arg = args[i];
-    if (arg == "--json") {
+    if (arg == "--plan" || arg.starts_with("--plan=")) {
+      if (arg == "--plan") {
+        if (i + 1 >= args.size() ||
+            std::string_view(args[i + 1]).starts_with("-")) {
+          std::cerr << "Error: --plan requires a manifest path\n";
+          return 2;
+        }
+        plan_path = args[++i];
+      } else {
+        plan_path = std::string(arg.substr(7));
+      }
+      if (plan_path.empty()) {
+        std::cerr << "Error: --plan requires a manifest path\n";
+        return 2;
+      }
+    } else if (arg == "--json") {
       json_mode = true;
     } else if (arg == "--fingerprint") {
       fingerprint_mode = true;
@@ -327,6 +346,24 @@ int RunDiagnose(std::span<const char* const> args) {
       section != "gpu") {
     std::cerr << "Error: unknown diagnostic section '" << section << "'\n";
     return 2;
+  }
+
+  if (!plan_path.empty()) {
+    if (json_mode || fingerprint_mode || !validate_artifact_path.empty() ||
+        !benchmark_name.empty() || !output_file.empty() || section != "all") {
+      std::cerr
+          << "Error: --plan cannot be combined with other diagnostic modes "
+             "or --output (read-only)\n";
+      return 2;
+    }
+    try {
+      const auto plan = diagnostics::PlanModels(plan_path);
+      std::cout << plan.text;
+      return plan.has_failures ? 1 : 0;
+    } catch (const std::exception& e) {
+      std::cerr << "Error: plan manifest: " << e.what() << "\n";
+      return 2;
+    }
   }
 
   // Handle artifact validation mode
