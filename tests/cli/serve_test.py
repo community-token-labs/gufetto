@@ -194,6 +194,20 @@ def main():
     check(["serve", "--help"], 0, "--log-level")
     load = ["serve", "llm", "--model", "missing.gguf"]
     assert "event=options" not in run(load).stderr
+    # The final loader summary must preserve the complete backend error, not
+    # hide actionable details (including a verified-to-fit recommendation)
+    # behind a later generic load_failed line. No model weights are needed.
+    for level in ("info", "error"):
+        failed = run(load + ["--log-level", level])
+        assert failed.returncode == 1, failed.stderr
+        lines = [line for line in failed.stderr.splitlines() if line.strip()]
+        error_line = next(line for line in lines
+                          if line.startswith("Error loading model 'missing.gguf': "))
+        reason = error_line.split("': ", 1)[1]
+        assert reason, failed.stderr
+        assert "[ERROR] [loader] event=load_failed kind=text " in lines[-1], failed.stderr
+        assert lines[-1].endswith(" reason=" + reason), failed.stderr
+        assert sum("event=load_failed kind=text " in line for line in lines) == 1, failed.stderr
     for spelling in (["-v"], ["--verbose"], ["--log-level", "debug"]):
         result = run(load + spelling)
         assert "[DEBUG] [server] event=options" in result.stderr, spelling
