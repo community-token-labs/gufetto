@@ -1238,7 +1238,8 @@ Raw Completions accepts an integer `logprobs` from 0 to 20. Its choices
 return parallel `tokens`, `token_logprobs`, `top_logprobs`, and `text_offset`
 arrays. Offsets count the Unicode characters of the preceding selected tokens,
 identically in buffered and streamed responses, including tokens a stop
-sequence holds back or removes.
+sequence holds back or removes. They are token-spelling coordinates, as in vLLM,
+so they can exceed the returned text's length when a stop sequence removes text.
 Zero requests only the selected token. Omitted/null settings disable collection;
 Chat also accepts `false`. Positive Chat `top_logprobs` requires `logprobs: true`.
 

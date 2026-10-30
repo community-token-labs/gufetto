@@ -3444,16 +3444,28 @@ void TestCompletionLogprobOffsetsWithStops() {
     std::size_t max_tokens;
     std::string text;
     std::string offsets;
+    std::optional<std::string> terminal{};
   };
-  for (const auto& [tokens, max_tokens, text, offsets] : {
+  for (const auto& [tokens, max_tokens, text, offsets, terminal] : {
            // An unsuccessful stop prefix is held, then released with "x".
            Case{{"S", "x"}, 8, "Sx", "[0,1]"},
            // A successful stop split across tokens still scores each token.
            Case{{"a", "ST", "OP", "z"}, 8, "a", "[0,1,3]"},
            // A held prefix is flushed when the token limit ends generation.
            Case{{"a", "S"}, 2, "aS", "[0,1]"},
+           // "é" split across two byte tokens (spellings "" then "é"), an
+           // empty-spelling token, then an EOS that publishes only metadata.
+           Case{{"a", "\xC3", "\xA9", "", "b"},
+                8,
+                "a\xC3\xA9" "b",
+                "[0,1,1,2,2,3]",
+                "</s>"},
+           // Four-byte "🙂" split across tokens while a stop prefix is held.
+           Case{{"\xF0\x9F", "\x99\x82", "S", "x"}, 8,
+                "\xF0\x9F\x99\x82Sx", "[0,0,1,2]"},
        }) {
     server.backend->scripted_tokens = tokens;
+    server.backend->scripted_terminal = terminal;
     const std::string request =
         R"({"prompt":"hello","stop":"STOP","logprobs":0,"max_tokens":)" +
         std::to_string(max_tokens);
@@ -3494,6 +3506,7 @@ void TestCompletionLogprobOffsetsWithStops() {
     assert(streamed_tokens.dump() == expected.find("tokens")->dump());
   }
   server.backend->scripted_tokens.clear();
+  server.backend->scripted_terminal.reset();
 }
 
 void TestRawCompletionPromptProgress() {

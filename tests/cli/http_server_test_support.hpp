@@ -275,9 +275,12 @@ public:
     }
     return result;
   }
-  // Selected token spellings published as the scheduler does: each record is
-  // retained before stop filtering, and a held prefix flushes on completion.
+  // Raw token bytes published as the scheduler does: each record is decoded
+  // by the real LogprobDecoder and retained before stop filtering, an
+  // optional EOS publishes only its terminal record, and a held prefix
+  // flushes on completion.
   std::vector<std::string> scripted_tokens;
+  std::optional<std::string> scripted_terminal;
   Result CompleteScripted(std::size_t limit,
                           const gufo::sampling::SamplingConfig& sampling,
                           const TokenCallback& token,
@@ -285,32 +288,48 @@ public:
     Result result;
     result.prompt_tokens = 10;
     result.finish_reason = FinishReason::kStop;
-    result.logprobs.reserve(scripted_tokens.size());
+    result.logprobs.reserve(scripted_tokens.size() + 1);
+    gufo::server::LogprobDecoder decoder;
+    const auto retain =
+        [&](std::size_t index) -> const gufo::server::DecodedLogprobs* {
+      if (!sampling.logprobs)
+        return nullptr;
+      const auto id = static_cast<gufo::sampling::TokenId>(index + 1);
+      result.logprobs.push_back(
+          decoder.DecodeToken({.selected = {id, -1.0}}, [&](auto value) {
+            const auto at = static_cast<std::size_t>(value);
+            return at <= scripted_tokens.size()
+                       ? scripted_tokens[at - 1]
+                       : scripted_terminal.value_or("");
+          }));
+      return &result.logprobs.back();
+    };
     gufo::server::StopSequenceFilter filter(stop_sequences);
-    for (const auto& spelling : scripted_tokens) {
+    bool ended = false;
+    for (std::size_t index = 0; index < scripted_tokens.size(); ++index) {
+      const auto& bytes = scripted_tokens[index];
       ++result.completion_tokens;
       if (result.completion_tokens == limit)
         result.finish_reason = FinishReason::kLength;
-      const gufo::server::DecodedLogprobs* record = nullptr;
-      if (sampling.logprobs) {
-        gufo::server::DecodedLogprobs probabilities;
-        probabilities.entries.push_back(
-            {static_cast<gufo::sampling::TokenId>(result.completion_tokens),
-             spelling, -1.0});
-        result.logprobs.push_back(std::move(probabilities));
-        record = &result.logprobs.back();
-      }
-      const auto piece = filter.enabled() ? filter.Push(spelling) : spelling;
+      const auto* record = retain(index);
+      const auto piece = filter.enabled() ? filter.Push(bytes) : bytes;
       result.text += piece;
       if (token && (!piece.empty() || !filter.enabled() || record))
         (void)token(gufo::server::TokenPiece(piece, record));
       if (filter.stopped()) {
         result.finish_reason = FinishReason::kStopSequence;
         result.stop_sequence = filter.matched_sequence();
+        ended = true;
         break;
       }
-      if (result.completion_tokens == limit)
+      if (result.completion_tokens == limit) {
+        ended = true;
         break;
+      }
+    }
+    if (!ended && scripted_terminal) {
+      if (const auto* record = retain(scripted_tokens.size()); token && record)
+        (void)token(gufo::server::TokenPiece(std::string_view{}, record));
     }
     if (filter.enabled()) {
       const auto tail = filter.Finish();
