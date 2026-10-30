@@ -575,9 +575,9 @@ class SkillDocumentTest(unittest.TestCase):
         "Detected AMD Strix Halo GPU (gfx1151)":
             "src/cli/diagnose/diagnose.cpp",
         "verified to fit: --context ":
-            "src/cli/serve/component_text_cache.cpp",
+            "src/cli/serve/measured_admission.hpp",
         "no fitting context found within the search limits":
-            "src/cli/serve/component_text_cache.cpp",
+            "src/cli/serve/measured_admission.hpp",
         "insufficient component backing budget":
             "src/cli/serve/inference_backend.cpp",
         "pass --enable-yarn": "src/models/qwen38_flash_next/rope_scaling.cpp",
