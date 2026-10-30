@@ -176,7 +176,8 @@ privacy-safe scheduler and stage metrics used by
 `tools/serving/gufo-serving-bench.py`: queue, prefill, decode, TTFT and ITL timing;
 actual prefill work; cache use; logical concurrency; physical execution width;
 and the executed plan. Prompts, generated text, local paths, request IDs, and
-token IDs are excluded.
+token IDs are excluded. See [Stability for downstream consumers](#stability-for-downstream-consumers)
+for compatibility of these names.
 
 DeepSeek V4 Flash batches up to eight active requests. Each request owns its
 attention caches, compressor state, position, and sampling state. Dense and
@@ -1461,6 +1462,23 @@ Run the server under a supervisor that restarts on failure, such as systemd
 a restart is the only recovery.
 
 ## Metrics
+
+### Stability for downstream consumers
+
+External tools rely on exact `usage.gufo.*` field names. For example, slotpin
+consumes `usage.gufo.cache_hit`, `usage.gufo.cache_disk_hit`,
+`usage.gufo.cache_restore_ms`, `usage.gufo.cache_restore_bytes`,
+`usage.gufo.cache_snapshot_ms`, `usage.gufo.cache_snapshot_bytes`,
+`usage.gufo.cache_disk_queued_bytes`, `usage.gufo.cache_miss_reason`, and the
+nested `usage.gufo.component_cache` object when supplied.
+
+The `llamacpp:*` names exposed by `/metrics` are also part of the
+llama.cpp-compatible surface; external monitoring may rely on them.
+Renaming or removing these response fields or metric names is a breaking change
+and requires `!` in the pull request title, per the [release policy](RELEASING.md).
+Additions are compatible.
+
+### Available metrics
 
 `/metrics` exposes total prompt/generated tokens and the latest prompt/decode
 speeds. The token counters advance as each prefill chunk and generated token
