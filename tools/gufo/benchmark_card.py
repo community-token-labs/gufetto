@@ -67,14 +67,22 @@ def render(raw: bytes, metadata: dict) -> str:
         # Native gufo bench and rendered BENCHMARKS.md tables. Keep only Gufo
         # columns; reference comparisons and gains are deliberately excluded.
         headers = None
-        for line in text.splitlines():
+        table_lines = text.splitlines()
+        for index, line in enumerate(table_lines):
             if not line.strip().startswith("|"):
+                headers = None
                 continue
             values = [v.strip() for v in line.strip().strip("|").split("|")]
-            if "t/s" in values and "model" in values:
-                headers = values
-            elif any(v.startswith("Gufo pp") or v.startswith("Gufo tg") for v in values):
-                headers = values
+            following = table_lines[index + 1].strip() if index + 1 < len(table_lines) else ""
+            is_header = following.startswith("|") and all(
+                not v.strip() or set(v.strip()) <= set("-: ")
+                for v in following.strip("|").split("|")
+            )
+            if is_header:
+                headers = values if (
+                    "t/s" in values and "model" in values
+                    or any(v.startswith("Gufo pp") or v.startswith("Gufo tg") for v in values)
+                ) else None
             elif headers and len(values) == len(headers) and not all(
                 not v or set(v) <= set("-: ") for v in values
             ):

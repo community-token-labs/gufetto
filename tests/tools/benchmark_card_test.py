@@ -75,6 +75,9 @@ class CardTest(unittest.TestCase):
             self.assertIn("Card status: **INCONCLUSIVE**", card)
             self.assertNotIn("999", card)
             self.assertNotIn("-10%", card)
+        mixed = ("| Depth | Gufo pp (tok/s) |\n| --- | --- |\n| 0 | 42 |\n\n"
+                 "| Reference only | Rate |\n| --- | --- |\n| other | 999 |\n")
+        self.assertNotIn("999", render(mixed.encode(), self.meta))
         with self.assertRaises(ValueError):
             render(b"unrecognized", self.meta)
 

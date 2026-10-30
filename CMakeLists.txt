@@ -997,6 +997,12 @@ if (BUILD_TESTING)
     set_tests_properties(${name}_test PROPERTIES LABELS "cpu;tools;quality")
   endforeach()
 
+  add_test(NAME benchmark_card_test
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/benchmark_card_test.py)
+  set_tests_properties(benchmark_card_test PROPERTIES
+    LABELS "cpu;tools;benchmarks;json" TIMEOUT 30)
+
   add_test(NAME serving_bench_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/serving_bench_test.py)
