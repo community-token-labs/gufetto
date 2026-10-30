@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -26,6 +27,7 @@
 #include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/rerank_api.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/env.hpp"
@@ -910,6 +912,183 @@ void TestLlamaSlotsAndMetrics() {
   }
   assert(metrics.find("# TYPE llamacpp:kv_cache_usage_ratio gauge\n") !=
          std::string::npos);
+}
+
+// The value of one exposition sample, or -1 when the series is absent.
+double SampleValue(const std::string& metrics, const std::string& series) {
+  const auto found = metrics.find("\n" + series + " ");
+  if (found == std::string::npos)
+    return -1;
+  return std::stod(metrics.substr(found + series.size() + 2));
+}
+
+void TestCacheAndSpeedMetrics() {
+  using gufo::server::CacheHitTier;
+  using gufo::server::ComponentCacheMetrics;
+  using gufo::server::RecordRequestMetrics;
+  using Result = gufo::server::TextGenerationBackend::Result;
+  RunningServer server;
+  const auto scrape = [&] {
+    const auto response = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 200);
+    return response;
+  };
+  const auto before = scrape();
+  const auto delta = [&](const std::string& after, const std::string& series) {
+    const double was = SampleValue(before, series);
+    const double now = SampleValue(after, series);
+    assert(was >= 0 && now >= 0);
+    return now - was;
+  };
+
+  // Hits by tier: flags classify backends without component metrics, and a
+  // component tier wins when present.
+  const auto hit = [](bool disk, std::size_t restore_bytes,
+                      std::optional<CacheHitTier> tier = {}) {
+    Result result;
+    result.cache_hit = true;
+    result.cache_disk_hit = disk;
+    result.cache_restore_bytes = restore_bytes;
+    if (tier) {
+      result.component_cache = ComponentCacheMetrics{};
+      result.component_cache->hit_tier = *tier;
+    }
+    return result;
+  };
+  RecordRequestMetrics(hit(false, 0));
+  RecordRequestMetrics(hit(false, 64));
+  RecordRequestMetrics(hit(true, 64));
+  for (const auto tier :
+       {CacheHitTier::kLive, CacheHitTier::kRam, CacheHitTier::kDisk,
+        CacheHitTier::kPinned, CacheHitTier::kPinned, CacheHitTier::kRoot})
+    RecordRequestMetrics(hit(false, 0, tier));
+  // A component report without a tier falls back to the flags.
+  RecordRequestMetrics(hit(true, 0, CacheHitTier::kNone));
+  // Misses by reason; unrecognized reasons are `unknown`, and a request that
+  // never reached a lookup counts as neither a hit nor a miss.
+  for (const std::string reason :
+       {"disabled", "no_checkpoint", "no_checkpoint", "no_compatible_boundary",
+        "prefix_changed", "input_changed", "future_reason"}) {
+    Result result;
+    result.cache_miss_reason = reason;
+    RecordRequestMetrics(result);
+  }
+  RecordRequestMetrics(Result{});
+
+  // Speeds by context band. Bounds are inclusive on both axes.
+  const auto timed = [](std::size_t prompt, std::size_t prefill,
+                        double prefill_ms, std::size_t generated,
+                        double decode_ms) {
+    Result result;
+    result.prompt_tokens = prompt;
+    result.prefill_tokens = prefill;
+    result.prefill_ms = prefill_ms;
+    result.completion_tokens = generated;
+    result.decode_ms = decode_ms;
+    return result;
+  };
+  RecordRequestMetrics(timed(1024, 100, 2000, 10, 1000));    // 50, 10 tok/s
+  RecordRequestMetrics(timed(1025, 100, 1000, 30, 1000));    // 100, 30
+  RecordRequestMetrics(timed(300000, 1000, 10, 500, 1000));  // 1e5, 500
+  RecordRequestMetrics(timed(5000, 63, 1, 0, 0));            // too short
+  RecordRequestMetrics(timed(5000, 64, 1000, 0, 0));         // 64 tok/s
+  // Cumulative buckets within one band: 1, 3, 3, 60 and 500 decode tok/s.
+  for (const double tokens_per_second : {1.0, 3.0, 3.0, 60.0, 500.0})
+    RecordRequestMetrics(timed(
+        20000, 0, 0, static_cast<std::size_t>(tokens_per_second * 10), 10000));
+  // A cancelled request adds no speed sample but its cache outcome counts.
+  auto cancelled = timed(20000, 1000, 1000, 50, 1000);
+  cancelled.cancelled = true;
+  cancelled.cache_miss_reason = "disabled";
+  RecordRequestMetrics(cancelled);
+
+  const auto after = scrape();
+  for (const auto& [tier, count] : std::vector<std::pair<std::string, double>>{
+           {"live", 2}, {"ram", 2}, {"disk", 3}, {"pinned", 2}, {"root", 1}})
+    assert(delta(after, "gufo_cache_hits_total{tier=\"" + tier + "\"}") ==
+           count);
+  assert(after.find("tier=\"none\"") == std::string::npos);
+  for (const auto& [reason, count] :
+       std::vector<std::pair<std::string, double>>{
+           {"disabled", 2},
+           {"no_checkpoint", 2},
+           {"no_compatible_boundary", 1},
+           {"prefix_changed", 1},
+           {"input_changed", 1},
+           {"unknown", 1}})
+    assert(delta(after, "gufo_cache_misses_total{reason=\"" + reason + "\"}") ==
+           count);
+  for (std::size_t i = 1; i < gufo::server::kCacheReuseReasonNames.size(); ++i)
+    assert(SampleValue(
+               after, "gufo_cache_acquisitions_total{reason=\"" +
+                          std::string(gufo::server::kCacheReuseReasonNames[i]) +
+                          "\"}") >= 0);
+
+  const auto bucket = [&](std::string_view name, std::string_view context,
+                          std::string_view le) {
+    return delta(after, std::string(name) + "_bucket{context=\"" +
+                            std::string(context) + "\",le=\"" +
+                            std::string(le) + "\"}");
+  };
+  const auto count = [&](std::string_view name, std::string_view context) {
+    return delta(after, std::string(name) + "_count{context=\"" +
+                            std::string(context) + "\"}");
+  };
+  const std::string prefill = "gufo_prefill_tokens_per_second";
+  const std::string decode = "gufo_decode_tokens_per_second";
+  // 1024 prompt tokens fall in the first band; 50 tok/s in the `le="50"` one.
+  assert(bucket(prefill, "0_1k", "50") == 1 &&
+         bucket(prefill, "1k_4k", "50") == 0);
+  assert(bucket(prefill, "0_1k", "+Inf") == 1 && count(prefill, "0_1k") == 1);
+  assert(delta(after, prefill + "_sum{context=\"0_1k\"}") == 50);
+  assert(bucket(prefill, "1k_4k", "50") == 0 &&
+         bucket(prefill, "1k_4k", "100") == 1 && count(prefill, "1k_4k") == 1);
+  // Above the last bound only `+Inf` counts.
+  assert(bucket(prefill, "256k_plus", "20000") == 0 &&
+         bucket(prefill, "256k_plus", "+Inf") == 1);
+  // 63 prefilled tokens are too few; 64 count.
+  assert(count(prefill, "4k_16k") == 1 &&
+         bucket(prefill, "4k_16k", "50") == 0 &&
+         bucket(prefill, "4k_16k", "100") == 1);
+  assert(count(prefill, "16k_64k") == 0 && count(prefill, "64k_256k") == 0);
+  assert(bucket(decode, "0_1k", "5") == 0 && bucket(decode, "0_1k", "10") == 1);
+  assert(bucket(decode, "1k_4k", "20") == 0 &&
+         bucket(decode, "1k_4k", "30") == 1);
+  assert(bucket(decode, "256k_plus", "200") == 0 &&
+         bucket(decode, "256k_plus", "+Inf") == 1);
+  assert(delta(after, decode + "_sum{context=\"256k_plus\"}") == 500);
+  // Requests without decode work add no decode sample.
+  assert(count(decode, "4k_16k") == 0);
+  // Buckets are cumulative and `_count` is the `+Inf` bucket; the cancelled
+  // request in this band is absent from both histograms.
+  const std::vector<std::pair<std::string, double>> cumulative{
+      {"1", 1},  {"2", 1},  {"5", 3},   {"10", 3},  {"20", 3},  {"30", 3},
+      {"50", 3}, {"75", 4}, {"100", 4}, {"150", 4}, {"200", 4}, {"+Inf", 5}};
+  double previous = 0;
+  for (const auto& [le, expected] : cumulative) {
+    const double value = bucket(decode, "16k_64k", le);
+    assert(value == expected && value >= previous);
+    previous = value;
+  }
+  assert(count(decode, "16k_64k") == 5 && count(prefill, "16k_64k") == 0);
+  assert(delta(after, decode + "_sum{context=\"16k_64k\"}") == 567);
+  for (const auto& band : gufo::server::detail::kContextDepthNames)
+    for (const auto& name : {prefill, decode})
+      assert(SampleValue(after, name + "_count{context=\"" + std::string(band) +
+                                    "\"}") ==
+             SampleValue(after, name + "_bucket{context=\"" +
+                                    std::string(band) + "\",le=\"+Inf\"}"));
+  for (const auto& name : {prefill, decode}) {
+    assert(after.find("# TYPE " + name + " histogram\n") != std::string::npos);
+    assert(after.find("# HELP " + name + " ") != std::string::npos);
+  }
+  for (const std::string counter :
+       {"gufo_cache_hits_total", "gufo_cache_misses_total",
+        "gufo_cache_acquisitions_total"})
+    assert(after.find("# TYPE " + counter + " counter\n") != std::string::npos);
+  // New series follow the llama.cpp-compatible block, which stays first.
+  assert(after.find("llamacpp:kv_cache_usage_ratio ") <
+         after.find("# HELP gufo_cache_hits_total "));
 }
 
 void TestDiagnosticMetrics() {
@@ -3591,6 +3770,92 @@ void TestEmbeddingService() {
   }
 }
 
+/// One score per document; `lost` turns every request into a device loss.
+class FakeRerankScorer final : public gufo::server::RerankScorer {
+public:
+  [[nodiscard]] bool ready() const noexcept override { return true; }
+  [[nodiscard]] bool device_lost() const noexcept override { return lost_; }
+  [[nodiscard]] std::string model_id() const override { return "rerank-test"; }
+  [[nodiscard]] std::string backend_name() const override { return "cpu-fake"; }
+  [[nodiscard]] std::size_t max_pair_tokens() const override { return 64; }
+  gufo::server::RerankStatus Score(const std::string&,
+                                   const std::vector<std::string>& documents,
+                                   const std::function<bool()>&,
+                                   gufo::server::RerankScores* scores,
+                                   std::string*) override {
+    if (lose_device) {
+      lost_ = true;
+      return gufo::server::RerankStatus::kDeviceLost;
+    }
+    for (std::size_t i = 0; i < documents.size(); ++i) {
+      scores->scores.push_back(1.0 / static_cast<double>(i + 1));
+      scores->token_counts.push_back(4);
+    }
+    return gufo::server::RerankStatus::kOk;
+  }
+  bool lose_device{false};
+
+private:
+  std::atomic<bool> lost_{false};
+};
+
+void TestRerankRoutes() {
+  const std::string request = R"({"query":"q","documents":["a","b"]})";
+  {
+    // A text server without a reranker names the missing model on every
+    // llama.cpp alias.
+    RunningServer text;
+    for (const char* path :
+         {"/v1/rerank", "/v1/reranking", "/rerank", "/reranking"}) {
+      const auto response = text.Post(path, request);
+      ExpectStatus(response, 503);
+      assert(response.find("\"code\":\"reranker_not_loaded\"") !=
+             std::string::npos);
+    }
+  }
+  {
+    // So does a server with no text backend, instead of 404.
+    HttpServer server("127.0.0.1", 0, nullptr);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    const auto response =
+        EmbeddingPost(server.port(), request, {}, "/v1/rerank");
+    ExpectStatus(response, 503);
+    assert(response.find("reranker_not_loaded") != std::string::npos);
+    server.stop();
+    worker.join();
+  }
+  {
+    auto scorer = std::make_shared<FakeRerankScorer>();
+    std::atomic<int> hook_calls{0};
+    HttpServer server(
+        "127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+        {.api_key = "test-secret", .on_device_lost = [&] { ++hook_calls; }},
+        nullptr, nullptr, scorer);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    const int port = server.port();
+    const std::string auth = "Authorization: Bearer test-secret\r\n";
+    ExpectStatus(EmbeddingPost(port, request, {}, "/v1/rerank"), 401);
+    const auto ranked = EmbeddingPost(port, request, auth, "/v1/rerank");
+    ExpectStatus(ranked, 200);
+    assert(ranked.find("\"results\":[{\"index\":0,\"relevance_score\":1},"
+                       "{\"index\":1,\"relevance_score\":0.5}]") !=
+           std::string::npos);
+    assert(ranked.find("\"prompt_tokens\":8") != std::string::npos);
+    scorer->lose_device = true;
+    ExpectStatus(EmbeddingPost(port, request, auth, "/v1/rerank"), 503);
+    assert(hook_calls.load() == 1);
+    ExpectStatus(SendParts("127.0.0.1", port,
+                           {"GET /health HTTP/1.1\r\n" + auth + "\r\n"}),
+                 503);
+    server.stop();
+    worker.join();
+  }
+}
+
 void TestCacheLookupOptIn() {
   const std::string input =
       R"({"model":"test","messages":[{"role":"user","content":"private-lookup-sentinel"}]})";
@@ -3697,6 +3962,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   assert(argc == 1);
+  TestCacheAndSpeedMetrics();
   TestClientRecipeToolLoops();
   TestCheckpointTransferHttp();
   TestCacheLookupOptIn();
@@ -3750,5 +4016,6 @@ int main(int argc, char** argv) {
   TestDeferredStreamHeaders();
   TestAdmittedStreamHeaders();
   TestEmbeddingService();
+  TestRerankRoutes();
   std::cout << "HTTP transport checks passed.\n";
 }
