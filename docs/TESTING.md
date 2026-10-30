@@ -166,6 +166,8 @@ Record hardware/software identities and the exact timed scope. Use
 
 ## Admission-only native recovery gate
 
+Repeated in-process admission cycles show bounded RSS movement from allocator retention and runtime anonymous-mapping churn; no live heap growth (mallinfo2 uordblks flat). Serve admits once at startup and `diagnose --plan` is one-shot, so this does not affect normal use.
+
 On an explicitly allocated Linux GPU host, build **before loading models**:
 
 ```sh
