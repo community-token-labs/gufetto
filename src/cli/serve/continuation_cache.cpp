@@ -580,6 +580,8 @@ ContinuationCache::ContinuationCache(std::size_t capacity,
     try {
       impl_->snapshot_capacity_bytes = impl_->snapshot_support.capacity_bytes();
     } catch (...) {
+      if (impl_->snapshot_support.require_capacity)
+        throw;
       impl_->snapshot_capacity_bytes = 0;
     }
   }
