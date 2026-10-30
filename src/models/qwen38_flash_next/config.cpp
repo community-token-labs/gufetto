@@ -7,10 +7,10 @@
 #include <utility>
 #include <variant>
 
+#include "src/models/qwen/architecture.hpp"
+
 namespace gufo::models::qwen38_flash_next {
 namespace {
-
-constexpr std::string_view kArchitecture = "qwen4exp";
 
 struct Reader {
   const core::GgufReader& gguf;
@@ -77,7 +77,8 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
                                        bool require_trunk,
                                        std::string* error_msg) {
   Reader r{gguf, error_msg};
-  if (gguf.GetMetadataString("general.architecture") != kArchitecture) {
+  if (!qwen::IsQwen4PreviewArch(
+          gguf.GetMetadataString("general.architecture").value_or(""))) {
     r.Fail("GGUF architecture is not qwen4exp");
     return std::nullopt;
   }

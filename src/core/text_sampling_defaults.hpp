@@ -32,7 +32,7 @@ struct SamplingOverrides {
 inline TextModelPreset TextPreset(const core::ModelConfig& config) {
   if (config.architecture == "deepseek4")
     return TextModelPreset::kDeepSeekV4Flash;
-  if (models::qwen::IsQwen4Family(config.architecture) ||
+  if (models::qwen::IsQwen4PreviewArch(config.architecture) ||
       (config.num_layers == 64 && config.hidden_size == 5120 &&
        config.vocab_size == 248320))
     return TextModelPreset::kQwen38;
