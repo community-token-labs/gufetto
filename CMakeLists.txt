@@ -1041,9 +1041,10 @@ if (BUILD_TESTING)
 
   add_test(NAME setup_verify_test
     COMMAND ${Python3_EXECUTABLE} -B
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/setup_verify_test.py)
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/setup_verify_test.py
+      --gufo $<TARGET_FILE:gufo>)
   set_tests_properties(setup_verify_test PROPERTIES
-    LABELS "cpu;tools;server;docs" TIMEOUT 30)
+    LABELS "cpu;tools;server;docs" TIMEOUT 60)
 
   add_test(NAME functional_runner_test
     COMMAND ${Python3_EXECUTABLE}

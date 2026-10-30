@@ -16,8 +16,32 @@ personal skills from `~/.claude/skills/<name>/SKILL.md`. Link the skill from
 a Gufo checkout so it always matches the CLI built from that checkout:
 
 ```sh
-mkdir -p ~/.claude/skills
-ln -s "$PWD/docs/skills/gufo-setup" ~/.claude/skills/gufo-setup
+SKILL="$HOME/.claude/skills/gufo-setup"
+mkdir -p "$HOME/.claude/skills"
+if [ -e "$SKILL" ] || [ -L "$SKILL" ]; then
+  echo "$SKILL already exists; inspect it, do not replace it" >&2
+else
+  ln -s "$PWD/docs/skills/gufo-setup" "$SKILL"
+fi
+```
+
+Never overwrite an existing `gufo-setup` entry, whether it is your own copy,
+another checkout's link or an edited skill. Inspect it with `ls -l` and
+remove it yourself only if you no longer need it.
+
+The link points at this checkout's absolute path. If you move or delete the
+checkout, the link dangles and agents stop seeing the skill; remove the
+dangling link as below and create it again from the new location.
+
+To uninstall, remove the entry only if it is a symbolic link to a
+`docs/skills/gufo-setup` directory; never delete a real directory there:
+
+```sh
+SKILL="$HOME/.claude/skills/gufo-setup"
+case "$(readlink "$SKILL")" in
+  */docs/skills/gufo-setup) rm "$SKILL" ;;
+  *) echo "$SKILL is not a gufo-setup link; left unchanged" >&2 ;;
+esac
 ```
 
 Agents that support the same format load it from their own skills
@@ -35,9 +59,12 @@ at the file in the Gufo repository; its first step obtains the checkout.
 - **Paths, not links, inside the skill.** The skill names repository files
   as plain paths relative to the checkout, so it works unchanged when linked
   into a skills directory.
-- **No invented commands.** Every `--option` in the skill must exist in the
-  CLI sources or the verify script; `setup_verify_test` enforces this and
-  checks that every repository path it names exists.
+- **No invented commands.** `setup_verify_test` checks every `--option` in
+  the skill against the `--help` of the command it belongs to (built
+  `gufo diagnose`, `gufo serve`, `gufo serve llm`, or the verify script). It
+  also checks that each quoted Gufo message still exists in the sources, and
+  that every repository path the skill names exists. Its single pending
+  option, `--api-key-file`, is used only after the skill checks `--help`.
 - **Read-only or confirmed steps.** Diagnostics, `--plan`, `--help` and
   `GET` requests run freely. Cloning, building, downloads, manifests, client
   configuration and starting a server need the user's agreement and stay
@@ -45,9 +72,11 @@ at the file in the Gufo repository; its first step obtains the checkout.
   Privileged host changes are explained, never performed.
 - **No credential handling.** The agent never asks for, prints or stores
   keys or tokens; the user exports `GUFO_API_KEY` or logs in to Hugging
-  Face themselves. The verify script reads the key from the environment,
-  never prints it, and refuses to send it over plain HTTP to a non-loopback
-  host unless told to.
+  Face themselves. The server takes its key from `--api-key-file`;
+  `GUFO_API_KEY` is client-side only. The verify script reads the key from
+  the environment and never prints it. It never follows redirects, and it
+  sends the key over plain HTTP only to numeric `127.0.0.1`/`::1`, unless
+  told otherwise (`localhost` is not trusted).
 - **No agent instruction files.** The skill forbids creating `AGENTS.md`,
   `CLAUDE.md` or similar files in the checkout or the user's projects.
 - **Refusals are answers.** Startup admission, `--plan` states and HTTP
@@ -67,4 +96,6 @@ non-streaming Chat Completions request with `reasoning_effort: none` and
 reports the loaded `context_length` and input modalities. `--wait` keeps
 polling while the server answers 503 `loading`. Exit status is 0 on pass,
 1 on a failed check and 2 on a usage error; failures print the server's
-error code with a hint.
+error code with a hint. With `--json` every outcome, usage errors included,
+prints one result object. Malformed responses, timeouts and transport
+errors become plain failures without tracebacks.

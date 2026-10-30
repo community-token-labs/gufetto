@@ -32,7 +32,8 @@ flags that are not listed in `gufo <command> --help`.
 5. **Do not create `AGENTS.md`, `CLAUDE.md` or other agent instruction
    files**, in the Gufo checkout or in the user's projects.
 6. **Loopback only.** Bind `--host 127.0.0.1` unless the user asks for LAN
-   access; then require their `--api-key` and a TLS reverse proxy. Never
+   access; then require a key (`--api-key-file`, step 6) and a TLS reverse
+   proxy. Never
    disable authentication to make a client work.
 7. **Do not guess.** If a model, variant, flag or value is not in the Gufo
    docs, say so and ask. A refused startup is the answer, not something to
@@ -148,9 +149,14 @@ projector options. For Qwen3.8 27B Q4 without a draft:
 echo "gufo serve PID $!"
 ```
 
-Add `--api-key "$GUFO_API_KEY"` only if the user exported that variable and
-wants authentication; it is then visible in the process list (see
-`docs/clients/README.md`). Use `--speculative dflash2 --dflash-model "$DRAFT"`
+If the user wants authentication, start the server with
+`--api-key-file PATH`, naming a file the user created with the key. Do not
+read or write that file. The server takes the key only from that file or
+from `--api-key`. Clients and the verify script read it from `GUFO_API_KEY`,
+which the user exports in their own shell; that variable does not configure
+the server. If `"$GUFO" serve llm --help` does not list `--api-key-file`,
+this build predates it: tell the user that `--api-key` would show the key in
+the process list (see `docs/clients/README.md`), and let them decide. Use `--speculative dflash2 --dflash-model "$DRAFT"`
 (Qwen3.8 27B), `--speculative mtp --mtp-model "$MTP"` (Flash-Next) or
 `--dspark-model "$DSPARK"` (DeepSeek) only as the model README shows.
 `--mmproj` is auto-discovered beside the model; `--no-vision` disables it.
@@ -167,8 +173,9 @@ python3 "$GUFO_SRC/tools/setup/verify_server.py" --wait 600
 It lists `/v1/models`, sends one short Chat Completions request with thinking
 off and prints `PASS` with the loaded `context_length` and input modalities,
 or `FAIL` with a hint. It reads the key from `GUFO_API_KEY` when that is set
-and never prints it. Use `--base-url` for another port and `--model` for a
-second served name. Report the actual `context_length`; clients must not be
+and never prints it. It sends a key over plain HTTP only to `127.0.0.1` or
+`::1`, and never follows redirects. Use `--base-url` for another port and
+`--model` for a second served name. Report the actual `context_length`; clients must not be
 configured with a larger window.
 
 ## 8. Configure the client (ask first)
@@ -202,7 +209,7 @@ qualification; `docs/clients/QUALIFICATION.md` covers that separately.
 | `... pass --enable-yarn` | Flash-Next `--context` above the native 262144 needs `--enable-yarn`; it changes every request, so prefer a smaller context |
 | 503 `loading` | Model still loading; wait |
 | Connection refused | The server is not running; read `gufo-serve.log` |
-| 401 | Server has `--api-key`; the client must send it as a bearer token (`x-api-key` alone fails) |
+| 401 | The server has a key; the client must send it as a bearer token (`x-api-key` alone fails) |
 | 404 `model_not_found` | Client sends a model ID that is not served; use `gufo-local` |
 | 503 `device_lost`, exit status 75 | GPU context lost; restart `gufo serve` |
 | 429 | Admission queue full (`--max-pending`); retry |

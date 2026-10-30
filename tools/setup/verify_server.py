@@ -10,6 +10,7 @@ and never printed. Exit status: 0 pass, 1 check failed, 2 usage error.
 from __future__ import annotations
 
 import argparse
+import http.client
 import ipaddress
 import json
 import os
@@ -33,7 +34,7 @@ CODE_HINTS = {
     "context_length_exceeded": "the prompt does not fit the loaded context",
 }
 STATUS_HINTS = {
-    401: "the server requires its --api-key; export it in this shell under "
+    401: "the server requires its API key; export it in this shell under "
          "the variable named by --api-key-env (default GUFO_API_KEY)",
     404: "unknown route or model; check --base-url has no trailing /v1",
     413: "request too large for --max-request-bytes or the loaded context",
@@ -50,13 +51,34 @@ class CheckError(Exception):
         self.hint = hint
 
 
-def is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
+class UsageError(Exception):
+    """An invalid command line; exit status 2."""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str):
+        raise UsageError(message)
+
+
+class RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect, so a credential cannot be re-sent elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise CheckError(
+            f"server answered {code} redirect; redirects are not followed",
+            "point --base-url at the Gufo server itself")
+
+
+def is_numeric_loopback(host: str) -> bool:
+    """True only for literal 127.0.0.0/8 or ::1; names are never trusted."""
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def valid_header_value(value: str) -> bool:
+    return bool(value) and all(0x21 <= ord(c) <= 0x7E for c in value)
 
 
 def error_details(body: bytes) -> tuple[str, str]:
@@ -64,10 +86,12 @@ def error_details(body: bytes) -> tuple[str, str]:
     try:
         error = json.loads(body).get("error", {})
     except (ValueError, AttributeError):
-        return "", body[:200].decode("utf-8", "replace")
+        return "", ""
     if not isinstance(error, dict):
         return "", ""
-    return str(error.get("code") or ""), str(error.get("message") or "")
+    code, message = error.get("code"), error.get("message")
+    return (code if isinstance(code, str) else "",
+            message[:300] if isinstance(message, str) else "")
 
 
 class Client:
@@ -77,7 +101,7 @@ class Client:
         self.timeout = timeout
         # Never route a local server check through an environment proxy.
         self.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}))
+            urllib.request.ProxyHandler({}), RejectRedirects())
 
     def request(self, method: str, path: str,
                 payload: dict[str, Any] | None = None) -> tuple[int, bytes]:
@@ -88,17 +112,38 @@ class Client:
             req.add_header("Content-Type", "application/json")
         if self.key:
             req.add_header("Authorization", "Bearer " + self.key)
+        what = f"{method} {path}"
         try:
             with self.opener.open(req, timeout=self.timeout) as response:
                 return response.status, response.read()
+        except CheckError:
+            raise
         except urllib.error.HTTPError as error:
-            return error.code, error.read()
-        except (urllib.error.URLError, OSError) as error:
-            reason = getattr(error, "reason", error)
+            try:
+                return error.code, error.read()
+            except (OSError, http.client.HTTPException):
+                return error.code, b""
+        except TimeoutError:
+            raise CheckError(f"{what} timed out after {self.timeout:g} s",
+                             "the server is busy or stuck; check its log, "
+                             "or raise --timeout") from None
+        except http.client.IncompleteRead:
+            raise CheckError(f"{what} response body was truncated") from None
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise CheckError(
+                    f"{what} timed out after {self.timeout:g} s",
+                    "the server is busy or stuck; check its log, or raise "
+                    "--timeout") from None
             raise CheckError(
-                f"cannot reach {self.base_url}: {reason}",
+                f"cannot reach {self.base_url}: "
+                f"{type(error.reason).__name__}",
                 "a refused connection means `gufo serve` is not running on "
                 "this host/port") from None
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            # Messages can quote request data, so only the type is reported.
+            raise CheckError(f"{what} failed: {type(error).__name__}") \
+                from None
 
 
 def fail_for(what: str, status: int, body: bytes) -> CheckError:
@@ -106,6 +151,18 @@ def fail_for(what: str, status: int, body: bytes) -> CheckError:
     hint = CODE_HINTS.get(code) or STATUS_HINTS.get(status, "")
     label = f"{status} {code}".strip()
     return CheckError(f"{what} returned {label}: {message}".rstrip(": "), hint)
+
+
+def parse_json(what: str, body: bytes) -> Any:
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise CheckError(f"{what} returned a body that is not JSON") from None
+
+
+def is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and \
+        value >= 0
 
 
 def list_models(client: Client, wait: float) -> list[dict[str, Any]]:
@@ -118,28 +175,45 @@ def list_models(client: Client, wait: float) -> list[dict[str, Any]]:
             continue
         if status != 200:
             raise fail_for("GET /v1/models", status, body)
-        try:
-            models = json.loads(body)["data"]
-        except (ValueError, KeyError, TypeError):
-            raise CheckError("GET /v1/models returned no model list") from None
+        listing = parse_json("GET /v1/models", body)
+        models = listing.get("data") if isinstance(listing, dict) else None
         if not isinstance(models, list) or not models:
-            raise CheckError("GET /v1/models lists no models")
+            raise CheckError("GET /v1/models returned no model list")
+        for model in models:
+            if not isinstance(model, dict) or \
+                    not isinstance(model.get("id"), str) or not model["id"]:
+                raise CheckError("GET /v1/models lists a malformed entry")
         return models
 
 
 def select_model(models: list[dict[str, Any]], wanted: str | None) -> dict:
-    ids = [str(model.get("id")) for model in models]
+    ids = [model["id"] for model in models]
     if wanted:
         for model in models:
-            if model.get("id") == wanted:
-                return model
-        raise CheckError(f"model {wanted!r} is not served (served: "
-                         f"{', '.join(ids)})", CODE_HINTS["model_not_found"])
-    for model in models:
-        if "context_length" in model:  # The text model entry.
-            return model
-    raise CheckError(f"no text model is served (served: {', '.join(ids)})",
-                     "start `gufo serve llm`, or pass --model")
+            if model["id"] == wanted:
+                break
+        else:
+            raise CheckError(f"model {wanted!r} is not served (served: "
+                             f"{', '.join(ids)})",
+                             CODE_HINTS["model_not_found"])
+    else:
+        text = [model for model in models if "context_length" in model]
+        if not text:
+            raise CheckError(f"no text model is served (served: "
+                             f"{', '.join(ids)})",
+                             "start `gufo serve llm`, or pass --model")
+        model = text[0]
+    context = model.get("context_length")
+    if context is not None and not is_count(context):
+        raise CheckError("GET /v1/models reports a malformed context_length")
+    architecture = model.get("architecture")
+    modalities = architecture.get("input_modalities") \
+        if isinstance(architecture, dict) else None
+    if modalities is not None and (
+            not isinstance(modalities, list) or
+            not all(isinstance(item, str) for item in modalities)):
+        raise CheckError("GET /v1/models reports malformed input_modalities")
+    return model
 
 
 def chat(client: Client, model: str, max_tokens: int,
@@ -152,28 +226,45 @@ def chat(client: Client, model: str, max_tokens: int,
     }
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
+    what = "POST /v1/chat/completions"
     started = time.monotonic()
     status, body = client.request("POST", "/v1/chat/completions", payload)
     elapsed = time.monotonic() - started
     if status != 200:
-        raise fail_for("POST /v1/chat/completions", status, body)
-    try:
-        response = json.loads(body)
-        choice = response["choices"][0]
-        content = choice["message"].get("content") or ""
-    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-        raise CheckError("chat response is not a Chat Completions object") \
-            from None
-    finish = str(choice.get("finish_reason") or "")
-    if not isinstance(content, str) or not content.strip():
+        raise fail_for(what, status, body)
+    response = parse_json(what, body)
+    malformed = CheckError(f"{what} returned a malformed Chat Completions "
+                           "object")
+    choices = response.get("choices") if isinstance(response, dict) else None
+    if not isinstance(choices, list) or not choices or \
+            not isinstance(choices[0], dict):
+        raise malformed
+    choice = choices[0]
+    message = choice.get("message")
+    finish = choice.get("finish_reason")
+    if not isinstance(message, dict) or \
+            not isinstance(finish, (str, type(None))):
+        raise malformed
+    content = message.get("content")
+    if not isinstance(content, (str, type(None))):
+        raise malformed
+    usage = response.get("usage")
+    if usage is None:
+        usage = {}
+    if not isinstance(usage, dict):
+        raise malformed
+    for field in ("prompt_tokens", "completion_tokens"):
+        if usage.get(field) is not None and not is_count(usage[field]):
+            raise malformed
+    finish = finish or ""
+    if not content or not content.strip():
         hint = ("the output budget ran out before visible text; raise "
                 "--max-tokens or keep thinking off" if finish == "length"
                 else "")
         raise CheckError(f"chat response has no text (finish_reason "
                          f"{finish or 'missing'})", hint)
-    usage = response.get("usage") or {}
     return {
-        "content": content.strip(),
+        "content": content.strip()[:200],
         "finish_reason": finish,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
@@ -182,7 +273,7 @@ def chat(client: Client, model: str, max_tokens: int,
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = Parser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
                         help="server root, without /v1 (default: %(default)s)")
     parser.add_argument("--model",
@@ -207,69 +298,107 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="keep polling while the server answers 503 "
                              "loading (default: %(default)s)")
     parser.add_argument("--allow-cleartext-key", action="store_true",
-                        help="send the key over plain HTTP to a non-loopback "
-                             "host")
+                        help="send the key over plain HTTP to a host that is "
+                             "not 127.0.0.1 or ::1")
     parser.add_argument("--json", action="store_true",
                         help="print one JSON result object")
     args = parser.parse_args(argv)
-    url = urllib.parse.urlsplit(args.base_url)
-    if url.scheme not in ("http", "https") or not url.hostname:
-        parser.error("--base-url must be an http:// or https:// URL")
+    try:
+        url = urllib.parse.urlsplit(args.base_url)
+        port = url.port
+        host = url.hostname
+    except ValueError:
+        raise UsageError("--base-url is not a valid URL") from None
+    if url.scheme not in ("http", "https") or not host:
+        raise UsageError("--base-url must be an http:// or https:// URL")
+    if port == 0:
+        raise UsageError("--base-url port must be 1-65535")
+    if url.username is not None or url.password is not None:
+        raise UsageError("--base-url must not contain credentials")
+    if url.query or url.fragment:
+        raise UsageError("--base-url must not contain a query or fragment")
     if url.path.rstrip("/").endswith("/v1"):
-        parser.error("--base-url is the server root; drop the trailing /v1")
-    if args.max_tokens <= 0 or args.timeout <= 0 or args.wait < 0:
-        parser.error("--max-tokens and --timeout must be positive, "
-                     "--wait non-negative")
-    args.host = url.hostname
+        raise UsageError(
+            "--base-url is the server root; drop the trailing /v1")
+    if args.max_tokens <= 0 or not args.timeout > 0 or not args.wait >= 0:
+        raise UsageError("--max-tokens and --timeout must be positive, "
+                         "--wait non-negative")
+    args.host = host
     args.scheme = url.scheme
     return args
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     key = os.environ.get(args.api_key_env) or None
-    if key and args.scheme == "http" and not is_loopback(args.host) and \
-            not args.allow_cleartext_key:
+    if key is not None and not valid_header_value(key):
+        raise CheckError(
+            f"the value of {args.api_key_env} is not a valid bearer token",
+            "it must be printable ASCII without spaces or line breaks")
+    if key and args.scheme == "http" and not is_numeric_loopback(args.host) \
+            and not args.allow_cleartext_key:
         raise CheckError(
             f"refusing to send the bearer key in cleartext to {args.host}",
-            "use loopback, a TLS reverse proxy, or --allow-cleartext-key")
+            "use http://127.0.0.1 or http://[::1], a TLS reverse proxy, or "
+            "--allow-cleartext-key")
     client = Client(args.base_url, key, args.timeout)
     model = select_model(list_models(client, args.wait), args.model)
-    architecture = model.get("architecture") or {}
+    architecture = model.get("architecture")
     result = {
-        "model": model.get("id"),
+        "model": model["id"],
         "context_length": model.get("context_length"),
-        "input_modalities": architecture.get("input_modalities"),
+        "input_modalities": architecture.get("input_modalities")
+        if isinstance(architecture, dict) else None,
         "authenticated": key is not None,
     }
-    result.update(chat(client, str(model.get("id")), args.max_tokens,
+    result.update(chat(client, model["id"], args.max_tokens,
                        args.reasoning_effort))
     return result
 
 
+def redact(text: str, secret: str | None) -> str:
+    return text.replace(secret, "<redacted>") if secret else text
+
+
+def report(as_json: bool, ok: bool, fields: dict[str, Any],
+           lines: list[str], secret: str | None) -> None:
+    text = json.dumps({"ok": ok, **fields}) if as_json else "\n".join(lines)
+    print(redact(text, secret))
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    raw = sys.argv[1:] if argv is None else argv
+    as_json = "--json" in raw
+    try:
+        args = parse_args(raw)
+    except UsageError as error:
+        if as_json:
+            report(True, False, {"error": str(error), "usage": True}, [],
+                   None)
+        print(f"usage error: {error}", file=sys.stderr)
+        return 2
+    secret = os.environ.get(args.api_key_env) or None
     try:
         result = run(args)
     except CheckError as error:
-        if args.json:
-            print(json.dumps({"ok": False, "error": str(error),
-                              "hint": error.hint}))
-        else:
-            print(f"FAIL: {error}")
-            if error.hint:
-                print(f"hint: {error.hint}")
+        report(args.json, False, {"error": str(error), "hint": error.hint},
+               [f"FAIL: {error}"] + ([f"hint: {error.hint}"]
+                                     if error.hint else []), secret)
         return 1
-    if args.json:
-        print(json.dumps({"ok": True, **result}))
-    else:
-        print(f"PASS: {result['model']} answered {result['content']!r} "
-              f"in {result['seconds']} s")
-        print(f"context_length={result['context_length']} "
-              f"input_modalities={result['input_modalities']} "
-              f"finish_reason={result['finish_reason']} "
-              f"prompt_tokens={result['prompt_tokens']} "
-              f"completion_tokens={result['completion_tokens']} "
-              f"authenticated={str(result['authenticated']).lower()}")
+    except Exception as error:  # Never print a traceback that may hold data.
+        report(args.json, False,
+               {"error": f"internal error: {type(error).__name__}",
+                "hint": ""},
+               [f"FAIL: internal error: {type(error).__name__}"], secret)
+        return 1
+    report(args.json, True, result, [
+        f"PASS: {result['model']} answered {result['content']!r} "
+        f"in {result['seconds']} s",
+        f"context_length={result['context_length']} "
+        f"input_modalities={result['input_modalities']} "
+        f"finish_reason={result['finish_reason']} "
+        f"prompt_tokens={result['prompt_tokens']} "
+        f"completion_tokens={result['completion_tokens']} "
+        f"authenticated={str(result['authenticated']).lower()}"], secret)
     return 0
 
 
