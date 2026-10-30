@@ -52,15 +52,18 @@ struct ClientCall {
   std::string id, name, arguments;
 };
 
-void CheckClientUsage(std::string_view protocol, const gufo::json::Value& usage) {
+void CheckClientUsage(std::string_view protocol,
+                      const gufo::json::Value& usage) {
   if (protocol == "chat") {
     assert(usage.member_size("prompt_tokens") == 10);
     assert(usage.member_size("completion_tokens") == 1);
-    assert(usage.find("prompt_tokens_details")->member_size("cached_tokens") == 8);
+    assert(usage.find("prompt_tokens_details")->member_size("cached_tokens") ==
+           8);
   } else if (protocol == "responses") {
     assert(usage.member_size("input_tokens") == 10);
     assert(usage.member_size("output_tokens") == 1);
-    assert(usage.find("input_tokens_details")->member_size("cached_tokens") == 8);
+    assert(usage.find("input_tokens_details")->member_size("cached_tokens") ==
+           8);
   } else {
     assert(usage.member_size("input_tokens") == 2);
     assert(usage.member_size("output_tokens") == 1);

@@ -8,10 +8,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <semaphore>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -45,7 +47,7 @@ void TestAuthorization() {
     ExpectStatus(secured.Send("POST " + path + " HTTP/1.1\r\n\r\n"), 401);
   }
   for (const std::string header :
-       {"", "Authorization: Bearer wrong\r\n",
+       {"", "x-api-key: test-secret\r\n", "Authorization: Bearer wrong\r\n",
         "Authorization: Basic test-secret\r\n",
         "Authorization: Bearer test-secret\r\nAuthorization: Bearer "
         "test-secret\r\n"}) {
@@ -176,6 +178,8 @@ std::string ChunkedBody(const std::string& response) {
     cursor = line_end + 2 + size + 2;
   }
 }
+
+#include "tests/cli/client_recipe_checks.hpp"
 
 // `--trace` keeps what a text request carried in and out under the id the
 // logs name. Polls, other routes and unauthenticated requests stay out.
@@ -3556,6 +3560,7 @@ void TestCheckpointTransferHttp() {
   assert(unauthorized.find("100 Continue") == std::string::npos);
 }
 int main() {
+  TestClientRecipeToolLoops();
   TestCheckpointTransferHttp();
   TestCacheLookupOptIn();
   // The log assertions below match "[LEVEL] [component]" text written to a
