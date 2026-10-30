@@ -2029,13 +2029,14 @@ int main(int argc, char** argv) {
        !logprobs_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only | --prefill-only | --sampling-only | "
-                 "--cache-only | --eos-only | --lookup-only | --logprobs-only | "
-                 "--execution-only TOKENS] "
-                 "[--kv-cache-type f16|q8_0"
-                 "|q8_0-rotated"
-                 "]\n";
+    std::cerr
+        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+           "[--batch-only | --prefill-only | --sampling-only | "
+           "--cache-only | --eos-only | --lookup-only | --logprobs-only | "
+           "--execution-only TOKENS] "
+           "[--kv-cache-type f16|q8_0"
+           "|q8_0-rotated"
+           "]\n";
     return 77;
   }
   if (execution_only) {

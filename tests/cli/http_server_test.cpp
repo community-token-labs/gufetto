@@ -3636,12 +3636,15 @@ void TestCompletionLogprobOffsetsWithStops() {
            // empty-spelling token, then an EOS that publishes only metadata.
            Case{{"a", "\xC3", "\xA9", "", "b"},
                 8,
-                "a\xC3\xA9" "b",
+                "a\xC3\xA9"
+                "b",
                 "[0,1,1,2,2,3]",
                 "</s>"},
            // Four-byte "🙂" split across tokens while a stop prefix is held.
-           Case{{"\xF0\x9F", "\x99\x82", "S", "x"}, 8,
-                "\xF0\x9F\x99\x82Sx", "[0,0,1,2]"},
+           Case{{"\xF0\x9F", "\x99\x82", "S", "x"},
+                8,
+                "\xF0\x9F\x99\x82Sx",
+                "[0,0,1,2]"},
        }) {
     server.backend->scripted_tokens = tokens;
     server.backend->scripted_terminal = terminal;
