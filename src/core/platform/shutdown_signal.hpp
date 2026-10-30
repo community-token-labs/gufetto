@@ -42,6 +42,12 @@ private:
 /// process can exit before the OS deadline expires. No-op on POSIX.
 void NotifyShutdownHandled() noexcept;
 
+/// Destructor-free EX_TEMPFAIL on every platform; GPU owners must not unwind.
+[[noreturn]] void ExitAfterDeviceLoss() noexcept;
+/// Invoke the current process-lifetime shutdown handler with SIGTERM. Outside
+/// its registration lifetime, exit 75 rather than raise an unhandled signal.
+void RequestDeviceLossShutdown() noexcept;
+
 /// Ignore SIGPIPE for the process (POSIX); a no-op on Windows, where Winsock
 /// reports WSAECONNRESET instead of raising a signal.
 inline void IgnoreSocketPipeSignal() noexcept {

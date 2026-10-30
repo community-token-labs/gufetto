@@ -15,7 +15,7 @@ set(gufo_pr_targets
   cache_retention_test
   cache_model_capabilities_test
   arg_parser_test json_test json_constraint_test gguf_reader_test gguf_identity_test
-  heap_placement_test
+  heap_placement_test startup_admission_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test
   logit_sampler_test ggml_dequant_test
@@ -69,7 +69,8 @@ list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.kv_cache" "qwen38_flash_next\\.target_probe"
   "qwen38_flash_next\\.continuation_identity"
   pd_attribution_scheduler_test pd_attribution_analyzer_test
-  perf_trace_disabled_test pinned_prefix_harness_test cache_lookup_harness_test
+  perf_trace_disabled_test perf_trace_phase_limit_test
+  pinned_prefix_harness_test cache_lookup_harness_test
   cache_lookup_classify_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test

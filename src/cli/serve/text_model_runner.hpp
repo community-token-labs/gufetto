@@ -23,6 +23,7 @@
 #include "src/cli/serve/text_diagnostic_lease.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
+#include "src/core/memory_budget.hpp"
 #include "src/core/sampling.hpp"
 
 namespace gufo::server {
@@ -124,6 +125,8 @@ inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
 /// Most an explicit --cache-ram-bytes may claim: available host RAM minus
 /// kHostSnapshotHeadroomBytes.
 [[nodiscard]] std::size_t HostSnapshotCeilingBytes();
+/// AUTO basis and ceiling from ONE host observation, before liabilities.
+[[nodiscard]] core::ProtectedCacheHeadroom ObserveHostSnapshotHeadroom();
 
 enum class TextExecutionPlanKind : std::uint8_t {
   kSerial,
@@ -325,6 +328,12 @@ public:
   /// (for example the vision projector). Called only when creating the pool.
   [[nodiscard]] virtual std::string LookupContextIdentity() const { return {}; }
   [[nodiscard]] virtual TextRunnerResourceClaim ResourceClaim() const = 0;
+  /// Opt in only with a homogeneous component pool and complete measured
+  /// startup callbacks. Logical payload claims remain unchanged, but do not
+  /// authorize/refuse the aggregate pool before resources and slots exist.
+  [[nodiscard]] virtual bool UsesMeasuredStartupAdmission() const {
+    return false;
+  }
   [[nodiscard]] virtual std::vector<TextExecutionPlan> SupportedPlans()
       const = 0;
 

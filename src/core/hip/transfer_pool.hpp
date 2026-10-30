@@ -16,6 +16,18 @@ struct TransferLease;
 
 enum class CopyDirection { kDeviceToHost, kHostToDevice };
 
+struct FatalCopyInfo {
+  const char*
+      operation{};  // Static HIP API literal, never an error-name lookup.
+  int error{};
+  bool has_entry_id{};
+  std::uint64_t entry_id{}, bytes{};
+};
+using FatalCopyHandler = void (*)(const FatalCopyInfo&);
+// Install before backend load; target/state must live until process exit.
+// The handler must arrange bounded exit without releasing transfer owners.
+void SetFatalCopyHandler(FatalCopyHandler) noexcept;
+
 // One stream/event pair per transfer. Caller orders access to this object;
 // different leases may run concurrently. Sources must already be ready and
 // stay immutable; retain all buffers until completion settles. A lease accepts
@@ -28,6 +40,7 @@ public:
   // are released; synchronization and error draining use the bound stream.
   void BindTo(hipStream_t, std::shared_ptr<void> owner);
   [[nodiscard]] hipStream_t Native() const;
+  void SetPersistenceContext(std::uint64_t, std::uint64_t) noexcept override;
   [[nodiscard]] cache::TransferResult Synchronize() noexcept override;
   [[nodiscard]] cache::Completion Complete();
   [[nodiscard]] cache::Completion Copy(void* destination, const void* source,
@@ -37,6 +50,7 @@ public:
 private:
   friend class TransferPool;
   explicit TransferStream(std::shared_ptr<detail::TransferLease>);
+  cache::Completion Finish(std::unique_ptr<cache::CompletionSignal>);
   std::shared_ptr<detail::TransferLease> lease_;
 };
 
@@ -46,7 +60,7 @@ public:
   explicit TransferPool(std::size_t capacity);
   // Returns null on exhaustion. No HIP allocation/stream/event creation here.
   // A pair returns only after BOTH stream and completion release their lease.
-  // Failed pairs are quarantined rather than reused.
+  // An unproven transfer fault terminates without releasing/reusing its owners.
   [[nodiscard]] std::unique_ptr<TransferStream> TryAcquire();
 
 private:

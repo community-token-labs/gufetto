@@ -646,13 +646,19 @@ if (BUILD_TESTING)
   target_link_libraries(perf_trace_test PRIVATE gufo_core)
   add_test(NAME perf_trace_test COMMAND perf_trace_test)
   add_test(NAME perf_trace_disabled_test COMMAND perf_trace_test --disabled)
-  set_tests_properties(perf_trace_test perf_trace_disabled_test PROPERTIES
+  add_test(NAME perf_trace_phase_limit_test COMMAND perf_trace_test --phase-limit-high)
+  set_tests_properties(perf_trace_test perf_trace_disabled_test perf_trace_phase_limit_test PROPERTIES
     LABELS "cpu;core")
 
   add_executable(json_test tests/core/json_test.cpp)
   target_link_libraries(json_test PRIVATE gufo_core)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
+
+  add_executable(startup_admission_test tests/core/startup_admission_test.cpp)
+  target_link_libraries(startup_admission_test PRIVATE gufo_core)
+  add_test(NAME startup_admission_test COMMAND startup_admission_test)
+  set_tests_properties(startup_admission_test PROPERTIES LABELS "cpu;core")
 
   add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
   target_link_libraries(heap_placement_test PRIVATE gufo_core)
