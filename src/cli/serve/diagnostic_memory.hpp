@@ -52,9 +52,9 @@ public:
       Logger::Error("memory", refusal);
       return false;
     }
-    stats_.bytes = bytes;
     Logger::Info("memory", "event=full_logits_static_claim bytes=" +
                                std::to_string(bytes));
+    stats_.bytes = bytes;
     return true;
   }
   // First cache admission freezes the startup choice BEFORE sampling or growth.

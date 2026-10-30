@@ -700,6 +700,8 @@ if (BUILD_TESTING)
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
+  add_test(NAME http_server_test_diagnostic_memory COMMAND http_server_test --diagnostic-memory)
+  set_tests_properties(http_server_test_diagnostic_memory PROPERTIES LABELS "cpu;server;http;memory" TIMEOUT 30)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
 
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
@@ -860,6 +862,8 @@ if (BUILD_TESTING)
   src/cli/serve/text_model_runner.cpp)
   target_link_libraries(text_model_runner_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
+  add_test(NAME text_model_runner_test_diagnostic_memory COMMAND text_model_runner_test --diagnostic-memory)
+  set_tests_properties(text_model_runner_test_diagnostic_memory PROPERTIES LABELS "cpu;server;runner;memory")
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
 

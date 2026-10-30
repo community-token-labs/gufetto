@@ -944,7 +944,7 @@ struct ComponentTextCache::Impl {
       // Slots allocated under the host ceiling; return to the budget. This
       // ignores pinned_bytes: a runner that pins must commit backing.
       const auto staging = ledger.Limits().staging_bytes;
-      if (resources->freeze_execution_liability) {
+      if (resources->freeze_execution_liability || diagnostic_bytes) {
         ram = std::min(ram, headroom.ceiling - staging);
         if (automatic_ram)
           ram = std::min(ram, headroom.automatic);

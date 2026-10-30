@@ -554,6 +554,15 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                 resources.retained_snapshot_ceiling_bytes.value_or(automatic);
             if (const auto diagnostic =
                     DiagnosticMemoryClaim::Process().Snapshot().bytes) {
+              if (diagnostic > ceiling) {
+                Logger::Error(
+                    "cache",
+                    "event=diagnostic_snapshots_disabled claim_bytes=" +
+                        std::to_string(diagnostic) +
+                        " ceiling_bytes=" + std::to_string(ceiling) +
+                        " reason=diagnostic_claim_exceeds_ceiling");
+                return std::size_t{0};
+              }
               const auto protected_memory =
                   core::ProtectCacheHeadroom(automatic, ceiling, diagnostic);
               automatic = protected_memory.automatic;
