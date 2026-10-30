@@ -17,6 +17,7 @@
 #include "src/cli/serve/measured_admission.hpp"
 #include "src/core/platform/mapped_file.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
+#include "tests/diagnostics/native_memory_accounting.hpp"
 #include "tests/diagnostics/recovery_bounds.hpp"
 #include "tests/diagnostics/rss_slope.hpp"
 
@@ -234,6 +235,9 @@ int RunRssDiscriminator(const char* path) {
                      .count()
               << '\n'
               << std::flush;
+    // Advisory only; exact original RSS gate and sample remain unchanged.
+    gufo::testing::PrintNativeAccounting(std::cout, phase, index);
+    std::cout << std::flush;
     return rss.anon;
   };
   cycle("prime", 0, false);

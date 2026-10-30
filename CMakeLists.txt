@@ -1064,7 +1064,15 @@ if (BUILD_TESTING)
   set_tests_properties(prof_test PROPERTIES
     LABELS "cpu;tools;profiling")
 
-  if (ENGINE_ENABLE_HIP)
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(native_memory_accounting_test tests/diagnostics/native_memory_accounting_test.cpp)
+    target_include_directories(native_memory_accounting_test PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_options(native_memory_accounting_test PRIVATE -UNDEBUG)
+    add_test(NAME native_memory_accounting_test COMMAND native_memory_accounting_test)
+    set_tests_properties(native_memory_accounting_test PROPERTIES LABELS "cpu;diagnostics")
+  endif()
+
+  if (ENGINE_ENABLE_HIP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(admission_native_test
       tests/diagnostics/admission_native_test.cpp
       src/cli/serve/inference_backend.cpp src/cli/serve/text_model_runner.cpp
