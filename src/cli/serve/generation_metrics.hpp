@@ -2,10 +2,14 @@
 #define GUFO_SERVER_GENERATION_METRICS_HPP_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <iomanip>
+#include <ostream>
 #include <sstream>
+#include <string_view>
 
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/core/json.hpp"
@@ -82,7 +86,95 @@ inline std::atomic<std::int64_t>& RequestsDeferred() {
   static std::atomic<std::int64_t> count{0};
   return count;
 }
+
+// `usage.gufo.cache_miss_reason` values from both text caches; any other
+// reason counts as `unknown`. A request that never reached a cache lookup, such
+// as one cancelled while queued, reports no reason and counts as neither.
+inline constexpr std::array<std::string_view, 6> kCacheMissReasonNames{
+    "disabled",       "no_checkpoint", "no_compatible_boundary",
+    "prefix_changed", "input_changed", "unknown"};
+inline auto& CacheHitCounts() {
+  static std::array<std::atomic<std::uint64_t>, kCacheHitTierNames.size()>
+      counts{};
+  return counts;
+}
+inline auto& CacheMissCounts() {
+  static std::array<std::atomic<std::uint64_t>, kCacheMissReasonNames.size()>
+      counts{};
+  return counts;
+}
+
+/// Fixed-bucket speed histogram per context-depth band. Buckets hold
+/// per-band counts; the exposition makes them cumulative and reports `_count`
+/// as the `+Inf` total of the same reads, so the two always agree. Recording
+/// is relaxed atomic adds, so `_sum` may lag or lead a concurrent sample.
+template<std::size_t Bounds>
+struct SpeedHistogram {
+  std::array<double, Bounds> bounds;
+  std::array<std::array<std::atomic<std::uint64_t>, Bounds + 1>, 6> buckets{};
+  std::array<std::atomic<double>, 6> sums{};
+};
+// Upper bounds of the context-depth bands, in prompt tokens; the last band is
+// open-ended. Labels name each band.
+inline constexpr std::array<std::size_t, 5> kContextDepthBounds{
+    1024, 4096, 16384, 65536, 262144};
+inline constexpr std::array<std::string_view, 6> kContextDepthNames{
+    "0_1k", "1k_4k", "4k_16k", "16k_64k", "64k_256k", "256k_plus"};
+inline auto& PrefillSpeedHistogram() {
+  static SpeedHistogram<9> histogram{
+      .bounds = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000}};
+  return histogram;
+}
+inline auto& DecodeSpeedHistogram() {
+  static SpeedHistogram<11> histogram{
+      .bounds = {1, 2, 5, 10, 20, 30, 50, 75, 100, 150, 200}};
+  return histogram;
+}
+// Shorter prefills mostly measure launch and scheduling latency.
+inline constexpr std::size_t kMinPrefillSpeedTokens = 64;
 }  // namespace detail
+
+inline std::size_t ContextDepthBand(std::size_t prompt_tokens) {
+  return static_cast<std::size_t>(
+      std::ranges::lower_bound(detail::kContextDepthBounds, prompt_tokens) -
+      detail::kContextDepthBounds.begin());
+}
+
+template<std::size_t Bounds>
+void RecordSpeed(detail::SpeedHistogram<Bounds>& histogram, std::size_t band,
+                 double tokens_per_second) {
+  const auto bucket = static_cast<std::size_t>(
+      std::ranges::lower_bound(histogram.bounds, tokens_per_second) -
+      histogram.bounds.begin());
+  histogram.buckets[band][bucket].fetch_add(1, std::memory_order_relaxed);
+  auto& sum = histogram.sums[band];
+  double current = sum.load(std::memory_order_relaxed);
+  while (!sum.compare_exchange_weak(current, current + tokens_per_second,
+                                    std::memory_order_relaxed)) {
+  }
+}
+
+/// The tier a finished request's cache hit is counted under. Backends without
+/// component metrics are classified from their disk and restore flags.
+inline CacheHitTier ResultCacheHitTier(
+    const TextGenerationBackend::Result& result) {
+  if (!result.cache_hit)
+    return CacheHitTier::kNone;
+  if (result.component_cache &&
+      result.component_cache->hit_tier != CacheHitTier::kNone)
+    return result.component_cache->hit_tier;
+  return result.cache_disk_hit        ? CacheHitTier::kDisk
+         : result.cache_restore_bytes ? CacheHitTier::kRam
+                                      : CacheHitTier::kLive;
+}
+
+inline std::size_t CacheMissReasonIndex(std::string_view reason) {
+  const auto found = std::ranges::find(detail::kCacheMissReasonNames, reason);
+  return found == detail::kCacheMissReasonNames.end()
+             ? detail::kCacheMissReasonNames.size() - 1
+             : static_cast<std::size_t>(found -
+                                        detail::kCacheMissReasonNames.begin());
+}
 
 inline double PrefillTokensPerSecond(
     const TextGenerationBackend::Result& result) {
@@ -138,6 +230,79 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
   if (tok_per_sec > 0.0) {
     detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
   }
+  if (const auto tier = ResultCacheHitTier(result); tier != CacheHitTier::kNone)
+    detail::CacheHitCounts()[static_cast<std::size_t>(tier)].fetch_add(
+        1, std::memory_order_relaxed);
+  else if (!result.cache_miss_reason.empty())
+    detail::CacheMissCounts()[CacheMissReasonIndex(result.cache_miss_reason)]
+        .fetch_add(1, std::memory_order_relaxed);
+  // A cancelled request's phases stop early, so its speeds are not
+  // representative; its cache outcome above still counts.
+  if (result.cancelled)
+    return;
+  const std::size_t band = ContextDepthBand(result.prompt_tokens);
+  if (prompt_per_second > 0.0 &&
+      result.prefill_tokens >= detail::kMinPrefillSpeedTokens)
+    RecordSpeed(detail::PrefillSpeedHistogram(), band, prompt_per_second);
+  if (tok_per_sec > 0.0)
+    RecordSpeed(detail::DecodeSpeedHistogram(), band, tok_per_sec);
+}
+
+template<std::size_t Bounds>
+void WriteSpeedHistogram(std::ostream& out, std::string_view name,
+                         std::string_view help,
+                         const detail::SpeedHistogram<Bounds>& histogram) {
+  out << "# HELP " << name << ' ' << help << "\n# TYPE " << name
+      << " histogram\n";
+  for (std::size_t band = 0; band < detail::kContextDepthNames.size(); ++band) {
+    const auto context = detail::kContextDepthNames[band];
+    std::uint64_t cumulative = 0;
+    for (std::size_t i = 0; i <= Bounds; ++i) {
+      cumulative += histogram.buckets[band][i].load(std::memory_order_relaxed);
+      out << name << "_bucket{context=\"" << context << "\",le=\"";
+      if (i < Bounds)
+        out << histogram.bounds[i];
+      else
+        out << "+Inf";
+      out << "\"} " << cumulative << '\n';
+    }
+    out << name << "_sum{context=\"" << context << "\"} "
+        << histogram.sums[band].load(std::memory_order_relaxed) << '\n'
+        << name << "_count{context=\"" << context << "\"} " << cumulative
+        << '\n';
+  }
+}
+
+/// Cache outcome counters and speed histograms for `/metrics`, after the
+/// llama.cpp-compatible block.
+inline void WriteCacheAndSpeedMetrics(std::ostream& out) {
+  out << "# HELP gufo_cache_hits_total Finished text requests that reused a "
+         "cached prefix, by source tier\n"
+      << "# TYPE gufo_cache_hits_total counter\n";
+  for (std::size_t i = 1; i < kCacheHitTierNames.size(); ++i)
+    out << "gufo_cache_hits_total{tier=\"" << kCacheHitTierNames[i] << "\"} "
+        << detail::CacheHitCounts()[i].load(std::memory_order_relaxed) << '\n';
+  out << "# HELP gufo_cache_misses_total Finished text requests that reused "
+         "no cached prefix, by usage.gufo.cache_miss_reason\n"
+      << "# TYPE gufo_cache_misses_total counter\n";
+  for (std::size_t i = 0; i < detail::kCacheMissReasonNames.size(); ++i)
+    out << "gufo_cache_misses_total{reason=\""
+        << detail::kCacheMissReasonNames[i] << "\"} "
+        << detail::CacheMissCounts()[i].load(std::memory_order_relaxed) << '\n';
+  out << "# HELP gufo_cache_acquisitions_total Component cache acquisitions, "
+         "including later cancelled ones, by reuse reason\n"
+      << "# TYPE gufo_cache_acquisitions_total counter\n";
+  for (std::size_t i = 1; i < kCacheReuseReasonNames.size(); ++i)
+    out << "gufo_cache_acquisitions_total{reason=\""
+        << kCacheReuseReasonNames[i] << "\"} "
+        << CacheReuseReasonCounts()[i].load(std::memory_order_relaxed) << '\n';
+  WriteSpeedHistogram(out, "gufo_prefill_tokens_per_second",
+                      "Per-request prefill speed of at least 64 prefilled "
+                      "tokens, by prompt context depth",
+                      detail::PrefillSpeedHistogram());
+  WriteSpeedHistogram(out, "gufo_decode_tokens_per_second",
+                      "Per-request decode speed, by prompt context depth",
+                      detail::DecodeSpeedHistogram());
 }
 
 inline std::string GenerationLogDetails(
