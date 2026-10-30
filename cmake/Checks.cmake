@@ -48,6 +48,7 @@ set(gufo_pr_targets
   embedding_gemma2_image_processor_test
   embedding_gemma2_batch_scheduler_test
   gemma4_config_test gemma4_tokenizer_contract_test gemma4_template_test
+  gemma4_tool_syntax_test
   qwen3_tts_config_test qwen3_tts_audio_api_test
   qwen_image_21_test
   video_api_test minimax_h3_sampling_test minimax_h3_runtime_test
@@ -64,7 +65,8 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_continuation_identity_test
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test
-  gemma4_config_test gemma4_tokenizer_contract_test gemma4_template_test)
+  gemma4_config_test gemma4_tokenizer_contract_test gemma4_template_test
+  gemma4_tool_syntax_test)
 list(APPEND gufo_pr_tests
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
   text_model_runner_test_diagnostic_refusal_auto
@@ -84,6 +86,7 @@ list(APPEND gufo_pr_tests
   cache_lookup_classify_harness_test token_parity_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
   "gemma4\\.config" "gemma4\\.tokenizer_contract" "gemma4\\.template"
+  "gemma4\\.tool_syntax"
   gufo_version gufo_help model_plan_cli_test serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test

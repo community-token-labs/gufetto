@@ -15,6 +15,7 @@ add_gemma4_test(artifact_config "cpu;models;config;external-model")
 add_gemma4_test(tokenizer_contract "cpu;models;tokenization")
 add_gemma4_test(tokenizer_goldens "cpu;models;tokenization;external-model")
 add_gemma4_test(template "cpu;models;chat_template")
+add_gemma4_test(tool_syntax "cpu;models;tools")
 foreach(target gemma4_tokenizer_goldens_test gemma4_template_test)
   target_compile_definitions(${target} PRIVATE
     GUFO_GEMMA4_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
