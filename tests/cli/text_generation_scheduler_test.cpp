@@ -207,6 +207,7 @@ struct FakeControl {
   std::atomic<std::size_t> invalidations{0};
   std::atomic<std::size_t> states_created{0};
   bool structured_output{false};
+  bool ownership_fixture{false};
   bool vocabulary_failure{false};
   std::atomic<std::size_t> vocabulary_builds{0};
   std::atomic<std::size_t> decode_calls{0};
@@ -247,6 +248,8 @@ public:
     position = 0;
     decode_count = 0;
     frontier.reset();
+    pending_draft.clear();
+    draft_owner = 0;
   }
 
   std::shared_ptr<FakeControl> control_;
@@ -254,6 +257,8 @@ public:
   std::size_t position{0};
   std::size_t decode_count{0};
   std::optional<TextRunnerToken> frontier;
+  std::vector<TextRunnerToken> pending_draft;
+  TextRunnerToken draft_owner{0};
 };
 
 FakeState& RequireFakeState(TextRunnerState& state) {
@@ -574,10 +579,52 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       gufo::sampling::SamplerState& sampler) const override {
+    auto& fake = RequireFakeState(state);
+    if (control_->ownership_fixture) {
+      // Fake model proposals live in the opaque state, while the real pool
+      // owns the sampler/grammar and chooses which live rows enter each batch.
+      const bool constrained = fake.label % 2 != 0;
+      const std::string text =
+          constrained ? (fake.label == 1 ? R"({"A":0})" : R"({"C":1})")
+                      : "plain";
+      Expect(bool(sampler.config().constraint) == constrained,
+             "each draft row receives its own grammar binding");
+      Expect(sampler.history().size() == fake.decode_count + 1,
+             "request-local accepted history survives other cohorts");
+      if (fake.decode_count == text.size())
+        return {.stop = true};
+      const auto expected =
+          static_cast<TextRunnerToken>(text[fake.decode_count]);
+      if (fake.pending_draft.empty()) {
+        fake.draft_owner = fake.label;
+        // Deliberately retain an uncommitted tail at request completion.
+        fake.pending_draft = {expected, static_cast<TextRunnerToken>(
+                                            fake.decode_count + 1 < text.size()
+                                                ? text[fake.decode_count + 1]
+                                                : '!')};
+      }
+      Expect(fake.draft_owner == fake.label &&
+                 fake.pending_draft.front() == expected,
+             "live and recycled slots cannot inherit another request's drafts");
+      std::vector<float> logits(256, -std::numeric_limits<float>::infinity());
+      logits[expected] = 1.0F;
+      if (constrained)
+        logits['x'] = 2.0F;  // Illegal distractor wins if A lost its grammar.
+      Expect(sampler.Distribution(logits).best_token() == expected,
+             "the real grammar state advances only for this request");
+      fake.pending_draft.erase(fake.pending_draft.begin());
+      ++fake.decode_count;
+      ++fake.position;
+      return {.selections = {{.token = expected,
+                              .piece =
+                                  std::string(1, static_cast<char>(expected))}},
+              .draft_rounds = 1,
+              .draft_tokens = 2,
+              .draft_accepted_tokens = 1};
+    }
     if (!control_->multi_token_decode) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
-    auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no multi-token frontier");
     }
@@ -2963,6 +3010,19 @@ void TestStopSequenceChunkBoundaries() {
   check({"┌終"}, "hi┌終later", "hi", "┌終");
   check({"STOP"}, "SSTOSTxST", "SSTOSTxST", "");
   check({"STOP"}, "STOP", "", "STOP");
+  // Independent family spellings: Qwen (also H3/Flash-Next) and DeepSeek.
+  // Explicit byte stops are not EOS IDs; marker pieces remain ordinary text.
+  for (const std::string marker :
+       {"<|im_end|>", "<|endoftext|>", "<｜end▁of▁sentence｜>"}) {
+    check({marker}, "Nerazim | > im " + marker + "tail", "Nerazim | > im ",
+          marker);
+    check({}, "literal " + marker + " remains",
+          "literal " + marker + " remains", "");
+    for (std::size_t end = 1; end < marker.size(); ++end) {
+      const auto partial = "Nerazim " + marker.substr(0, end);
+      check({marker}, partial, partial, "");
+    }
+  }
 }
 
 void TestStopSequencesPreserveExecutedState() {
@@ -3307,6 +3367,111 @@ void TestShutdownCancelsRunnerAcquisition() {
   lease = {};
   Expect(completed, "shutdown cancels acquisition of a leased runner");
   stopped.get();
+}
+
+gufo::sampling::SamplingConfig OwnershipSampling(
+    const gufo::server::TextModelRunner& runner, TextRunnerToken label) {
+  gufo::sampling::SamplingConfig sampling;
+  if (label % 2 != 0) {
+    const auto schema = gufo::json::parse(
+        label == 1
+            ? R"({"type":"object","properties":{"A":{"type":"integer"}},"required":["A"],"additionalProperties":false})"
+            : R"({"type":"object","properties":{"C":{"type":"integer"}},"required":["C"],"additionalProperties":false})");
+    sampling.constraint = runner.BindConstraint(
+        gufo::sampling::JsonConstraint::Compile(schema, false));
+  }
+  return sampling;
+}
+
+void TestDraftGrammarOwnershipAcrossCohorts() {
+  auto control = std::make_shared<FakeControl>();
+  control->structured_output = true;
+  control->ownership_fixture = true;
+  control->multi_token_decode = true;
+  control->batched_multi_token_decode = true;
+  control->supports_batched_advance = true;
+  auto runner = std::make_shared<FakeRunner>(control);
+  gufo::server::TextRunnerPool pool(runner, 3);
+  const auto acquire = [&](TextRunnerToken label) {
+    auto request =
+        pool.Acquire({label}, OwnershipSampling(*runner, label), {}, {}, false);
+    Expect(request.Prefill(1).decode_ready, "ownership fixture prefills");
+    return request;
+  };
+  const auto decode =
+      [&](std::vector<gufo::server::TextRunnerPool::Request*> rows) {
+        if (rows.size() == 1)
+          return std::vector<TextDecodeStep>{rows[0]->DecodeStep(1)};
+        const std::vector<std::size_t> limits(rows.size(), 1);
+        return pool.DecodeBatch(rows, limits,
+                                pool.SelectDecodePlan(rows.size()));
+      };
+  // Alternate constrained identities and plain peers, then recycle both slots.
+  for (const TextRunnerToken label : {1U, 3U, 1U, 3U}) {
+    auto a = acquire(label);
+    auto b = acquire(label + 1);
+    auto c = acquire(label + 5);
+    const auto mixed = decode({&a, &b, &c});
+    Expect(mixed.size() == 3 && mixed[0].selections[0].piece == "{" &&
+               mixed[1].selections[0].piece == "p",
+           "mixed batch keeps each row's accepted proposal");
+    std::string plain = "p";
+    for (int i = 0; i < 4; ++i)
+      plain += decode({&b, &c})[0].selections[0].piece;
+    const auto finished_plain = decode({&b, &c});
+    Expect(plain == "plain" && finished_plain[0].stop && finished_plain[1].stop,
+           "unconstrained-only cohorts finish without touching live A");
+    (void)b.Commit();
+    (void)c.Commit();
+    b = {};
+    c = {};
+    b = acquire(label + 3);
+    Expect(decode({&b})[0].selections[0].piece == "p",
+           "recycled plain slot starts with no stale draft or grammar");
+    std::string structured = "{";
+    for (int i = 0; i < 6; ++i)
+      structured += decode({&a})[0].selections[0].piece;
+    Expect(
+        structured == (label == 1 ? R"({"A":0})" : R"({"C":1})") &&
+            decode({&a})[0].stop,
+        "A retains its draft tail and advanced grammar across B-only batches");
+    (void)a.Commit();
+    (void)b.Cancel();
+  }
+  Expect(control->states_created == 3,
+         "alternating cohorts actually recycle the same bounded state pool");
+}
+
+void TestFinishedOwnershipRequestIdsDisappear() {
+  auto control = std::make_shared<FakeControl>();
+  control->structured_output = true;
+  control->ownership_fixture = true;
+  control->multi_token_decode = true;
+  control->batched_multi_token_decode = true;
+  control->supports_batched_advance = true;
+  control->incremental_text_is_exact = true;
+  auto scheduler = MakeScheduler(control, 2);
+  std::uint64_t previous = 0;
+  for (const TextRunnerToken label : {1U, 2U, 3U, 4U}) {
+    auto request = scheduler->Submit(
+        {label}, 8, OwnershipSampling(scheduler->runner(), label), {}, true);
+    Expect(request.id() > previous, "recycled sessions use fresh request IDs");
+    previous = request.id();
+    const auto result = request.Wait();
+    Expect(result.text == (label % 2 == 0 ? "plain"
+                           : label == 1   ? R"({"A":0})"
+                                          : R"({"C":1})") &&
+               result.draft_accepted_tokens == result.text.size() &&
+               result.draft_tokens == result.text.size() * 2,
+           "scheduler preserves actual fake draft acceptance per request");
+    const auto states = scheduler->SessionStates();
+    Expect(std::none_of(states.begin(), states.end(),
+                        [&](const auto& state) {
+                          return state.processing ||
+                                 state.request_id == request.id();
+                        }),
+           "finished request IDs leave the published live-session inventory");
+  }
 }
 
 void TestStructuredOutputIsPreparedBeforeServing() {
@@ -3754,6 +3919,8 @@ int main(int argc, char** argv) {
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   gufo::platform::SetEnv("NO_COLOR", "1");
   TestProgressLoggingIsOptInAndBounded();
+  TestDraftGrammarOwnershipAcrossCohorts();
+  TestFinishedOwnershipRequestIdsDisappear();
   TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();
   TestPromptProgressPrecedesStreamedTokens();

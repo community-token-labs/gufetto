@@ -21,6 +21,7 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/qwen/architecture.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -299,7 +300,8 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
       reader.GetMetadataString("general.architecture");
   if (artifact_architecture == "deepseek4") {
     preset = sampling::TextModelPreset::kDeepSeekV4Flash;
-  } else if (artifact_architecture == "qwen4exp") {
+  } else if (models::qwen::IsQwen4PreviewArch(
+                 artifact_architecture.value_or(""))) {
     preset = sampling::TextModelPreset::kQwen38;
   } else if (const auto config = reader.ExtractModelConfig()) {
     preset = sampling::TextPreset(*config);
@@ -1072,7 +1074,8 @@ int RunPrompt(std::span<const char* const> args) {
   };
 
 #if defined(ENGINE_ENABLE_HIP)
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  if (models::qwen::IsQwen4PreviewArch(
+          reader->GetMetadataString("general.architecture").value_or(""))) {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)
       return 1;
@@ -1280,7 +1283,8 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
   std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  if (models::qwen::IsQwen4PreviewArch(
+          reader->GetMetadataString("general.architecture").value_or(""))) {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!flash_model)
       return 1;
@@ -1294,7 +1298,7 @@ int RunChat(std::span<const char* const> args) {
       return 1;
     }
     tokenizer = &flash_model->tokenizer();
-    architecture = "qwen4exp";
+    architecture = models::qwen::kQwen4PreviewArchitecture;
     vision_encoder = flash_model->VisionEncoder();
   }
   int device_count = 0;

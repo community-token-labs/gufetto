@@ -32,6 +32,22 @@ add_test(NAME qwen38_flash_next.cold_score_lifetime
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_lifetime_test.py"
     --binary $<TARGET_FILE:qwen38_flash_next_cold_score_lifetime_test>)
 set_tests_properties(qwen38_flash_next.cold_score_lifetime PROPERTIES LABELS "qwen38_flash_next;cpu" TIMEOUT 30)
+add_test(NAME qwen38_flash_next.tokenizer_diff
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tokenizer_diff_test.py")
+set_tests_properties(qwen38_flash_next.tokenizer_diff PROPERTIES
+  LABELS "qwen38_flash_next;cpu;tools")
+set(geometry_guards "${CMAKE_CURRENT_BINARY_DIR}/attention_geometry_guards.inc")
+add_custom_command(OUTPUT "${geometry_guards}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_attention_geometry.py"
+    --source-root "${PROJECT_SOURCE_DIR}" --output "${geometry_guards}"
+  DEPENDS extract_attention_geometry.py
+    "${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/kernels/rocm/executor.cpp"
+    "${PROJECT_SOURCE_DIR}/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp"
+  VERBATIM)
+add_qwen38_flash_next_test(attention_geometry gufo_core "cpu")
+target_sources(qwen38_flash_next_attention_geometry_test PRIVATE "${geometry_guards}")
+target_include_directories(qwen38_flash_next_attention_geometry_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}")
 add_qwen38_flash_next_test(npu_contracts gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_q4km gufo_qwen38_flash_next_reference "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")

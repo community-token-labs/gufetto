@@ -5924,6 +5924,32 @@ ToolBoundaryOutput ToolBoundaryRequest(
   return out;
 }
 
+void TestLiteralStopMarkerPartitions() {
+  using Format = gufo::sampling::JsonConstraint::ToolFormat;
+  // EOS has already been consumed by the runner. Serializer input is literal
+  // accepted content, never a token-ID stream or an implicit byte-stop list.
+  for (const auto format : {Format::kQwen, Format::kDeepSeek})
+    for (const std::string marker :
+         {"<|im_end|>", "<|endoftext|>", "<｜end▁of▁sentence｜>"}) {
+      const std::string raw = "Nerazim | > im literal " + marker + " remains";
+      for (const int api : {0, 2})
+        for (const bool stream : {false, true})
+          for (std::size_t split = 0; split <= raw.size() + 1; ++split) {
+            std::vector<std::string> pieces;
+            if (split > raw.size())
+              for (const char byte : raw)
+                pieces.emplace_back(1, byte);
+            else
+              pieces = {raw.substr(0, split), raw.substr(split)};
+            const auto out = ToolBoundaryRequest(pieces, format, api, stream);
+            Expect(!out.failed && out.content == raw && out.reasoning.empty() &&
+                       out.arguments.empty() &&
+                       out.finish == (api == 0 ? "stop" : "end_turn"),
+                   "Chat and Messages preserve literal markers at every split");
+          }
+    }
+}
+
 void TestToolTagBoundaries() {
   using Format = gufo::sampling::JsonConstraint::ToolFormat;
   using Initial = FakeBackend::InitialOutputState;
@@ -6591,6 +6617,7 @@ void TestCacheLookup() {
 int main() {
   TestCacheLookup();
   TestToolCallRenderParseRoundTrip();
+  TestLiteralStopMarkerPartitions();
   TestToolTagBoundaries();
   TestStreamingQuotedAndMalformedTools();
   TestIncrementalToolArguments();
