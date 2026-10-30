@@ -2,11 +2,22 @@
 
 #include <array>
 #include <cassert>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <span>
+#include <sstream>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include "src/cli/kv_cache_options.hpp"
+#include "src/core/gguf_reader.hpp"
+#include "tests/support/temporary_directory.hpp"
 
 void TestDefaultOptions() {
   const std::array<const char*, 2> args = {"Hello", "world"};
@@ -277,6 +288,182 @@ void TestSamplingAndReasoningFlags() {
   assert(opt->prompt_text == "Explicit prompt text");
 }
 
+// Minimal GGUF v3 writer: string/u32 metadata and one BF16 embedding table.
+class ArchitectureGguf {
+public:
+  void String(std::string_view key, std::string_view value) {
+    Key(key, 8);
+    Text(value);
+  }
+  void U32(std::string_view key, std::uint32_t value) {
+    Key(key, 4);
+    Pod(value);
+  }
+  std::string Build(std::uint64_t embedding_rows) const {
+    std::string out = "GGUF";
+    const auto pod = [&](auto value) {
+      out.append(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+    pod(std::uint32_t{3});
+    pod(std::uint64_t{1});
+    pod(count_);
+    out += metadata_;
+    const std::string_view name = "token_embd.weight";
+    pod(static_cast<std::uint64_t>(name.size()));
+    out += name;
+    pod(std::uint32_t{2});
+    pod(std::uint64_t{64});
+    pod(embedding_rows);
+    pod(static_cast<std::uint32_t>(gufo::core::GgmlType::kBF16));
+    pod(std::uint64_t{0});
+    out.resize((out.size() + 31) / 32 * 32, '\0');
+    out.append(64 * embedding_rows * 2, '\0');
+    return out;
+  }
+
+private:
+  template<typename T>
+  void Pod(T value) {
+    metadata_.append(reinterpret_cast<const char*>(&value), sizeof(value));
+  }
+  void Text(std::string_view value) {
+    Pod(static_cast<std::uint64_t>(value.size()));
+    metadata_ += value;
+  }
+  void Key(std::string_view key, std::uint32_t type) {
+    Text(key);
+    Pod(type);
+    ++count_;
+  }
+  std::string metadata_;
+  std::uint64_t count_{0};
+};
+
+struct PromptRun {
+  int status;
+  std::string error;
+};
+
+// Quantized KV is a GPU-only option, so those runs omit --cpu; the KV gate
+// rejects them before any device or weight access.
+PromptRun RunPromptOn(const std::filesystem::path& path,
+                      const char* kv_cache_type = nullptr) {
+  const auto model = path.string();
+  std::vector<const char*> args = {"--model", model.c_str(), "-n", "1"};
+  if (kv_cache_type)
+    args.insert(args.end(), {"--kv-cache-type", kv_cache_type});
+  else
+    args.push_back("--cpu");
+  args.push_back("hi");
+  std::ostringstream error;
+  std::ostringstream output;
+  auto* const old_error = std::cerr.rdbuf(error.rdbuf());
+  auto* const old_output = std::cout.rdbuf(output.rdbuf());
+  const int status = gufo::cli::RunPrompt(args);
+  std::cerr.rdbuf(old_error);
+  std::cout.rdbuf(old_output);
+  return {status, error.str()};
+}
+
+// Dispatch on general.architecture through the real prompt loader. Hybrid
+// Qwen hyperparameters are read under the declared architecture's prefix, so
+// a missing or renamed architecture must not borrow another family's keys.
+void TestArchitectureDispatch() {
+  TemporaryDirectory directory("gufo-prompt-arch");
+  const auto write = [&](std::optional<std::string_view> architecture,
+                         std::string_view prefix) {
+    ArchitectureGguf gguf;
+    if (architecture)
+      gguf.String("general.architecture", *architecture);
+    const std::string p(prefix);
+    for (const auto& [key, value] :
+         std::initializer_list<std::pair<std::string_view, std::uint32_t>>{
+             {"block_count", 4},
+             {"embedding_length", 64},
+             {"feed_forward_length", 64},
+             {"attention.head_count", 1},
+             {"attention.head_count_kv", 1},
+             {"attention.key_length", 64},
+             {"full_attention_interval", 4},
+             {"rope.dimension_count", 64},
+             {"ssm.conv_kernel", 4},
+             {"ssm.state_size", 128},
+             {"ssm.group_count", 1},
+             {"ssm.time_step_rank", 1},
+             {"ssm.inner_size", 128}})
+      gguf.U32(p + "." + std::string(key), value);
+    const auto path =
+        directory.path() /
+        (std::string(architecture.value_or("absent")) + "-" + p + ".gguf");
+    std::ofstream(path, std::ios::binary) << gguf.Build(2);
+    return path;
+  };
+  constexpr std::string_view kQwenLoad = "Error creating Qwen generator: ";
+
+  // The supported hybrid Qwen family passes the architecture and structure
+  // checks and reaches tensor validation.
+  const auto qwen = RunPromptOn(write("qwen35", "qwen35"));
+  assert(qwen.status == 1);
+  assert(qwen.error.starts_with(
+      std::string(kQwenLoad) +
+      "Missing required Qwen tensor: output_norm.weight\n"));
+
+  // Missing, empty, unknown and renamed architectures are refused by name
+  // before weights, never by adopting qwen35.* metadata or built-in defaults.
+  for (const auto& [architecture, refusal] : std::initializer_list<
+           std::pair<std::optional<std::string_view>, std::string_view>>{
+           {std::nullopt, "GGUF has no general.architecture"},
+           {"", "GGUF has no general.architecture"},
+           {"unknown", "unsupported GGUF architecture 'unknown'"},
+           {"llama", "unsupported GGUF architecture 'llama'"}}) {
+    const auto run = RunPromptOn(write(architecture, "qwen35"));
+    assert(run.status == 1);
+    assert(run.error.starts_with(std::string(kQwenLoad) + std::string(refusal) +
+                                 "\n"));
+  }
+  // Qwen3.6 MoE has its own loader; its refusal names the architecture.
+  const auto moe = RunPromptOn(write("qwen35moe", "qwen35moe"));
+  assert(moe.status == 1 && moe.error.starts_with(kQwenLoad) &&
+         moe.error.find("qwen35moe") != std::string::npos);
+
+  // Quantized KV is admitted only for the Flash-Next architecture.
+  for (const auto architecture : {"qwen35", "unknown", "deepseek4"}) {
+    const auto run = RunPromptOn(write(architecture, architecture), "q8_0");
+    assert(run.status == 1);
+    assert(run.error ==
+           "Error: quantized --kv-cache-type requires Qwen3.8-Flash-Next "
+           "(GGUF architecture qwen4exp)\n");
+  }
+
+  // DeepSeek and Flash-Next route to their own loaders, never to Qwen.
+  // A failed load also reports its load time on the error stream.
+  const auto deepseek = RunPromptOn(write("deepseek4", "deepseek4"));
+  assert(deepseek.status == 1);
+#if defined(ENGINE_ENABLE_HIP)
+  assert(deepseek.error.starts_with(
+      "DeepSeek V4 Flash is supported only by the ROCm backend\n"));
+#else
+  assert(deepseek.error.starts_with(
+      "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n"));
+#endif
+  const auto flash_path = write("qwen4exp", "qwen4exp");
+  const auto flash = RunPromptOn(flash_path);
+  assert(flash.status == 1);
+#if defined(ENGINE_ENABLE_HIP)
+  assert(flash.error ==
+         "Flash-Next requires ROCm and supports MTP with "
+         "--min-draft-tokens 1\n");
+#else
+  // CPU builds have no Flash-Next runtime: it passes the quantized-KV gate
+  // and the architecture check, then fails on this fixture's tensors.
+  for (const auto& run : {flash, RunPromptOn(flash_path, "q8_0")})
+    assert(run.status == 1 &&
+           run.error.starts_with(
+               std::string(kQwenLoad) +
+               "Missing required Qwen tensor: output_norm.weight\n"));
+#endif
+}
+
 int main() {
   TestDefaultOptions();
   TestKvCacheType();
@@ -285,6 +472,7 @@ int main() {
   TestFlashMtpFlags();
   TestImageFlags();
   TestInvalidFlags();
+  TestArchitectureDispatch();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;
 }

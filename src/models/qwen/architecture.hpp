@@ -14,6 +14,17 @@ inline constexpr bool IsQwen4PreviewArch(
   return architecture == kQwen4PreviewArchitecture;
 }
 
+inline constexpr std::string_view kQwen35Architecture = "qwen35";
+
+// Architectures whose hyperparameters use the hybrid Qwen key layout read by
+// GgufReader::ExtractModelConfig: the Qwen3.5/3.8 loader and the Flash-Next
+// preview. Every other family has its own loader or is unsupported.
+inline constexpr bool IsQwenHybridConfigArch(
+    std::string_view architecture) noexcept {
+  return architecture == kQwen35Architecture ||
+         IsQwen4PreviewArch(architecture);
+}
+
 }  // namespace gufo::models::qwen
 
 #endif

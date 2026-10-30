@@ -22,6 +22,7 @@
 
 #include "src/core/platform/mapped_file.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen/architecture.hpp"
 
 namespace gufo::core {
 
@@ -879,10 +880,19 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
     std::string* error_msg) const {
   ModelConfig config;
 
-  // 1. Check architecture prefix (e.g. "qwen2", "qwen3", "qwen35", "llama")
-  auto arch_str = GetMetadataString("general.architecture").value_or("qwen");
+  // 1. Check architecture prefix; absent keys would otherwise keep defaults
+  auto arch_str = GetMetadataString("general.architecture").value_or("");
   config.architecture = std::string(arch_str);
   const std::string prefix = config.architecture + ".";
+  if (!models::qwen::IsQwenHybridConfigArch(config.architecture)) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          config.architecture.empty()
+              ? "GGUF has no general.architecture"
+              : "unsupported GGUF architecture '" + config.architecture + "'";
+    }
+    return std::nullopt;
+  }
 
   // 2. Read standard architectural hyperparameters
   const auto total_layers =
