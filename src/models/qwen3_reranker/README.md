@@ -2,13 +2,16 @@
 
 The relevance scorer behind `POST /v1/rerank` ([SERVER.md](../../../docs/SERVER.md#reranking)).
 This directory has config parsing, the prompt frame and a scalar float32 CPU
-reference. A loader, a tokenizer and the HIP runtime come next.
+reference. The loader, tokenizer and HIP runtime are parked (owner, 2026-10-30).
 
 ## Checkpoint
 
 `Qwen/Qwen3-Reranker-0.6B` at `e61197ed45024b0ed8a2d74b80b4d909f1255473`.
-It is Apache-2.0 by its model card. The repository has no LICENSE file; the
-Apache-2.0 text is that of its declared base, `Qwen/Qwen3-0.6B-Base`. It is a
+The reranker repository contains no `LICENSE` file. Its pinned model card
+declares Apache-2.0 and names `Qwen/Qwen3-0.6B-Base` as its base; that
+declared base's actual `LICENSE`
+(`Qwen/Qwen3-0.6B-Base@da87bfb608c14b7cf20ba1ce41287e8de496c0cd`) is
+retained separately. The checkpoint is a
 `Qwen3ForCausalLM` (28 layers, hidden 1024, 16 query and 8 key/value heads of
 width 128, vocabulary 151,669, tied embeddings) in BF16 safetensors.
 
