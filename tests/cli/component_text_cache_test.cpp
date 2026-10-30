@@ -26,6 +26,7 @@
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/measured_admission.hpp"
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -624,7 +625,7 @@ std::string Refuse(const std::shared_ptr<MeasuredRunner>& runner,
   std::string message;
   try {
     TextRunnerPool pool(runner, 3, disk, {.enabled = ram});
-  } catch (const std::invalid_argument& e) {
+  } catch (const admission::CapacityRefusal& e) {
     message = e.what();
   }
   assert(
@@ -1204,6 +1205,25 @@ void StaticDiagnosticClaim() {
 
 void Check() {
   assert(DiagnosticMemoryClaim::Process().Snapshot().bytes == 0);
+  // The admission-only facade uses this same pool with no scheduler. Repeat
+  // success/refusal/after-admission failure in process; every owner must
+  // unwind.
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    SuccessRetainsAllSlotsAndOneFrozenObservation();
+    MeasuredDebitRefusesBeforeRemainingSlots();
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->alter = [](ComponentCacheResources& resources) {
+      resources.commit_backing = [](std::size_t) { throw CreationFailure(); };
+    };
+    bool failed = false;
+    try {
+      TextRunnerPool pool(runner, 3);
+    } catch (const CreationFailure&) {
+      failed = true;
+    }
+    assert(failed);
+    runner->Released();
+  }
   MeasuredDebitRefusesBeforeRemainingSlots();
   FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation();
   StagedProbeDeadlineStopsSlotCreation();
