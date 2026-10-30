@@ -134,7 +134,10 @@ off and21.44s with disk on; the adjacent35,531-token ordinary boundary survived.
 The measured root's private state was126.87MiB; shared rows/backing are separate.
 
 Measurements use **host HIP7.2.4 + patched ROCr7.2.3**, not production Nix
-ROCm10.1/HIP-Clang24. The first-visit split is an explicit feature cost, not
+ROCm10.1/HIP-Clang24. All alternating follow-up/resume timings use **PPD
+performance policy (self-activated23:41:41Z)**; the initial run used
+powersave/balance_performance. Compare main/candidate only within each run,
+never absolute timings across these policies. The first-visit split is an explicit feature cost, not
 latency parity. Other ordinary-path timing flags require separate attribution;
 these measurements alone are not general performance or release qualification.
 
