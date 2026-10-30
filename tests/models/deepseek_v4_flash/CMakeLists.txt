@@ -99,7 +99,9 @@ if(ENGINE_ENABLE_HIP)
   add_executable(ds4_quantize_test quantize_test.hip)
   target_include_directories(ds4_quantize_test PRIVATE ${PROJECT_SOURCE_DIR})
   target_compile_definitions(ds4_quantize_test PRIVATE GGML_USE_HIP GGML_HIP_NO_VMM)
-  target_link_libraries(ds4_quantize_test PRIVATE gufo_deepseek_v4_flash_mmq)
+  # As in ds4_serving_test's closure, the CXX host target supplies the implicit
+  # C++/math runtime libraries while HIP remains the linker language.
+  target_link_libraries(ds4_quantize_test PRIVATE gufo_hip_host gufo_deepseek_v4_flash_mmq)
   add_test(NAME ds4.quantization COMMAND ds4_quantize_test)
   set_tests_properties(ds4.quantization PROPERTIES
     LABELS "gpu;hip;gfx1151;ds4;quality"
@@ -110,7 +112,7 @@ if(ENGINE_ENABLE_HIP)
   target_include_directories(ds4_projection_test SYSTEM PRIVATE ${ROCWMMA_INCLUDE_DIR})
   target_include_directories(ds4_projection_test PRIVATE ${PROJECT_SOURCE_DIR})
   target_compile_options(ds4_projection_test PRIVATE -O3 -ffast-math -fno-finite-math-only)
-  target_link_libraries(ds4_projection_test PRIVATE hip::host)
+  target_link_libraries(ds4_projection_test PRIVATE gufo_hip_host hip::host)
   add_test(NAME ds4.projections COMMAND ds4_projection_test)
   set_tests_properties(ds4.projections PROPERTIES
     LABELS "gpu;hip;gfx1151;ds4;quality"
@@ -122,7 +124,8 @@ if(ENGINE_ENABLE_HIP)
   target_include_directories(ds4_attention_test SYSTEM PRIVATE
     ${HIPCUB_INCLUDE_DIR} ${ROCPRIM_INCLUDE_DIR} ${ROCWMMA_INCLUDE_DIR})
   target_compile_options(ds4_attention_test PRIVATE -O3 -ffast-math -fno-finite-math-only)
-  target_link_libraries(ds4_attention_test PRIVATE hip::host)
+  # Include the same CXX host-runtime closure as the other HIP-only checks.
+  target_link_libraries(ds4_attention_test PRIVATE gufo_hip_host hip::host)
   add_test(NAME ds4.attention COMMAND ds4_attention_test)
   set_tests_properties(ds4.attention PROPERTIES
     LABELS "gpu;hip;gfx1151;ds4;quality"
