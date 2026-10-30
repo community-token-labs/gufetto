@@ -238,28 +238,66 @@ def main():
     assert "api_key=set" in keyed.stderr
     assert "super-secret-value" not in keyed.stderr
     assert "api_key=unset" in run(load + ["-v"]).stderr
-    # The key can stay out of the process list: from a file's first line, or
-    # from GUFO_API_KEY when no option names it.
+    # The key can stay out of the process list: from a file, or from
+    # GUFO_API_KEY. Each key has exactly one source; several are an error.
+    keyed_env = {**env, "GUFO_API_KEY": "fake-env-key"}
+
+    def run_env(args, environment):
+        return subprocess.run([binary, *args], env=environment, text=True,
+                              capture_output=True, timeout=10)
+
     with tempfile.TemporaryDirectory() as directory:
         key_file = Path(directory) / "key"
-        key_file.write_text("fake-file-key\nignored second line\n")
-        from_file = run(load + ["-v", "--api-key-file", str(key_file)])
-        assert from_file.returncode == 1, from_file.stderr
-        assert "api_key=set" in from_file.stderr
-        assert "fake-file-key" not in from_file.stderr
-        check(load + ["--api-key", "x", "--api-key-file", str(key_file)], 2,
-              "--api-key and --api-key-file cannot combine")
-        for content in ("", "\n", "\r\nfake-key\n"):
-            key_file.write_text(content)
-            check(load + ["--api-key-file", str(key_file)], 2,
-                  "--api-key-file must name a readable file")
+        for content in ("fake-file-key\n", "fake-file-key\r\n",
+                        "fake-file-key"):
+            key_file.write_bytes(content.encode())
+            key_file.chmod(0o600)
+            from_file = run(load + ["-v", "--api-key-file", str(key_file)])
+            assert from_file.returncode == 1, from_file.stderr
+            assert "api_key=set" in from_file.stderr
+            assert "fake-file-key" not in from_file.stderr
+            assert "api_key_file_readable" not in from_file.stderr
+        # Group- or world-readable files warn but still load.
+        for mode in (0o640, 0o604):
+            key_file.chmod(mode)
+            readable = run(load + ["-v", "--api-key-file", str(key_file)])
+            assert readable.returncode == 1, readable.stderr
+            assert "event=api_key_file_readable mode=0" + oct(mode)[2:] in \
+                readable.stderr, readable.stderr
+            assert "api_key=set" in readable.stderr
+        key_file.chmod(0o600)
+        for args, environment, sources in (
+                (["--api-key", "x", "--api-key-file", str(key_file)], env,
+                 "--api-key, --api-key-file"),
+                (["--api-key", "x"], keyed_env, "--api-key, GUFO_API_KEY"),
+                (["--api-key-file", str(key_file)], keyed_env,
+                 "--api-key-file, GUFO_API_KEY"),
+                (["--api-key", "x", "--api-key-file", str(key_file)],
+                 keyed_env, "--api-key, --api-key-file, GUFO_API_KEY")):
+            result = run_env(load + args, environment)
+            assert result.returncode == 2, result.stderr
+            assert ("the API key has more than one source (" + sources +
+                    "); use exactly one") in result.stderr, result.stderr
+            assert "fake-env-key" not in result.stderr
+        # Exactly one line ending is trimmed: an empty key, a second line or
+        # a doubled newline is refused rather than silently reshaped.
+        for content, reason in (("", "holds an empty key"),
+                                ("\n", "holds an empty key"),
+                                ("\r\n", "holds an empty key"),
+                                ("fake-key\n\n", "single line"),
+                                ("fake-key\nsecond\n", "single line"),
+                                ("fake-key\r", "single line"),
+                                ("k" * 4097, "larger than 4096 bytes")):
+            key_file.write_bytes(content.encode())
+            check(load + ["--api-key-file", str(key_file)], 2, reason)
+        check(load + ["--api-key-file", directory], 2, "not a regular file")
         check(load + ["--api-key-file", str(Path(directory) / "missing")], 2,
-              "--api-key-file must name a readable file")
-    from_env = subprocess.run(
-        [binary, *load, "-v"], env={**env, "GUFO_API_KEY": "fake-env-key"},
-        text=True, capture_output=True, timeout=10)
+              "cannot be opened")
+    from_env = run_env(load + ["-v"], keyed_env)
     assert "api_key=set" in from_env.stderr
     assert "fake-env-key" not in from_env.stderr
+    assert "api_key=unset" in run_env(load + ["-v"],
+                                      {**env, "GUFO_API_KEY": ""}).stderr
     origins = run(load + ["-v", "--cors-origin", "http://webui.lan:3000",
                           "--cors-origin", "https://chat.test"])
     assert "cors_origins=2" in origins.stderr, origins.stderr

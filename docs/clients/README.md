@@ -30,7 +30,8 @@ Gufo accepts its single key as `Authorization: Bearer` (OpenAI clients) or
 `x-api-key` (Anthropic SDKs); a request sending both must send the key in
 both. Supply the server key through `GUFO_API_KEY` or `--api-key-file`, not
 `--api-key`, which puts it in server argv, visible to process inspection (`ps`,
-`/proc/*/cmdline`). Avoid shell tracing/history with literal keys and keep
+`/proc/*/cmdline`). Use exactly one source: the server refuses to start when
+`GUFO_API_KEY` is set alongside either option. Avoid shell tracing/history with literal keys and keep
 launch logs private. See [authentication](../SERVER.md#authentication-and-exposure).
 
 Choose `C` from the actual loaded context reported by `/v1/models`, constrained

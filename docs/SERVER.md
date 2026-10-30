@@ -1371,14 +1371,19 @@ OpenAI clients send the first, Anthropic SDKs the second. Every credential
 header a request carries must name the key: a request with both is accepted
 only when both match, so a valid `x-api-key` never excuses a wrong or
 non-Bearer `Authorization`, and a repeated header is refused. Keys are compared
-by SHA-256 digest. Supply the key in one of three ways:
+by SHA-256 digest. Supply the key from exactly one source; naming more than
+one is a startup error that lists the conflicting sources, never a silent
+precedence:
 
 - `--api-key KEY`: on the command line, visible in the process list
   (`ps`, `/proc/*/cmdline`).
-- `--api-key-file PATH`: the file's first line, without its line ending. Keep
-  the file private (`chmod 600`). It cannot combine with `--api-key`.
-- `GUFO_API_KEY`: used when neither option is given; an empty value means no
-  key. Only the same user (and root) can read a process's environment.
+- `--api-key-file PATH`: the file's contents less exactly one trailing `\n` or
+  `\r\n`, at most 4096 bytes, on one line. An empty key is an error. Keep the
+  file private (`chmod 600`): a group- or world-readable file loads but logs
+  the warning `event=api_key_file_readable`.
+- `GUFO_API_KEY`: the environment, which only the same user (and root) can
+  read. An empty value counts as unset. Unset it in the server's environment
+  when using either option, even if clients in the same shell read it.
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
@@ -1386,6 +1391,12 @@ address with `--host`; it must be a numeric IPv4 or IPv6 address, not a host
 name. `--host ::` is dual-stack: it accepts IPv6 clients and IPv4 clients, and
 an IPv4 client keeps its IPv4 address as its client ID. `--host ::1` accepts
 only IPv6 loopback clients. TLS termination belongs in a reverse proxy.
+
+**A server bound to a LAN address with no key can be driven by any web page.**
+The default `Access-Control-Allow-Origin: *` lets a page opened in any browser
+on the network send it requests and read the replies, with no credential to
+steal. Before binding beyond loopback, set a key (`--api-key-file` or
+`GUFO_API_KEY`) and/or restrict browsers with `--cors-origin`.
 
 Request bodies, prompts, generated text and credentials are not logged.
 
@@ -1409,7 +1420,9 @@ allowlist, responses carry `Vary: Origin`; a listed origin is echoed in
 `Access-Control-Allow-Origin` for preflights and replies, and a request whose
 `Origin` is not listed (including `null` or a repeated `Origin`) is refused
 with 403 `origin_not_allowed` before authentication, without CORS headers.
-Requests without `Origin`, such as curl and SDK clients, are unaffected.
+Requests without `Origin`, such as curl and SDK clients, are unaffected, but
+once an allowlist is set **every** browser origin that calls the server must be
+listed, including pages served by the same host on another port.
 `Access-Control-Allow-Credentials` is never sent: browsers attach no cookies,
 and the client must send the key itself. The same listener and API key serve
 inference and metrics.

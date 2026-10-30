@@ -7,6 +7,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -35,6 +36,8 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+#include "src/core/platform/fs.hpp"
+#include "src/core/platform/mapped_file.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -233,10 +236,9 @@ struct ServerLogOptions {
   std::optional<server::LogLevel> level;
 };
 
-/// Who may call the server. `--api-key` and `--api-key-file` supply the key
-/// on the command line or from a file the process list does not show; with
-/// neither, `GUFO_API_KEY` supplies it. The sources are resolved, and the
-/// conflict between the two options reported, where the server is prepared.
+/// Who may call the server. `--api-key`, `--api-key-file` and `GUFO_API_KEY`
+/// each supply the key; `ResolveApiKey` refuses more than one, since a silent
+/// precedence between credentials hides which key is in force.
 struct ServerAccessOptions {
   std::string api_key;
   std::string api_key_file;
@@ -247,10 +249,10 @@ struct ServerAccessOptions {
 // hand while every modality help registers them through the parser, so both
 // readings share one source for the wording.
 constexpr std::string_view kApiKeyHelp =
-    "Require this key as Authorization: Bearer or x-api-key (default: "
+    "Require this key as Authorization: Bearer or x-api-key (or set "
     "GUFO_API_KEY)";
 constexpr std::string_view kApiKeyFileHelp =
-    "Read the API key from the first line of this file";
+    "Read the API key from this file (one line; keep it chmod 600)";
 constexpr std::string_view kCorsOriginHelp =
     "Allow only this browser origin; repeat for more (default: any)";
 constexpr std::string_view kLogLevelHelp =
@@ -346,6 +348,77 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
                    include_sessions ? &targets->session_count : nullptr,
                    &targets->max_connections, &targets->max_request_body_bytes,
                    &targets->access, &targets->log);
+}
+
+// The `--api-key-file` key: the file less exactly one trailing `\n` or
+// `\r\n`. A key file group or other users can read draws a warning.
+bool ReadApiKeyFile(const std::string& path, std::string* key) {
+  constexpr std::size_t kMaxKeyBytes = 4096;
+  const auto fail = [&](std::string_view reason) {
+    std::cerr << "Error: --api-key-file '" << path << "' " << reason << "\n";
+    return false;
+  };
+  const platform::PlatformFile file = platform::OpenReadFile(path);
+  if (!platform::FileValid(file))
+    return fail("cannot be opened");
+  platform::FileInfo info{};
+  std::error_code ec;
+  const bool stat_ok = platform::Stat(file, &info, ec);
+  std::string text(kMaxKeyBytes + 1, '\0');
+  const std::size_t read =
+      stat_ok && info.regular && info.size <= kMaxKeyBytes
+          ? platform::ReadFileAt(file, text.data(), text.size(), 0)
+          : 0;
+  platform::CloseFile(file);
+  if (!stat_ok || !info.regular)
+    return fail("is not a regular file");
+  if (info.size > kMaxKeyBytes || read > kMaxKeyBytes)
+    return fail("is larger than 4096 bytes");
+  text.resize(read);
+  if (text.ends_with("\r\n"))
+    text.resize(text.size() - 2);
+  else if (text.ends_with('\n'))
+    text.pop_back();
+  if (text.empty())
+    return fail("holds an empty key");
+  if (text.find_first_of("\r\n") != std::string::npos)
+    return fail("must hold the key on a single line");
+  // POSIX group/other read bits; Windows reports no permission bits.
+  if ((info.permissions & 044U) != 0) {
+    char mode[8];
+    (void)std::snprintf(mode, sizeof(mode), "%04o", info.permissions);
+    server::Logger::Warn(
+        "server", "event=api_key_file_readable mode=" + std::string(mode) +
+                      " reason=group or other users can read the API key "
+                      "file; chmod 600 it");
+  }
+  *key = std::move(text);
+  return true;
+}
+
+// Settles the key from its one configured source. Empty values count as
+// unset, as an empty `--api-key` always has.
+bool ResolveApiKey(ServerAccessOptions* access) {
+  const char* env_key = std::getenv("GUFO_API_KEY");
+  std::vector<std::string_view> sources;
+  if (!access->api_key.empty())
+    sources.emplace_back("--api-key");
+  if (!access->api_key_file.empty())
+    sources.emplace_back("--api-key-file");
+  if (env_key != nullptr && *env_key != '\0')
+    sources.emplace_back("GUFO_API_KEY");
+  if (sources.size() > 1) {
+    std::cerr << "Error: the API key has more than one source (";
+    for (std::size_t i = 0; i < sources.size(); ++i)
+      std::cerr << (i == 0 ? "" : ", ") << sources[i];
+    std::cerr << "); use exactly one\n";
+    return false;
+  }
+  if (!access->api_key_file.empty())
+    return ReadApiKeyFile(access->api_key_file, &access->api_key);
+  if (env_key != nullptr)
+    access->api_key = env_key;
+  return true;
 }
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
@@ -1097,26 +1170,6 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: server limits must be positive\n";
       return false;
     }
-    if (!access.api_key_file.empty()) {
-      if (!access.api_key.empty()) {
-        std::cerr << "Error: --api-key and --api-key-file cannot combine\n";
-        return false;
-      }
-      auto key = ReadTextFile(access.api_key_file);
-      // The first line is the key, so a final newline or later lines cannot
-      // change it.
-      if (key.has_value())
-        key->resize(std::min(key->find_first_of("\r\n"), key->size()));
-      if (!key.has_value() || key->empty()) {
-        std::cerr << "Error: --api-key-file must name a readable file whose "
-                     "first line is the key\n";
-        return false;
-      }
-      access.api_key = std::move(*key);
-    } else if (const char* env_key = std::getenv("GUFO_API_KEY");
-               access.api_key.empty() && env_key != nullptr) {
-      access.api_key = env_key;
-    }
     // Arm verbosity here: this runs after every server option is parsed and
     // before the first loader, cache or HTTP line is written, so one call sets
     // the level for all modalities. `-v/--verbose` is shorthand for
@@ -1132,6 +1185,9 @@ int RunServe(std::span<const char* const> args) {
             ? server::LogLevel::kDebug
             : log_options.level.value_or(server::LogLevel::kInfo);
     server::Logger::SetLevel(resolved);
+    // Resolved after the level is armed, so the permission warning obeys it.
+    if (!ResolveApiKey(&access))
+      return false;
     // The queue plan is applied only after a valid invocation is established,
     // and the `queue_budget` line is emitted now so an absolute threshold
     // (`--log-level=error`) suppresses this INFO startup diagnostic with the
