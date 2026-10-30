@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """No model weights, HIP calls, host tuning or network; explicit --no-gpu."""
 import pathlib
+import os
 import struct
 import subprocess
 import sys
@@ -26,13 +27,14 @@ def main():
             return subprocess.run(
                 [binary, "diagnose", *args], capture_output=True,
                 text=True, timeout=10, check=False,
+                env={**os.environ, "XDG_CACHE_HOME": str(model.parent / "identity-cache")},
             )
 
         base = ("--plan", "--model", str(model), "--no-gpu")
         result = run(*base)
         assert result.returncode == 0, result.stderr
         assert "UNPROVEN:" in result.stdout and "context=32768 sessions=1" in result.stdout
-        assert "requested_file_sha256=" in result.stdout
+        assert "gguf_identity_sha256=" in result.stdout
         assert "FIT:" not in result.stdout
         result = run(*base, "--context=65536", "--sessions=4", "--enable-yarn",
                      "--kv-cache-type=q8_0", "--speculative=mtp", "--mtp-model=draft.gguf",
@@ -53,8 +55,15 @@ def main():
         assert run("--model", str(model), "--no-gpu").returncode == 2
         assert run("--plan=x", "--model", str(model), "--no-gpu").returncode == 2
         assert run("--plan", "--model", str(model), "--help").returncode == 0
+        missing_context = model.parent / "no-context.gguf"
+        metadata = string("general.architecture") + struct.pack("<I", 8) + string("llama")
+        no_context = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + metadata
+        missing_context.write_bytes(no_context + b"\0" * (-len(no_context) % 32))
+        result = run("--plan", "--model", str(missing_context), "--no-gpu")
+        assert result.returncode == 0 and "UNPROVEN:" in result.stdout, result.stderr
+        assert "no native context" in result.stdout
         assert model.read_bytes() == raw
-        assert list(model.parent.iterdir()) == [model]
+        assert {p.name for p in model.parent.iterdir()} <= {"metadata.gguf", "no-context.gguf", "identity-cache"}
     print("model_admission_cli_test passed")
 
 

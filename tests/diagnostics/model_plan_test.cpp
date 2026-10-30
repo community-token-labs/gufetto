@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
+#include "tests/diagnostics/recovery_bounds.hpp"
 
 namespace {
 const std::string header =
@@ -281,6 +282,12 @@ void NegativeCases(Fixture& fixture) {
 }  // namespace
 
 int main() {
+  const RecoveryBounds recovery({{1000, 100, 4}, {1004, 102, 4}});
+  assert(recovery.Contains({1000, 102, 4}));
+  assert(recovery.Contains({1100, 90, 3}));
+  assert(!recovery.Contains({999, 100, 4}));
+  assert(!recovery.Contains({1000, 103, 4}));
+  assert(!recovery.Contains({1000, 100, 5}));
   Fixture fixture;
   const auto unbudgeted = header + "\n" + Row() + "\n";
   auto report = fixture.Run(unbudgeted);
