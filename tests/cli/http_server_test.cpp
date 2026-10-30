@@ -2221,6 +2221,23 @@ void TestGenerationFailureLogsCause() {
   assert(count("[ERROR] [chat] context exceeded") == 3);
 }
 
+void TestUnavailableCacheReadiness() {
+  RunningServer server;
+  server.backend->failure = 9;
+  const auto failed = server.Post("/v1/completions", R"({"prompt":"hello"})");
+  ExpectStatus(failed, 503);
+  assert(failed.find("\"code\":\"cache_unavailable\"") != std::string::npos);
+  assert(failed.find("Retry-After:") == std::string::npos);
+  server.backend->is_ready = false;
+  for (const auto* path : {"/health", "/v1/health", "/healthz", "/ready",
+                           "/v1/ready", "/readyz"}) {
+    const auto response =
+        server.Send(std::string("GET ") + path + " HTTP/1.1\r\n\r\n");
+    ExpectStatus(response, 503);
+    assert(response.find("\"code\":\"not_ready\"") != std::string::npos);
+    assert(response.find("Retry-After:") == std::string::npos);
+  }
+}
 void TestDeviceLoss() {
   std::atomic<int> hook_calls{0};
   RunningServer server({.on_device_lost = [&] { ++hook_calls; }});
@@ -3570,6 +3587,7 @@ int main() {
   TestServedModelNames();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();
+  TestUnavailableCacheReadiness();
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
   TestRawCompletionPromptProgress();

@@ -4147,7 +4147,8 @@ std::vector<std::string> InferenceBackend::model_ids() const {
 
 bool InferenceBackend::ready() const {
 #if defined(ENGINE_ENABLE_HIP)
-  return impl_->Snapshot() != nullptr;
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->runner_pool->usable_capacity() != 0;
 #else
   return false;
 #endif

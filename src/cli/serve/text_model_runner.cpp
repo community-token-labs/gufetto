@@ -2050,6 +2050,14 @@ std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->component_cache ? impl_->component_cache->capacity()
                                 : impl_->cache->capacity();
 }
+std::size_t TextRunnerPool::usable_capacity() const noexcept {
+  return impl_->component_cache ? impl_->component_cache->usable_capacity()
+                                : capacity();
+}
+void TextRunnerPool::SetAvailabilityCallback(std::function<void()> callback) {
+  if (impl_->component_cache)
+    impl_->component_cache->SetAvailabilityCallback(std::move(callback));
+}
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(
     std::size_t ready_requests) const {
@@ -2218,6 +2226,13 @@ std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
     request.state_reusable = true;
   }
   return steps;
+}
+
+std::unique_ptr<TextRunnerPool::DiagnosticLease>
+TextRunnerPool::TryAcquireDiagnostic(const CancellationCheck& cancelled) {
+  return impl_->component_cache
+             ? impl_->component_cache->TryAcquireDiagnostic(cancelled)
+             : nullptr;
 }
 
 TextRunnerPool::Request TextRunnerPool::Acquire(

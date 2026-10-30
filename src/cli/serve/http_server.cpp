@@ -2162,6 +2162,9 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
        req.path == "/healthz")) {
     if (device_lost())
       return DeviceLost();
+    if (backend_ != nullptr && !backend_->ready())
+      return Err(503, "Service Unavailable", "model service is not ready",
+                 "server_error", "not_ready");
     json::Value body = json::Value::object();
     body["status"] = "ok";
     return Ok(body);

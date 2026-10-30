@@ -19,6 +19,7 @@ namespace gufo::server {
 class TextModelRunner;
 class TextRunnerState;
 class TextRunnerSnapshot;
+class TextDiagnosticLease;
 struct TextRunnerDiskCacheOptions;
 struct TextPromptContext;
 
@@ -72,6 +73,15 @@ struct ComponentCacheResources {
   cache::StreamLease stream;
   std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;
+  // Opt-in diagnostic witnesses; absent means immediate refusal. Called only
+  // with exclusive slot ownership (ready also participates in atomic claim).
+  // Ready is strong, nonblocking native quiescence +
+  // healthy/materialized/empty, not Slot::ExecutionComplete's hint. Reset
+  // returns pending without mutation, or clears native/bound-state residue and
+  // fences before reporting complete.
+  std::function<bool(const cache::Slot&)> diagnostic_ready;
+  std::function<cache::DiagnosticDiscardResult(cache::Slot&, TextRunnerState&)>
+      diagnostic_reset;
   // Prepare on-demand backing immediately before the next prefill chunk.
   std::function<void(std::size_t)> prepare_prefill;
   // Optional capacity bound before assigning a complete capture. False takes
@@ -181,6 +191,13 @@ public:
       const ContinuationCache::CancellationCheck&,
       std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
       bool persist = true);
+  // Full concrete fixed lease object (not the interface base), with no
+  // allocation. Provider-owned BindComponentState heap storage is separate and
+  // must also be booked by the provider; this object owns no
+  // vectors/strings/functions.
+  [[nodiscard]] static std::size_t DiagnosticRequestBytes() noexcept;
+  [[nodiscard]] std::unique_ptr<TextDiagnosticLease> TryAcquireDiagnostic(
+      const ContinuationCache::CancellationCheck& = {});
   [[nodiscard]] std::optional<ContinuationReuse> Lookup(
       std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
       std::size_t stable) const;
@@ -205,6 +222,10 @@ public:
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t usable_capacity() const noexcept;
+  // One scheduler observer; must not throw. Invoked outside publication locks.
+  // Callers settling a diagnostic lease must not hold the scheduler queue lock.
+  void SetAvailabilityCallback(std::function<void()>);
 
 private:
   void InitializePins(const TextRunnerPinnedPrefixOptions&);
