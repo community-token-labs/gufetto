@@ -10,6 +10,9 @@ results and qualification gaps live in:
 - [Qwen3-ASR](models/qwen3-asr/BENCHMARKS.md)
 - [MiniMax H3](models/minimax-h3/BENCHMARKS.md)
 
+For models without a reference runtime, use a [Gufo-only benchmark card](BENCHMARK-CARDS.md).
+Unknown stack or per-request evidence remains explicitly INCONCLUSIVE.
+
 ## Model benchmark driver
 
 `tools/bench/model-bench.py` measures the tables of a model's `BENCHMARKS.md`
