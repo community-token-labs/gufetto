@@ -42,6 +42,7 @@ set(gufo_pr_targets
   qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_continuation_identity_test
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
+  qwen36_moe_loader_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test
   qwen3_asr_config_test qwen3_asr_audio_api_test
   embedding_gemma2_config_test embedding_gemma2_embeddings_api_test
@@ -62,6 +63,7 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_continuation_identity_test
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
+  qwen36_moe_loader_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
@@ -76,6 +78,7 @@ list(APPEND gufo_pr_tests
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.kv_cache" "qwen38_flash_next\\.target_probe"
   "qwen38_flash_next\\.continuation_identity"
+  "qwen36_moe\\.loader"
   pd_attribution_scheduler_test pd_attribution_analyzer_test
   perf_trace_disabled_test perf_trace_phase_limit_test
   pinned_prefix_harness_test cache_lookup_harness_test

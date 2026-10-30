@@ -882,6 +882,16 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   // 1. Check architecture prefix (e.g. "qwen2", "qwen3", "qwen35", "llama")
   auto arch_str = GetMetadataString("general.architecture").value_or("qwen");
   config.architecture = std::string(arch_str);
+  if (config.architecture == "qwen35moe") {
+    // Qwen3.5/3.6 MoE replaces every dense FFN with experts; its loader lives
+    // in src/models/qwen36_moe and has no runtime yet.
+    if (error_msg != nullptr) {
+      *error_msg =
+          "qwen35moe (Qwen3.6-35B-A3B) models are not supported by this "
+          "build yet";
+    }
+    return std::nullopt;
+  }
   const std::string prefix = config.architecture + ".";
 
   // 2. Read standard architectural hyperparameters

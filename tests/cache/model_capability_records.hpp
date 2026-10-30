@@ -8,6 +8,7 @@
 #include "src/models/embedding_gemma2/cache_capabilities.hpp"
 #include "src/models/minimax_h3/cache_capabilities.hpp"
 #include "src/models/qwen/cache_capabilities.hpp"
+#include "src/models/qwen36_moe/cache_capabilities.hpp"
 #include "src/models/qwen38_flash_next/cache_capabilities.hpp"
 #include "src/models/qwen3_asr/cache_capabilities.hpp"
 #include "src/models/qwen3_tts/cache_capabilities.hpp"
@@ -27,6 +28,7 @@ inline constexpr std::array kModelCapabilityRecords{
            gufo::models::embedding_gemma2::kCacheCapabilities},
     Record{"minimax_h3", gufo::minimax_h3::kCacheCapabilities},
     Record{"qwen", gufo::models::qwen::kCacheCapabilities},
+    Record{"qwen36_moe", gufo::models::qwen36_moe::kCacheCapabilities},
     Record{"qwen38_flash_next",
            gufo::models::qwen38_flash_next::kCacheCapabilities},
     Record{"qwen3_asr", gufo::models::qwen3_asr::kCacheCapabilities},
