@@ -286,6 +286,7 @@ add_library(gufo_diagnostics STATIC
   src/core/diagnostics/compatibility.cpp
   src/core/diagnostics/fingerprint.cpp
   src/core/diagnostics/artifact_validator.cpp
+  src/core/diagnostics/model_plan.cpp
   src/core/diagnostics/allocation_benchmark.cpp
   src/core/diagnostics/bandwidth.cpp
   src/core/hip/bandwidth.cpp
@@ -293,7 +294,7 @@ add_library(gufo_diagnostics STATIC
   src/cli/diagnose/diagnose.cpp
 )
 target_include_directories(gufo_diagnostics PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(gufo_diagnostics PUBLIC gufo_platform)
+target_link_libraries(gufo_diagnostics PUBLIC gufo_platform gufo_core)
 target_compile_definitions(gufo_diagnostics PRIVATE
   GUFO_REVISION="${GUFO_REVISION}")
 
@@ -347,6 +348,10 @@ target_compile_definitions(gufo_core PRIVATE
 target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
   Threads::Threads PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl
   OpenSSL::Crypto)
+
+# CPU expert-streaming policy: read plans and slot leases, no I/O or HIP.
+add_library(gufo_expert_stream STATIC src/core/expert_stream/policy.cpp)
+target_include_directories(gufo_expert_stream PUBLIC ${CMAKE_SOURCE_DIR})
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
@@ -705,6 +710,8 @@ if (BUILD_TESTING)
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
+  add_test(NAME http_server_test_diagnostic_memory COMMAND http_server_test --diagnostic-memory)
+  set_tests_properties(http_server_test_diagnostic_memory PROPERTIES LABELS "cpu;server;http;memory" TIMEOUT 30)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
 
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
@@ -818,6 +825,7 @@ if (BUILD_TESTING)
     lookup
     pins
     lifecycle
+    diagnostic_memory
     reuse
     disk
     ram)
@@ -851,6 +859,11 @@ if (BUILD_TESTING)
   set_tests_properties(qfn_kv_ingress_validation_test PROPERTIES
     LABELS "cpu;server;cache;qwen38_flash_next")
 
+  add_executable(diagnostic_memory_test tests/cli/diagnostic_memory_test.cpp)
+  target_link_libraries(diagnostic_memory_test PRIVATE gufo_logging gufo_platform)
+  add_test(NAME diagnostic_memory_test COMMAND diagnostic_memory_test)
+  set_tests_properties(diagnostic_memory_test PROPERTIES LABELS "cpu;server;memory")
+
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp
     src/cli/serve/continuation_cache.cpp
@@ -859,6 +872,14 @@ if (BUILD_TESTING)
   src/cli/serve/text_model_runner.cpp)
   target_link_libraries(text_model_runner_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
+  add_test(NAME text_model_runner_test_diagnostic_memory COMMAND text_model_runner_test --diagnostic-memory)
+  set_tests_properties(text_model_runner_test_diagnostic_memory PROPERTIES LABELS "cpu;server;runner;memory")
+  foreach(mode auto explicit)
+    add_test(NAME text_model_runner_test_diagnostic_refusal_${mode}
+      COMMAND text_model_runner_test --diagnostic-refusal-${mode})
+    set_tests_properties(text_model_runner_test_diagnostic_refusal_${mode} PROPERTIES
+      WILL_FAIL TRUE LABELS "cpu;server;runner;memory")
+  endforeach()
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
 
@@ -1002,6 +1023,12 @@ if (BUILD_TESTING)
     set_tests_properties(${name}_test PROPERTIES LABELS "cpu;tools;quality")
   endforeach()
 
+  add_test(NAME benchmark_card_test
+    COMMAND ${Python3_EXECUTABLE} -B
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/benchmark_card_test.py)
+  set_tests_properties(benchmark_card_test PROPERTIES
+    LABELS "cpu;tools;benchmarks;json" TIMEOUT 30)
+
   add_test(NAME serving_bench_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/serving_bench_test.py)
@@ -1012,7 +1039,7 @@ if (BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_runner.py)
   set_tests_properties(functional_runner_test PROPERTIES LABELS "cpu;server;functional")
-  foreach(name IN ITEMS pinned_prefix cache_lookup cache_lookup_classify)
+  foreach(name IN ITEMS pinned_prefix cache_lookup cache_lookup_classify token_parity)
     add_test(NAME ${name}_harness_test
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_${name}.py)
@@ -1044,6 +1071,14 @@ if (BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/prof_test.py)
   set_tests_properties(prof_test PROPERTIES
     LABELS "cpu;tools;profiling")
+
+  add_executable(model_plan_test tests/diagnostics/model_plan_test.cpp)
+  target_link_libraries(model_plan_test PRIVATE gufo_diagnostics)
+  add_test(NAME model_plan_test COMMAND model_plan_test)
+  set_tests_properties(model_plan_test PROPERTIES LABELS "cpu;diagnostics")
+  add_test(NAME model_plan_cli_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/model_plan_cli_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(model_plan_cli_test PROPERTIES LABELS "cpu;diagnostics")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
   target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
@@ -1084,6 +1119,14 @@ if (BUILD_TESTING)
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
   endif()
+
+  add_executable(expert_stream_test tests/core/expert_stream_test.cpp)
+  target_link_libraries(expert_stream_test PRIVATE gufo_expert_stream)
+  add_test(NAME expert_stream_test COMMAND expert_stream_test)
+  set_tests_properties(expert_stream_test PROPERTIES LABELS "cpu;core;expert_stream")
+  # Replay driver for tools/bench/expert_trace.py.
+  add_executable(expert_stream_replay tools/bench/expert_stream_replay.cpp)
+  target_link_libraries(expert_stream_replay PRIVATE gufo_expert_stream)
 
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)

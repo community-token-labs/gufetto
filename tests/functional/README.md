@@ -610,7 +610,12 @@ checks the default byte ceiling with 22 resized 1080p images.
 
 For real coding-agent regressions, run `pi_agent.py` against a local server with
 `--base-url`, `--model`, `--pi /path/to/pi-0.87.0`, `--server-log`, and a fresh
-`--output` directory. Repeat `--case` to select affected tasks;
+`--output` directory. For a different loaded capacity, pass `--context-window C`
+and `--max-output-tokens O` explicitly; historical defaults remain 262144/8192.
+Set `GUFO_API_KEY` privately for bearer-authenticated upstream requests; the
+proxy does not save the key in argv, configuration or wire-header artifacts.
+See [client qualification](../../docs/clients/QUALIFICATION.md) for the paired
+native-client/Pi workflow. Repeat `--case` to select affected tasks;
 `--case literal-protocol --passes 1` exercises a real write/read/verify loop
 containing literal ChatML vocabulary spellings.
 `--case wide-tool --passes 1` loads a fixture extension with a 12-field `todo`

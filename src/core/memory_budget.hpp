@@ -2,10 +2,15 @@
 #define GUFO_CORE_MEMORY_BUDGET_HPP_
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 
 namespace gufo::core {
+
+/// Serve's post-loading host execution/cache reserve, not a weight-load gate.
+inline constexpr std::uint64_t kHostExecutionReserveBytes = std::uint64_t{4}
+                                                            << 30;
 
 [[nodiscard]] inline std::size_t AddMemoryBytes(std::size_t a, std::size_t b) {
   if (b > std::numeric_limits<std::size_t>::max() - a)

@@ -19,6 +19,7 @@
 
 #include "src/cache/disk_catalog.hpp"
 #include "src/cache/retention.hpp"
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/crypto/sha256.hpp"
@@ -616,16 +617,20 @@ struct ComponentTextCache::Impl {
       std::size_t permanent_bytes, std::vector<std::unique_ptr<Entry>>& staged,
       Clock::time_point deadline = Clock::time_point::max()) {
     const auto& startup = *resources->startup_admission;
+    const auto diagnostic_bytes =
+        DiagnosticMemoryClaim::Process().Snapshot().bytes;
     if (startup.now() >= deadline)
       return std::nullopt;
     auto pending = startup.pending(adapter, context);
     auto capacity = startup.observe();
     core::ExecutionDebit maximum{};
     std::size_t max_slot_execution{}, max_slot_images{};
-    const auto fixed =
-        core::AddMemoryBytes(ledger.Limits().staging_bytes, permanent_bytes);
+    const auto fixed = core::AddMemoryBytes(
+        core::AddMemoryBytes(ledger.Limits().staging_bytes, permanent_bytes),
+        diagnostic_bytes);
     const auto fits = [&](std::size_t remaining,
                           std::size_t first_slot_bytes = 0) {
+      RequireDiagnosticMemoryFits(diagnostic_bytes, capacity.Capacity());
       // Pending slot counters are independent of the shared counters: shared
       // materialization may lower the latter during construction.
       std::size_t required = core::AddMemoryBytes(
@@ -688,7 +693,9 @@ struct ComponentTextCache::Impl {
     }
     return StagedExecution{
         capacity,
-        core::AddMemoryBytes(pending.shared_execution, pending.slot_execution)};
+        core::AddMemoryBytes(core::AddMemoryBytes(pending.shared_execution,
+                                                  pending.slot_execution),
+                             diagnostic_bytes)};
   }
 
   StagedExecution AdmitMeasuredExecution(std::size_t count,
@@ -755,13 +762,18 @@ struct ComponentTextCache::Impl {
         ledger({slot_ceiling + DiskStaging(bool(options), pins.enabled()),
                 slot_ceiling, DiskStaging(bool(options), pins.enabled()),
                 slot_ceiling}),
-        resources(this->runner->CreateComponentCacheResources(ledger, ram)),
+        resources([&] {
+          DiagnosticMemoryClaim::Process().SealStartup();
+          return this->runner->CreateComponentCacheResources(ledger, ram);
+        }()),
         identity(PinnedCompatibility(
             resources->adapter->CompatibilityIdentity(), pins.enabled())),
         index(ledger),
         retention(ledger, index, &events),
         lookup_enabled(publish_lookup),
         ram_enabled(ram_on) {
+    const auto diagnostic_bytes =
+        DiagnosticMemoryClaim::Process().Snapshot().bytes;
     if (!ram_enabled && pins.enabled() && !pins.lazy)
       throw std::invalid_argument(
           "RAM-warm pinned prefixes require an enabled RAM cache; use "
@@ -836,13 +848,16 @@ struct ComponentTextCache::Impl {
     }
     // Freeze only after every slot allocated, before any backing or staging.
     // Resident weights/slot bytes already reduced the provider's free sample.
-    const auto pending_execution = resources->freeze_execution_liability
-                                       ? resources->freeze_execution_liability()
-                                       : 0;
+    const auto pending_execution =
+        core::AddMemoryBytes(resources->freeze_execution_liability
+                                 ? resources->freeze_execution_liability()
+                                 : 0,
+                             diagnostic_bytes);
     if (admitted && pending_execution != admitted->pending_execution)
       throw std::logic_error(
           "startup execution obligations changed while freezing");
-    const auto claim = !admitted && (resources->freeze_execution_liability ||
+    const auto claim = !admitted && (diagnostic_bytes ||
+                                     resources->freeze_execution_liability ||
                                      (ram_enabled && resources->commit_backing))
                            ? this->runner->ResourceClaim()
                            : TextRunnerResourceClaim{};
@@ -854,13 +869,14 @@ struct ComponentTextCache::Impl {
             : core::ProtectedCacheHeadroom{
                   measured,
                   claim.retained_snapshot_ceiling_bytes.value_or(measured)};
-    if (resources->freeze_execution_liability) {
+    if (resources->freeze_execution_liability || diagnostic_bytes) {
       Logger::Info("cache", "event=execution_liability pending_bytes=" +
                                 std::to_string(pending_execution) +
                                 " unprotected_automatic_bytes=" +
                                 std::to_string(headroom.automatic) +
                                 " unprotected_ceiling_bytes=" +
                                 std::to_string(headroom.ceiling));
+      RequireDiagnosticMemoryFits(diagnostic_bytes, headroom.ceiling);
       headroom = core::ProtectCacheHeadroom(
           headroom.automatic, headroom.ceiling, pending_execution);
       if (ledger.Limits().staging_bytes > headroom.ceiling)
@@ -873,7 +889,7 @@ struct ComponentTextCache::Impl {
       // pool exists. The ledger admits what the slots already charged, that
       // backing, and request metadata.
       ram = options ? kDiskOnlyBackingBytes : 0;
-      if (resources->freeze_execution_liability &&
+      if ((resources->freeze_execution_liability || diagnostic_bytes) &&
           !core::FitsMemoryBudget(headroom.ceiling, ram,
                                   ledger.Limits().staging_bytes))
         throw std::invalid_argument(
@@ -930,7 +946,7 @@ struct ComponentTextCache::Impl {
       // Slots allocated under the host ceiling; return to the budget. This
       // ignores pinned_bytes: a runner that pins must commit backing.
       const auto staging = ledger.Limits().staging_bytes;
-      if (resources->freeze_execution_liability) {
+      if (resources->freeze_execution_liability || diagnostic_bytes) {
         ram = std::min(ram, headroom.ceiling - staging);
         if (automatic_ram)
           ram = std::min(ram, headroom.automatic);

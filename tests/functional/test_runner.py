@@ -240,21 +240,32 @@ class FunctionalRunnerTest(unittest.TestCase):
         import threading
         from pi_agent import Recorder as PiRecorder
 
+        received_auth = []
+
         class Upstream(http.server.BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
 
             def do_GET(self):
+                received_auth.append(self.headers.get("Authorization"))
                 self.send_response(200)
                 if "untyped" not in self.path:
                     self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"object":"list","data":[]}')
 
+            def do_POST(self):
+                received_auth.append(self.headers.get("Authorization"))
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b'data: [DONE]\n\n')
+
         with tempfile.TemporaryDirectory() as directory, \
                 http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream) as upstream:
             with PiRecorder(f"http://127.0.0.1:{upstream.server_port}",
-                            Path(directory)) as proxy:
+                            Path(directory), api_key="fixture-secret") as proxy:
                 workers = [threading.Thread(target=s.serve_forever, daemon=True)
                            for s in (upstream, proxy)]
                 for worker in workers:
@@ -276,11 +287,22 @@ class FunctionalRunnerTest(unittest.TestCase):
                             connection.close()
                     self.assertEqual(proxy.requests, [])
                     self.assertEqual(list(Path(directory).iterdir()), [])
+                    connection = http.client.HTTPConnection("127.0.0.1", proxy.server_port, timeout=5)
+                    try:
+                        connection.request("POST", "/v1/chat/completions", '{"stream":true}',
+                                           {"Content-Type": "application/json"})
+                        response = connection.getresponse()
+                        self.assertEqual(response.read(), b'data: [DONE]\n\n')
+                    finally:
+                        connection.close()
                 finally:
                     for server in (proxy, upstream):
                         server.shutdown()
                     for worker in workers:
                         worker.join(timeout=5)
+                self.assertEqual(received_auth, ["Bearer fixture-secret"] * 3)
+                for path in Path(directory).iterdir():
+                    self.assertNotIn("fixture-secret", path.read_text())
 
     def test_image_inputs_require_a_projector_before_starting_a_server(self):
         for suite in ("image-inputs", "image-count", "tool-images", "image-detail"):
@@ -1950,6 +1972,16 @@ sys.exit({exit_code})
 
 
 class PiWatchdogTest(unittest.TestCase):
+    def test_explicit_loaded_model_limits(self):
+        from pi_agent import model_metadata
+        model = model_metadata("local", "off", 32768, 4096, {"temperature": 0})
+        self.assertEqual(model["contextWindow"], 32768)
+        self.assertEqual(model["maxTokens"], 4096)
+        self.assertFalse(model["reasoning"])
+        for context, output in ((0, 1), (10, 0), (10, 10), (10, 11), (-1, 1)):
+            with self.assertRaises(ValueError):
+                model_metadata("local", "off", context, output, {})
+
     def test_wide_tool_checks_intent_and_actual_execution(self):
         from pi_agent import validate_task
 

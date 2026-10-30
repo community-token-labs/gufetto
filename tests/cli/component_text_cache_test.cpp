@@ -24,6 +24,7 @@
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/qfn_kv_ingress_validation.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -640,9 +641,9 @@ std::string Refuse(const std::shared_ptr<MeasuredRunner>& runner,
 }
 void NoFit(const std::shared_ptr<MeasuredRunner>& runner) {
   const auto message = Refuse(runner);
-  assert(message.find("no fitting context found within the search limits") !=
-         std::string::npos);
-  assert(message.find("verified to fit:") == std::string::npos);
+  assert(message ==
+         "measured startup execution exceeds capacity for --context 32768; "
+         "no fitting context found within the search limits");
   assert((runner->probes == std::vector<std::size_t>{16384, 8192, 4096}));
 }
 
@@ -679,10 +680,19 @@ void FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation() {
         for (auto& capacity : trial.capacity)
           std::swap(capacity.host, capacity.device);
       trial.pending.assign(4, Pending(2, 0, 1, 0));
+      // Independent counterfactual: provide E extra raw bytes, so the one
+      // fixed claim must recover the same pre-claim decisions and advice.
+      const auto e = DiagnosticMemoryClaim::Process().Snapshot().bytes;
+      for (auto& capacity : trial.capacity) {
+        capacity.host += e;
+        capacity.device += e;
+      }
     };
     const auto message = Refuse(runner);
-    assert(message.find("verified to fit: --context 8192") !=
-           std::string::npos);
+    assert(message ==
+           "measured startup execution exceeds capacity for --context 32768; "
+           "verified to fit: --context 8192 (staged execution pool, not a "
+           "maximum)");
     assert((runner->probes == std::vector<std::size_t>{16384, 8192, 12288}));
     for (const auto& trial : runner->trials) {
       // Six logical MiB alone and three pending MiB alone both fit, but
@@ -943,10 +953,17 @@ void SuggestionsRequireFullPoolsAndIsolateProbeCounters() {
       trial.capacity[1] = Capacity(20, 20, 10);
     else if (trial.context > 24576)
       trial.capacity[3] = Capacity(0, 0, 0);
+    const auto e = DiagnosticMemoryClaim::Process().Snapshot().bytes;
+    for (auto& capacity : trial.capacity) {
+      capacity.host += e;
+      capacity.device += e;
+    }
   };
   const auto message = Refuse(runner);
-  assert(message.find("verified to fit: --context 24576 (staged execution "
-                      "pool, not a maximum)") != std::string::npos);
+  assert(message ==
+         "measured startup execution exceeds capacity for --context 32768; "
+         "verified to fit: --context 24576 (staged execution pool, not a "
+         "maximum)");
   assert((runner->probes == std::vector<std::size_t>{16384, 24576, 28672}));
   assert(runner->trials.front()->created == 1);
   assert(runner->trials.front()->pending_calls == 2);
@@ -1079,7 +1096,114 @@ void DefaultDisabledKeepsTheOriginalGateAndBudget() {
   }
 }
 
+// Fresh process only: the real production singleton deliberately has no reset.
+void StaticDiagnosticClaim() {
+  constexpr std::size_t envelope = 4 * kMiB;
+  auto& claim = DiagnosticMemoryClaim::Process();
+  assert(claim.Activate(envelope, Capacity(100, 100, 50), nullptr));
+  FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation();
+  SuggestionsRequireFullPoolsAndIsolateProbeCounters();
+  auto runner = std::make_shared<MeasuredRunner>();
+  runner->configure = [](Trial& trial) {
+    trial.capacity = {Capacity(100, 100, 50), Capacity(92, 96, 46),
+                      Capacity(84, 92, 42), Capacity(76, 88, 38)};
+    trial.pending.assign(4, Pending(0, 0, 0, 0));
+  };
+  {
+    TextRunnerPool pool(runner, 3);
+    assert(runner->probes.empty());
+    // Existing half-free policy: one 4 MiB hard claim, not 3 slot claims,
+    // not full-debit policy, and no credit for materialized diagnostic bytes.
+    assert(runner->committed == 36 * kMiB);
+  }
+  runner->Released();
+  for (const int delta : {-1, 0, 1}) {
+    const auto ceiling = envelope + delta;
+    const std::string expected =
+        "--full-logits-api needs 4194304 bytes; snapshot ceiling is " +
+        std::to_string(ceiling) +
+        " bytes; lower --context or --sessions, free memory, or restart "
+        "without --full-logits-api";
+    for (const bool device_limits : {false, true}) {
+      for (const bool initial : {false, true}) {
+        auto off = std::make_shared<MeasuredRunner>();
+        off->configure = [=](Trial& trial) {
+          trial.capacity = {Capacity(100, 100, 50), Capacity(90, 90, 45),
+                            Capacity(80, 80, 40), Capacity(8, 8, 4)};
+          auto& sample = trial.capacity[initial ? 0 : 3];
+          (device_limits ? sample.device : sample.host) = ceiling;
+          assert(sample.Capacity() == ceiling);
+          // The initial observation must also fit slot one's ordinary logical
+          // bytes. Use zero only for this diagnostic-only boundary fixture.
+          trial.pending.assign(4, Pending(0, 0, 0, 0));
+        };
+        off->logical_slot = [](std::size_t) { return std::size_t{0}; };
+        bool refused = false;
+        try {
+          TextRunnerPool pool(off, 3, {}, {.enabled = false});
+        } catch (const std::invalid_argument& error) {
+          refused = true;
+          assert(delta < 0 && std::string_view(error.what()) == expected);
+        }
+        assert(refused == (delta < 0));
+        assert(off->commits == 0 && off->probes.empty());
+        if (refused)
+          assert(off->freezes == 0 && off->bound_slots.empty());
+        for (const auto& trial : off->trials)
+          assert(trial->created == trial->destroyed &&
+                 trial->created == (refused && initial ? 0 : 3));
+        off->Released();
+      }
+    }
+    struct LegacyCeilingRunner final : Runner {
+      std::size_t ceiling;
+      explicit LegacyCeilingRunner(std::size_t bytes) : ceiling(bytes) {}
+      TextRunnerResourceClaim ResourceClaim() const override {
+        auto result = Runner::ResourceClaim();
+        result.retained_snapshot_capacity_bytes = ceiling / 2;
+        result.retained_snapshot_ceiling_bytes = ceiling;
+        return result;
+      }
+    };
+    bool refused = false;
+    try {
+      TextRunnerPool pool(std::make_shared<LegacyCeilingRunner>(ceiling), 1, {},
+                          {.enabled = false});
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      assert(delta < 0 && std::string_view(error.what()) == expected);
+    }
+    assert(refused == (delta < 0));
+  }
+  {
+    // Legacy/nonmeasured cache-off still samples capacity for the hard claim,
+    // even when its provider has no freeze or commit callback.
+    TextRunnerPool ordinary(std::make_shared<Runner>(), 1, {},
+                            {.enabled = false});
+  }
+  {
+    // No freeze/commit callbacks: RAM-on must use the protected headroom too.
+    std::ostringstream log;
+    auto* previous = std::clog.rdbuf(log.rdbuf());
+    struct HeadroomRunner final : Runner {
+      TextRunnerResourceClaim ResourceClaim() const override {
+        auto result = Runner::ResourceClaim();
+        result.retained_snapshot_capacity_bytes = 16ULL << 20;
+        result.retained_snapshot_ceiling_bytes = 32ULL << 20;
+        return result;
+      }
+    };
+    TextRunnerPool ordinary(std::make_shared<HeadroomRunner>(), 1);
+    std::clog.rdbuf(previous);
+    assert(log.str().find("capacity_bytes=14680064 staging_capacity_bytes=0") !=
+           std::string::npos);
+  }
+  assert(claim.Snapshot().bytes == envelope);
+  assert(!claim.Activate(envelope, Capacity(100, 100, 50), nullptr));
+}
+
 void Check() {
+  assert(DiagnosticMemoryClaim::Process().Snapshot().bytes == 0);
   MeasuredDebitRefusesBeforeRemainingSlots();
   FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation();
   StagedProbeDeadlineStopsSlotCreation();
@@ -7125,7 +7249,12 @@ int main(int argc, char* argv[]) {
     std::cout << "CPU packed disk admission PASS\n";
     return 0;
   }
-  // CTest runs bounded suites; direct no-argument execution retains every case.
+  if (suite == "diagnostic_memory") {
+    measured_startup::StaticDiagnosticClaim();
+    return 0;
+  }
+  // CTest runs bounded suites. The irreversible activation case above needs
+  // its own process; no-argument execution retains the ordinary cases.
   bool selected = false;
   const auto run = [&](std::string_view name, auto body) {
     if (suite.empty() || suite == name) {

@@ -8,10 +8,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <semaphore>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -21,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -45,7 +48,7 @@ void TestAuthorization() {
     ExpectStatus(secured.Send("POST " + path + " HTTP/1.1\r\n\r\n"), 401);
   }
   for (const std::string header :
-       {"", "Authorization: Bearer wrong\r\n",
+       {"", "x-api-key: test-secret\r\n", "Authorization: Bearer wrong\r\n",
         "Authorization: Basic test-secret\r\n",
         "Authorization: Bearer test-secret\r\nAuthorization: Bearer "
         "test-secret\r\n"}) {
@@ -176,6 +179,8 @@ std::string ChunkedBody(const std::string& response) {
     cursor = line_end + 2 + size + 2;
   }
 }
+
+#include "tests/cli/client_recipe_checks.hpp"
 
 // `--trace` keeps what a text request carried in and out under the id the
 // logs name. Polls, other routes and unauthenticated requests stay out.
@@ -877,6 +882,7 @@ void TestLlamaSlotsAndMetrics() {
          token.member_size("n_decoded") == 3);
 
   const auto metrics = get("/metrics");
+  assert(metrics.find("gufo_full_logits_memory_") == std::string::npos);
   assert(metrics.find("# HELP gufo_device_lost_total ") != std::string::npos);
   assert(metrics.find("# TYPE gufo_device_lost_total counter\n") !=
          std::string::npos);
@@ -903,6 +909,29 @@ void TestLlamaSlotsAndMetrics() {
            std::string::npos);
   }
   assert(metrics.find("# TYPE llamacpp:kv_cache_usage_ratio gauge\n") !=
+         std::string::npos);
+}
+
+void TestDiagnosticMetrics() {
+  RunningServer server;
+  const auto get = [&server] {
+    return server.Send("GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+  };
+  assert(get().find("gufo_full_logits_memory_") == std::string::npos);
+  // Dedicated process: no singleton reset or diagnostics in later tests.
+  // This network-only fake owns no serving cache/native resources. Exercise
+  // reporting, not a claim of HIP failure/retirement qualification.
+  auto& claim = gufo::server::DiagnosticMemoryClaim::Process();
+  assert(claim.Activate(1048576, {2097152, 2097152, 1048576}, nullptr));
+  claim.ReportUnknown("mock_retirement");
+  const auto reported = get();
+  assert(reported.find("# HELP gufo_full_logits_memory_claim_bytes ") !=
+         std::string::npos);
+  assert(reported.find("# HELP gufo_full_logits_memory_unknown_total ") !=
+         std::string::npos);
+  assert(reported.find("gufo_full_logits_memory_claim_bytes 1048576\n") !=
+         std::string::npos);
+  assert(reported.find("gufo_full_logits_memory_unknown_total 1\n") !=
          std::string::npos);
 }
 
@@ -1003,6 +1032,113 @@ void TestTextOnlyBackendRefusesImagesBeforeReading() {
              std::string::npos);
     }
   }
+  assert(server.backend->calls == calls);
+}
+
+void TestLlamaStringParity() {
+  RunningServer server;
+  std::ifstream fixture(std::filesystem::path(__FILE__).parent_path() /
+                        "fixtures/llama_completion_string_bodies.json");
+  assert(fixture);
+  const auto expected = gufo::json::parse(
+      std::string(std::istreambuf_iterator<char>(fixture), {}));
+  std::size_t index = 0;
+  for (
+      const char* body :
+      {R"({"prompt":"hi"})", R"({"prompt":"hi","n_predict":1})",
+       R"({"prompt":"hi","cache_prompt":false,"cache_persist":false,"stop":["end"]})"}) {
+    const auto response = server.Post("/completion", body);
+    ExpectStatus(response, 200);
+    assert(response.substr(response.find("\r\n\r\n") + 4) ==
+           expected.items()[index++].str());
+  }
+}
+
+void TestLlamaTokenIds() {
+  RunningServer server;
+  const auto post = [&](const std::string& body) {
+    const auto response = server.Post("/completion", body);
+    ExpectStatus(response, 200);
+    return gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  const auto string = post(R"({"prompt":"hi","return_tokens":true})");
+  const auto string_ids = server.backend->LastCall().prompt_ids;
+  const auto numeric = post(R"({"prompt":[104,105],"return_tokens":true})");
+  assert(server.backend->LastCall().prompt_ids == string_ids);
+  assert(server.backend->LastCall().prompt.empty());  // no detokenization
+  assert(numeric.find("tokens")->dump() == string.find("tokens")->dump());
+  assert(numeric.find("tokens")->dump() == "[111,107]");
+  assert(numeric.find("stopped_eos")->as_bool());
+  assert(!numeric.find("stopped_limit")->as_bool());
+  const auto limited =
+      post(R"({"prompt":[104,105],"return_tokens":true,"n_predict":1})");
+  assert(limited.find("stopped_limit")->as_bool());
+  assert(!limited.find("stopped_eos")->as_bool());
+  server.backend->forced_stop_sequence = "end";
+  const auto stopped =
+      post(R"({"prompt":[104,105],"return_tokens":true,"stop":["end"]})");
+  assert(stopped.find("stopped_word")->as_bool());
+  assert(stopped.member_str("stopping_word") == "end");
+  assert(stopped.find("tokens")->dump() == "[111,107]");
+  assert(!stopped.find("stopped_eos")->as_bool());
+  server.backend->forced_stop_sequence.clear();
+  assert(post(R"({"prompt":[0,255],"return_tokens":false})")
+             .find("tokens")
+             ->dump() == "[]");
+  assert(!post(R"({"prompt":[104,105]})").contains("tokens"));
+  assert(!post(R"({"prompt":"hi"})").contains("tokens"));
+  assert(!post(R"({"prompt":"hi","return_tokens":null})").contains("tokens"));
+  assert(
+      !post(R"({"prompt":[104,105],"return_tokens":null})").contains("tokens"));
+  post(R"({"prompt":[1.0,1e2,-0],"return_tokens":true})");
+  assert((server.backend->LastCall().prompt_ids ==
+          std::vector<gufo::tokenization::TokenId>{1, 100, 0}));
+
+  const auto exact = post(R"({"prompt":[104,105],"n_predict":4,
+    "return_tokens":true,"stream":false,"cache_prompt":false,
+    "temperature":0,"top_k":1,"top_p":1,"min_p":0,"repeat_penalty":1,
+    "frequency_penalty":0,"presence_penalty":0,"seed":0,
+    "n_probs":5,"post_sampling_probs":false})");
+  const auto call = server.backend->LastCall();
+  assert(call.max_tokens == 4 && call.sampling.temperature == 0 &&
+         call.sampling.top_k == 1 && call.sampling.top_p == 1 &&
+         call.sampling.min_p == 0 && call.sampling.repeat_penalty == 1 &&
+         call.sampling.frequency_penalty == 0 &&
+         call.sampling.presence_penalty == 0 && call.sampling.seed == 0);
+  assert(!server.backend->last_cache_prompt);
+  assert(exact.find("tokens")->dump() == "[111,107]");
+  assert(!exact.contains("completion_probabilities"));
+  post(R"({"prompt":[104,105],"stop":["end"],"cache_persist":false})");
+  assert(server.backend->LastCall().stop_sequences ==
+         std::vector<std::string>{"end"});
+  assert(!server.backend->last_cache_persist);
+
+  const auto calls = server.backend->calls.load();
+  for (const char* prompt :
+       {"[]", "[-1]", "[256]", "[4294967295]", "[4294967296]", "[1e100]",
+        "[1.5]", "[true]", "[null]", "[1,\"hi\"]", "[\"hi\"]", "[[1]]"}) {
+    const auto response =
+        server.Post("/completion", std::string("{\"prompt\":") + prompt + "}");
+    ExpectStatus(response, 400);
+    const auto error =
+        gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    assert(error.find("error")->member_str("code") == "invalid_prompt");
+    assert(
+        error.find("error")->member_str("message") ==
+        "'prompt' must be a nonempty array of in-vocabulary integer token IDs");
+  }
+  for (const char* field : {"return_tokens", "ignore_eos"}) {
+    for (const char* value : {"1", "\"true\""}) {
+      ExpectStatus(
+          server.Post("/completion", std::string("{\"prompt\":[1],\"") + field +
+                                         "\":" + value + "}"),
+          400);
+    }
+  }
+  ExpectStatus(server.Post("/completion", R"({"prompt":[1],"stream":true})"),
+               400);
+  ExpectStatus(
+      server.Post("/completion", R"({"prompt":[1],"ignore_eos":true})"), 400);
   assert(server.backend->calls == calls);
 }
 
@@ -3555,7 +3691,13 @@ void TestCheckpointTransferHttp() {
   ExpectStatus(unauthorized, 401);
   assert(unauthorized.find("100 Continue") == std::string::npos);
 }
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--diagnostic-memory") {
+    TestDiagnosticMetrics();
+    return 0;
+  }
+  assert(argc == 1);
+  TestClientRecipeToolLoops();
   TestCheckpointTransferHttp();
   TestCacheLookupOptIn();
   // The log assertions below match "[LEVEL] [component]" text written to a
@@ -3580,6 +3722,8 @@ int main() {
   TestOpenAiInputTokens(false);
   TestOpenAiInputTokens(true);
   TestLlamaSlotsAndMetrics();
+  TestLlamaStringParity();
+  TestLlamaTokenIds();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestResponsesToolImages();

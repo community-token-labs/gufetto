@@ -6,6 +6,12 @@ This fork adds experimental q8 KV storage for Qwen3.8 Flash-Next on AMD Strix Ha
 
 Follow the [upstream build requirements](https://github.com/gufo-org/gufo/blob/c92b19c5dc7ec12f83d0c2a5603cda78cc200b3e/README.md#build-from-source), then use the [current fork build and usage commands](docs/q8-kv-cache/reproduce.md). Historical validation used ROCm 7.2.4 / Clang 22; the pinned ROCm 10.1 / Clang 24 stack remains untested for this change.
 
+## Client setup
+
+[Client recipes](docs/clients/README.md) cover Claude Code, OpenCode, Cline,
+Aider, Open WebUI and Pi, with truthful limits, authentication caveats and
+separate CPU-contract versus live-model qualification procedures.
+
 ## Experimental q8 KV cache
 
 Ordinary attention keys and values, including the MTP predictor, use block32 8-bit storage. Indexer keys stay F16; recurrent GDN state stays F32. Model weights are unchanged.

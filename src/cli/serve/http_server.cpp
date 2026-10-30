@@ -29,6 +29,7 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
@@ -1379,10 +1380,31 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
 
   const auto* input = body.find("prompt");
-  if (input == nullptr || !input->is_string() || input->str().empty()) {
+  if (input == nullptr ||
+      (!input->is_array() && (!input->is_string() || input->str().empty()))) {
     return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
   }
-  const std::string prompt = input->str();
+  std::vector<tokenization::TokenId> prompt_tokens;
+  if (input->is_array()) {
+    for (const auto& value : input->items()) {
+      const double id = value.as_double(-1);
+      if (!value.is_number() || !std::isfinite(id) || id < 0 ||
+          std::floor(id) != id ||
+          id > std::numeric_limits<tokenization::TokenId>::max())
+        throw std::invalid_argument(
+            "'prompt' must be a nonempty array of in-vocabulary integer token "
+            "IDs");
+      prompt_tokens.push_back(static_cast<tokenization::TokenId>(id));
+    }
+    if (prompt_tokens.empty())
+      throw std::invalid_argument(
+          "'prompt' must be a nonempty array of in-vocabulary integer token "
+          "IDs");
+  }
+  const auto* return_tokens = body.find("return_tokens");
+  if (return_tokens != nullptr && !return_tokens->is_null() &&
+      !return_tokens->is_bool())
+    return InvalidCompatibilityRequest("'return_tokens' must be a boolean");
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -1403,10 +1425,21 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
 
   const auto res =
-      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt, cache_persist);
+      input->is_array()
+          ? b.complete_tokens(prompt_tokens, max_tokens, sampling_config,
+                              req.is_cancelled, {}, req.client_id,
+                              stop_sequences, cache_prompt, cache_persist)
+          : b.complete(input->str(), max_tokens, sampling_config,
+                       req.is_cancelled, {}, req.client_id, stop_sequences,
+                       cache_prompt, cache_persist);
 
   json::Value resp = json::Value::object();
+  if (return_tokens != nullptr && !return_tokens->is_null()) {
+    resp["tokens"] = json::Value::array();
+    if (return_tokens->as_bool())
+      for (const auto id : res.tokens)
+        resp["tokens"].push_back(static_cast<std::uint64_t>(id));
+  }
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
   resp["stop"] = true;
   const bool limited =
@@ -1548,6 +1581,18 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
 
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   std::ostringstream out;
+  const auto diagnostic = DiagnosticMemoryClaim::Process().Snapshot();
+  if (diagnostic.bytes) {
+    out << "# HELP gufo_full_logits_memory_claim_bytes Process-lifetime "
+           "diagnostic memory claim\n"
+        << "# TYPE gufo_full_logits_memory_claim_bytes gauge\n"
+        << "gufo_full_logits_memory_claim_bytes " << diagnostic.bytes << '\n'
+        << "# HELP gufo_full_logits_memory_unknown_total Unknown diagnostic "
+           "memory outcomes\n"
+        << "# TYPE gufo_full_logits_memory_unknown_total counter\n"
+        << "gufo_full_logits_memory_unknown_total "
+        << diagnostic.unknown_outcomes << '\n';
+  }
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
       << "# TYPE gufo_device_lost_total counter\n"

@@ -1,0 +1,18 @@
+{
+  "model": null,
+  "artifacts": [],
+  "stack": {
+    "runtime": null,
+    "hip": null,
+    "rocr": null,
+    "compiler": null,
+    "commit": null,
+    "build_flags": null,
+    "hardware": null
+  },
+  "settings": null,
+  "quality": {
+    "status": "INCONCLUSIVE",
+    "evidence": null
+  }
+}
