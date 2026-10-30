@@ -133,6 +133,10 @@ serving-cache admission reports:
 `full-logits diagnostics must be activated before cache admission; restart Gufo with --full-logits-api`.
 Restart is required even after healthy diagnostic Model teardown. With diagnostics
 never enabled, the claim is zero and admission follows the ordinary path.
+With images, eager pins and diagnostics, the pin cushion can over-deduct by up to
+its persistent bytes (safe, by design). If the diagnostic claim exceeds the native
+snapshot ceiling, snapshots are disabled with one ERROR log per serving cache;
+serving continues with live-state reuse only.
 
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
