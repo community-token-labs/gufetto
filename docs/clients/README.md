@@ -25,6 +25,14 @@ initial text-only session, a **requested** context of 32768 and output budget
 curl -fsS -H "Authorization: Bearer $GUFO_API_KEY" http://127.0.0.1:8080/v1/models
 ```
 
+**Known server credential caveat:** Gufo currently offers only `--api-key`,
+not an environment/file input. Expanding `$GUFO_API_KEY` in the example still
+puts the key in server argv, visible to process inspection (for example `ps`
+and `/proc/*/cmdline`) under the host's access rules. Use only a trusted host,
+avoid shell tracing/history with literal keys, and keep launch logs private.
+The later Pi proxy reads its credential from the environment without putting
+it on client argv; that does not remove the server-side limitation.
+
 Choose `C` from the actual loaded context reported by `/v1/models`, constrained
 by the model's supported context and memory fit; choose output `O < C`, leaving
 room for system prompt, tools and full history. The examples below use `C=32768`,
@@ -38,7 +46,9 @@ changes model architecture/capabilities. See [context and limits](../SERVER.md).
 - Gufo recognizes **one shared bearer key**, not per-user keys. Anthropic SDKs
   commonly send `x-api-key`; **that alone fails** against authenticated Gufo.
   Use documented bearer/auth-token support. Do not fix this by disabling auth
-  on a LAN bind. Native `x-api-key` support is a separate auth change.
+  on a LAN bind. Plain HTTP sends bearer credentials in cleartext; use a TLS
+  reverse proxy for LAN access, or a host-only bridge for colocated containers.
+  Native `x-api-key` support is a separate auth change.
 - Start thinking off (`--think off`). Chat `reasoning_effort: none` disables it;
   enable only a model-supported mode during explicit qualification. Responses
   uses `reasoning.effort`; Messages uses `thinking` / `output_config.effort`.
@@ -56,7 +66,7 @@ changes model architecture/capabilities. See [context and limits](../SERVER.md).
 ## CPU contracts and known limitations
 
 `http_server_test` replays recorded fake-backend SSE for Chat, Responses and
-Messages in 1-byte, 7-byte and whole-frame fragments, then exercises each real
+Messages in 1-byte, 7-byte and whole-body fragments, then exercises each real
 HTTP route and replays its tool result with the returned call ID. It checks
 Chat tool indexes/argument assembly/finish/usage/DONE; Responses sequence and
 argument/completion events; Messages block ordering, JSON deltas and terminal

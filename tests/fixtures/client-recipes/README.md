@@ -17,10 +17,17 @@ stable equality targets. No live-update/writer is present in the test.
 of build-directory location. It reassembles each recorded SSE body under 1-byte,
 7-byte and full-frame network fragmentation, validates contract semantics and
 usage/cache accounting, then generates a new response via the actual route and
-checks the same contract. It returns the generated call ID in a second HTTP
+checks the same contract. Recorded and live events are also compared in order
+as normalized JSON bytes: only generated id/call_id/item_id and created/created_at
+fields are masked; counters, timings, schemas and all other fields must match.
+Typed Responses/Messages require matching `event:` names and the complete
+expected single-call event order. It returns the generated call ID in a second HTTP
 request with a synthetic tool result and checks backend history and final SSE.
 The fake backend does not touch a filesystem tool; real tools belong in the
 [model-slot client qualification](../../../docs/clients/QUALIFICATION.md).
+
+Required zero-valued numeric fields are checked for presence and type before
+value comparison; a missing index/sequence/cache-creation count is not zero.
 
 Contracts: Chat index/ID/name/argument assembly, tool_calls finish, terminal
 usage and `[DONE]`; Responses typed events/sequence, function argument deltas

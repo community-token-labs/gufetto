@@ -21,7 +21,11 @@ The recipe examples use C=32768/O=4096 only if that capacity was actually loaded
 Check `/v1/models` using the single bearer key, including context and modalities.
 Disable all unqualified hosted tools, extra providers and automatic cloud
 fallback. Run a bearer-auth smoke request before giving the client tools.
-Do not log auth headers. Never put credentials in argv, project config or git.
+Do not log auth headers. Never put client credentials in argv, project config
+or git. Gufo's current server `--api-key` option does expose its key in server
+argv: see the [known server credential caveat](README.md); there is no env/file
+alternative at this source revision. Plain HTTP on a LAN exposes bearer keys;
+use a TLS reverse proxy for LAN access, not an unauthenticated bind.
 
 ## 2. Exact bounded task for each client's native run
 
@@ -71,7 +75,10 @@ were not edited. Inspect actual tools, not just the model's final sentence.
 Check at least one second model request containing the real prior call IDs and
 results, terminal events, usage and expected cache/prefill work. Save errors,
 truncations, unsupported parameters and compaction/capacity mismatches verbatim.
-Record protocol mode (native calls versus text/XML edit flow); these aren't
+For Claude Code, confirm every auxiliary/background request uses a served
+model and the server log contains no `model_not_found`; verify actual output
+limits as well as the main conversation's model. Record protocol mode (native
+calls versus text/XML edit flow); these aren't
 interchangeable coverage. Start a fresh session and then a retained-history
 follow-up; use the same files and request ordering for matched timing controls.
 

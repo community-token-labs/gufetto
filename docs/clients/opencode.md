@@ -1,6 +1,6 @@
 # OpenCode → Gufo
 
-Source: official [provider guide](https://opencode.ai/docs/providers.md),
+Source: official [provider guide](https://opencode.ai/docs/providers/),
 especially the llama.cpp/LM Studio custom-provider examples. Use the
 `@ai-sdk/openai-compatible` package for Chat Completions, not a cloud provider
 whose default may be Responses.

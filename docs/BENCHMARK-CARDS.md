@@ -32,7 +32,8 @@ The generator accepts:
   concurrency tables. Each `results.<group>.samples[]` entry supplies
   `repetition`, `request_index`, `queue_ms`, `prefill_ms`, `decode_ms`,
   `server_ttft_ms`, and `wall_ms` (`tools/gufo/serving_bench.py`). Every sample
-  gets its own row; no averaging across requests. Null stage metrics remain UNKNOWN.
+  gets its own row, labeled with group, repetition, request index, corpus case_id
+  and ordinal; no averaging across requests. Null stage metrics remain UNKNOWN.
 
 Retain raw inputs, settings, counts and the input SHA256 alongside the card.
 The small JSON test fixture is synthetic, not measured performance evidence.

@@ -15,8 +15,9 @@ as experimental. Read [the common contract](README.md).
 4. Start with ordinary text chat, thinking off and no image/hosted tools.
 
 If WebUI runs in a container, `127.0.0.1` refers to that container, not Gufo.
-Arrange an explicitly secured reachable address through your normal deployment;
-do not casually bind an unauthenticated Gufo to all interfaces. Gufo has one
+Use a host-only bridge for a colocated container, or a reverse proxy with TLS
+for LAN access: HTTP bearer keys otherwise travel in cleartext. Do not casually
+bind an unauthenticated Gufo to all interfaces. Gufo has one
 shared bearer credential, not per-WebUI-user isolation. Anthropic `x-api-key`
 alone would fail.
 
@@ -30,7 +31,8 @@ separately instead of switching the existing chat connection silently.
 
 For tool qualification choose **Native** function calling in model Advanced
 Params, with a reviewed bounded client-side tool. The provider guide documents
-the requirement for streamed tool `index`; the Gufo CPU fixture checks it.
+the requirement for streamed tool `index`; the CPU fixture requires that key
+to be present, numeric and equal to the expected call index.
 Legacy text-tool mode is not native streaming tool coverage.
 
 ## Qualification slot

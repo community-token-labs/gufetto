@@ -2,6 +2,8 @@
 # re-mangle them.
 *.jinja text eol=lf
 tests/fixtures/** text eol=lf
+# Final empty line terminates the last recorded SSE event; preserve wire bytes.
+tests/fixtures/client-recipes/*.sse whitespace=-blank-at-eof
 # Compressed fixtures are binary (zip CRLF bytes must survive).
 *.npz binary
 # cmd.exe parses batch files reliably only with CRLF line endings.

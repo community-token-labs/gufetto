@@ -14,8 +14,30 @@ Use the bearer variable for Gufo's single key:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
 export ANTHROPIC_AUTH_TOKEN="$GUFO_API_KEY"
 export ANTHROPIC_MODEL=gufo-local
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gufo-local
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gufo-local
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gufo-local
+export CLAUDE_CODE_SUBAGENT_MODEL=gufo-local
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096
 claude --model gufo-local
 ```
+
+These mappings target the actual served name, not spoofed Claude model IDs.
+The official [environment variable reference](https://code.claude.com/docs/en/env-vars)
+confirms all four default/subagent variable names and the output-cap knob
+(source-verified 2026-10-30; high confidence in names, **not live-qualified**).
+Haiku also handles background functionality such as titles/command checks;
+without these mappings Gufo rejects unserved model IDs with `model_not_found`.
+The output cap applies to most requests, not a guaranteed cap on every auxiliary
+request: check actual outbound budgets and all background requests.
+
+Current [subagent documentation](https://code.claude.com/docs/en/sub-agents#run-every-subagent-on-one-model)
+says an explicit model in a subagent definition/spawn can override the default.
+For versions 2.1.257+, setting `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` together with
+the mapped subagent variable forces that served model for such requests. This
+recipe's bounded qualification task prohibits subagents; if you later qualify
+them, inspect their actual model IDs rather than assuming default mapping wins.
+Older builds may differ; do not guess legacy variable support.
 
 Use an isolated client profile/environment; don't overwrite a personal
 subscription configuration. Remove conflicting API-key/provider routing
