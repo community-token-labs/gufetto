@@ -8,12 +8,9 @@
 #include <utility>
 
 #include "src/core/memory_budget.hpp"
+#include "src/core/memory_reservations.hpp"
 
 namespace gufo::core {
-
-inline constexpr char kSecondComponentBackendError[] =
-    "a second component backend on the same Model is not supported "
-    "(one backend per Model); release the first or load a separate Model";
 
 // One authority for lazy image capacity and competing physical cache growth.
 // Headroom is physical free memory AFTER hard execution/staging/OS reserves.
