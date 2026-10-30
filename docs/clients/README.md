@@ -12,6 +12,9 @@ in the affected model's allocated slot before describing that combination as tes
 - [Open WebUI](open-webui.md): Chat Completions and optional native tools
 - [Pi](pi.md): Chat Completions; stateless Responses as a separate profile
 
+The [setup skill](../skills/README.md) lets a coding agent follow these recipes
+end to end; `tools/setup/verify_server.py` sends its one-request smoke check.
+
 ## Common server contract
 
 Use a production binary and the model's documented startup command; do not

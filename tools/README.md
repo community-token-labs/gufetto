@@ -11,6 +11,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | `bench/` | Kernel microbenchmarks, hipBLASLt tuning, and direct speculative-corpus checks; `model-bench.py` drives per-model BENCHMARKS.md tables against each model's reference |
 | `prof/` | rocprofv3 capture, stage summaries, and ISA inspection |
 | `serving/` | HTTP serving benchmarks |
+| `setup/` | Standard-library server smoke check used by the [setup skill](../docs/skills/README.md) |
 | [`quality/`](quality/README.md) | Offline full-logit teacher-token scoring and matched-KL reports |
 | `ds4/` | DeepSeek-specific validation and experiments |
 | `qwen27b/` | Qwen27B/DFlash2 kernels, reference checks, and vision validation |

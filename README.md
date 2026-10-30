@@ -11,6 +11,9 @@ Follow the [upstream build requirements](https://github.com/gufo-org/gufo/blob/c
 [Client recipes](docs/clients/README.md) cover Claude Code, OpenCode, Cline,
 Aider, Open WebUI and Pi, with truthful limits, authentication caveats and
 separate CPU-contract versus live-model qualification procedures.
+The [coding-agent setup skill](docs/skills/README.md) walks an agent through
+host checks, model choice, fit planning, serving, client setup and a
+one-request verification.
 
 ## Experimental q8 KV cache
 
