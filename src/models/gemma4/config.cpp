@@ -133,6 +133,10 @@ Config ReadCommon(Reader& r) {
     r.Fail("gemma4 dimensions must be positive");
     return c;
   }
+  if (c.num_layers > kMaxLayers) {
+    r.Fail("gemma4 block_count exceeds " + std::to_string(kMaxLayers));
+    return c;
+  }
 
   const auto ffn = r.PerLayer("feed_forward_length", c.num_layers);
   if (!r.ok) {
@@ -178,6 +182,11 @@ Config ReadCommon(Reader& r) {
     // 256-aligned reductions for the output projection.
     if (dim == 0 || dim % 64 != 0) {
       r.Fail("gemma4 head dimensions must be positive multiples of 64");
+      return c;
+    }
+    // Query widths bound KV widths, since KV heads divide query heads.
+    if (std::uint64_t{c.num_heads} * dim > 0xffffffffULL) {
+      r.Fail("gemma4 query width overflows 32 bits");
       return c;
     }
   }

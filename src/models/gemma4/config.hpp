@@ -19,6 +19,8 @@ namespace gufo::models::gemma4 {
 /// Routed experts per token and experts per layer the kernels support.
 inline constexpr std::uint32_t kMaxExpertsUsed = 8;
 inline constexpr std::uint32_t kMaxExperts = 256;
+/// Bounds every per-layer array read from the file (60 layers at most today).
+inline constexpr std::uint32_t kMaxLayers = 512;
 
 struct Config {
   std::uint32_t num_layers{0};      ///< 60 for the 31B target, 4 for its draft.
@@ -62,6 +64,8 @@ struct Config {
   [[nodiscard]] float RopeTheta(std::uint32_t layer) const noexcept {
     return IsSliding(layer) ? rope_theta_sliding : rope_theta_global;
   }
+  // FromGguf and DraftFromGguf reject geometries whose widths overflow
+  // 32 bits, so the products below cannot wrap.
   [[nodiscard]] std::uint32_t QDim(std::uint32_t layer) const noexcept {
     return num_heads * HeadDim(layer);
   }

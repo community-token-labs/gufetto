@@ -124,6 +124,21 @@ void CheckRejections() {
   reject("gemma4.attention.head_count_kv", I32Array{{2, 0}},
          "zero KV heads in one layer");
   reject("gemma4.feed_forward_length", std::uint32_t{0}, "scalar zero FFN");
+  {
+    // The cap applies before any per-layer allocation, so a huge count with
+    // scalar per-layer values fails fast with its own message.
+    Metadata huge = valid;
+    huge["gemma4.block_count"] = std::uint32_t{0xffffffffU};
+    huge["gemma4.attention.head_count_kv"] = std::uint32_t{1};
+    GgufImage image(huge);
+    std::string error;
+    Require(!g4::Config::FromGguf(*image.reader(), &error) &&
+                error.find("block_count exceeds") != std::string::npos,
+            "layer cap: " + error);
+  }
+  // 2^25 heads of 256 overflow a 32-bit query width.
+  reject("gemma4.attention.head_count", std::uint32_t{1} << 25,
+         "query width overflow");
   reject("gemma4.feed_forward_length", I32Array{{128, 0}},
          "zero FFN in one layer");
   reject("gemma4.attention.sliding_window_pattern", BoolArray{{true}},
@@ -263,6 +278,9 @@ void CheckDraft() {
   reject(p + "rope.freq_base_swa", 20000.0F, "draft rope base differs");
   reject(p + "attention.sliding_window", std::uint32_t{32},
          "draft window differs");
+  reject(p + "block_count", std::uint32_t{513}, "draft with too many layers");
+  reject(p + "attention.head_count", std::uint32_t{1} << 25,
+         "draft query width overflow");
   reject(p + "attention.head_count_kv", std::uint32_t{0},
          "draft scalar zero KV heads");
   reject(p + "attention.head_count_kv", I32Array{{2, 0}},
