@@ -121,6 +121,9 @@ std::vector<float> Boundary(const std::shared_ptr<qfn::Model>& model,
   }
   if (failure)
     std::rethrow_exception(failure);
+  Require(std::all_of(output.begin(), output.end(),
+                      [](float value) { return std::isfinite(value); }),
+          "nonfinite native boundary rows");
   return output;
 }
 Value RunCapture(const std::shared_ptr<qfn::Model>& model) {
