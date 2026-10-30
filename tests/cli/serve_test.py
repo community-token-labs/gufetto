@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -285,6 +286,17 @@ def main():
             key_file.write_bytes(content.encode())
             check(load + ["--api-key-file", str(key_file)], 2, reason)
         check(load + ["--api-key-file", directory], 2, "not a regular file")
+        # A FIFO without a writer is refused at once; a blocking open would
+        # hang startup until the timeout.
+        fifo = Path(directory) / "fifo"
+        os.mkfifo(fifo, 0o600)
+        started = time.monotonic()
+        result = subprocess.run([binary, *load, "--api-key-file", str(fifo)],
+                                env=env, text=True, capture_output=True,
+                                timeout=5)
+        assert result.returncode == 2, result.stderr
+        assert "not a regular file" in result.stderr, result.stderr
+        assert time.monotonic() - started < 5
         check(load + ["--api-key-file", str(Path(directory) / "missing")], 2,
               "cannot be opened")
     assert "api_key=unset" in run_env(load + ["-v"], keyed_env).stderr

@@ -14,6 +14,7 @@
 #include <optional>
 #include <semaphore>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -39,7 +40,24 @@ using gufo::server::LogLevel;
 using gufo::server::LogLevelFromName;
 using gufo::server::LogLevelName;
 
+void TestDigestsEqual() {
+  namespace crypto = gufo::crypto;
+  const auto digest = [](std::string_view text) {
+    return crypto::Sha256(std::span(
+        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+  };
+  const auto key = digest("fake-key");
+  assert(crypto::DigestsEqual(key, digest("fake-key")));
+  assert(!crypto::DigestsEqual(key, digest("fake-kez")));
+  for (const std::size_t byte : {std::size_t{0}, std::size_t{31}}) {
+    auto flipped = key;
+    flipped[byte] ^= 1;
+    assert(!crypto::DigestsEqual(key, flipped));
+  }
+}
+
 void TestAuthorization() {
+  TestDigestsEqual();
   RunningServer secured({.api_key = "test-secret"});
   for (const std::string path :
        {"/health", "/ready", "/v1/models", "/v1/chat/completions",
@@ -129,10 +147,49 @@ void TestCorsOrigins() {
          "https://webui.lan:3000");
   assert(gufo::server::ParseCorsOrigin("http://[::1]:8080", &error) ==
          "http://[::1]:8080");
-  for (const std::string_view bad :
-       {"", "*", "webui.lan", "ftp://webui.lan", "http://", "http://:80",
-        "http://webui.lan/", "http://webui.lan/path", "http://user@webui.lan",
-        "http://*.lan", "http://webui.lan\r\nX-Injected: 1", "null"}) {
+  // Normalized to what a browser sends: canonical IPv6, no default port and
+  // no leading zeros.
+  for (const auto& [configured, expected] :
+       std::vector<std::pair<std::string_view, std::string_view>>{
+           {"http://[0:0:0:0:0:0:0:1]", "http://[::1]"},
+           {"http://webui.lan:80", "http://webui.lan"},
+           {"https://webui.lan:0443", "https://webui.lan"},
+           {"https://webui.lan:80", "https://webui.lan:80"},
+           {"http://webui.lan:03000", "http://webui.lan:3000"},
+           {"http://192.168.1.20:65535", "http://192.168.1.20:65535"}})
+    assert(gufo::server::ParseCorsOrigin(configured, &error) == expected);
+  for (const std::string_view bad : {"",
+                                     "*",
+                                     "webui.lan",
+                                     "ftp://webui.lan",
+                                     "http://",
+                                     "http://:80",
+                                     "http://webui.lan/",
+                                     "http://webui.lan/path",
+                                     "http://user@webui.lan",
+                                     "http://*.lan",
+                                     "http://webui.lan\r\nX-Injected: 1",
+                                     "null",
+                                     "http://webui.lan:abc",
+                                     "http://[garbage]",
+                                     "http://[::1",
+                                     "http://[::1]x",
+                                     "http://[::1%eth0]",
+                                     "http://webui.lan:99999",
+                                     "http://webui.lan:65536",
+                                     "http://webui.lan:0",
+                                     "http://webui.lan:",
+                                     "http://webui.lan:-1",
+                                     "http://webui.lan:80:81",
+                                     "http://:8080",
+                                     "https://",
+                                     "http://.lan",
+                                     "http://webui..lan",
+                                     "http://webui.lan.",
+                                     "http://webui.lan?q=1",
+                                     "http://webui.lan#top",
+                                     "http://webui.lan:80/",
+                                     "http://user:pass@webui.lan"}) {
     error.clear();
     assert(!gufo::server::ParseCorsOrigin(bad, &error).has_value());
     assert(!error.empty());

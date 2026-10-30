@@ -11,6 +11,10 @@
 
 #include "src/core/platform/fs.hpp"
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+
 namespace {
 
 // Checks stay active under NDEBUG: several conditions carry the call under
@@ -294,6 +298,42 @@ int main() {
     CHECK(link_entries == 1);
   }
 #endif
+
+  // ReadSmallRegularFile: bounded reads of regular files only.
+  {
+    const auto small = root / "small.txt";
+    std::ofstream(small, std::ios::binary) << "fake-secret\n";
+    std::string contents;
+    platform::FileInfo info{};
+    CHECK(platform::ReadSmallRegularFile(small, 12, &contents, &info, ec) ==
+          platform::SmallFileRead::kRead);
+    CHECK(contents == "fake-secret\n" && info.regular && info.size == 12);
+    CHECK(platform::ReadSmallRegularFile(small, 11, &contents, &info, ec) ==
+          platform::SmallFileRead::kTooLarge);
+    CHECK(platform::ReadSmallRegularFile(root / "absent", 16, &contents, &info,
+                                         ec) ==
+          platform::SmallFileRead::kOpenFailed);
+    CHECK(ec == std::errc::no_such_file_or_directory);
+    const auto directory_read =
+        platform::ReadSmallRegularFile(root, 16, &contents, &info, ec);
+    CHECK(directory_read == platform::SmallFileRead::kNotRegular ||
+          directory_read == platform::SmallFileRead::kOpenFailed);
+#if !defined(_WIN32)
+    // A FIFO with no writer must be refused at once, not block the open.
+    const auto fifo = root / "fifo";
+    CHECK(::mkfifo(fifo.c_str(), 0600) == 0);
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(platform::ReadSmallRegularFile(fifo, 16, &contents, &info, ec) ==
+          platform::SmallFileRead::kNotRegular);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
+    // Symlinks are followed, as for a mounted secret.
+    fs::create_symlink(small, root / "small-link");
+    CHECK(platform::ReadSmallRegularFile(root / "small-link", 16, &contents,
+                                         &info,
+                                         ec) == platform::SmallFileRead::kRead);
+    CHECK(contents == "fake-secret\n");
+#endif
+  }
 
   // Advise is best effort and must not crash on any range.
   {

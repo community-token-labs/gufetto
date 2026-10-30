@@ -37,7 +37,6 @@
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/fs.hpp"
-#include "src/core/platform/mapped_file.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -358,23 +357,22 @@ bool ReadApiKeyFile(const std::string& path, std::string* key) {
     std::cerr << "Error: --api-key-file '" << path << "' " << reason << "\n";
     return false;
   };
-  const platform::PlatformFile file = platform::OpenReadFile(path);
-  if (!platform::FileValid(file))
-    return fail("cannot be opened");
+  // Opened without blocking and type-checked on the same handle, so a FIFO
+  // or device fails at once instead of hanging startup.
   platform::FileInfo info{};
+  std::string text;
   std::error_code ec;
-  const bool stat_ok = platform::Stat(file, &info, ec);
-  std::string text(kMaxKeyBytes + 1, '\0');
-  const std::size_t read =
-      stat_ok && info.regular && info.size <= kMaxKeyBytes
-          ? platform::ReadFileAt(file, text.data(), text.size(), 0)
-          : 0;
-  platform::CloseFile(file);
-  if (!stat_ok || !info.regular)
-    return fail("is not a regular file");
-  if (info.size > kMaxKeyBytes || read > kMaxKeyBytes)
-    return fail("is larger than 4096 bytes");
-  text.resize(read);
+  switch (
+      platform::ReadSmallRegularFile(path, kMaxKeyBytes, &text, &info, ec)) {
+    case platform::SmallFileRead::kRead:
+      break;
+    case platform::SmallFileRead::kOpenFailed:
+      return fail("cannot be opened");
+    case platform::SmallFileRead::kNotRegular:
+      return fail("is not a regular file");
+    case platform::SmallFileRead::kTooLarge:
+      return fail("is larger than 4096 bytes");
+  }
   if (text.ends_with("\r\n"))
     text.resize(text.size() - 2);
   else if (text.ends_with('\n'))

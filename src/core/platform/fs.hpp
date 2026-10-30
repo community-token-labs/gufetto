@@ -121,6 +121,19 @@ PlatformFile OpenAt(const Directory& dir, std::string_view name, FileMode mode,
 PlatformFile OpenForAppend(const std::filesystem::path& path,
                            std::error_code& ec) noexcept;
 
+/// Outcome of ReadSmallRegularFile.
+enum class SmallFileRead { kRead, kOpenFailed, kNotRegular, kTooLarge };
+
+/// Reads all of `path` when it is a regular file of at most `max_bytes`, for
+/// secrets and other small configuration files. Symlinks are followed, so a
+/// mounted secret's link works. The type is checked on the opened handle, not
+/// the path: POSIX opens with O_NONBLOCK, so a FIFO or device cannot block,
+/// and fstat()s that descriptor; Windows requires a disk file. `info`
+/// receives the file's metadata, and `ec` the reason for kOpenFailed.
+SmallFileRead ReadSmallRegularFile(const std::filesystem::path& path,
+                                   std::size_t max_bytes, std::string* contents,
+                                   FileInfo* info, std::error_code& ec);
+
 /// Opens the subdirectory `name` of `dir`; `name` may be "." or "..".
 /// Returns an invalid Directory on failure.
 Directory OpenDirectoryAt(const Directory& dir, std::string_view name,

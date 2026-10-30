@@ -517,6 +517,52 @@ bool OwnerOnly(const FileInfo&, std::uint32_t, std::uint32_t) noexcept {
   return true;
 }
 
+SmallFileRead ReadSmallRegularFile(const std::filesystem::path& path,
+                                   std::size_t max_bytes, std::string* contents,
+                                   FileInfo* info, std::error_code& ec) {
+  ec.clear();
+  HANDLE file =
+      CreateFileW(path.c_str(), GENERIC_READ, kDirectoryShare, nullptr,
+                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    ec = LastError();
+    return SmallFileRead::kOpenFailed;
+  }
+  const struct Closer {
+    HANDLE handle;
+    ~Closer() { CloseHandle(handle); }
+  } closer{file};
+  if (!FromHandle(file, info)) {
+    ec = LastError();
+    return SmallFileRead::kOpenFailed;
+  }
+  // Pipes and character devices are not disk files.
+  if (GetFileType(file) != FILE_TYPE_DISK || !info->regular)
+    return SmallFileRead::kNotRegular;
+  if (info->size > max_bytes)
+    return SmallFileRead::kTooLarge;
+  // Read one byte past the limit so a file that grew since the stat is
+  // refused.
+  contents->assign(max_bytes + 1, '\0');
+  std::size_t total = 0;
+  while (total < contents->size()) {
+    DWORD read_bytes = 0;
+    if (!ReadFile(file, contents->data() + total,
+                  static_cast<DWORD>(contents->size() - total), &read_bytes,
+                  nullptr)) {
+      if (GetLastError() == ERROR_HANDLE_EOF)
+        break;
+      ec = LastError();
+      return SmallFileRead::kOpenFailed;
+    }
+    if (read_bytes == 0)
+      break;
+    total += read_bytes;
+  }
+  contents->resize(total);
+  return total > max_bytes ? SmallFileRead::kTooLarge : SmallFileRead::kRead;
+}
+
 PlatformFile OpenForAppend(const std::filesystem::path& path,
                            std::error_code& ec) noexcept {
   ec.clear();

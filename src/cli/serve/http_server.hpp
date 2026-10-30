@@ -2,9 +2,11 @@
 #define GUFO_SERVER_HTTP_SERVER_HPP_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -176,7 +178,7 @@ private:
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
   HttpServerOptions options_;
-  std::string api_key_hash_;
+  std::optional<std::array<std::uint8_t, 32>> api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> device_lost_reported_{false};

@@ -228,8 +228,8 @@ bool ExpectsContinue(const HttpRequest& request) {
   });
 }
 
-std::string CredentialHash(std::string_view value) {
-  return crypto::Sha256Hex(std::span(
+crypto::Sha256Digest CredentialHash(std::string_view value) {
+  return crypto::Sha256(std::span(
       reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
 }
 
@@ -237,8 +237,9 @@ std::string CredentialHash(std::string_view value) {
 // (Anthropic clients) carry the same key. Every credential a request presents
 // must match it: a valid header never excuses a wrong or non-Bearer other one,
 // and a repeated header is refused rather than resolved.
-bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
-  if (key_hash.empty()) {
+bool IsAuthorized(const HttpRequest& request,
+                  const std::optional<crypto::Sha256Digest>& key_hash) {
+  if (!key_hash.has_value()) {
     return true;
   }
   std::optional<std::string_view> authorization;
@@ -259,7 +260,8 @@ bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
   if (!authorization.has_value() && !api_key.has_value()) {
     return false;
   }
-  // Comparing digests does not disclose matching prefixes of the API key.
+  // Constant-time comparison of fixed-size digests discloses neither matching
+  // prefixes of the key nor its length.
   if (authorization.has_value()) {
     std::string_view credential = *authorization;
     const auto space = credential.find(' ');
@@ -271,11 +273,12 @@ bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
     while (credential.starts_with(' ')) {
       credential.remove_prefix(1);
     }
-    if (CredentialHash(credential) != key_hash) {
+    if (!crypto::DigestsEqual(CredentialHash(credential), *key_hash)) {
       return false;
     }
   }
-  return !api_key.has_value() || CredentialHash(*api_key) == key_hash;
+  return !api_key.has_value() ||
+         crypto::DigestsEqual(CredentialHash(*api_key), *key_hash);
 }
 
 // The configured origin a request's single `Origin` header names, or null.
@@ -1946,28 +1949,73 @@ void LoadingResponder::serve() {
 
 std::optional<std::string> ParseCorsOrigin(std::string_view origin,
                                            std::string* error) {
-  std::string lowered = ToLower(origin);
-  const auto scheme_end = lowered.find("://");
-  const std::string_view scheme =
-      std::string_view(lowered).substr(0, scheme_end);
-  const std::string_view authority =
-      scheme_end == std::string::npos
-          ? std::string_view()
-          : std::string_view(lowered).substr(scheme_end + 3);
-  const bool valid_authority =
-      !authority.empty() && authority.front() != ':' &&
-      std::ranges::all_of(authority, [](char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) != 0 ||
-               std::string_view("-.:[]").find(c) != std::string_view::npos;
-      });
-  if ((scheme != "http" && scheme != "https") || !valid_authority) {
+  const auto invalid = [&] {
     *error =
-        "CORS origin must be http://HOST[:PORT] or https://HOST[:PORT] "
-        "without a path: '" +
+        "CORS origin must be http://HOST[:PORT] or https://HOST[:PORT] with "
+        "a port of 1-65535 and no path, query or credentials: '" +
         std::string(origin) + "'";
     return std::nullopt;
+  };
+  const std::string lowered = ToLower(origin);
+  const auto scheme_end = lowered.find("://");
+  if (scheme_end == std::string::npos)
+    return invalid();
+  const std::string scheme = lowered.substr(0, scheme_end);
+  if (scheme != "http" && scheme != "https")
+    return invalid();
+  std::string_view rest = std::string_view(lowered).substr(scheme_end + 3);
+  std::string host;
+  if (rest.starts_with('[')) {
+    // A bracketed IPv6 literal, re-serialized as browsers send it.
+    const auto close = rest.find(']');
+    if (close == std::string_view::npos)
+      return invalid();
+    const std::string literal(rest.substr(1, close - 1));
+    in6_addr address{};
+    char text[INET6_ADDRSTRLEN]{};
+    if (::inet_pton(AF_INET6, literal.c_str(), &address) != 1 ||
+        ::inet_ntop(AF_INET6, &address, text, sizeof(text)) == nullptr)
+      return invalid();
+    host = "[" + std::string(text) + "]";
+    rest.remove_prefix(close + 1);
+  } else {
+    const auto colon = rest.find(':');
+    const std::string_view name = rest.substr(0, colon);
+    // Dot-separated labels of letters, digits and hyphens. This excludes
+    // paths, queries, fragments, userinfo and wildcards.
+    bool label_start = true;
+    for (const char c : name) {
+      if (c == '.') {
+        if (label_start)
+          return invalid();
+        label_start = true;
+      } else if (std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '-') {
+        label_start = false;
+      } else {
+        return invalid();
+      }
+    }
+    if (name.empty() || label_start)
+      return invalid();
+    host = std::string(name);
+    rest.remove_prefix(name.size());
   }
-  return lowered;
+  std::string port;
+  if (!rest.empty()) {
+    if (rest.front() != ':')
+      return invalid();
+    rest.remove_prefix(1);
+    unsigned value = 0;
+    const auto [end, failure] =
+        std::from_chars(rest.data(), rest.data() + rest.size(), value);
+    if (rest.empty() || failure != std::errc{} ||
+        end != rest.data() + rest.size() || value == 0 || value > 65535)
+      return invalid();
+    // Browsers omit the scheme's default port and leading zeros.
+    if (value != (scheme == "http" ? 80U : 443U))
+      port = ":" + std::to_string(value);
+  }
+  return scheme + "://" + host + port;
 }
 
 bool IsListenAddress(const std::string& host) {
