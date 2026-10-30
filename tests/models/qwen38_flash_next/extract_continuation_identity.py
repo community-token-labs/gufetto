@@ -65,7 +65,10 @@ def generate(root: Path) -> str:
         "  struct { std::uint32_t max_draft_tokens; } options{proposals};\n",
         between(engine, "  exec.max_batch = m->PrefillThroughCapacity();", "\n#if"),
         "\n",
-        between(engine, "  exec.max_logit_rows =", "\n  exec.max_context ="),
+        # Identity binds ordinary speculative capacity S, before diagnostic
+        # widening of the output head to L. The cold-score suite covers L.
+        between(engine, "  exec.max_logit_rows =\n",
+                "\n  const auto capacity = DiagnosticLogitCapacity::Plan("),
         "\n  return exec.max_speculative;\n}\n",
         "cache::Identity Process(ModelProxy* model_, std::uint32_t max_context_,\n"
         "                        bool use_mtp_, std::uint32_t max_draft_tokens_) {\n"

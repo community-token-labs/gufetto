@@ -38,7 +38,7 @@ def main():
                         + ' const auto capacity=gufo::models::qwen38_flash_next::DiagnosticLogitCapacity::Plan(3,8,1,options.enable_diagnostic_logits);\n'
                         + ' if(options.enable_diagnostic_logits) ' + block(source, 'if (options.enable_diagnostic_logits) {')
                         + '\n auto e=Create(m->diagnostic_approved_ ? &m->executor_ : nullptr, partial, error_msg);\n'
-                        + ' if(!e) return nullptr; m->executor_=std::move(e); return m; }\n')
+                        + ' if(!e) return nullptr;\n m->executor_=std::move(e);\n return m;\n}\n')
 
 
 if __name__ == '__main__':

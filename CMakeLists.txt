@@ -861,7 +861,7 @@ if (BUILD_TESTING)
     src/cli/serve/continuation_cache.cpp src/cli/serve/continuation_disk_store.cpp
     src/cli/serve/component_text_cache.cpp src/cli/serve/text_model_runner.cpp)
   target_include_directories(cold_score_control_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-  target_link_libraries(cold_score_control_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache gufo_qwen38_flash_next)
+  target_link_libraries(cold_score_control_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache_fake gufo_qwen38_flash_next)
   add_test(NAME cold_score_control_test COMMAND cold_score_control_test)
   set_tests_properties(cold_score_control_test PROPERTIES LABELS "cpu;server;cold_score" TIMEOUT 30)
 
