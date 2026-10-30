@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <numeric>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/quant/ggml_gemm.hpp"
 
 namespace {
 
@@ -265,6 +267,56 @@ void TestQ8_0() {
              expected_dot, "Q8_0 dot product");
 }
 
+// Two hand-checked Q5_1 blocks, value = d * q + m. Block 0: d = 0.5, m = -2,
+// nibbles i (low) and 15 - i (high), fifth bits at elements 1 and 18, which
+// are not mirrored, so swapping the qh halfwords fails. Block 1: d = 1,
+// m = 0.25, other nibbles and fifth bits 0 and 31, which pins the 24-byte
+// block stride.
+void TestQ5_1() {
+  std::array<gufo::quant::block_q5_1, 2> blocks{};
+  blocks[0].d = 0x3800;  // fp16 0.5
+  blocks[0].m = 0xC000;  // fp16 -2
+  blocks[1].d = 0x3C00;  // fp16 1
+  blocks[1].m = 0x3400;  // fp16 0.25
+  const std::uint32_t qh[2] = {(1U << 1) | (1U << 18), 1U | (1U << 31)};
+  for (std::size_t b = 0; b < 2; ++b) {
+    std::memcpy(blocks[b].qh, &qh[b], sizeof(qh[b]));
+    for (std::size_t i = 0; i < 16; ++i) {
+      const std::size_t low = b == 0 ? i : (i + 3) % 16;
+      const std::size_t high = b == 0 ? 15 - i : (i * 5) % 16;
+      blocks[b].qs[i] = static_cast<std::uint8_t>(low | (high << 4));
+    }
+  }
+  std::array<float, 64> actual{};
+  gufo::quant::Dequantize(gufo::core::GgmlType::kQ5_1, blocks.data(),
+                          actual.data(), actual.size());
+  const float d[2] = {0.5F, 1.0F};
+  const float m[2] = {-2.0F, 0.25F};
+  for (std::size_t b = 0; b < 2; ++b) {
+    for (std::size_t e = 0; e < 32; ++e) {
+      const std::size_t byte = e % 16;
+      const std::size_t nibble = e < 16
+                                     ? (b == 0 ? byte : (byte + 3) % 16)
+                                     : (b == 0 ? 15 - byte : (byte * 5) % 16);
+      const std::size_t q = nibble + (((qh[b] >> e) & 1U) != 0 ? 16 : 0);
+      ExpectNear(actual[b * 32 + e], d[b] * static_cast<float>(q) + m[b],
+                 "Q5_1 dequant value");
+    }
+  }
+  ExpectNear(actual[1], 6.5F, "Q5_1 fifth bit of element 1");        // q 17
+  ExpectNear(actual[17], 5.0F, "Q5_1 element 17 has no fifth bit");  // q 14
+  ExpectNear(actual[18], 12.5F, "Q5_1 fifth bit of element 18");     // q 29
+  ExpectNear(actual[32], 19.25F, "Q5_1 second block, element 0");    // q 19
+  ExpectNear(actual[63], 27.25F, "Q5_1 second block, element 31");   // q 27
+  std::array<float, 64> vector{};
+  std::iota(vector.begin(), vector.end(), -0.75F);
+  const float expected_dot =
+      std::inner_product(actual.begin(), actual.end(), vector.begin(), 0.0F);
+  ExpectNear(
+      gufo::quant::Dot(gufo::core::GgmlType::kQ5_1, blocks.data(), vector, 64),
+      expected_dot, "Q5_1 dot product over two blocks");
+}
+
 void TestQ5_K() {
   constexpr std::size_t kQ5Elements = 256;
   struct Q5Block {
@@ -456,6 +508,7 @@ int main() {
   TestQ8();
   TestQ8_0();
   TestQ5_K();
+  TestQ5_1();
   if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {
     TestModelRows(model);

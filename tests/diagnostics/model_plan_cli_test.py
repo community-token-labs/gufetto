@@ -32,6 +32,7 @@ def main():
         assert report.stdout.endswith(initial.decode())
         assert ": FIT" not in report.stdout
         assert run(f"--plan={manifest}").stdout == report.stdout
+        assert run("--plan", str(manifest), "--no-gpu").stdout == report.stdout
         for args in [
             ("--plan",), ("--plan=",), ("--plan", "--json"),
             ("--plan", str(manifest), "--json"),

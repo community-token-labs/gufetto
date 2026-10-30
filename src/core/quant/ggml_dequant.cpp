@@ -407,6 +407,39 @@ void DequantizeQ5_0(const void* src, float* dst, std::size_t k) {
   }
 }
 
+void DequantizeQ5_1(const void* src, float* dst, std::size_t k) {
+  const auto* bytes = static_cast<const std::uint8_t*>(src);
+  for (std::size_t b = 0; b < k / 32; ++b) {
+    block_q5_1 block;
+    std::memcpy(&block, bytes + b * sizeof(block), sizeof(block));
+    const float d = Fp16ToFloat(block.d);
+    const float m = Fp16ToFloat(block.m);
+    std::uint32_t qh = 0;
+    std::memcpy(&qh, block.qh, sizeof(qh));
+    for (std::size_t i = 0; i < 16; ++i) {
+      const std::uint32_t lo = (block.qs[i] & 0x0FU) | (((qh >> i) & 1U) << 4U);
+      const std::uint32_t hi =
+          (block.qs[i] >> 4U) | (((qh >> (i + 16)) & 1U) << 4U);
+      dst[b * 32 + i] = d * static_cast<float>(lo) + m;
+      dst[b * 32 + i + 16] = d * static_cast<float>(hi) + m;
+    }
+  }
+}
+
+float DotProductQ5_1(const void* row_data, std::span<const float> vec,
+                     std::size_t k) {
+  const auto* bytes = static_cast<const std::uint8_t*>(row_data);
+  float values[32];
+  float sum = 0.0F;
+  for (std::size_t b = 0; b < k / 32; ++b) {
+    DequantizeQ5_1(bytes + b * sizeof(block_q5_1), values, 32);
+    for (std::size_t i = 0; i < 32; ++i) {
+      sum += values[i] * vec[b * 32 + i];
+    }
+  }
+  return sum;
+}
+
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_q8_0*>(src);
   const std::size_t nb = k / 32;

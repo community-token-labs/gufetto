@@ -1,5 +1,6 @@
 #include "src/cli/serve/http_server.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <semaphore>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
@@ -41,7 +43,24 @@ using gufo::server::LogLevel;
 using gufo::server::LogLevelFromName;
 using gufo::server::LogLevelName;
 
+void TestDigestsEqual() {
+  namespace crypto = gufo::crypto;
+  const auto digest = [](std::string_view text) {
+    return crypto::Sha256(std::span(
+        reinterpret_cast<const std::uint8_t*>(text.data()), text.size()));
+  };
+  const auto key = digest("fake-key");
+  assert(crypto::DigestsEqual(key, digest("fake-key")));
+  assert(!crypto::DigestsEqual(key, digest("fake-kez")));
+  for (const std::size_t byte : {std::size_t{0}, std::size_t{31}}) {
+    auto flipped = key;
+    flipped[byte] ^= 1;
+    assert(!crypto::DigestsEqual(key, flipped));
+  }
+}
+
 void TestAuthorization() {
+  TestDigestsEqual();
   RunningServer secured({.api_key = "test-secret"});
   for (const std::string path :
        {"/health", "/ready", "/v1/models", "/v1/chat/completions",
@@ -50,10 +69,16 @@ void TestAuthorization() {
     ExpectStatus(secured.Send("POST " + path + " HTTP/1.1\r\n\r\n"), 401);
   }
   for (const std::string header :
-       {"", "x-api-key: test-secret\r\n", "Authorization: Bearer wrong\r\n",
+       {"", "x-api-key: wrong\r\n", "x-api-key: \r\n",
+        "Authorization: Bearer wrong\r\n",
         "Authorization: Basic test-secret\r\n",
         "Authorization: Bearer test-secret\r\nAuthorization: Bearer "
-        "test-secret\r\n"}) {
+        "test-secret\r\n",
+        "x-api-key: test-secret\r\nx-api-key: test-secret\r\n",
+        // Both headers present must both name the key.
+        "Authorization: Bearer test-secret\r\nx-api-key: wrong\r\n",
+        "Authorization: Bearer wrong\r\nx-api-key: test-secret\r\n",
+        "Authorization: Basic test-secret\r\nx-api-key: test-secret\r\n"}) {
     const auto response =
         secured.Send("GET /v1/models HTTP/1.1\r\n" + header + "\r\n");
     ExpectStatus(response, 401);
@@ -64,6 +89,26 @@ void TestAuthorization() {
   ExpectStatus(secured.Send("GET /v1/models HTTP/1.1\r\naUtHoRiZaTiOn: bEaReR  "
                             "test-secret\r\n\r\n"),
                200);
+  // Anthropic clients send the key as `x-api-key`.
+  for (const std::string header :
+       {"x-api-key: test-secret\r\n", "X-Api-Key:   test-secret\r\n",
+        "Authorization: Bearer test-secret\r\nx-api-key: test-secret\r\n"}) {
+    ExpectStatus(secured.Send("GET /v1/models HTTP/1.1\r\n" + header + "\r\n"),
+                 200);
+  }
+  // The key is compared exactly: no prefix, suffix or case variant matches.
+  for (const std::string key : {"test-secre", "test-secret2", "TEST-SECRET"}) {
+    ExpectStatus(secured.Send("GET /v1/models HTTP/1.1\r\nx-api-key: " + key +
+                              "\r\n\r\n"),
+                 401);
+  }
+  // Without a configured key, any or no credential is accepted as before.
+  RunningServer open_server;
+  for (const std::string header :
+       {"", "x-api-key: anything\r\n", "Authorization: Bearer x\r\n"}) {
+    ExpectStatus(
+        open_server.Send("GET /v1/models HTTP/1.1\r\n" + header + "\r\n"), 200);
+  }
   ExpectStatus(secured.Send("OPTIONS /v1/chat/completions HTTP/1.1\r\n\r\n"),
                204);
   const std::string body = R"({"prompt":"hi","max_tokens":1})";
@@ -73,6 +118,174 @@ void TestAuthorization() {
                             std::to_string(body.size()) + "\r\n\r\n" + body),
                200);
   assert(secured.backend->calls == 1);
+}
+
+std::string HeaderValue(const std::string& response, std::string_view name) {
+  const auto head = response.substr(0, response.find("\r\n\r\n"));
+  const auto found = head.find("\r\n" + std::string(name) + ": ");
+  if (found == std::string::npos)
+    return {};
+  const auto begin = found + name.size() + 4;
+  return head.substr(begin, head.find("\r\n", begin) - begin);
+}
+
+void TestCorsOrigins() {
+  // Default: any origin, as before, plus the Anthropic key header.
+  {
+    RunningServer server;
+    const auto preflight = server.Send(
+        "OPTIONS /v1/messages HTTP/1.1\r\nOrigin: http://a.test\r\n"
+        "Access-Control-Request-Method: POST\r\n\r\n");
+    ExpectStatus(preflight, 204);
+    assert(HeaderValue(preflight, "Access-Control-Allow-Origin") == "*");
+    assert(HeaderValue(preflight, "Access-Control-Allow-Headers")
+               .find("X-API-Key") != std::string::npos);
+    assert(preflight.find("Access-Control-Allow-Credentials") ==
+           std::string::npos);
+    assert(preflight.find("Vary: Origin") == std::string::npos);
+  }
+
+  std::string error;
+  assert(gufo::server::ParseCorsOrigin("HTTPS://WebUI.Lan:3000", &error) ==
+         "https://webui.lan:3000");
+  assert(gufo::server::ParseCorsOrigin("http://[::1]:8080", &error) ==
+         "http://[::1]:8080");
+  // Normalized to what a browser sends: canonical IPv6, no default port and
+  // no leading zeros.
+  for (const auto& [configured, expected] :
+       std::vector<std::pair<std::string_view, std::string_view>>{
+           {"http://[0:0:0:0:0:0:0:1]", "http://[::1]"},
+           {"http://webui.lan:80", "http://webui.lan"},
+           {"https://webui.lan:0443", "https://webui.lan"},
+           {"https://webui.lan:80", "https://webui.lan:80"},
+           {"http://webui.lan:03000", "http://webui.lan:3000"},
+           {"http://192.168.1.20:65535", "http://192.168.1.20:65535"},
+           // IPv6 as the WHATWG URL serializer writes it: hex pieces only,
+           // the first longest zero run compressed, single zeros kept.
+           {"http://[::ffff:192.0.2.1]", "http://[::ffff:c000:201]"},
+           {"http://[::FFFF:C000:0201]:8080", "http://[::ffff:c000:201]:8080"},
+           {"http://[::1.2.3.4]", "http://[::102:304]"},
+           {"http://[2001:db8:0:0:1:0:0:1]", "http://[2001:db8::1:0:0:1]"},
+           {"http://[2001:db8:0:1:1:1:1:1]", "http://[2001:db8:0:1:1:1:1:1]"},
+           {"http://[1:0:0:2:0:0:0:3]", "http://[1:0:0:2::3]"},
+           {"http://[::]", "http://[::]"},
+           {"http://0.0.0.0", "http://0.0.0.0"}})
+    assert(gufo::server::ParseCorsOrigin(configured, &error) == expected);
+  // Numeric hosts a browser would rewrite are refused, naming its spelling.
+  for (const auto& [configured, canonical] :
+       std::vector<std::pair<std::string_view, std::string_view>>{
+           {"http://127.1", "http://127.0.0.1"},
+           {"http://0177.0.0.1", "http://127.0.0.1"},
+           {"http://0x7f000001:8080", "http://127.0.0.1"},
+           {"https://0x7F.0.0.1", "https://127.0.0.1"},
+           {"http://2130706433", "http://127.0.0.1"},
+           {"http://192.168.010.1", "http://192.168.8.1"}}) {
+    error.clear();
+    assert(!gufo::server::ParseCorsOrigin(configured, &error).has_value());
+    assert(error.find("as browsers send it: '" + std::string(canonical) +
+                      "'") != std::string::npos);
+  }
+  // Numeric hosts browsers reject are invalid too.
+  for (const std::string_view bad :
+       {"http://256.0.0.1", "http://1.2.3.4.5", "http://4294967296",
+        "http://08.0.0.1", "http://example.123", "http://a.0x"}) {
+    error.clear();
+    assert(!gufo::server::ParseCorsOrigin(bad, &error).has_value());
+    assert(error.find("as the browser sends it") != std::string::npos);
+  }
+  for (const std::string_view bad : {"",
+                                     "*",
+                                     "webui.lan",
+                                     "ftp://webui.lan",
+                                     "http://",
+                                     "http://:80",
+                                     "http://webui.lan/",
+                                     "http://webui.lan/path",
+                                     "http://user@webui.lan",
+                                     "http://*.lan",
+                                     "http://webui.lan\r\nX-Injected: 1",
+                                     "null",
+                                     "http://webui.lan:abc",
+                                     "http://[garbage]",
+                                     "http://[::1",
+                                     "http://[::1]x",
+                                     "http://[::1%eth0]",
+                                     "http://webui.lan:99999",
+                                     "http://webui.lan:65536",
+                                     "http://webui.lan:0",
+                                     "http://webui.lan:",
+                                     "http://webui.lan:-1",
+                                     "http://webui.lan:80:81",
+                                     "http://:8080",
+                                     "https://",
+                                     "http://.lan",
+                                     "http://webui..lan",
+                                     "http://webui.lan.",
+                                     "http://webui.lan?q=1",
+                                     "http://webui.lan#top",
+                                     "http://webui.lan:80/",
+                                     "http://user:pass@webui.lan"}) {
+    error.clear();
+    assert(!gufo::server::ParseCorsOrigin(bad, &error).has_value());
+    assert(!error.empty());
+  }
+
+  RunningServer server(
+      {.api_key = "fake-cors-key",
+       .cors_origins = {"http://webui.lan:3000", "https://chat.test"}});
+  // An allowed preflight needs no credential and echoes the configured
+  // spelling of the origin, never credentials.
+  const auto allowed = server.Send(
+      "OPTIONS /v1/chat/completions HTTP/1.1\r\nOrigin: HTTP://WebUI.lan:3000"
+      "\r\nAccess-Control-Request-Method: POST\r\n"
+      "Access-Control-Request-Headers: authorization, content-type\r\n\r\n");
+  ExpectStatus(allowed, 204);
+  assert(HeaderValue(allowed, "Access-Control-Allow-Origin") ==
+         "http://webui.lan:3000");
+  assert(HeaderValue(allowed, "Vary") == "Origin");
+  assert(HeaderValue(allowed, "Access-Control-Allow-Headers")
+             .find("Authorization") != std::string::npos);
+  assert(allowed.find("Access-Control-Allow-Credentials") == std::string::npos);
+  // The actual request still needs the key, and the reply carries CORS.
+  const auto unauthorized = server.Send(
+      "GET /v1/models HTTP/1.1\r\nOrigin: https://chat.test\r\n\r\n");
+  ExpectStatus(unauthorized, 401);
+  assert(HeaderValue(unauthorized, "Access-Control-Allow-Origin") ==
+         "https://chat.test");
+  const auto authorized = server.Send(
+      "GET /v1/models HTTP/1.1\r\nOrigin: https://chat.test\r\n"
+      "Authorization: Bearer fake-cors-key\r\n\r\n");
+  ExpectStatus(authorized, 200);
+  assert(HeaderValue(authorized, "Access-Control-Allow-Origin") ==
+         "https://chat.test");
+  assert(authorized.find("fake-cors-key") == std::string::npos);
+
+  // A disallowed origin is refused before authorization, even with the key,
+  // and learns nothing it could read through CORS.
+  for (const std::string request :
+       {"OPTIONS /v1/chat/completions HTTP/1.1\r\nOrigin: http://evil.test\r\n"
+        "Access-Control-Request-Method: POST\r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\nOrigin: http://evil.test\r\n"
+        "Authorization: Bearer fake-cors-key\r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\nOrigin: http://webui.lan:3001\r\n"
+        "x-api-key: fake-cors-key\r\n\r\n",
+        "GET /v1/models HTTP/1.1\r\nOrigin: null\r\n"
+        "x-api-key: fake-cors-key\r\n\r\n",
+        // Two origins are not resolved in the client's favour.
+        "GET /v1/models HTTP/1.1\r\nOrigin: https://chat.test\r\n"
+        "Origin: http://evil.test\r\nx-api-key: fake-cors-key\r\n\r\n"}) {
+    const auto refused = server.Send(request);
+    ExpectStatus(refused, 403);
+    assert(refused.find("origin_not_allowed") != std::string::npos);
+    assert(refused.find("Access-Control-Allow-") == std::string::npos);
+    assert(HeaderValue(refused, "Vary") == "Origin");
+  }
+  // Non-browser clients send no Origin and are unaffected by the allowlist.
+  const auto plain = server.Send(
+      "GET /v1/models HTTP/1.1\r\nx-api-key: fake-cors-key\r\n\r\n");
+  ExpectStatus(plain, 200);
+  assert(plain.find("Access-Control-Allow-Origin") == std::string::npos);
+  assert(server.backend->calls == 0);
 }
 
 struct CapturedLogs {
@@ -3055,6 +3268,102 @@ void TestPeerDisconnect() {
   assert(server.backend->disconnected);
 }
 
+// Real stop sequences through the Chat and Messages routes: the backend
+// filters split pieces, and each route reports the exact text and reason.
+void TestRouteStopSequencesAcrossSplits() {
+  RunningServer server;
+  struct Case {
+    std::vector<std::string> stops;
+    std::string raw, text, matched;
+  };
+  // Literal spellings: these are request stop strings, not EOS token IDs.
+  const std::vector<Case> cases = {
+      {{"<|im_end|>"},
+       "Nerazim | > im <|im_end|>tail",
+       "Nerazim | > im ",
+       "<|im_end|>"},
+      {{"END", "┌終"}, "hi┌終later END", "hi", "┌終"},
+      {{"<|im_end|>"}, "held <|im_end", "held <|im_end", ""},
+  };
+  const auto events = [](const std::string& wire) {
+    std::vector<gufo::json::Value> out;
+    for (auto data = wire.find("data: "); data != std::string::npos;
+         data = wire.find("data: ", data + 6)) {
+      const auto payload = std::string_view(wire).substr(
+          data + 6, wire.find("\n\n", data) - data - 6);
+      if (payload != "[DONE]")
+        out.push_back(gufo::json::parse(payload));
+    }
+    return out;
+  };
+  for (const auto& test : cases) {
+    std::vector<std::vector<std::string>> splits;
+    for (std::size_t split = 0; split <= test.raw.size(); ++split)
+      splits.push_back({test.raw.substr(0, split), test.raw.substr(split)});
+    splits.emplace_back();
+    for (const char byte : test.raw)
+      splits.back().emplace_back(1, byte);
+    for (const auto& pieces : splits)
+      for (const bool messages : {false, true})
+        for (const bool stream : {false, true}) {
+          server.backend->pieces = pieces;
+          auto body = gufo::json::parse(
+              R"({"model":"test","max_tokens":64,"messages":[{"role":"user","content":"hi"}]})");
+          body["stream"] = stream;
+          auto& stops = body[messages ? "stop_sequences" : "stop"];
+          stops = gufo::json::Value::array();
+          for (const auto& stop : test.stops)
+            stops.push_back(stop);
+          const auto response = server.Post(
+              messages ? "/v1/messages" : "/v1/chat/completions", body.dump());
+          ExpectStatus(response, 200);
+          assert(server.backend->LastCall().stop_sequences == test.stops);
+          std::string text, finish;
+          const gufo::json::Value* sequence = nullptr;
+          std::vector<gufo::json::Value> parsed;
+          if (stream)
+            parsed = events(response);
+          else
+            parsed.push_back(gufo::json::parse(
+                response.substr(response.find("\r\n\r\n") + 4)));
+          for (const auto& event : parsed) {
+            if (!messages) {
+              for (const auto& choice : event.find("choices")->items()) {
+                text += choice.find(stream ? "delta" : "message")
+                            ->member_str("content");
+                if (!choice.member_str("finish_reason").empty()) {
+                  assert(finish.empty());
+                  finish = choice.member_str("finish_reason");
+                }
+              }
+            } else if (!stream) {
+              for (const auto& block : event.find("content")->items())
+                text += block.member_str("text");
+              finish = event.member_str("stop_reason");
+              sequence = event.find("stop_sequence");
+            } else if (const auto* delta = event.find("delta")) {
+              if (delta->member_str("type") == "text_delta")
+                text += delta->member_str("text");
+              if (event.member_str("type") == "message_delta") {
+                assert(finish.empty());
+                finish = delta->member_str("stop_reason");
+                sequence = delta->find("stop_sequence");
+              }
+            }
+          }
+          assert(text == test.text);
+          if (!messages)
+            assert(finish == "stop");
+          else if (test.matched.empty())
+            assert(finish == "end_turn" && sequence && sequence->is_null());
+          else
+            assert(finish == "stop_sequence" && sequence &&
+                   sequence->get_str() == test.matched);
+        }
+  }
+  server.backend->pieces.clear();
+}
+
 void TestCompatibilityStopSequences() {
   RunningServer server;
   server.backend->forced_stop_sequence = "END";
@@ -3931,9 +4240,64 @@ void TestCheckpointTransferHttp() {
       "POST /v1/cache/import HTTP/1.1\r\nContent-Type: "
       "application/vnd.gufo.checkpoint\r\nContent-Length: " +
       std::to_string(wire.size()) + "\r\n";
-  ExpectStatus(server.Send(head + "\r\n" + wire), 200);
+  // The bulk-transfer client must tolerate short writes and transient socket
+  // failures. Inject those outcomes after progress, not with scheduler sleeps.
+  const auto transfer_send = [&](std::string_view pending) {
+    const auto fd = server.Connect();
+    struct SendResult {
+      std::intptr_t count;
+      bool retry;
+    };
+    int calls = 0, would_block = 0, interrupted = 0, short_writes = 0;
+    const auto send_piece = [&](std::string_view bytes) -> SendResult {
+      ++calls;
+      if (calls == 2 || calls == 6) {
+        ++would_block;
+        return {-1, true};
+      }
+      if (calls == 4) {
+        ++interrupted;
+        return {-1, true};
+      }
+      const auto count = net::SendNoSignal(
+          fd, bytes.data(), std::min(bytes.size(), std::size_t{64 * 1024}));
+      if (count > 0 && static_cast<std::size_t>(count) < bytes.size())
+        ++short_writes;
+      return {count, count < 0 && (net::IsSocketInterrupted() ||
+                                   net::IsSocketWouldBlockOrTimeout())};
+    };
+    // This deadline bounds broken peers; no expected transport latency is
+    // asserted. A socket timeout/interruption is not an EOF or a lost prefix.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!pending.empty()) {
+      assert(std::chrono::steady_clock::now() < deadline);
+      const auto result = send_piece(pending);
+      if (result.retry)
+        continue;
+      assert(result.count > 0);
+      pending.remove_prefix(static_cast<std::size_t>(result.count));
+    }
+    assert(would_block == 2 && interrupted == 1 && short_writes > 1);
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+      assert(std::chrono::steady_clock::now() < deadline);
+      const auto count = net::Receive(fd, buffer, sizeof(buffer));
+      if (count < 0 &&
+          (net::IsSocketInterrupted() || net::IsSocketWouldBlockOrTimeout()))
+        continue;
+      assert(count >= 0);
+      if (count == 0)
+        break;
+      response.append(buffer, static_cast<std::size_t>(count));
+    }
+    net::CloseSocket(fd);
+    return response;
+  };
+  ExpectStatus(transfer_send(head + "\r\n" + wire), 200);
   const auto continued =
-      server.Send(head + "Expect: 100-continue\r\n\r\n" + wire);
+      transfer_send(head + "Expect: 100-continue\r\n\r\n" + wire);
   ExpectStatus(continued, 100);
   assert(continued.find("HTTP/1.1 200 ") != std::string::npos);
   assert(server.backend->LastCall().chat.messages.empty());
@@ -3947,7 +4311,7 @@ void TestCheckpointTransferHttp() {
   ExpectStatus(server.Post("/v1/cache/import", ""), 415);
   auto corrupt = wire;
   corrupt.back() ^= 1;
-  ExpectStatus(server.Send(head + "\r\n" + corrupt), 400);
+  ExpectStatus(transfer_send(head + "\r\n" + corrupt), 400);
   ExpectStatus(server.Send(head + "\r\n" + wire.substr(0, 200), true), 400);
   // Auth rejection must not request/consume an upload or emit 100 Continue.
   RunningServer secured(
@@ -3980,6 +4344,7 @@ int main(int argc, char** argv) {
   TestLoadingResponder();
   TestQueryParameters();
   TestAuthorization();
+  TestCorsOrigins();
   TestFramingAndMetrics();
   TestExpectContinue();
   TestFallbackBackendMetrics();
@@ -4005,6 +4370,7 @@ int main(int argc, char** argv) {
   TestRawCompletionCachePersist();
   TestCachePersistEcho();
   TestCompatibilityStopSequences();
+  TestRouteStopSequencesAcrossSplits();
   TestCompatibilityThinkingDefaults();
   TestResponseSamplingDefaults();
   TestCompatibilityUtf8();

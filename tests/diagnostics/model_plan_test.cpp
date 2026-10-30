@@ -7,10 +7,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
+#include "tests/diagnostics/recovery_bounds.hpp"
+#include "tests/diagnostics/rss_slope.hpp"
 
 namespace {
 const std::string header =
@@ -281,6 +284,71 @@ void NegativeCases(Fixture& fixture) {
 }  // namespace
 
 int main() {
+  const RecoveryBounds recovery({{1000, 100, 4}, {1004, 102, 4}});
+  assert(recovery.Contains({1000, 102, 4}));
+  assert(recovery.Contains({1100, 90, 3}));
+  assert(!recovery.Contains({999, 100, 4}));
+  assert(!recovery.Contains({1000, 103, 4}));
+  assert(!recovery.Contains({1000, 100, 5}));
+  const RecoveryBounds pages({{1000, 100, 4}, {1004, 102, 4}}, 16);
+  assert(pages.Contains({984, 118, 4}));  // Inclusive preregistered slack.
+  assert(!pages.Contains({983, 118, 4}));
+  assert(!pages.Contains({984, 119, 4}));
+  assert(!pages.Contains({1000, 100, 5}));  // No thread-count allowance.
+  assert(pages.OutsideCount({{983, 100, 4}, {1000, 100, 4}, {1000, 119, 4}}) ==
+         2);  // Retain/count all results, not just the first band miss.
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  const RecoveryBounds edges({{0, maximum, 4}}, 16);
+  assert(edges.Contains({maximum, maximum, 4}));
+  const RecoveryBounds extreme({{maximum, 0, 4}}, 16);
+  assert(!extreme.Contains({0, maximum, 4}));
+  bool empty_rejected = false;
+  try {
+    const RecoveryBounds empty({});
+  } catch (const std::invalid_argument&) {
+    empty_rejected = true;
+  }
+  assert(empty_rejected);
+  const RecoveryTrend growth({{100, 10, 4}, {99, 11, 4}, {98, 11, 4}});
+  assert(growth.rss_monotonic_growth && growth.heap_monotonic_loss);
+  const RecoveryTrend jitter({{100, 10, 4}, {99, 12, 4}, {101, 11, 4}});
+  assert(!jitter.rss_monotonic_growth && !jitter.heap_monotonic_loss);
+  assert(!RecoveryTrend({{100, 10, 4}, {100, 10, 4}}).rss_monotonic_growth);
+  static_assert(kRecoveryInconclusiveExit != 0 &&
+                kRecoveryInconclusiveExit != 1 &&
+                kRecoveryInconclusiveExit != 77);
+  using RssVerdict = RssDiscriminatorResult::Verdict;
+  const auto linear = [](std::uint64_t slope) {
+    std::vector<std::uint64_t> rows;
+    for (std::uint64_t i = 0; i < 20; ++i)
+      rows.push_back((1ULL << 50) + i * slope);
+    return rows;
+  };
+  auto rss = ClassifyRssAnon(linear(64 * 1024));
+  assert(rss.verdict == RssVerdict::kPass &&
+         rss.slope_bytes_per_cycle == 64 * 1024);
+  assert(ClassifyRssAnon(linear(64 * 1024 + 1)).verdict ==
+         RssVerdict::kBetween);
+  assert(ClassifyRssAnon(linear(256 * 1024)).verdict == RssVerdict::kBetween);
+  assert(ClassifyRssAnon(linear(256 * 1024 + 1)).verdict == RssVerdict::kFail);
+  auto endpoints = linear(0);
+  endpoints.back() += 2 * 1024 * 1024;
+  assert(ClassifyRssAnon(endpoints).verdict == RssVerdict::kPass);
+  ++endpoints.back();
+  assert(ClassifyRssAnon(endpoints).verdict == RssVerdict::kBetween);
+  auto ignored = linear(0);
+  std::fill(ignored.begin(), ignored.begin() + 5, maximum);
+  assert(ClassifyRssAnon(ignored).verdict == RssVerdict::kPass);
+  auto decreasing = linear(64 * 1024);
+  std::reverse(decreasing.begin(), decreasing.end());
+  assert(ClassifyRssAnon(decreasing).growth_bytes == 0);
+  bool incomplete_rejected = false;
+  try {
+    (void)ClassifyRssAnon(std::vector<std::uint64_t>(19));
+  } catch (const std::invalid_argument&) {
+    incomplete_rejected = true;
+  }
+  assert(incomplete_rejected);
   Fixture fixture;
   const auto unbudgeted = header + "\n" + Row() + "\n";
   auto report = fixture.Run(unbudgeted);

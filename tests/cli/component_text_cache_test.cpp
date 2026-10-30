@@ -1,5 +1,6 @@
 #include "tests/cli/component_text_cache_fixture.hpp"
 
+#include "src/cli/serve/measured_admission.hpp"
 namespace {
 void ExecutionReclamationWaitsForActiveSourcesAndUnbinds() {
   class ReclaimRunner final : public Runner {
@@ -362,7 +363,7 @@ std::string Refuse(const std::shared_ptr<MeasuredRunner>& runner,
   std::string message;
   try {
     TextRunnerPool pool(runner, 3, disk, {.enabled = ram});
-  } catch (const std::invalid_argument& e) {
+  } catch (const admission::CapacityRefusal& e) {
     message = e.what();
   }
   assert(
@@ -940,8 +941,108 @@ void StaticDiagnosticClaim() {
   assert(!claim.Activate(envelope, Capacity(100, 100, 50), nullptr));
 }
 
+// Investigation-only suite: exercise the same five native fault outcomes,
+// through the production pool/helper/idle workers, without HIP or a model.
+// A fresh runner owns all fixture traces in each case, just as FullCycle
+// destroys the native model. No cumulative diagnostic vectors survive a case.
+void RssLoopCase(int fault) {
+  using Clock = std::chrono::steady_clock;
+  auto runner = std::make_shared<MeasuredRunner>();
+  std::weak_ptr<MeasuredRunner> runner_owner = runner;
+  Clock::time_point now{};
+  runner->configure = [fault, &now](Trial& trial) {
+    trial.capacity.assign(4, Capacity(100, 100, 50));
+    trial.pending.assign(4, Pending(0, 0, 0, 0));
+    if (fault && trial.context == 32768)
+      trial.capacity[2] = Capacity(0, 0, 0);
+    if (fault == 1 && trial.context < 32768)
+      trial.capacity[2] = Capacity(0, 0, 0);
+    trial.step = [fault, &now, current = &trial](std::string_view point) {
+      if (point != "observe")
+        return;
+      if ((fault == 2 && current->context == 32768 && current->Live() == 2) ||
+          (fault == 3 && current->context < 32768 && current->Live() == 1))
+        throw CreationFailure();
+      if (fault == 4 && current->context < 32768 && current->Live() == 2)
+        now += std::chrono::seconds(31);
+    };
+  };
+  runner->alter = [&now](ComponentCacheResources& resources) {
+    resources.startup_admission->now = [&now] { return now; };
+  };
+  int outcome = 0;
+  try {
+    TextRunnerPool pool(runner, 3);
+  } catch (const admission::CapacityRefusal&) {
+    outcome = 1;
+  } catch (const CreationFailure&) {
+    outcome = 2;
+  }
+  assert(outcome == (fault == 0 ? 0 : fault == 2 || fault == 3 ? 2 : 1));
+  assert(runner->trials.front()->created == (fault == 0 ? 3 : 2));
+  if (fault == 1 || fault == 3 || fault == 4) {
+    assert(runner->probes.size() > 0);
+    assert(runner->trials.back()->created == (fault == 3 ? 1 : 2));
+  }
+  runner->Released();
+  std::vector<std::weak_ptr<Trial>> trials;
+  for (const auto& trial : runner->trials)
+    trials.push_back(trial);
+  runner.reset();
+  assert(runner_owner.expired());
+  for (const auto& trial : trials)
+    assert(trial.expired());
+}
+
+void RssLoop() {
+  std::size_t count = 24;  // Same prime + 3 warm + 20 measured native shape.
+  if (const auto* input = std::getenv("GUFO_ADMISSION_CPU_CYCLES")) {
+    count = std::stoull(input);
+    if (count < 24 || count > 2000)
+      throw std::invalid_argument("CPU cycle count must be in [24, 2000]");
+  }
+  for (std::size_t cycle = 0; cycle < count; ++cycle) {
+    for (int fault = 0; fault != 5; ++fault)
+      RssLoopCase(fault);
+    // Sampling occurs after all pool/runner/fixture owners have died. Stream
+    // directly to stdout: retaining the output would manufacture a leak.
+    std::ifstream status("/proc/self/status");
+    if (!status)
+      throw std::runtime_error("RSS investigation requires /proc/self/status");
+    std::cout << "cpu_cycle=" << cycle;
+    for (std::string line; std::getline(status, line);) {
+      for (const std::string_view field : {"RssAnon:", "RssFile:"}) {
+        if (line.starts_with(field))
+          std::cout << ' ' << field.substr(0, field.size() - 1) << '='
+                    << std::stoull(line.substr(field.size())) * 1024;
+      }
+    }
+    std::cout << " fixture_owners=0\n" << std::flush;
+  }
+  std::cout << "CPU admission loop complete; NOT native/model leak clearance\n";
+}
+
 void Check() {
   assert(DiagnosticMemoryClaim::Process().Snapshot().bytes == 0);
+  // The admission-only facade uses this same pool with no scheduler. Repeat
+  // success/refusal/after-admission failure in process; every owner must
+  // unwind.
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    SuccessRetainsAllSlotsAndOneFrozenObservation();
+    MeasuredDebitRefusesBeforeRemainingSlots();
+    auto runner = std::make_shared<MeasuredRunner>();
+    runner->alter = [](ComponentCacheResources& resources) {
+      resources.commit_backing = [](std::size_t) { throw CreationFailure(); };
+    };
+    bool failed = false;
+    try {
+      TextRunnerPool pool(runner, 3);
+    } catch (const CreationFailure&) {
+      failed = true;
+    }
+    assert(failed);
+    runner->Released();
+  }
   MeasuredDebitRefusesBeforeRemainingSlots();
   FirstSlotLogicalClaimProtectsBothReservesBeforeAllocation();
   StagedProbeDeadlineStopsSlotCreation();
@@ -6997,6 +7098,10 @@ int main(int argc, char* argv[]) {
     packed_ingress_cpu::AdmissionFailuresPreserveDisk();
     packed_ingress_cpu::MalformedDisk();
     std::cout << "CPU packed disk admission PASS\n";
+    return 0;
+  }
+  if (suite == "admission_rss_loop") {
+    measured_startup::RssLoop();
     return 0;
   }
   if (suite == "diagnostic_memory") {

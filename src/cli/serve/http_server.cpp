@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -229,37 +230,112 @@ bool ExpectsContinue(const HttpRequest& request) {
   });
 }
 
-std::string CredentialHash(std::string_view value) {
-  return crypto::Sha256Hex(std::span(
+crypto::Sha256Digest CredentialHash(std::string_view value) {
+  return crypto::Sha256(std::span(
       reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
 }
 
-bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
-  if (key_hash.empty()) {
+// `Authorization: Bearer <key>` (OpenAI clients) and `x-api-key: <key>`
+// (Anthropic clients) carry the same key. Every credential a request presents
+// must match it: a valid header never excuses a wrong or non-Bearer other one,
+// and a repeated header is refused rather than resolved.
+bool IsAuthorized(const HttpRequest& request,
+                  const std::optional<crypto::Sha256Digest>& key_hash) {
+  if (!key_hash.has_value()) {
     return true;
   }
-  std::string_view credential;
-  bool found = false;
+  std::optional<std::string_view> authorization;
+  std::optional<std::string_view> api_key;
   for (const auto& [name, value] : request.headers) {
-    if (ToLower(name) == "authorization") {
-      if (found) {
-        return false;
-      }
-      found = true;
-      credential = value;
+    const auto lowered = ToLower(name);
+    auto* slot = lowered == "authorization" ? &authorization
+                 : lowered == "x-api-key"   ? &api_key
+                                            : nullptr;
+    if (slot == nullptr) {
+      continue;
     }
+    if (slot->has_value()) {
+      return false;
+    }
+    *slot = value;
   }
-  const auto space = credential.find(' ');
-  if (space == std::string_view::npos ||
-      ToLower(credential.substr(0, space)) != "bearer") {
+  if (!authorization.has_value() && !api_key.has_value()) {
     return false;
   }
-  credential.remove_prefix(space + 1);
-  while (credential.starts_with(' ')) {
-    credential.remove_prefix(1);
+  // Constant-time comparison of fixed-size digests discloses neither matching
+  // prefixes of the key nor its length.
+  if (authorization.has_value()) {
+    std::string_view credential = *authorization;
+    const auto space = credential.find(' ');
+    if (space == std::string_view::npos ||
+        ToLower(credential.substr(0, space)) != "bearer") {
+      return false;
+    }
+    credential.remove_prefix(space + 1);
+    while (credential.starts_with(' ')) {
+      credential.remove_prefix(1);
+    }
+    if (!crypto::DigestsEqual(CredentialHash(credential), *key_hash)) {
+      return false;
+    }
   }
-  // Comparing digests does not disclose matching prefixes of the API key.
-  return CredentialHash(credential) == key_hash;
+  return !api_key.has_value() ||
+         crypto::DigestsEqual(CredentialHash(*api_key), *key_hash);
+}
+
+// The configured origin a request's single `Origin` header names, or null.
+// The configured spelling is echoed, never the client's bytes.
+const std::string* AllowedOrigin(const std::vector<std::string>& allowed,
+                                 const HttpRequest& request) {
+  const std::string* match = nullptr;
+  bool seen = false;
+  for (const auto& [name, value] : request.headers) {
+    if (ToLower(name) != "origin") {
+      continue;
+    }
+    if (seen) {
+      return nullptr;
+    }
+    seen = true;
+    const auto lowered = ToLower(value);
+    const auto found = std::ranges::find(allowed, lowered);
+    match = found == allowed.end() ? nullptr : &*found;
+  }
+  return match;
+}
+
+// A browser request from an origin outside a configured allowlist. Requests
+// without `Origin` (curl, SDKs) are not browser cross-origin calls.
+bool OriginRefused(const std::vector<std::string>& allowed,
+                   const HttpRequest& request) {
+  if (allowed.empty()) {
+    return false;
+  }
+  const bool has_origin = std::ranges::any_of(
+      request.headers,
+      [](const auto& header) { return ToLower(header.first) == "origin"; });
+  return has_origin && AllowedOrigin(allowed, request) == nullptr;
+}
+
+// CORS response headers. `Access-Control-Allow-Credentials` is never sent, so
+// browsers do not attach cookies; clients send the API key explicitly.
+std::string CorsHead(const std::vector<std::string>& allowed,
+                     const std::string* origin) {
+  std::string out;
+  if (allowed.empty()) {
+    out = "Access-Control-Allow-Origin: *\r\n";
+  } else {
+    out = "Vary: Origin\r\n";
+    if (origin == nullptr) {
+      return out;
+    }
+    out += "Access-Control-Allow-Origin: " + *origin + "\r\n";
+  }
+  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  out +=
+      "Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key, "
+      "Range\r\n";
+  return out;
 }
 
 bool HasHeader(const HttpResponse& response, std::string_view name) {
@@ -305,7 +381,8 @@ bool IsEventStream(const HttpResponse& response) {
 }
 
 std::string BuildResponseHead(const HttpResponse& resp,
-                              std::optional<std::size_t> content_length) {
+                              std::optional<std::size_t> content_length,
+                              std::string_view cors) {
   std::string out;
   out.reserve(256);
   out += "HTTP/1.1 ";
@@ -319,9 +396,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
   if (content_length.has_value()) {
     out += "Content-Length: " + std::to_string(*content_length) + "\r\n";
   }
-  out += "Access-Control-Allow-Origin: *\r\n";
-  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
-  out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
+  out += cors;
   for (const auto& [name, value] : resp.headers) {
     out += name;
     out += ": ";
@@ -334,8 +409,8 @@ std::string BuildResponseHead(const HttpResponse& resp,
   return out;
 }
 
-std::string BuildResponse(const HttpResponse& resp) {
-  std::string out = BuildResponseHead(resp, resp.body.size());
+std::string BuildResponse(const HttpResponse& resp, std::string_view cors) {
+  std::string out = BuildResponseHead(resp, resp.body.size(), cors);
   out += resp.body;
   return out;
 }
@@ -1778,7 +1853,9 @@ std::string PeerAddress(int client_fd) {
 
 }  // namespace
 
-LoadingResponder::LoadingResponder(const std::string& host, int port) {
+LoadingResponder::LoadingResponder(const std::string& host, int port,
+                                   std::vector<std::string> cors_origins)
+    : cors_origins_(std::move(cors_origins)) {
   net::EnsureSocketRuntimeStarted();
   sockaddr_storage addr{};
   net::SocklenT addr_length = 0;
@@ -1825,7 +1902,8 @@ void LoadingResponder::serve() {
   HttpResponse loading = Err(503, "Service Unavailable", "Loading model",
                              "unavailable_error", "loading");
   loading.headers.emplace_back("Retry-After", "1");
-  const std::string reply = BuildResponse(loading);
+  const std::string reply =
+      BuildResponse(loading, CorsHead(cors_origins_, nullptr));
   // One connection at a time is enough for probes. Read the request head
   // before replying, and after replying read what the client still sends (a
   // request body) until it closes: closing with unread data resets the
@@ -1870,6 +1948,187 @@ void LoadingResponder::serve() {
     }
     net::CloseSocket(client_fd);
   }
+}
+
+namespace {
+
+// WHATWG URL serialization of an IPv6 host: lowercase hex pieces without
+// leading zeros, the first longest run of two or more zero pieces as "::",
+// and never a dotted IPv4 tail (so `::ffff:192.0.2.1` is `::ffff:c000:201`).
+std::string SerializeIpv6(const in6_addr& address) {
+  std::array<unsigned, 8> pieces{};
+  for (std::size_t i = 0; i < pieces.size(); ++i)
+    pieces[i] =
+        (unsigned{address.s6_addr[2 * i]} << 8) | address.s6_addr[2 * i + 1];
+  std::size_t best = pieces.size(), best_length = 1;
+  for (std::size_t i = 0; i < pieces.size();) {
+    std::size_t end = i;
+    while (end < pieces.size() && pieces[end] == 0)
+      ++end;
+    if (end - i > best_length) {
+      best = i;
+      best_length = end - i;
+    }
+    i = end == i ? i + 1 : end;
+  }
+  std::string out;
+  for (std::size_t i = 0; i < pieces.size(); ++i) {
+    if (i == best) {
+      out += i == 0 ? "::" : ":";
+      i += best_length - 1;
+      continue;
+    }
+    char piece[8];
+    (void)std::snprintf(piece, sizeof(piece), "%x", pieces[i]);
+    out += piece;
+    if (i + 1 < pieces.size())
+      out += ':';
+  }
+  return out;
+}
+
+// The WHATWG URL IPv4 parser: a host whose last label is a number is an IPv4
+// address in decimal, octal (leading 0) or hex (0x) parts, which browsers
+// serialize as dotted decimal. Returns nullopt for other hosts, and an empty
+// string for a numeric host browsers reject.
+std::optional<std::string> WhatwgIpv4(std::string_view host) {
+  const auto number =
+      [](std::string_view part) -> std::optional<std::uint64_t> {
+    int base = 10;
+    if (part.starts_with("0x")) {
+      base = 16;
+      part.remove_prefix(2);
+      if (part.empty())
+        return 0;
+    } else if (part.size() > 1 && part.starts_with('0')) {
+      base = 8;
+      part.remove_prefix(1);
+    }
+    if (part.empty() || part.size() > 16)
+      return std::nullopt;
+    std::uint64_t value = 0;
+    const auto [end, failure] =
+        std::from_chars(part.data(), part.data() + part.size(), value, base);
+    if (failure != std::errc{} || end != part.data() + part.size())
+      return std::nullopt;
+    return value;
+  };
+  const auto last = host.substr(host.rfind('.') + 1);
+  const bool ends_in_number =
+      !last.empty() &&
+      (std::ranges::all_of(last, [](char c) { return c >= '0' && c <= '9'; }) ||
+       number(last).has_value());
+  if (!ends_in_number)
+    return std::nullopt;
+  std::vector<std::uint64_t> parts;
+  for (std::size_t start = 0;;) {
+    const auto dot = host.find('.', start);
+    const auto value = number(host.substr(start, dot - start));
+    if (!value || parts.size() == 4)
+      return std::string();
+    parts.push_back(*value);
+    if (dot == std::string_view::npos)
+      break;
+    start = dot + 1;
+  }
+  std::uint64_t address = 0;
+  for (std::size_t i = 0; i + 1 < parts.size(); ++i) {
+    if (parts[i] > 255)
+      return std::string();
+    address = (address << 8) | parts[i];
+  }
+  const unsigned tail_bits = 8 * (5 - static_cast<unsigned>(parts.size()));
+  if (parts.back() >= (std::uint64_t{1} << tail_bits))
+    return std::string();
+  address = (address << tail_bits) | parts.back();
+  return std::to_string(address >> 24) + "." +
+         std::to_string((address >> 16) & 255) + "." +
+         std::to_string((address >> 8) & 255) + "." +
+         std::to_string(address & 255);
+}
+
+}  // namespace
+
+std::optional<std::string> ParseCorsOrigin(std::string_view origin,
+                                           std::string* error) {
+  const auto invalid = [&] {
+    *error =
+        "CORS origin must be http://HOST[:PORT] or https://HOST[:PORT] with "
+        "a port of 1-65535 and no path, query or credentials, as the browser "
+        "sends it (international names in punycode, no trailing dot): '" +
+        std::string(origin) + "'";
+    return std::nullopt;
+  };
+  const std::string lowered = ToLower(origin);
+  const auto scheme_end = lowered.find("://");
+  if (scheme_end == std::string::npos)
+    return invalid();
+  const std::string scheme = lowered.substr(0, scheme_end);
+  if (scheme != "http" && scheme != "https")
+    return invalid();
+  std::string_view rest = std::string_view(lowered).substr(scheme_end + 3);
+  std::string host;
+  if (rest.starts_with('[')) {
+    // A bracketed IPv6 literal, re-serialized as browsers send it.
+    const auto close = rest.find(']');
+    if (close == std::string_view::npos)
+      return invalid();
+    const std::string literal(rest.substr(1, close - 1));
+    in6_addr address{};
+    if (::inet_pton(AF_INET6, literal.c_str(), &address) != 1)
+      return invalid();
+    host = "[" + SerializeIpv6(address) + "]";
+    rest.remove_prefix(close + 1);
+  } else {
+    const auto colon = rest.find(':');
+    const std::string_view name = rest.substr(0, colon);
+    // Dot-separated labels of letters, digits and hyphens. This excludes
+    // paths, queries, fragments, userinfo and wildcards.
+    bool label_start = true;
+    for (const char c : name) {
+      if (c == '.') {
+        if (label_start)
+          return invalid();
+        label_start = true;
+      } else if (std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '-') {
+        label_start = false;
+      } else {
+        return invalid();
+      }
+    }
+    if (name.empty() || label_start)
+      return invalid();
+    host = std::string(name);
+    // Browsers rewrite numeric hosts, so `127.1` would never match their
+    // `127.0.0.1`. Ask for the spelling they send rather than guess.
+    if (const auto ipv4 = WhatwgIpv4(name)) {
+      if (ipv4->empty())
+        return invalid();
+      if (*ipv4 != name) {
+        *error = "CORS origin '" + std::string(origin) +
+                 "' must spell its IPv4 address as browsers send it: '" +
+                 scheme + "://" + *ipv4 + "'";
+        return std::nullopt;
+      }
+    }
+    rest.remove_prefix(name.size());
+  }
+  std::string port;
+  if (!rest.empty()) {
+    if (rest.front() != ':')
+      return invalid();
+    rest.remove_prefix(1);
+    unsigned value = 0;
+    const auto [end, failure] =
+        std::from_chars(rest.data(), rest.data() + rest.size(), value);
+    if (rest.empty() || failure != std::errc{} ||
+        end != rest.data() + rest.size() || value == 0 || value > 65535)
+      return invalid();
+    // Browsers omit the scheme's default port and leading zeros.
+    if (value != (scheme == "http" ? 80U : 443U))
+      port = ":" + std::to_string(value);
+  }
+  return scheme + "://" + host + port;
 }
 
 bool IsListenAddress(const std::string& host) {
@@ -2150,7 +2409,9 @@ void HttpServer::run(bool handle_signals) {
           Err(503, "Service Unavailable", "connection limit reached",
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
-      (void)SendAll(client_fd, BuildResponse(response));
+      (void)SendAll(
+          client_fd,
+          BuildResponse(response, CorsHead(options_.cors_origins, nullptr)));
       net::CloseSocket(client_fd);
     }
   }
@@ -2360,6 +2621,10 @@ void HttpServer::handle_connection(int client_fd,
   if (auto peer = PeerAddress(client_fd); !peer.empty())
     req.client_id = std::move(peer);
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
+  const auto cors_head = [&] {
+    return CorsHead(options_.cors_origins,
+                    AllowedOrigin(options_.cors_origins, req));
+  };
   // Set for routes `--trace` records; `traced_stream` collects the body bytes
   // a streaming reply delivered.
   bool traced = false;
@@ -2563,6 +2828,9 @@ void HttpServer::handle_connection(int client_fd,
     } else if (!ok) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
+    } else if (OriginRefused(options_.cors_origins, req)) {
+      resp = Err(403, "Forbidden", "origin is not allowed", "permission_error",
+                 "origin_not_allowed");
     } else if (req.method == "OPTIONS") {
       resp = {.status = 204, .reason = "No Content"};
     } else {
@@ -2580,7 +2848,8 @@ void HttpServer::handle_connection(int client_fd,
     bool connected = true;
     if (resp.websocket) {
       response_started = true;
-      connected = SendAll(client_fd, BuildResponseHead(resp, std::nullopt));
+      connected = SendAll(client_fd,
+                          BuildResponseHead(resp, std::nullopt, cors_head()));
       if (connected) {
         WebSocket socket(client_fd, std::move(req.body));
         resp.websocket(socket);
@@ -2589,7 +2858,7 @@ void HttpServer::handle_connection(int client_fd,
       const bool chunked = http11 && !HasHeader(resp, "content-length");
       if (chunked)
         resp.headers.emplace_back("Transfer-Encoding", "chunked");
-      const auto head = BuildResponseHead(resp, std::nullopt);
+      const auto head = BuildResponseHead(resp, std::nullopt, cors_head());
       if (!resp.defer_stream_headers) {
         response_started = true;
         connected = SendAll(client_fd, head);
@@ -2663,7 +2932,7 @@ void HttpServer::handle_connection(int client_fd,
           connected = SendAll(client_fd, "0\r\n\r\n");
       }
     } else {
-      const auto payload = BuildResponse(resp);
+      const auto payload = BuildResponse(resp, cors_head());
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
@@ -2718,7 +2987,7 @@ void HttpServer::handle_connection(int client_fd,
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
-      (void)SendAll(client_fd, BuildResponse(resp));
+      (void)SendAll(client_fd, BuildResponse(resp, cors_head()));
     response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
@@ -2737,7 +3006,7 @@ void HttpServer::handle_connection(int client_fd,
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
-      (void)SendAll(client_fd, BuildResponse(resp));
+      (void)SendAll(client_fd, BuildResponse(resp, cors_head()));
     response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
@@ -2753,7 +3022,7 @@ void HttpServer::handle_connection(int client_fd,
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
-      (void)SendAll(client_fd, BuildResponse(resp));
+      (void)SendAll(client_fd, BuildResponse(resp, cors_head()));
     response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.

@@ -29,7 +29,14 @@ private:
       EVP_MD_CTX_new(), EVP_MD_CTX_free};
 };
 
+using Sha256Digest = std::array<std::uint8_t, 32>;
+
 [[nodiscard]] std::string Sha256Hex(std::span<const std::uint8_t> bytes);
+[[nodiscard]] Sha256Digest Sha256(std::span<const std::uint8_t> bytes);
+/// Compares two digests in time independent of where they differ: every byte
+/// is read and folded into one result, with no early exit.
+[[nodiscard]] bool DigestsEqual(const Sha256Digest& left,
+                                const Sha256Digest& right) noexcept;
 [[nodiscard]] std::string Sha256FileHex(const std::filesystem::path& path);
 
 }  // namespace gufo::crypto

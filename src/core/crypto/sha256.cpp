@@ -63,6 +63,24 @@ std::string Sha256Hex(std::span<const std::uint8_t> bytes) {
   return hasher.FinishHex();
 }
 
+Sha256Digest Sha256(std::span<const std::uint8_t> bytes) {
+  Sha256Hasher hasher;
+  hasher.Update(bytes);
+  return hasher.Finish();
+}
+
+bool DigestsEqual(const Sha256Digest& left,
+                  const Sha256Digest& right) noexcept {
+  // Volatile accesses stop the compiler from turning the fold into a compare
+  // that returns at the first differing byte.
+  const volatile std::uint8_t* a = left.data();
+  const volatile std::uint8_t* b = right.data();
+  volatile std::uint8_t difference = 0;
+  for (std::size_t i = 0; i < left.size(); ++i)
+    difference = static_cast<std::uint8_t>(difference | (a[i] ^ b[i]));
+  return difference == 0;
+}
+
 std::string Sha256FileHex(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
   if (!input.is_open()) {
