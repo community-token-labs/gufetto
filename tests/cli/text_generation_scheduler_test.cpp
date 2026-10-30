@@ -2963,6 +2963,19 @@ void TestStopSequenceChunkBoundaries() {
   check({"┌終"}, "hi┌終later", "hi", "┌終");
   check({"STOP"}, "SSTOSTxST", "SSTOSTxST", "");
   check({"STOP"}, "STOP", "", "STOP");
+  // Independent family spellings: Qwen (also H3/Flash-Next) and DeepSeek.
+  // Explicit byte stops are not EOS IDs; marker pieces remain ordinary text.
+  for (const std::string marker :
+       {"<|im_end|>", "<|endoftext|>", "<｜end▁of▁sentence｜>"}) {
+    check({marker}, "Nerazim | > im " + marker + "tail", "Nerazim | > im ",
+          marker);
+    check({}, "literal " + marker + " remains",
+          "literal " + marker + " remains", "");
+    for (std::size_t end = 1; end < marker.size(); ++end) {
+      const auto partial = "Nerazim " + marker.substr(0, end);
+      check({marker}, partial, partial, "");
+    }
+  }
 }
 
 void TestStopSequencesPreserveExecutedState() {
