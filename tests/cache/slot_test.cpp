@@ -10,6 +10,7 @@
 #include <chrono>
 #include <future>
 #include <iostream>
+#include <semaphore>
 #include <thread>
 #include <vector>
 
@@ -131,6 +132,76 @@ void DiagnosticClaims() {
   assert(checkpoint->IsValid() && !observed->IsValid());
   assert(f.adapter.Invalidations() == invalidations);
   assert(f.ledger.Snapshot().total_bytes == bytes);
+}
+void DiagnosticMetadataContention() {
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    ResourceLedger ledger{kLimits};
+    FakeAdapter adapter;
+    FakeStream stream;
+    LeasedSlot slots(ledger, adapter, stream, SlotId{1});
+    std::binary_semaphore held(0), release(0), contended(0);
+    std::atomic_bool observed{false};
+    std::atomic<unsigned> ready_calls{};
+    // ready() executes under the slot metadata mutex. Refuse this helper's
+    // claim after releasing the barrier, so the real request can acquire it.
+    std::jthread blocker([&] {
+      assert(!slots.TryAcquireDiagnostic([&](const Slot&) {
+        held.release();
+        release.acquire();
+        return false;
+      }));
+    });
+    held.acquire();
+    auto request = std::async(std::launch::async, [&] {
+      return slots.TryAcquireDiagnostic(
+          [&](const Slot&) {
+            ++ready_calls;
+            return true;
+          },
+          {},
+          [&] {
+            if (!observed.exchange(true))
+              contended.release();
+            return mode == 1;
+          });
+    });
+    assert(contended.try_acquire_for(1s));  // A real failed try_lock occurred.
+    if (mode == 0) {
+      release.release();
+      assert(request.wait_for(2s) == std::future_status::ready);
+      auto lease = request.get();
+      assert(lease && ready_calls == 1);
+      assert(
+          lease->Discard([](const Slot&) { return true; },
+                         [&](Slot& s) {
+                           return adapter.Invalidate(s)
+                                      ? DiagnosticDiscardResult::kComplete
+                                      : DiagnosticDiscardResult::kQuarantined;
+                         }) == DiagnosticDiscardResult::kComplete);
+    } else {
+      // Cancellation/timeout must finish while the mutex is STILL held, with
+      // no ready/native admission callback and no mutation or quarantine.
+      assert(request.wait_for(2s) == std::future_status::ready);
+      if (mode == 1) {
+        assert(!request.get());
+      } else {
+        bool timeout = false;
+        try {
+          (void)request.get();
+        } catch (const std::runtime_error& error) {
+          timeout = std::string_view(error.what()) ==
+                    "diagnostic admission timed out waiting for slot metadata";
+        }
+        assert(timeout);
+      }
+      assert(ready_calls == 0 && adapter.Invalidations() == 0);
+      release.release();
+    }
+    blocker.join();
+    auto recovered =
+        slots.TryAcquireDiagnostic([](const Slot&) { return true; });
+    assert(recovered);  // Timeout/cancellation did not leak an exclusive claim.
+  }
 }
 void Paths() {
   // Prefill/decode share Append; rewind and speculative rollback share the
@@ -676,6 +747,7 @@ int main() {
                ResourceCategory::kBackingFree)] == 0);
   }
   DiagnosticClaims();
+  DiagnosticMetadataContention();
   Paths();
   Failures();
   EveryPreservationConversion();

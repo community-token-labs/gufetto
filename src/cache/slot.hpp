@@ -1,6 +1,7 @@
 #ifndef GUFO_CACHE_SLOT_HPP_
 #define GUFO_CACHE_SLOT_HPP_
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -187,8 +188,14 @@ public:
   [[nodiscard]] SlotLease Acquire(std::optional<BorrowedLocation> live = {},
                                   std::stop_token = {});
 
+  // Wait at most100ms for transient metadata-lock contention only. Once
+  // locked, actual busy/live/pending/unhealthy state still refuses immediately.
+  // No facade/native work starts while waiting; timeout throws a clear error.
   [[nodiscard]] std::optional<DiagnosticSlotLease> TryAcquireDiagnostic(
-      const std::function<bool(const Slot&)>& ready, std::stop_token = {});
+      const std::function<bool(const Slot&)>& ready, std::stop_token = {},
+      const std::function<bool()>& cancelled = {},
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
 
   // Snapshot only: another acquirer may win before Acquire. Busy slots return
   // false; successful acquisitions still enforce exclusive generation checks.

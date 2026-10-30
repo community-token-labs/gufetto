@@ -1475,17 +1475,40 @@ std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
   if (!impl_->resources->diagnostic_ready ||
       !impl_->resources->diagnostic_reset || (cancelled && cancelled()))
     return {};
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   std::unique_lock lock(impl_->mutex.native);
-  for (auto& entry : impl_->entries) {
+  for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
+    auto* entry = impl_->entries[index].get();
     if (!entry->Selectable() || entry->live || !entry->live_tokens.empty() ||
         entry->history || entry->branch || entry->durable)
       continue;
-    auto slot =
-        entry->slot->TryAcquireDiagnostic(impl_->resources->diagnostic_ready);
-    if (!slot)
+    // Claim the entry before the bounded slot-metadata wait. Keep callbacks
+    // and waiting outside the publication lock, just like native reset/fence.
+    auto& selected = *entry;
+    selected.busy = true;
+    lock.unlock();
+    bool admission_cancelled = false;
+    const auto is_cancelled = [&] {
+      admission_cancelled = admission_cancelled || (cancelled && cancelled());
+      return admission_cancelled;
+    };
+    auto slot = [&] {
+      try {
+        return selected.slot->TryAcquireDiagnostic(
+            impl_->resources->diagnostic_ready, {}, is_cancelled, deadline);
+      } catch (...) {
+        impl_->SettleDiagnostic(selected, false);
+        throw;
+      }
+    }();
+    if (!slot) {
+      impl_->SettleDiagnostic(selected, false);
+      if (admission_cancelled)
+        return {};
+      lock.lock();
       continue;
-    entry->busy = true;
-    lock.unlock();  // Native reset/fence never holds publication/queue locks.
+    }
     std::unique_ptr<TextRunnerState> state;
     std::unique_ptr<DiagnosticRequest> result;
     try {
@@ -1493,7 +1516,7 @@ std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
                                                 slot->Execution());
       if (state) {
         result = std::make_unique<DiagnosticRequest>(
-            *impl_, *entry, std::move(*slot), std::move(state));
+            *impl_, selected, std::move(*slot), std::move(state));
         if (!result->Initialize())
           return {};
         if (cancelled && cancelled()) {
@@ -1512,7 +1535,7 @@ std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
         [](cache::Slot&) { return cache::DiagnosticDiscardResult::kComplete; },
         [&] { state.reset(); });
     impl_->SettleDiagnostic(
-        *entry, settled != cache::DiagnosticDiscardResult::kComplete,
+        selected, settled != cache::DiagnosticDiscardResult::kComplete,
         std::move(state));
     return {};
   }

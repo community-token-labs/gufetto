@@ -880,23 +880,42 @@ SlotLease LeasedSlot::Acquire(std::optional<BorrowedLocation> live,
 }
 
 std::optional<DiagnosticSlotLease> LeasedSlot::TryAcquireDiagnostic(
-    const std::function<bool(const Slot&)>& ready, std::stop_token stop) try {
-  std::unique_lock lock(state_->mutex, std::try_to_lock);
-  if (!lock.owns_lock() || !ready || stop.stop_requested() || state_->leased ||
-      state_->live || state_->spilling || state_->idle_failed ||
-      !state_->slot || !state_->slot->IsValid())
+    const std::function<bool(const Slot&)>& ready, std::stop_token stop,
+    const std::function<bool()>& cancelled,
+    std::chrono::steady_clock::time_point deadline) {
+  if (!ready || stop.stop_requested())
     return {};
-  for (const auto& entry : state_->rows)
-    if (!entry.rows.expired())
-      return {};  // Even materialized/observed/pinned registrations refuse.
-  if (!ready(*state_->slot) || !state_->DiagnosticEmpty() ||
-      stop.stop_requested())
-    return {};
-  state_->leased = true;
-  state_->stop = stop;
-  return DiagnosticSlotLease(state_);
-} catch (...) {
-  return {};  // No state changed before the nonthrowing exclusive claim.
+  // The idle worker briefly takes this mutex even for an empty slot. Do not
+  // turn its startup/wakeup predicate into a spurious unhealthy-slot refusal.
+  std::unique_lock lock(state_->mutex, std::defer_lock);
+  while (!lock.try_lock()) {
+    if (stop.stop_requested() || (cancelled && cancelled()))
+      return {};
+    if (detail::LeaseState::Clock::now() >= deadline)
+      throw std::runtime_error(
+          "diagnostic admission timed out waiting for slot metadata");
+    std::this_thread::yield();
+  }
+  if (detail::LeaseState::Clock::now() >= deadline)
+    throw std::runtime_error(
+        "diagnostic admission timed out waiting for slot metadata");
+  try {
+    if (stop.stop_requested() || (cancelled && cancelled()) || state_->leased ||
+        state_->live || state_->spilling || state_->idle_failed ||
+        !state_->slot || !state_->slot->IsValid())
+      return {};
+    for (const auto& entry : state_->rows)
+      if (!entry.rows.expired())
+        return {};  // Materialized/observed/pinned registrations still refuse.
+    if (!ready(*state_->slot) || !state_->DiagnosticEmpty() ||
+        stop.stop_requested() || (cancelled && cancelled()))
+      return {};
+    state_->leased = true;
+    state_->stop = stop;
+    return DiagnosticSlotLease(state_);
+  } catch (...) {
+    return {};  // No state changed before the nonthrowing exclusive claim.
+  }
 }
 Slot& DiagnosticSlotLease::Execution() const {
   if (!state_)

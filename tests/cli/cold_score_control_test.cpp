@@ -5,7 +5,7 @@
 namespace {
 struct ColdControl {
   bool pending{}, drain_ok{true}, nonfinite{}, refuse_begin{}, keep_pending{};
-  std::size_t drains{}, destroyed{};
+  std::size_t drains{}, destroyed{}, bindings{};
 };
 struct ColdState final : ColdScoreState {
   FakeAdapter& adapter;
@@ -67,6 +67,7 @@ public:
   std::shared_ptr<ColdControl> control = std::make_shared<ColdControl>();
   std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& a, cache::Slot& s) const override {
+    ++control->bindings;
     return std::make_unique<ColdState>(dynamic_cast<FakeAdapter&>(a), s,
                                        control);
   }
@@ -160,6 +161,15 @@ int main(int argc, char** argv) {
     auto recovered = ScoreColdOnWorker(pool, input, 8);
   }
   const auto drains = runner->control->drains;
+  // Not every pre-bind refusal is transient: pending native work must remain
+  // untouched, with no facade bound and no cleanup/retry hiding the refusal.
+  const auto pending_bindings = runner->control->bindings;
+  runner->control->pending = true;
+  Reject([&] { (void)ScoreColdOnWorker(pool, input, 8); });
+  assert(runner->control->pending &&
+         runner->control->bindings == pending_bindings &&
+         runner->control->drains == drains);
+  runner->control->pending = false;
   Reject([&] { (void)ScoreColdOnWorker(pool, input, 8, [] { return true; }); });
   assert(runner->control->drains ==
          drains);  // Never started, nothing borrowed.
@@ -170,8 +180,10 @@ int main(int argc, char** argv) {
   input[0] = 0;
   // L1: pre-ownership native refusal must not drain or poison the slot/gate.
   runner->control->refuse_begin = true;
+  const auto refused_bindings = runner->control->bindings;
   Reject([&] { (void)ScoreColdOnWorker(pool, input, 8); });
-  assert(runner->control->drains == drains && pool->usable_capacity() == 1);
+  assert(runner->control->drains == drains && pool->usable_capacity() == 1 &&
+         runner->control->bindings == refused_bindings + 1);
   runner->control->refuse_begin = false;
   {
     auto recovered = ScoreColdOnWorker(pool, input, 8);
