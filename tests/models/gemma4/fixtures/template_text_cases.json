@@ -1,0 +1,362 @@
+{
+ "source": "Cases chat..special_text: gufo-org/gufo PR #426 tests/models/gemma4/fixtures/template_cases.json at 25ba634f6cc4e172829b41dddc82fa2684c90399 (text-only cases). Others: written for G4-04a.",
+ "cases": {
+  "chat": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello there!"
+    }
+   ]
+  },
+  "system_chat": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "  You are terse.\n"
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello."
+    },
+    {
+     "role": "user",
+     "content": " How are you? "
+    }
+   ]
+  },
+  "thinking_on": {
+   "enable_thinking": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Think first."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ]
+  },
+  "thinking_only_system": {
+   "enable_thinking": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plan a trip."
+    }
+   ]
+  },
+  "reasoning_history": {
+   "enable_thinking": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "First?"
+    },
+    {
+     "role": "assistant",
+     "content": "One.",
+     "reasoning_content": "old reasoning"
+    },
+    {
+     "role": "user",
+     "content": "Second?"
+    },
+    {
+     "role": "assistant",
+     "content": "Two.",
+     "reasoning_content": "new reasoning"
+    }
+   ]
+  },
+  "strip_thinking": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q"
+    },
+    {
+     "role": "assistant",
+     "content": "<|channel>thought\nhidden<channel|>  Visible answer. "
+    },
+    {
+     "role": "user",
+     "content": "Next"
+    }
+   ]
+  },
+  "consecutive_assistant": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Tell me a story."
+    },
+    {
+     "role": "assistant",
+     "content": "Once upon a time"
+    },
+    {
+     "role": "assistant",
+     "content": "there was a fox."
+    },
+    {
+     "role": "user",
+     "content": "More"
+    }
+   ]
+  },
+  "developer_and_late_system": {
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Developer rules."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "system",
+     "content": "Late system note."
+    },
+    {
+     "role": "user",
+     "content": "Hi again"
+    }
+   ]
+  },
+  "unicode_whitespace": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "　  Rules "
+    },
+    {
+     "role": "user",
+     "content": "\t Ciao, come stai? ​\n"
+    }
+   ]
+  },
+  "no_generation_prompt": {
+   "add_generation_prompt": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    }
+   ]
+  },
+  "special_text": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Literal <|turn> and <|\"|> markers."
+    }
+   ]
+  },
+  "empty": {
+   "messages": []
+  },
+  "empty_thinking": {
+   "messages": [],
+   "enable_thinking": true
+  },
+  "system_only": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "  Be brief. \n"
+    }
+   ]
+  },
+  "developer_thinking": {
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Use metric units."
+    },
+    {
+     "role": "user",
+     "content": "How far is it?"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "consecutive_users": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "first"
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    },
+    {
+     "role": "user",
+     "content": "context: cwd=/tmp"
+    },
+    {
+     "role": "user",
+     "content": "now list files"
+    }
+   ]
+  },
+  "thought_before_last_user": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "hidden reasoning"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "thought_after_last_user": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "first thought"
+    },
+    {
+     "role": "assistant",
+     "content": "a2",
+     "reasoning_content": "second thought"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "preserve_without_tools": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "old thought"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "enable_thinking": true,
+   "preserve_thinking": true
+  },
+  "assistant_last_thinking_off": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "partial",
+     "reasoning_content": "t"
+    }
+   ]
+  },
+  "strip_channels": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "<|channel>thought\nx<channel|>Answer <|channel>a<channel|>part two <|channel>unterminated"
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ]
+  },
+  "stray_channel_end": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "before<channel|>after"
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ]
+  },
+  "unicode_trim": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "　 sys "
+    },
+    {
+     "role": "user",
+     "content": " hello"
+    },
+    {
+     "role": "assistant",
+     "content": " answer "
+    }
+   ]
+  },
+  "empty_contents": {
+   "messages": [
+    {
+     "role": "system",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": ""
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": ""
+    }
+   ]
+  },
+  "no_prompt_thinking": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "enable_thinking": true,
+   "add_generation_prompt": false
+  }
+ }
+}

@@ -1,0 +1,115 @@
+{
+ "schema": "gufo.gemma4-template-goldens.v1",
+ "generator": "tools/gemma4/template_goldens.py",
+ "renderer": "jinja2 3.1.6 (markupsafe 3.0.3), ImmutableSandboxedEnvironment, trim_blocks, lstrip_blocks, loopcontrols; python 3.13.5",
+ "template": {
+  "source": "tokenizer.chat_template",
+  "sha256": "845f1ee48e39fc942fe190da9df6a1c5db229e17a96ea08966ad1c9274e73d1b",
+  "repo": "unsloth/gemma-4-26B-A4B-it-GGUF",
+  "revision": "c099eb48e663fd284577b04978a94ffccb261841",
+  "file": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "file_sha256": "ef728c8e0c337fd1067b947af006e38a9ef2419e56feced4fd29b4bf0636e30c"
+ },
+ "cases": {
+  "chat": {
+   "text": "<bos><|turn>user\nHello there!<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "d98272d463b9deb54b98dea17082a26fce167995a0b2d18c07e061a58ca06423"
+  },
+  "system_chat": {
+   "text": "<bos><|turn>system\nYou are terse.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHello.<turn|>\n<|turn>user\nHow are you?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "d50975ea7537d34fc0c70c5f85dd9d1873fb95550b4368d6412417fad8686152"
+  },
+  "thinking_on": {
+   "text": "<bos><|turn>system\n<|think|>\nThink first.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n",
+   "sha256": "6f43ed48b3959073c386893473a98a98e78f43f647e85d7cb1903dbce113c426"
+  },
+  "thinking_only_system": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nPlan a trip.<turn|>\n<|turn>model\n",
+   "sha256": "f5e708b6d9c0bd4d97955aa2f44c7b0c88df23d342fb0f9e28b80712d985ea9b"
+  },
+  "reasoning_history": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nFirst?<turn|>\n<|turn>model\nOne.<turn|>\n<|turn>user\nSecond?<turn|>\n<|turn>model\n<|channel>thought\nnew reasoning\n<channel|>Two.<turn|>\n<|turn>model\n",
+   "sha256": "cc3b27891d26b97ecc165191f658da261159cabc0e1ba7e19bca1bb14c8406f1"
+  },
+  "strip_thinking": {
+   "text": "<bos><|turn>user\nQ<turn|>\n<|turn>model\nVisible answer.<turn|>\n<|turn>user\nNext<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "f116740df392c945de60849f8bf4cdc11767385ea379d0672259ec58b0768bb5"
+  },
+  "consecutive_assistant": {
+   "text": "<bos><|turn>user\nTell me a story.<turn|>\n<|turn>model\nOnce upon a timethere was a fox.<turn|>\n<|turn>user\nMore<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "4f3059fa147c3e52462bf311864d446569be222c93f481482f31c64840285793"
+  },
+  "developer_and_late_system": {
+   "text": "<bos><|turn>system\nDeveloper rules.<turn|>\n<|turn>user\nHi<turn|>\n<|turn>system\nLate system note.<turn|>\n<|turn>user\nHi again<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "039bf2016ceafbb9de50aec940e7aecb53af2b7338bb36d5332007072fafe897"
+  },
+  "unicode_whitespace": {
+   "text": "<bos><|turn>system\nRules<turn|>\n<|turn>user\nCiao, come stai? ​<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "fe979387b399fa08b76eeab62cb432c7e7be56b65b803189750f4c9465c1a3eb"
+  },
+  "no_generation_prompt": {
+   "text": "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n",
+   "sha256": "0232d7f0e34a503d45760912191c22f42a6a60fcdbb1cba2a9a5e3d321f4efe3"
+  },
+  "special_text": {
+   "text": "<bos><|turn>user\nLiteral <|turn> and <|\"|> markers.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "7d808a58c7d91f3e869e0816d85f7ca040df9d31d9c70e8f518f92116c8b2f61"
+  },
+  "empty": {
+   "text": "<bos><|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "f84701c8f1af96118cccf935fab8f1df3bf139ebd06b7c2937cb1af957b2e9d4"
+  },
+  "empty_thinking": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>model\n",
+   "sha256": "b62d4bfd168dc7df3667e74420c3298de1bce815e43a6983fb609164f42b0861"
+  },
+  "system_only": {
+   "text": "<bos><|turn>system\nBe brief.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "e3d4da4a7381faa911bd6db2565780aee511973cae2dbe397a63280116ca583d"
+  },
+  "developer_thinking": {
+   "text": "<bos><|turn>system\n<|think|>\nUse metric units.<turn|>\n<|turn>user\nHow far is it?<turn|>\n<|turn>model\n",
+   "sha256": "baeae83bc69bea376a0dba8f94a9879f436ffa2ade901b2c22de5f44eb0a2c96"
+  },
+  "consecutive_users": {
+   "text": "<bos><|turn>user\nfirst<turn|>\n<|turn>model\nok<turn|>\n<|turn>user\ncontext: cwd=/tmp<turn|>\n<|turn>user\nnow list files<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "00bc1c934cee0c4d01c2a5098641584b044609b7c985dc3e89cd93e391bfbf1e"
+  },
+  "thought_before_last_user": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nq1<turn|>\n<|turn>model\na1<turn|>\n<|turn>user\nq2<turn|>\n<|turn>model\n",
+   "sha256": "18cb3ef82aa4d469f66882af3cf46ea66606287c03573a4a91df3cdb330812b3"
+  },
+  "thought_after_last_user": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nq1<turn|>\n<|turn>model\n<|channel>thought\nfirst thought\n<channel|>a1<|channel>thought\nsecond thought\n<channel|>a2<turn|>\n<|turn>model\n",
+   "sha256": "373b47b7982ddbf5b2a8ad89450cd7999ae472b6a4a168e754c58ce4cf3d4380"
+  },
+  "preserve_without_tools": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nq1<turn|>\n<|turn>model\na1<turn|>\n<|turn>user\nq2<turn|>\n<|turn>model\n",
+   "sha256": "18cb3ef82aa4d469f66882af3cf46ea66606287c03573a4a91df3cdb330812b3"
+  },
+  "assistant_last_thinking_off": {
+   "text": "<bos><|turn>user\nq<turn|>\n<|turn>model\n<|channel>thought\nt\n<channel|>partial<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "af7c705d16542a3c31a10bdffecf62654ea28c80f0c35008dcece31a63db593a"
+  },
+  "strip_channels": {
+   "text": "<bos><|turn>user\nq<turn|>\n<|turn>model\nAnswer part two<turn|>\n<|turn>user\nnext<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "38418c2410e0c4cdfa17386e1e4e2e7ef6cd98030da2b73e4e56445b95269278"
+  },
+  "stray_channel_end": {
+   "text": "<bos><|turn>user\nq<turn|>\n<|turn>model\nbeforeafter<turn|>\n<|turn>user\nnext<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "c28f41f7fe21e547597200ec780c7458e29ddf085947e3a9541f998abe569f92"
+  },
+  "unicode_trim": {
+   "text": "<bos><|turn>system\nsys<turn|>\n<|turn>user\nhello<turn|>\n<|turn>model\nanswer<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "5a47cb58e722b5f058e40977e8d0455f24aaa17e6fd29f2bd28c86d0d8898a3e"
+  },
+  "empty_contents": {
+   "text": "<bos><|turn>system\n<turn|>\n<|turn>user\n<turn|>\n<|turn>model\n<turn|>\n<|turn>user\n<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "sha256": "228e48efd872e5364b39eb78c90fa47b80b5699d43d01b4f9f1b829febdb673b"
+  },
+  "no_prompt_thinking": {
+   "text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nhi<turn|>\n",
+   "sha256": "db1cba745d71972e927ef4daa340212d7517cdda95e4db04472000ea2987a8fc"
+  }
+ }
+}
