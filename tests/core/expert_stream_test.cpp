@@ -93,6 +93,7 @@ void TestPinnedSlotsRefuseThenRetry() {
   Expect(dup.deferred.size() == 1 &&
              dup.deferred[0].reason == DeferReason::kInFlight,
          "in-flight fill is not read twice");
+  Expect(pool.stats().deferred == 2, "both deferrals counted");
   Expect(pool.Complete(c.id) == PlanError::kNone, "empty plan completes");
   Expect(pool.Complete(dup.id) == PlanError::kNone, "deferred plan completes");
 

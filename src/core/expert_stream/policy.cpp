@@ -188,6 +188,7 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     if (filling_.contains(key)) {
       if (!optional) {
         plan->deferred.push_back({expert, DeferReason::kInFlight});
+        ++stats_.deferred;
       }
       continue;
     }
