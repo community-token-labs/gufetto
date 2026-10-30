@@ -1,5 +1,5 @@
-# Gemma 4 host contracts. The artifact check reads the GGUF headers named by
-# GUFO_GEMMA4_MODEL and GUFO_GEMMA4_MTP_MODEL and skips (77) without them.
+# Gemma 4 host contracts. The artifact checks read the GGUF headers named by
+# GUFO_GEMMA4_MODEL (and GUFO_GEMMA4_MTP_MODEL) and skip (77) without them.
 
 function(add_gemma4_test name labels)
   set(target gemma4_${name}_test)
@@ -12,3 +12,7 @@ endfunction()
 
 add_gemma4_test(config "cpu;models;config")
 add_gemma4_test(artifact_config "cpu;models;config;external-model")
+add_gemma4_test(tokenizer_contract "cpu;models;tokenization")
+add_gemma4_test(tokenizer_goldens "cpu;models;tokenization;external-model")
+target_compile_definitions(gemma4_tokenizer_goldens_test PRIVATE
+  GUFO_GEMMA4_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")

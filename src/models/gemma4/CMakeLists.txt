@@ -1,8 +1,9 @@
 # Gemma 4 text models (gemma4 targets and the gemma4-assistant MTP drafter).
-# Host-only for now: the GGUF config and weight-binding contracts that later
-# topics consume.
+# Host-only for now: the GGUF config, weight-binding and tokenizer contracts
+# that later topics consume.
 add_library(gufo_gemma4 STATIC
   config.cpp
+  tokenizer.cpp
   weights.cpp)
 
 target_include_directories(gufo_gemma4 PUBLIC ${PROJECT_SOURCE_DIR})

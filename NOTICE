@@ -18,16 +18,20 @@ Adapted code includes:
 - hipCUB: Duane Merrill, NVIDIA CORPORATION and AMD (BSD-3-Clause).
 - Flash-Next GDN row reuse and SSM stride optimization: adapted from
   mikealanni/gufo f450218743bc, Copyright (c) 2026 gufo contributors (MIT).
-- Gemma 4 config and weight-binding contracts
-  (src/models/gemma4/{config,weights}.{hpp,cpp}) and their tests
-  (tests/models/gemma4/{config_test.cpp,gguf_builder.hpp,check.hpp}): adapted
+- Gemma 4 config, weight-binding and tokenizer contracts
+  (src/models/gemma4/{config,weights,tokenizer}.{hpp,cpp}) and their tests
+  (tests/models/gemma4/{config_test.cpp,tokenizer_contract_test.cpp,
+  gguf_builder.hpp,check.hpp}): adapted
   from gufo-org/gufo PR #426 (franzmoca/gufo feat/gemma 25ba634f6cc4),
   Copyright (c) 2026 gufo contributors (MIT). config.cpp rejects scalar zero
   per-layer values (the donor divided by a zero KV head count) and drafter
   expert metadata. weights.cpp accepts only the 26B-A4B artifact's formats
   per role, rejects unmapped tensors and binds from headers alone, reading
-  scalar payloads in ReadHostValues. config_test.cpp adds drafter, zero-value,
-  format and unmapped-tensor cases.
+  scalar payloads in ReadHostValues. tokenizer.cpp lets the last duplicate
+  token text win and rejects overlong or out-of-range UTF-8, as llama.cpp
+  does (the donor kept the first duplicate and decoded those forms).
+  config_test.cpp and tokenizer_contract_test.cpp add drafter, zero-value,
+  format, unmapped-tensor, duplicate-token and invalid-UTF-8 cases.
 
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp
