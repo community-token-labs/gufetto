@@ -34,6 +34,13 @@ class QwenTokenizer;
 }
 
 namespace gufo::server {
+#if defined(GUFO_ADMISSION_TESTING)
+struct ComponentCacheResources;
+namespace testing {
+inline thread_local std::function<void(ComponentCacheResources&)>
+    admission_resources;
+}
+#endif
 
 enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
@@ -70,7 +77,7 @@ public:
   using TextGenerationBackend::start_chat;
 
   // Admission-only objects expose startup observations, never generation.
-  // They own the real pool but are not ready() serving backends.
+  // They stage the real pool but never publish generation state.
   enum class StartupMode { kServe, kAdmissionOnly };
   explicit InferenceBackend(StartupMode mode = StartupMode::kServe);
   [[nodiscard]] bool measured_capacity_refused() const {
@@ -222,6 +229,8 @@ private:
   std::unique_ptr<Impl> impl_;
   StartupMode startup_mode_;
   bool capacity_refused_ = false;
+  std::uint32_t admission_context_ = 0;
+  bool admission_vision_ = false;
 };
 
 }  // namespace gufo::server

@@ -1070,8 +1070,13 @@ if (BUILD_TESTING)
       src/cli/serve/inference_backend.cpp src/cli/serve/text_model_runner.cpp
       src/cli/serve/text_generation_scheduler.cpp src/cli/serve/component_text_cache.cpp
       src/cli/serve/continuation_cache.cpp src/cli/serve/continuation_disk_store.cpp)
-    target_link_libraries(admission_native_test PRIVATE gufo_cache_fake gufo_cache_hip
-      gufo_diagnostics gufo_llm_cli gufo_http gufo_deepseek_v4_flash)
+    target_compile_definitions(admission_native_test PRIVATE GUFO_ADMISSION_TESTING=1)
+    target_link_libraries(admission_native_test PRIVATE gufo_cache gufo_cache_hip
+      gufo_core gufo_logging gufo_qwen38_flash_next gufo_llm_cli gufo_http gufo_deepseek_v4_flash)
+    add_test(NAME admission_native COMMAND admission_native_test)
+    set_tests_properties(admission_native PROPERTIES
+      LABELS "gpu;hip;gfx1151;diagnostics;allocation;external-model;slow"
+      SKIP_RETURN_CODE 77 TIMEOUT 600)
   endif()
 
   add_executable(model_plan_test tests/diagnostics/model_plan_test.cpp)

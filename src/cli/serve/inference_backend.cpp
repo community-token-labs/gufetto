@@ -2841,6 +2841,10 @@ public:
     detail::InstallQfnPackedKvIngressValidation(*resources, model_->config(),
                                                 use_mtp_, max_context_,
                                                 model_->CacheType());
+#if defined(GUFO_ADMISSION_TESTING)
+    if (testing::admission_resources)
+      testing::admission_resources(*resources);
+#endif
     return resources;
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
@@ -3518,6 +3522,8 @@ bool InferenceBackend::load(
     std::uint32_t vision_max_tokens_per_slot,
     std::optional<std::uint32_t> vision_pool_tokens) {
   capacity_refused_ = false;
+  admission_context_ = 0;
+  admission_vision_ = false;
   if (vision_pool_tokens == 0) {
     SetError(error, "vision-pool-tokens must be positive");
     return false;
@@ -4053,6 +4059,8 @@ bool InferenceBackend::load(
     TextDiskCacheConfig disk_cache_config,
     TextRunnerRamCacheOptions ram_cache_config) {
   capacity_refused_ = false;
+  admission_context_ = 0;
+  admission_vision_ = false;
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -4139,9 +4147,13 @@ bool InferenceBackend::load(
     runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
-    if (startup_mode_ == StartupMode::kServe)
-      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-          runner_pool, prefill_policy, scheduler_policy);
+    if (startup_mode_ == StartupMode::kAdmissionOnly) {
+      admission_context_ = max_context;
+      admission_vision_ = new_state->supports_images;
+      return true;  // Destroy the pool; never publish a null-scheduler State.
+    }
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -4202,6 +4214,8 @@ bool InferenceBackend::device_lost() const {
 }
 
 bool InferenceBackend::supports_images() const {
+  if (startup_mode_ == StartupMode::kAdmissionOnly)
+    return admission_vision_;
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr && state->supports_images;
@@ -4211,6 +4225,8 @@ bool InferenceBackend::supports_images() const {
 }
 
 std::uint32_t InferenceBackend::max_context() const {
+  if (startup_mode_ == StartupMode::kAdmissionOnly)
+    return admission_context_;
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
   return state != nullptr ? state->max_context : 0;

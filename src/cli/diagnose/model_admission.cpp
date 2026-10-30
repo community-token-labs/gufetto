@@ -6,8 +6,8 @@
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/kv_cache_options.hpp"
 #include "src/cli/serve/inference_backend.hpp"
-#include "src/core/crypto/sha256.hpp"
 #include "src/core/diagnostics/model_plan.h"
+#include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -80,6 +80,11 @@ int RunModelAdmission(std::span<const char* const> args) {
           reader
               ->GetMetadataUint32(std::string(architecture) + ".context_length")
               .value_or(0);
+    if (!context) {
+      std::cout << "UNPROVEN: insufficient admission evidence: no native "
+                   "context; specify --context\n";
+      return 0;
+    }
     if (context < 2 || (yarn && architecture != "qwen4exp"))
       throw std::invalid_argument(
           "invalid native/requested context or --enable-yarn family");
@@ -95,13 +100,13 @@ int RunModelAdmission(std::span<const char* const> args) {
 #else
     (void)no_gpu;
 #endif
-    const auto identity = crypto::Sha256FileHex(model);
+    const auto identity = core::GgufIdentityHex(*reader);
     if (!gpu || architecture != "qwen4exp") {
       std::cout << "UNPROVEN: native measured admission not run (no GPU, "
                    "disabled, or unsupported provider)\n"
                 << diagnostics::DescribeModelLowerBound(model, context)
                 << "\ncontext=" << context << " sessions=" << sessions
-                << " requested_file_sha256=" << identity << "\n";
+                << " gguf_identity_sha256=" << identity << "\n";
       return 0;
     }
     bool accepted = false, refused = false;
@@ -136,13 +141,17 @@ int RunModelAdmission(std::span<const char* const> args) {
         throw std::runtime_error("admission quiescence failed");
 #endif
     }  // Pool, adapters, model bindings and weights die BEFORE reporting FIT.
+#if defined(ENGINE_ENABLE_HIP)
+    if (hipDeviceSynchronize() != hipSuccess || hipGetLastError() != hipSuccess)
+      throw std::runtime_error("admission teardown failed");
+#endif
     if (!accepted && !refused)
       throw std::runtime_error(error);
     std::cout << (accepted ? result : "DOES-NOT-FIT: " + error)
               << "\nrequested_kv_cache_type="
               << models::qwen38_flash_next::KvCacheTypeName(kv)
               << " speculative=" << (speculative == "mtp" ? "mtp" : "off")
-              << "\nrequested_file_sha256=" << identity
+              << "\ngguf_identity_sha256=" << identity
               << "\nMeasured startup only; not workload/quality qualification. "
                  "Resources released.\n";
     return accepted ? 0 : 1;
