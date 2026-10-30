@@ -10,6 +10,7 @@
 #include "src/models/qwen/cache_capabilities.hpp"
 #include "src/models/qwen38_flash_next/cache_capabilities.hpp"
 #include "src/models/qwen3_asr/cache_capabilities.hpp"
+#include "src/models/qwen3_reranker/cache_capabilities.hpp"
 #include "src/models/qwen3_tts/cache_capabilities.hpp"
 #include "src/models/qwen_image_21/cache_capabilities.hpp"
 
@@ -30,6 +31,7 @@ inline constexpr std::array kModelCapabilityRecords{
     Record{"qwen38_flash_next",
            gufo::models::qwen38_flash_next::kCacheCapabilities},
     Record{"qwen3_asr", gufo::models::qwen3_asr::kCacheCapabilities},
+    Record{"qwen3_reranker", gufo::models::qwen3_reranker::kCacheCapabilities},
     Record{"qwen3_tts", gufo::models::qwen3_tts::kCacheCapabilities},
     Record{"qwen_image_21", gufo::models::qwen_image_21::kCacheCapabilities},
 };

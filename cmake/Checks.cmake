@@ -22,7 +22,7 @@ set(gufo_pr_targets
   logit_sampler_test ggml_dequant_test
   quote_tracker_test
   openai_chat_test http_server_test http_server_signals_test trace_test
-  rerank_api_test
+  rerank_api_test qwen3_reranker_reference_test
   audio_websocket_test
   text_generation_scheduler_test
   perf_trace_test checkpoint_transfer_test

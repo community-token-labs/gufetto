@@ -185,6 +185,9 @@ add_subdirectory(src/models/qwen3_asr)
 # EmbeddingGemma 2 is a model-private BF16 text/image embedding runtime.
 add_subdirectory(src/models/embedding_gemma2)
 
+# Qwen3-Reranker: the dense Qwen3 yes/no relevance scorer behind /v1/rerank.
+add_subdirectory(src/models/qwen3_reranker)
+
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -588,6 +591,7 @@ if (BUILD_TESTING)
   gufo_qwen_image_21_register_tests()
 
   add_subdirectory(tests/models/embedding_gemma2)
+  add_subdirectory(tests/models/qwen3_reranker)
 
   add_test(NAME gufo_version COMMAND gufo --version)
   set_tests_properties(gufo_version PROPERTIES

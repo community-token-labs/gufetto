@@ -53,8 +53,8 @@ int main(int argc, char** argv) {
   }
   assert(complete);
 
-  for (const auto family : {"embedding_gemma2", "qwen3_asr", "qwen3_tts",
-                            "qwen_image_21", "minimax_h3"}) {
+  for (const auto family : {"embedding_gemma2", "qwen3_asr", "qwen3_reranker",
+                            "qwen3_tts", "qwen_image_21", "minimax_h3"}) {
     assert(!Find(family)->capabilities.continuation);
     assert(!Find(family)->capabilities.persistent_encoding);
   }
