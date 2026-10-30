@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare emitted IDs, never retokenized text. No automatic coherence PASS.
 
-Exit 0: exact fixed-length numeric match (human review still required);
+Exit 0: matching bounded generation and stop reason (human review still required);
 1: demonstrated non-near-tie first divergence; 2: invalid/blocked capability;
 3: unknown/incomplete or near-tie requiring human review. See token_parity.md.
 """
@@ -85,7 +85,7 @@ def native_live(url, config, prompts, count, top_k, timeout, engine):
     for prompt in prompts:
         payload = dict(SAMPLING, prompt=prompt["prompt_token_ids"], n_predict=count,
                        return_tokens=True, stream=False, cache_prompt=False,
-                       ignore_eos=True, n_probs=top_k, post_sampling_probs=False)
+                       n_probs=top_k, post_sampling_probs=False)
         request = Request(endpoint, data=json.dumps(payload).encode(),
                           headers={"Content-Type": "application/json"})
         # No retries, text-tokenization endpoints or endpoint fallback.
@@ -110,7 +110,13 @@ def native_live(url, config, prompts, count, top_k, timeout, engine):
             sampling=SAMPLING, max_tokens=count,
             top_logprobs=[entry.get("top_logprobs", []) for entry in probabilities],
             request=payload, generation_settings=result.get("generation_settings"),
-            response=result)
+            response=result,
+            stop_type=result.get("stop_type"),
+            stopped_eos=result.get("stopped_eos"),
+            stopped_limit=result.get("stopped_limit"),
+            stopped_length=result.get("stopped_length"),
+            stopped_word=result.get("stopped_word"),
+            stopping_word=result.get("stopping_word"))
     return config, rows
 
 
@@ -161,16 +167,54 @@ def near_tie(top, emitted, other, margin):
             "top1_top2_margin": gap, "other_winner_margin": cross_gap}
 
 
+def normalize_stop(row, engine):
+    normalized = dict(row)
+    reasons = set()
+    if row.get("stop_type") in ("eos", "limit", "word"):
+        reasons.add(row["stop_type"])
+    for key, reason in (("stopped_eos", "eos"), ("stopped_limit", "limit"),
+                        ("stopped_length", "limit"), ("stopped_word", "word")):
+        value = row.get(key)
+        if value is not None and type(value) is not bool:
+            raise ValueError(f"{key} must be boolean")
+        if value:
+            reasons.add(reason)
+    if len(reasons) > 1:
+        raise ValueError("conflicting stop reasons")
+    reason = next(iter(reasons), "other")
+    generated = list(row["generated_token_ids"])
+    terminal = row.get("terminal_eog_id")
+    if engine == "llama" and reason == "eos":
+        if not generated:
+            raise ValueError("llama EOS response is missing its terminal EOG token")
+        terminal = generated.pop()  # Pinned native llama includes EOG; Gufo excludes it.
+    if terminal is not None:
+        if reason != "eos":
+            raise ValueError("terminal EOG ID requires an EOS stop")
+        ids([terminal], "terminal EOG")
+    normalized.update(comparison_token_ids=generated, terminal_eog_id=terminal,
+                      stop_reason=reason, stop_reason_known=bool(reasons))
+    return normalized
+
+
 def compare_prompt(prompt, left, right, count, horizon, margin):
-    a, b = left["generated_token_ids"], right["generated_token_ids"]
+    left, right = normalize_stop(left, "gufo"), normalize_stop(right, "llama")
+    a, b = left["comparison_token_ids"], right["comparison_token_ids"]
     common = min(len(a), len(b))
     first = next((i for i in range(common) if a[i] != b[i]),
                  common if len(a) != len(b) else None)
-    matches = sum(i < common and a[i] == b[i] for i in range(horizon))
+    stop_mismatch = left["stop_reason"] != right["stop_reason"]
+    if first is None and stop_mismatch:
+        first = common
+    denominator = min(horizon, common)
+    matches = sum(a[i] == b[i] for i in range(denominator))
     row = {"id": prompt["id"], "prompt_token_ids": prompt["prompt_token_ids"],
            "lengths": {"gufo": len(a), "llama": len(b)},
            "first_divergence": first, "horizon": horizon,
-           "agreement_count": matches, "agreement_rate": matches / horizon,
+           "agreement_count": matches, "agreement_denominator": denominator,
+           "agreement_rate": matches / denominator if denominator else None,
+           "stop_reasons": {"gufo": left["stop_reason"], "llama": right["stop_reason"]},
+           "stop_reason_mismatch": stop_mismatch,
            "agreement_is_same_index_not_same_history_after_divergence": True,
            "gufo": left, "llama": right, "human_coherence": "NOT_REVIEWED",
            "near_tie": "NOT_APPLICABLE", "status": "NUMERIC_MATCH_REVIEW_REQUIRED"}
@@ -180,22 +224,30 @@ def compare_prompt(prompt, left, right, count, horizon, margin):
                           "llama_ids": b[max(0, first - 4):first + 5]}
         top_a, top_b = distribution(left, first), distribution(right, first)
         row["first_divergence_top_k"] = {"gufo": top_a, "llama": top_b}
-        if first < common:
-            diagnostics = {"gufo": near_tie(top_a, a[first], b[first], margin),
-                           "llama": near_tie(top_b, b[first], a[first], margin)}
+        chosen_a = a[first] if first < len(a) else left.get("terminal_eog_id")
+        chosen_b = b[first] if first < len(b) else right.get("terminal_eog_id")
+        row["divergent_decisions"] = {
+            "gufo": {"id": chosen_a, "kind": "token" if first < len(a) else left["stop_reason"]},
+            "llama": {"id": chosen_b, "kind": "token" if first < len(b) else right["stop_reason"]}}
+        if chosen_a is not None and chosen_b is not None:
+            diagnostics = {"gufo": near_tie(top_a, chosen_a, chosen_b, margin),
+                           "llama": near_tie(top_b, chosen_b, chosen_a, margin)}
             states = {item["status"] for item in diagnostics.values()}
             tie = "NO" if "NO" in states else "YES" if states == {"YES"} else "UNKNOWN"
             row.update(near_tie=tie, near_tie_diagnostics=diagnostics,
                        status={"NO": "NON_NEAR_TIE", "YES": "NEAR_TIE_REVIEW_REQUIRED",
                                "UNKNOWN": "UNKNOWN"}[tie])
         else:
-            row.update(near_tie="UNKNOWN", status="INCOMPLETE")
-    if len(a) != count or len(b) != count:
-        row["fixed_count_complete"] = False
-        if row["status"] != "NON_NEAR_TIE":
-            row["status"] = "INCOMPLETE"
-    else:
-        row["fixed_count_complete"] = True
+            row.update(near_tie="UNKNOWN", status="UNKNOWN")
+    complete = all(item["stop_reason_known"] and
+                   len(item["generated_token_ids"]) <= count and
+                   (item["stop_reason"] != "limit" or len(item["comparison_token_ids"]) == count)
+                   for item in (left, right))
+    row["bounded_generation_complete"] = complete
+    if not left["stop_reason_known"] or not right["stop_reason_known"]:
+        row["status"] = "UNKNOWN"
+    elif not complete and row["status"] != "NON_NEAR_TIE":
+        row["status"] = "UNKNOWN"
     return row
 
 
@@ -232,36 +284,34 @@ def main(argv=None):
         for prompt in prompts:
             ids(prompt["prompt_token_ids"], "prompt", True)
         report["prompts_sha256"] = sha(prompts)
-        if args.gufo_url:
-            if not args.gufo_config:
-                raise ValueError("--gufo-config is required with --gufo-url")
-            gufo = gufo_live(args.gufo_url, read_json(args.gufo_config), prompts,
-                             args.tokens, args.top_k, args.timeout)
-        else:
-            gufo = load_recordings(args.gufo_recorded, prompts, args.tokens, "gufo")
-        if args.llama_url:
-            if not args.llama_config:
-                raise ValueError("--llama-config is required with --llama-url")
-            llama_config = read_json(args.llama_config)
-            validate_config(llama_config, "llama")
-            for key in ("model_sha256", "tokenizer_sha256"):
-                if gufo[0][key] != llama_config[key]:
-                    raise ValueError(f"mismatched {key}; refusing live request")
-            llama = llama_live(args.llama_url, llama_config, prompts,
-                               args.tokens, args.top_k, args.timeout)
-        else:
-            llama = load_recordings(args.llama_recorded, prompts, args.tokens, "llama")
-        report["configs"] = {"gufo": gufo[0], "llama": llama[0]}
+        configs, outputs = {}, {}
+        report["configs"] = configs
+        for engine in ("gufo", "llama"):
+            url = getattr(args, engine + "_url")
+            if url:
+                path = getattr(args, engine + "_config")
+                if not path:
+                    raise ValueError(f"--{engine}-config is required with --{engine}-url")
+                configs[engine] = read_json(path)
+                validate_config(configs[engine], engine)
+            else:
+                configs[engine], outputs[engine] = load_recordings(
+                    getattr(args, engine + "_recorded"), prompts, args.tokens, engine)
         for key in ("model_sha256", "tokenizer_sha256"):
-            if gufo[0][key] != llama[0][key]:
-                raise ValueError(f"mismatched {key}; this is not a matched-weight/token-ID comparison")
-        report["requests"] = [compare_prompt(p, gufo[1][p["id"]], llama[1][p["id"]],
+            if configs["gufo"][key] != configs["llama"][key]:
+                raise ValueError(f"mismatched {key}; refusing unmatched-weight/token-ID comparison")
+        for engine, adapter in (("gufo", gufo_live), ("llama", llama_live)):
+            url = getattr(args, engine + "_url")
+            if url:
+                _, outputs[engine] = adapter(url, configs[engine], prompts,
+                                             args.tokens, args.top_k, args.timeout)
+        report["requests"] = [compare_prompt(p, outputs["gufo"][p["id"]], outputs["llama"][p["id"]],
                                              args.tokens, args.horizon, args.margin) for p in prompts]
         states = {row["status"] for row in report["requests"]}
         code = 1 if "NON_NEAR_TIE" in states else 0 if states == {"NUMERIC_MATCH_REVIEW_REQUIRED"} else 3
         report["status"] = {0: "NUMERIC_MATCH_REVIEW_REQUIRED", 1: "NON_NEAR_TIE",
                             3: "INCONCLUSIVE_OR_HUMAN_REVIEW_REQUIRED"}[code]
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except Exception as error:  # Never confuse a transport/input crash with numeric divergence.
         report.update(status="BLOCKED_OR_INVALID", error=str(error))
         code = 2
     print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False))

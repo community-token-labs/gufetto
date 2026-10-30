@@ -30,7 +30,7 @@ def row(tokens=None):
     return {"id": "tiny", "prompt_token_ids": [100, 101],
             "generated_token_ids": [10, 11, 12, 13] if tokens is None else tokens,
             "text": "Independent continuation text, not retokenized.",
-            "sampling": dict(PARITY.SAMPLING), "max_tokens": 4}
+            "sampling": dict(PARITY.SAMPLING), "max_tokens": 4, "stop_type": "limit"}
 
 
 def tops(first=10, second=20, gap=.01):
@@ -80,13 +80,52 @@ class TokenParityTest(unittest.TestCase):
         b["top_logprobs"] = tops(20, 10)
         self.assertEqual(self.compare(a, b)["near_tie"], "UNKNOWN")
 
-    def test_truncated_output_cannot_inflate_agreement(self):
+    def test_short_capture_reports_actual_denominator_not_fake_completion(self):
         result = self.compare(row([10]), row([10]))
-        self.assertEqual(result["agreement_rate"], .25)
-        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertEqual(result["agreement_rate"], 1)
+        self.assertEqual(result["agreement_denominator"], 1)
+        self.assertEqual(result["status"], "UNKNOWN")  # limit before requested budget is incomplete
         result = self.compare(row(), row([10]))
         self.assertEqual(result["first_divergence"], 1)
         self.assertEqual(result["near_tie"], "UNKNOWN")
+
+    def test_both_native_eos_shapes_normalize_identically(self):
+        a, b = row([10, 11]), row([10, 11, 99])
+        del a["stop_type"]
+        a["stopped_eos"] = True  # Gufo excludes terminal EOG.
+        b["stop_type"] = "eos"  # Pinned llama includes it.
+        result = self.compare(a, b)
+        self.assertIsNone(result["first_divergence"])
+        self.assertEqual(result["agreement_denominator"], 2)
+        self.assertEqual(result["agreement_rate"], 1)
+        self.assertEqual(result["stop_reasons"], {"gufo": "eos", "llama": "eos"})
+        self.assertEqual(result["llama"]["terminal_eog_id"], 99)
+        self.assertEqual(result["status"], "NUMERIC_MATCH_REVIEW_REQUIRED")
+
+    def test_eos_versus_token_near_tie_and_same_length_stop_mismatch(self):
+        a, b = row([10, 11]), row([10, 11, 20, 21])
+        a.update(stop_type="eos", terminal_eog_id=99,
+                 top_logprobs=[[], [], [{"id": 99, "logprob": -.5}, {"id": 20, "logprob": -.51}]])
+        b["top_logprobs"] = [[], [], [{"id": 20, "logprob": -.5}, {"id": 99, "logprob": -.51}]]
+        result = self.compare(a, b)
+        self.assertEqual(result["first_divergence"], 2)
+        self.assertEqual(result["near_tie"], "YES")
+        self.assertTrue(result["stop_reason_mismatch"])
+        a = row()
+        a["stop_type"] = "eos"
+        result = self.compare(a, row())
+        self.assertEqual(result["first_divergence"], 4)
+        self.assertEqual(result["near_tie"], "UNKNOWN")
+
+    def test_unknown_stop_never_matches_and_word_flags(self):
+        a = row()
+        del a["stop_type"]
+        self.assertEqual(self.compare(a, row())["status"], "UNKNOWN")
+        a.update(stopped_word=True, stopping_word="STOP")
+        self.assertEqual(PARITY.normalize_stop(a, "gufo")["stop_reason"], "word")
+        a["stopped_limit"] = True
+        with self.assertRaises(ValueError):
+            PARITY.normalize_stop(a, "gufo")
 
     def test_boolean_and_negative_ids_rejected(self):
         for invalid in ([True], [-1], ["10"], []):
@@ -146,12 +185,23 @@ class TokenParityTest(unittest.TestCase):
             with patch.object(PARITY, "urlopen", side_effect=error) as network:
                 code, result = self.invoke(["--prompts", str(p["prompts"]),
                     "--gufo-url", "http://127.0.0.1:1", "--gufo-config", str(c),
-                    "--llama-recorded", str(p["llama"]), "--margin", ".02"])
+                    "--llama-recorded", str(p["llama"]), "--tokens", "4", "--horizon", "4", "--margin", ".02"])
             self.assertEqual(code, 2)
             self.assertIn("BLOCKED", result["error"])
             self.assertEqual(network.call_count, 1)
             sent = json.loads(network.call_args.args[0].data)
             self.assertEqual(sent["prompt"], [100, 101])
+
+    def test_live_missing_ids_and_unexpected_exception_are_invalid(self):
+        with patch.object(PARITY, "urlopen", return_value=io.BytesIO(b'{"content":"no IDs"}')):
+            with self.assertRaisesRegex(ValueError, "BLOCKED"):
+                PARITY.gufo_live("http://127.0.0.1:1", config("gufo"), PROMPTS, 4, 5, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.files(Path(tmp))
+            args = ["--prompts", str(p["prompts"]), "--gufo-recorded", str(p["gufo"]),
+                    "--llama-recorded", str(p["llama"]), "--margin", ".02"]
+            with patch.object(PARITY, "load_recordings", side_effect=RecursionError("deep JSON")):
+                self.assertEqual(self.invoke(args)[0], 2)
 
     def test_config_identity_pin_and_mode(self):
         for field, value in (("revision", "wrong-pin"), ("mode", "mtp"),
@@ -164,6 +214,7 @@ class TokenParityTest(unittest.TestCase):
     def test_native_llama_fake_server_receives_only_id_prompt(self):
         requests = []
         response = {"tokens": [10, 11, 12, 13], "content": "fixture", "truncated": False,
+                    "stop_type": "limit",
                     "completion_probabilities": [{"id": token, "top_logprobs": []}
                                                  for token in [10, 11, 12, 13]],
                     "generation_settings": {"temperature": 0}}
@@ -184,19 +235,22 @@ class TokenParityTest(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever)
             thread.start()
             try:
-                _, outputs = PARITY.llama_live(f"http://127.0.0.1:{server.server_port}/v1",
-                                               config("llama"), PROMPTS, 4, 5, 2)
+                url = f"http://127.0.0.1:{server.server_port}/v1"
+                _, outputs = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
+                _, gufo_outputs = PARITY.gufo_live(url, config("gufo"), PROMPTS, 4, 5, 2)
             finally:
                 server.shutdown()
                 thread.join()
         self.assertEqual(outputs["tiny"]["generated_token_ids"], [10, 11, 12, 13])
+        self.assertEqual(gufo_outputs["tiny"]["generated_token_ids"], [10, 11, 12, 13])
+        self.assertEqual(requests[0], requests[1])  # No per-engine request dialect.
         path, payload = requests[0]
         self.assertEqual(path, "/completion")
         self.assertEqual(payload["prompt"], [100, 101])
         self.assertTrue(payload["return_tokens"])
         self.assertFalse(payload["cache_prompt"])
         self.assertFalse(payload["post_sampling_probs"])
-        self.assertTrue(payload["ignore_eos"])
+        self.assertNotIn("ignore_eos", payload)
         self.assertEqual(payload["n_predict"], 4)
         self.assertEqual(payload["n_probs"], 5)
 
