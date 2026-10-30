@@ -24,6 +24,7 @@ class TtsService;
 class AsrService;
 class ImageService;
 class EmbeddingService;
+class RerankScorer;
 class WebSocket;
 
 struct HttpRequest {
@@ -98,10 +99,10 @@ struct HttpServerOptions {
   std::size_t max_connections{16};
   std::string api_key;
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
-  /// Called once, on the listener or a request thread, when the text backend or
-  /// the embedding service reports a lost device. Health, readiness and
-  /// generation answer 503 `device_lost` from then on; the hook decides how the
-  /// process exits.
+  /// Called once, on the listener or a request thread, when the text backend,
+  /// the embedding service or the reranker reports a lost device. Health,
+  /// readiness and generation answer 503 `device_lost` from then on; the hook
+  /// decides how the process exits.
   std::function<void()> on_device_lost{};
   /// Opt-in, read-only engine cache query. Uses the existing API-key policy.
   bool cache_lookup_api{false};
@@ -122,7 +123,8 @@ public:
              std::shared_ptr<AsrService> asr = nullptr,
              HttpServerOptions options = {},
              std::shared_ptr<ImageService> images = nullptr,
-             std::shared_ptr<EmbeddingService> embeddings = nullptr);
+             std::shared_ptr<EmbeddingService> embeddings = nullptr,
+             std::shared_ptr<RerankScorer> reranker = nullptr);
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -160,6 +162,7 @@ private:
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
   std::shared_ptr<EmbeddingService> embeddings_;
+  std::shared_ptr<RerankScorer> reranker_;
   HttpServerOptions options_;
   std::string api_key_hash_;
   int listen_fd_ = -1;

@@ -70,6 +70,22 @@ inline json::Value CacheReuseCountersJson() {
         CacheReuseReasonCounts()[i].load(std::memory_order_relaxed);
   return result;
 }
+// Where a reused prefix came from, counted once per finished request in
+// `/metrics`. Provenance outranks storage: `pinned` is a registered pinned
+// prefix restored from RAM or disk, `root` a predicted system/tool root
+// checkpoint; otherwise the tier the prefix was restored from.
+enum class CacheHitTier : std::uint8_t {
+  kNone,
+  kLive,
+  kRam,
+  kDisk,
+  kPinned,
+  kRoot,
+  kCount,
+};
+inline constexpr std::array<std::string_view,
+                            static_cast<std::size_t>(CacheHitTier::kCount)>
+    kCacheHitTierNames{"none", "live", "ram", "disk", "pinned", "root"};
 // Static capture-attempt labels shared with the refusal log. Counts are
 // lease-local terminal refusals, not allocator/reclaim retries or disk skips.
 inline constexpr std::array<std::string_view, 2> kCacheCaptureRoutes{"ram",
@@ -86,6 +102,7 @@ struct CacheCaptureRefusal {
 struct ComponentCacheMetrics {
   std::string reuse{"none"};
   CacheReuseReason reuse_reason{CacheReuseReason::kNotAcquired};
+  CacheHitTier hit_tier{CacheHitTier::kNone};
   // Identity-qualified resident index agreement before retiring the live slot.
   // Not all-history reusable tokens; evicted and unrecorded state is absent.
   std::size_t indexed_common_tokens{}, indexed_gap_tokens{};
