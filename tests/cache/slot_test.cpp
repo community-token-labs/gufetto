@@ -163,7 +163,8 @@ void DiagnosticMetadataContention() {
             if (!observed.exchange(true))
               contended.release();
             return mode == 1;
-          });
+          },
+          std::chrono::steady_clock::now() + (mode == 0 ? 10s : 100ms));
     });
     assert(contended.try_acquire_for(1s));  // A real failed try_lock occurred.
     if (mode == 0) {
@@ -202,6 +203,32 @@ void DiagnosticMetadataContention() {
         slots.TryAcquireDiagnostic([](const Slot&) { return true; });
     assert(recovered);  // Timeout/cancellation did not leak an exclusive claim.
   }
+}
+void DiagnosticExhaustedSearchBudget() {
+  ResourceLedger ledger{kLimits};
+  FakeAdapter adapter;
+  FakeStream stream_a, stream_b;
+  // No idle workers: both metadata locks are deterministically uncontended.
+  LeasedSlot a(ledger, adapter, stream_a, SlotId{1});
+  LeasedSlot b(ledger, adapter, stream_b, SlotId{2});
+  // Model the shared budget exhausted by earlier contention/publication delay,
+  // without sleeping or depending on scheduler timing. A's real refusal must
+  // not become a timeout, and B's immediate lock must still admit the request.
+  const auto deadline = std::chrono::steady_clock::now() - 1s;
+  unsigned refusals{}, admissions{};
+  assert(!a.TryAcquireDiagnostic(
+      [&](const Slot&) {
+        ++refusals;
+        return false;
+      },
+      {}, {}, deadline));
+  auto lease = b.TryAcquireDiagnostic(
+      [&](const Slot&) {
+        ++admissions;
+        return true;
+      },
+      {}, {}, deadline);
+  assert(refusals == 1 && admissions == 1 && lease);
 }
 void Paths() {
   // Prefill/decode share Append; rewind and speculative rollback share the
@@ -748,6 +775,7 @@ int main() {
   }
   DiagnosticClaims();
   DiagnosticMetadataContention();
+  DiagnosticExhaustedSearchBudget();
   Paths();
   Failures();
   EveryPreservationConversion();

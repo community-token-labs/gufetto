@@ -3006,13 +3006,6 @@ public:
 template<class Cache>
 auto AcquireDiagnostic(Cache& cache) {
   auto lease = cache.TryAcquireDiagnostic();
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (!lease && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-    lease = cache.TryAcquireDiagnostic();  // Slot try-lock may lose to an idle
-                                           // worker.
-  }
   assert(lease);
   return lease;
 }

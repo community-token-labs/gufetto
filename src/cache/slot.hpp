@@ -188,7 +188,7 @@ public:
   [[nodiscard]] SlotLease Acquire(std::optional<BorrowedLocation> live = {},
                                   std::stop_token = {});
 
-  // Wait at most100ms for transient metadata-lock contention only. Once
+  // Wait at most 100 ms for transient metadata-lock contention only. Once
   // locked, actual busy/live/pending/unhealthy state still refuses immediately.
   // No facade/native work starts while waiting; timeout throws a clear error.
   [[nodiscard]] std::optional<DiagnosticSlotLease> TryAcquireDiagnostic(

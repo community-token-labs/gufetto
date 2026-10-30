@@ -896,9 +896,6 @@ std::optional<DiagnosticSlotLease> LeasedSlot::TryAcquireDiagnostic(
           "diagnostic admission timed out waiting for slot metadata");
     std::this_thread::yield();
   }
-  if (detail::LeaseState::Clock::now() >= deadline)
-    throw std::runtime_error(
-        "diagnostic admission timed out waiting for slot metadata");
   try {
     if (stop.stop_requested() || (cancelled && cancelled()) || state_->leased ||
         state_->live || state_->spilling || state_->idle_failed ||
