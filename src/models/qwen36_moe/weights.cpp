@@ -199,7 +199,7 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
   // The vocabulary is the embedding row count; no metadata key carries it.
   const auto* embd = reader.FindTensor("token_embd.weight");
   if (embd == nullptr || embd->dimensions.size() != 2 ||
-      embd->dimensions[1] == 0 || embd->dimensions[1] > UINT32_MAX) {
+      embd->dimensions[1] == 0 || embd->dimensions[1] > kMaxDimension) {
     if (error_msg != nullptr) {
       *error_msg = "missing or malformed token_embd.weight";
     }

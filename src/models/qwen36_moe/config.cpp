@@ -62,6 +62,14 @@ struct Reader {
   }
 };
 
+bool CheckedMul(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
+  return !__builtin_mul_overflow(a, b, out);
+}
+
+bool CheckedAdd(std::uint64_t a, std::uint64_t b, std::uint64_t* out) {
+  return !__builtin_add_overflow(a, b, out);
+}
+
 }  // namespace
 
 bool Config::IsQualifiedGeometry() const noexcept {
@@ -141,24 +149,7 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
   }
   c.rotary_dim = r.U32(key("rope.dimension_count"));
   c.rope_theta = r.F32(key("rope.freq_base"));
-  if (const auto sections = r.U64Array(key("rope.dimension_sections")); r.ok) {
-    if (sections.size() != 4 || sections[3] != 0) {
-      r.Fail("rope.dimension_sections must contain three axes and a zero pad");
-    } else {
-      std::uint64_t sum = 0;
-      for (std::size_t i = 0; i < 3; ++i) {
-        if (sections[i] == 0 || sections[i] > c.rotary_dim / 2) {
-          r.Fail("invalid mRoPE axis dimension");
-          break;
-        }
-        sum += sections[i];
-        c.rope_sections[i] = static_cast<std::uint32_t>(sections[i]);
-      }
-      if (r.ok && sum != c.rotary_dim / 2) {
-        r.Fail("mRoPE sections must sum to half the rotary dimension");
-      }
-    }
-  }
+  const auto sections = r.U64Array(key("rope.dimension_sections"));
 
   c.ssm_conv_kernel = r.U32(key("ssm.conv_kernel"));
   c.ssm_head_dim = r.U32(key("ssm.state_size"));
@@ -174,21 +165,77 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
     return std::nullopt;
   }
 
-  // Structural limits shared with the dense Qwen3.5 trunk (see
-  // core::ModelConfig::IsValidQwen), not limits of the format.
-  if (c.num_layers == 0 || c.hidden_size == 0 || c.context_length < 2 ||
-      c.context_length > INT32_MAX || c.rms_eps <= 0 || c.rope_theta <= 0 ||
-      c.full_attention_interval != 4 ||
-      c.num_layers % c.full_attention_interval != 0 || c.num_heads == 0 ||
-      c.num_kv_heads == 0 || c.num_heads % c.num_kv_heads != 0 ||
-      c.head_dim == 0 || c.rotary_dim == 0 || c.rotary_dim % 2 != 0 ||
-      c.rotary_dim > c.head_dim || c.ssm_conv_kernel != 4 ||
-      c.ssm_head_dim != 128 || c.ssm_num_k_heads == 0 ||
-      c.ssm_num_v_heads == 0 || c.ssm_num_v_heads % c.ssm_num_k_heads != 0 ||
-      c.ssm_inner_size != c.SsmValueDim() || c.num_experts == 0 ||
-      c.num_experts_used == 0 || c.num_experts_used > c.num_experts ||
-      c.expert_ff == 0 || c.shared_expert_ff == 0) {
+  // Stage 1: every raw value is positive and representable before any value
+  // takes part in arithmetic. Kernels index with 32-bit signed integers.
+  for (const std::uint32_t value :
+       {c.num_layers, c.hidden_size, c.full_attention_interval, c.num_heads,
+        c.num_kv_heads, c.head_dim, c.rotary_dim, c.ssm_conv_kernel,
+        c.ssm_head_dim, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_inner_size,
+        c.num_experts, c.num_experts_used, c.expert_ff, c.shared_expert_ff}) {
+    if (value == 0 || value > kMaxDimension) {
+      r.Fail("qwen35moe dimensions must be positive and fit 32-bit indexing");
+      return std::nullopt;
+    }
+  }
+  if (c.context_length < 2 || c.context_length > kMaxDimension ||
+      !(c.rms_eps > 0) || !(c.rope_theta > 0)) {
     r.Fail("qwen35moe metadata describes an unsupported shape");
+    return std::nullopt;
+  }
+
+  // Stage 2: every derived dimension in checked 64-bit arithmetic, each
+  // bounded like the raw values.
+  std::uint64_t key_dim = 0;
+  std::uint64_t value_dim = 0;
+  std::uint64_t conv_channels = 0;
+  std::uint64_t q_dim = 0;
+  std::uint64_t q_gate_dim = 0;
+  std::uint64_t kv_dim = 0;
+  if (!CheckedMul(c.ssm_num_k_heads, c.ssm_head_dim, &key_dim) ||
+      !CheckedMul(c.ssm_num_v_heads, c.ssm_head_dim, &value_dim) ||
+      !CheckedMul(2, key_dim, &conv_channels) ||
+      !CheckedAdd(conv_channels, value_dim, &conv_channels) ||
+      !CheckedMul(c.num_heads, c.head_dim, &q_dim) ||
+      !CheckedMul(2, q_dim, &q_gate_dim) ||
+      !CheckedMul(c.num_kv_heads, c.head_dim, &kv_dim)) {
+    r.Fail("qwen35moe derived dimensions overflow");
+    return std::nullopt;
+  }
+  for (const std::uint64_t value :
+       {key_dim, value_dim, conv_channels, q_dim, q_gate_dim, kv_dim}) {
+    if (value > kMaxDimension) {
+      r.Fail("qwen35moe derived dimensions exceed 32-bit indexing");
+      return std::nullopt;
+    }
+  }
+
+  // Stage 3: relations between validated values. Structural limits shared
+  // with the dense Qwen3.5 trunk (see core::ModelConfig::IsValidQwen), not
+  // limits of the format.
+  if (c.full_attention_interval != 4 ||
+      c.num_layers % c.full_attention_interval != 0 ||
+      c.num_heads % c.num_kv_heads != 0 || c.rotary_dim % 2 != 0 ||
+      c.rotary_dim > c.head_dim || c.ssm_conv_kernel != 4 ||
+      c.ssm_head_dim != 128 || c.ssm_num_v_heads % c.ssm_num_k_heads != 0 ||
+      c.ssm_inner_size != value_dim || c.num_experts_used > c.num_experts) {
+    r.Fail("qwen35moe metadata describes an unsupported shape");
+    return std::nullopt;
+  }
+  if (sections.size() != 4 || sections[3] != 0) {
+    r.Fail("rope.dimension_sections must contain three axes and a zero pad");
+    return std::nullopt;
+  }
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < 3; ++i) {
+    if (sections[i] == 0 || sections[i] > c.rotary_dim / 2) {
+      r.Fail("invalid mRoPE axis dimension");
+      return std::nullopt;
+    }
+    sum += sections[i];
+    c.rope_sections[i] = static_cast<std::uint32_t>(sections[i]);
+  }
+  if (sum != c.rotary_dim / 2) {
+    r.Fail("mRoPE sections must sum to half the rotary dimension");
     return std::nullopt;
   }
   return c;

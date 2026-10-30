@@ -274,6 +274,57 @@ void CheckMalformedMetadata(const Fixture& f) {
           "other qwen35moe shapes must parse but stay unqualified");
 }
 
+// Every raw dimension must be positive, and every derived dimension is
+// computed with checked arithmetic and bounded before it is compared.
+void CheckDimensionArithmetic(const Fixture& f) {
+  const std::string p = "qwen35moe.";
+  const auto rejects = [&](const std::string& what, const Metadata& extra,
+                           const std::string& expect) {
+    auto fields = f.metadata;
+    for (const auto& [key, value] : extra)
+      fields[p + key] = value;
+    std::string error;
+    Require(!Parse(fields, &error).has_value(), what + " accepted");
+    Require(error.find(expect) != std::string::npos, what + " gave: " + error);
+  };
+  for (const char* key :
+       {"block_count", "embedding_length", "full_attention_interval",
+        "attention.head_count", "attention.head_count_kv",
+        "rope.dimension_count", "ssm.conv_kernel", "ssm.state_size",
+        "ssm.group_count", "ssm.time_step_rank", "ssm.inner_size",
+        "expert_count", "expert_used_count", "expert_feed_forward_length",
+        "expert_shared_feed_forward_length"}) {
+    rejects(std::string("zero ") + key, {{key, std::uint32_t{0}}}, "positive");
+    rejects(std::string("oversized ") + key, {{key, std::uint32_t{1U << 31}}},
+            "positive");
+  }
+  rejects("zero head_dim",
+          {{"attention.key_length", std::uint32_t{0}},
+           {"attention.value_length", std::uint32_t{0}}},
+          "positive");
+  rejects("zero context", {{"context_length", std::uint32_t{0}}},
+          "unsupported shape");
+
+  // ssm.time_step_rank * 128 wraps to 4096 in 32 bits and would match
+  // ssm.inner_size; in 64 bits it exceeds the bound.
+  rejects("SSM value dim wrapping to inner size",
+          {{"ssm.time_step_rank", std::uint32_t{33554464}}}, "exceed");
+  rejects("SSM key dim", {{"ssm.group_count", std::uint32_t{1U << 24}}},
+          "exceed");
+  rejects("SSM conv channels", {{"ssm.group_count", std::uint32_t{1U << 23}}},
+          "exceed");
+  rejects("attention q dim",
+          {{"attention.head_count", std::uint32_t{1U << 24}}}, "exceed");
+  rejects("attention q|gate dim",
+          {{"attention.head_count", std::uint32_t{1U << 22}}}, "exceed");
+  rejects("attention kv dim",
+          {{"attention.head_count_kv", std::uint32_t{1U << 24}}}, "exceed");
+  rejects("head dim product",
+          {{"attention.key_length", std::uint32_t{1U << 30}},
+           {"attention.value_length", std::uint32_t{1U << 30}}},
+          "exceed");
+}
+
 void CheckPinnedTable(const Fixture& f) {
   auto c = *Parse(f.metadata);
   c.vocab_size = 248320;
@@ -449,6 +500,7 @@ int main() {
     const auto fixture = LoadTable();
     CheckPinnedMetadata(fixture);
     CheckMalformedMetadata(fixture);
+    CheckDimensionArithmetic(fixture);
     CheckPinnedTable(fixture);
     CheckBindSynthetic();
   } catch (const std::exception& e) {

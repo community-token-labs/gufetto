@@ -15,6 +15,9 @@ namespace gufo::models::qwen36_moe {
 /// GGUF architecture of Qwen3.5/3.6 MoE checkpoints (llama.cpp `qwen35moe`).
 inline constexpr std::string_view kArchitecture = "qwen35moe";
 
+/// Bound on every raw and derived dimension: kernels index with int32.
+inline constexpr std::uint64_t kMaxDimension = INT32_MAX;
+
 /// Architecture parameters of a `qwen35moe` GGUF artifact: the Qwen3.5 dense
 /// trunk (Gated DeltaNet plus gated GQA every fourth layer) with every dense
 /// FFN replaced by routed experts and one sigmoid-gated shared expert. Every
@@ -48,6 +51,8 @@ struct Config {
   std::uint32_t expert_ff{0};         ///< 512
   std::uint32_t shared_expert_ff{0};  ///< 512
 
+  // Derived dimensions. Exact only for a Config from FromGguf, which proves
+  // each of them positive and at most kMaxDimension.
   [[nodiscard]] std::uint32_t SsmKeyDim() const noexcept {
     return ssm_num_k_heads * ssm_head_dim;
   }
@@ -65,7 +70,8 @@ struct Config {
     return num_kv_heads * head_dim;
   }
   [[nodiscard]] bool IsLinearLayer(std::uint32_t layer) const noexcept {
-    return layer < num_layers && ((layer + 1) % full_attention_interval) != 0;
+    return layer < num_layers && full_attention_interval != 0 &&
+           ((layer + 1) % full_attention_interval) != 0;
   }
 
   /// True only for the Qwen3.6-35B-A3B geometry. Other `qwen35moe` shapes
