@@ -79,7 +79,7 @@ list(APPEND gufo_pr_tests
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test
-  kernel_resources_parser_test check_docs_test check_pr_title_test
+  kernel_resources_parser_test check_docs_test check_pr_title_test benchmark_card_test
   scoring_metrics_test scoring_contract_test matched_kl_test
   vision_images_test vision_reference_test vision_compare_test vision_downstream_test
   vision_encoder_reference_test vision_encoder_capture_test)
