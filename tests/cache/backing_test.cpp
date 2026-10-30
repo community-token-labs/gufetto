@@ -36,8 +36,7 @@ std::atomic<std::size_t> max_piece{};
 std::atomic<int> fail_populate_after{-1};
 std::atomic<void*> failed_page{};
 bool pins_denied{};
-bool fail_copy{}, fail_record{}, fail_query{}, fail_wait{}, fail_alloc{};
-int copies_before_failure{};
+bool fail_alloc{};
 thread_local bool fail_stream_new{}, observe_allocation_cleanup{};
 std::atomic<unsigned> allocation_cleanup_drains{};
 }  // namespace
@@ -105,22 +104,7 @@ hipError_t __real_hipMemcpyAsync(void*, const void*, std::size_t, hipMemcpyKind,
 hipError_t __wrap_hipMemcpyAsync(void* dst, const void* src, std::size_t n,
                                  hipMemcpyKind kind, hipStream_t stream) {
   max_piece = std::max(max_piece.load(), n);
-  if (fail_copy && copies_before_failure-- == 0)
-    return hipErrorInvalidValue;
   return __real_hipMemcpyAsync(dst, src, n, kind, stream);
-}
-hipError_t __real_hipEventRecord(hipEvent_t, hipStream_t);
-hipError_t __wrap_hipEventRecord(hipEvent_t event, hipStream_t stream) {
-  return fail_record ? hipErrorInvalidValue
-                     : __real_hipEventRecord(event, stream);
-}
-hipError_t __real_hipEventQuery(hipEvent_t);
-hipError_t __wrap_hipEventQuery(hipEvent_t event) {
-  return fail_query ? hipErrorInvalidValue : __real_hipEventQuery(event);
-}
-hipError_t __real_hipEventSynchronize(hipEvent_t);
-hipError_t __wrap_hipEventSynchronize(hipEvent_t event) {
-  return fail_wait ? hipErrorInvalidValue : __real_hipEventSynchronize(event);
 }
 hipError_t __real_hipStreamSynchronize(hipStream_t);
 hipError_t __wrap_hipStreamSynchronize(hipStream_t stream) {
@@ -697,7 +681,7 @@ void BoundTransfers() {
       destroyed = true;
     }
   };
-  for (const bool record_failure : {false, true}) {
+  {
     bool destroyed = false;
     auto owner = std::make_shared<Owner>(destroyed);
     hip::TransferPool pool(1);
@@ -714,21 +698,12 @@ void BoundTransfers() {
                &ran) == hipSuccess);
     owner.reset();
     assert(!destroyed);
-    if (record_failure) {
-      fail_record = true;
-      Throws<std::runtime_error>([&] { (void)stream->Complete(); });
-      fail_record = false;
-      assert(ran && !destroyed);
-      stream.reset();
-      assert(destroyed && !pool.TryAcquire());
-    } else {
-      std::optional<cache::Completion> done(stream->Complete());
-      assert(done->Wait() == Result::kSucceeded && ran);
-      stream.reset();
-      assert(!destroyed && !pool.TryAcquire());
-      done.reset();
-      assert(destroyed && pool.TryAcquire());
-    }
+    std::optional<cache::Completion> done(stream->Complete());
+    assert(done->Wait() == Result::kSucceeded && ran);
+    stream.reset();
+    assert(!destroyed && !pool.TryAcquire());
+    done.reset();
+    assert(destroyed && pool.TryAcquire());
   }
   bool destroyed = false;
   auto owner = std::make_shared<Owner>(destroyed);
@@ -738,7 +713,9 @@ void BoundTransfers() {
   (void)stream->Native();
   Throws<std::logic_error>([&] { stream->BindTo(owner->stream, owner); });
 }
-void LifetimeAndFailures() {
+// Fatal errors are tested in fresh CPU fake-HIP processes, never by forking
+// an initialized device runtime or expecting uncertain work to return normally.
+void LifetimeAndValidation() {
   std::optional<cache::Completion> completion;
   {
     hip::TransferPool pool(1);
@@ -753,55 +730,6 @@ void LifetimeAndFailures() {
   }
   assert(completion->Wait() == Result::kSucceeded);
   completion.reset();
-  for (int failure = 0; failure < 3; ++failure) {
-    hip::TransferPool pool(1);
-    auto stream = pool.TryAcquire();
-    if (failure == 0) {
-      fail_record = true;
-      Throws<std::runtime_error>([&] { (void)stream->Complete(); });
-      fail_record = false;
-    } else {
-      completion.emplace(stream->Complete());
-      if (failure == 1) {
-        fail_query = true;
-        assert(!completion->Ready());
-        fail_query = false;
-      } else {
-        fail_wait = true;
-      }
-      assert(completion->Wait() == Result::kFailed);
-      fail_wait = false;
-      assert(completion->Wait() == Result::kFailed);
-      completion.reset();
-    }
-    assert(stream->Synchronize() == Result::kFailed);
-    stream.reset();
-    assert(!pool.TryAcquire());
-  }
-  // A failure after one real queued copy drains before throwing.
-  void* device{};
-  void* host{};
-  assert(hipMalloc(&device, 8192) == hipSuccess);
-  assert(hipHostMalloc(&host, 8192, hipHostMallocCoherent) == hipSuccess);
-  std::memset(host, 0x71, 8192);
-  hip::TransferPool pool(1);
-  auto stream = pool.TryAcquire();
-  fail_copy = true;
-  copies_before_failure = 1;
-  Throws<std::runtime_error>([&] {
-    (void)stream->Copy(device, host, 8192, hip::CopyDirection::kHostToDevice,
-                       4096);
-  });
-  fail_copy = false;
-  std::vector<std::byte> actual(4096);
-  assert(hipMemcpy(actual.data(), device, actual.size(),
-                   hipMemcpyDeviceToHost) == hipSuccess);
-  assert(std::all_of(actual.begin(), actual.end(),
-                     [](std::byte b) { return b == std::byte{0x71}; }));
-  stream.reset();
-  assert(!pool.TryAcquire());
-  assert(hipHostFree(host) == hipSuccess);
-  assert(hipFree(device) == hipSuccess);
   // Successful completion destruction gives the pair back for reuse.
   hip::TransferPool reusable(1);
   for (int i = 0; i < 10; ++i) {
@@ -1103,7 +1031,7 @@ int main(int argc, char** argv) {
   CaptureCapacity();
   Transfers();
   BoundTransfers();
-  LifetimeAndFailures();
+  LifetimeAndValidation();
   PendingStreams();
   AcquireAllocationFailure();
   BorrowedPoolLifetime();

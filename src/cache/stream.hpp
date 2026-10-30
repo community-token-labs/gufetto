@@ -1,6 +1,8 @@
 #ifndef GUFO_CACHE_STREAM_HPP_
 #define GUFO_CACHE_STREAM_HPP_
 
+#include <cstdint>
+
 #include "src/cache/completion.hpp"
 
 namespace gufo::cache {
@@ -17,6 +19,9 @@ public:
   Stream& operator=(const Stream&) = delete;
   Stream(Stream&&) = delete;
   Stream& operator=(Stream&&) = delete;
+  // Copied diagnostic identity, supplied before submission even without
+  // tracing.
+  virtual void SetPersistenceContext(std::uint64_t, std::uint64_t) noexcept {}
   [[nodiscard]] virtual TransferResult Synchronize() noexcept = 0;
 };
 

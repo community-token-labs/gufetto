@@ -105,7 +105,14 @@ def validate(plan, contract, plan_hash, max_rows):
         for key in ("model_sha256", "source_sha256"):
             digest(producer.get(key), key)
     ref = headers["reference"]["producer"]
-    require(ref.get("accumulator_dtype") == "f32", "mandatory F32-accumulation reference")
+    precision = ref.get("accumulator_dtype")
+    require(precision in ("f32", "f32_qk_f64_softmax_pv"),
+            "mandatory F32 or approved F32/F64 reference")
+    if precision == "f32_qk_f64_softmax_pv":
+        expected = {"projections": "f32", "qk": "f32", "softmax": "f64",
+                    "pv": "f64", "output": "f32", "query_block": 128, "full_keys": True}
+        require(json.dumps(ref.get("arithmetic_plan"), sort_keys=True) ==
+                json.dumps(expected, sort_keys=True), "incomplete/unapproved reference arithmetic plan")
     required_origin = "pixels" if plan["scope"] == "encoder" else "frozen_qkv"
     require(ref.get("input_origin") == required_origin, "reference has wrong input boundary")
     require(ref.get("independent") is True, "independent reference declaration required")

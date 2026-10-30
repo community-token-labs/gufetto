@@ -32,6 +32,11 @@ inline std::uint64_t Now() noexcept {
       .count();
 }
 
+inline constexpr std::size_t kDefaultPhaseLimit = 4096;
+inline constexpr std::size_t PhaseLimit(std::string_view value) noexcept {
+  return value == "65536" ? 65536 : kDefaultPhaseLimit;
+}
+
 // Configuration is read once. An invalid destination disables all hooks.
 class Writer {
 public:
@@ -47,6 +52,8 @@ public:
       std::fputs("GUFO_PERF_TRACE: cannot open trace destination\n", stderr);
       return;
     }
+    if (const char* limit = std::getenv("GUFO_PERF_TRACE_PHASE_LIMIT"))
+      phase_limit = PhaseLimit(limit);
     if (const char* sample = std::getenv("GUFO_PERF_TRACE_MOE")) {
       const std::string_view value(sample);
       std::uint64_t parsed = 0;
@@ -87,6 +94,7 @@ public:
   }
 
   bool enabled{false};
+  std::size_t phase_limit{kDefaultPhaseLimit};
   std::uint64_t moe_every{0}, run_id{0}, process_id{0};
 
 private:
@@ -185,6 +193,8 @@ struct Record {
   std::vector<DraftTable> draft_tables;
   std::optional<CachePersistPiece> cache_persist_piece;
   std::uint64_t work_id{0}, dropped{0};
+  std::size_t phase_limit{kDefaultPhaseLimit};
+  std::uint64_t phase_dropped{0};
   std::vector<Lineage> ready, execution;
   std::vector<Publication> publications;
 };
@@ -204,6 +214,17 @@ inline void Collect(Record& r, std::vector<T>& values, T value) noexcept {
   } catch (...) {
   }
   ++r.dropped;
+}
+inline void CollectPhase(Record& r, Phase phase) noexcept {
+  try {
+    if (r.phases.size() < r.phase_limit) {
+      r.phases.push_back(phase);
+      return;
+    }
+  } catch (...) {
+  }
+  ++r.phase_dropped;
+  ++r.dropped;  // Preserve aggregate loss detection for existing consumers.
 }
 inline void SerializeLineage(std::ostream& o, const Lineage& l) {
   o << "\"request_id\":" << l.request_id << ",\"slot\":" << l.slot
@@ -230,7 +251,8 @@ inline std::string Serialize(const Record& r, std::uint64_t end) {
   o << "{\"schema\":1,\"run_id\":" << Sink().run_id
     << ",\"pid\":" << Sink().process_id << ",\"thread_id\":" << r.thread_id
     << ",\"kind\":\"" << r.kind << "\",\"start_ns\":" << r.start_ns
-    << ",\"end_ns\":" << end
+    << ",\"end_ns\":" << end << ",\"phase_limit\":" << r.phase_limit
+    << ",\"phase_dropped\":" << r.phase_dropped
     << ",\"queue\":{\"prefilling_waiting\":" << r.prefilling_waiting
     << ",\"decoders_due\":" << r.decoders_due
     << ",\"capturing\":" << r.capturing << ",\"waiting\":" << r.waiting
@@ -412,6 +434,7 @@ public:
     try {
       record_ = std::make_unique<Record>();
       record_->kind = kind;
+      record_->phase_limit = Sink().phase_limit;
       record_->work_id = NextTraceId();
       static std::atomic<std::uint64_t> next_thread{0};
       static thread_local const auto thread =
@@ -557,8 +580,8 @@ public:
     if (start_ != 0) {
       const auto start = std::exchange(start_, 0);
       try {
-        Collect(*current, current->phases,
-                Phase{name_, start, Now(), request_id_, forward_});
+        CollectPhase(*current,
+                     Phase{name_, start, Now(), request_id_, forward_});
       } catch (...) {
       }
     }

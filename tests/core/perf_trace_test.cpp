@@ -16,6 +16,37 @@ void RemoveTrace() {
   std::error_code ec;
   std::filesystem::remove(trace_path, ec);
 }
+void TestPhaseLimit(std::size_t expected) {
+  using namespace gufo;
+  assert(perf::PhaseLimit("65536") == 65536);
+  for (const auto value :
+       {"", "4096", "0", "4095", "4097", "65535", "65537", "-1", "+65536",
+        " 65536", "65536x", "18446744073709551616"})
+    assert(perf::PhaseLimit(value) == 4096);
+  assert(perf::Sink().phase_limit == expected);
+  // The environment is frozen when tracing starts, not reread per work unit.
+  assert(platform::SetEnv("GUFO_PERF_TRACE_PHASE_LIMIT",
+                          expected == 4096 ? "65536" : "4096"));
+  perf::Work work("phase_limit");
+  auto& record = *work.get();
+  assert(record.phase_limit == expected);
+  for (std::size_t i = 0; i < expected + 3; ++i) {
+    perf::HostPhase phase("phase_limit_fixture");
+    phase.Finish();
+    phase.Finish();
+  }
+  assert(record.phases.size() == expected);
+  assert(record.phase_dropped == 3 && record.dropped == 3);
+  // Raising the phase cap must not raise any attribution-vector cap.
+  for (std::size_t i = 0; i < 4098; ++i)
+    perf::Collect(record, record.ready, perf::Lineage{i + 1});
+  assert(record.ready.size() == 4096);
+  const auto value = json::parse(perf::Serialize(record, perf::Now()));
+  assert(value.member_size("phase_limit") == expected);
+  assert(value.member_size("phase_dropped") == 3);
+  assert(value.find("phases")->items().size() == expected);
+  assert(value.find("attribution")->member_size("dropped") == 5);
+}
 void TestAttribution() {
   using namespace gufo;
   perf::Record record{};
@@ -185,9 +216,14 @@ void TestMtpCounters() {
 }
 }  // namespace
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
   using namespace gufo;
-  if (argc > 1) {
+  assert(argc <= 2);
+  const bool high_limit =
+      argc == 2 && std::string_view(argv[1]) == "--phase-limit-high";
+  if (argc == 2 && !high_limit) {
+    assert(std::string_view(argv[1]) == "--disabled");
+    assert(platform::SetEnv("GUFO_PERF_TRACE_PHASE_LIMIT", "65536"));
     assert(platform::UnsetEnv("GUFO_PERF_TRACE"));
     assert(platform::UnsetEnv("GUFO_PERF_TRACE_MOE"));
     perf::Work work("decode_single");
@@ -226,7 +262,12 @@ int main(int argc, char**) {
   assert(std::atexit(RemoveTrace) == 0);
   assert(platform::SetEnv("GUFO_PERF_TRACE", path.string()));
   assert(platform::SetEnv("GUFO_PERF_TRACE_MOE", "2"));
+  if (high_limit)
+    assert(platform::SetEnv("GUFO_PERF_TRACE_PHASE_LIMIT", "65536"));
+  else
+    assert(platform::UnsetEnv("GUFO_PERF_TRACE_PHASE_LIMIT"));
   assert(perf::Enabled());
+  TestPhaseLimit(high_limit ? 65536 : 4096);
   TestMtpCounters();
   TestAttribution();
   // TestAttribution consumed a diagnostic forward; reset only this fixture's
@@ -303,7 +344,7 @@ int main(int argc, char**) {
     }
     ++lines;
   }
-  assert(lines == 66);
+  assert(lines == 67);
   assert(found_mask);
   input.close();
 }

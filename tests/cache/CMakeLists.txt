@@ -14,8 +14,7 @@ if (ENGINE_ENABLE_HIP)
     -Wl,--wrap=hipHostMalloc -Wl,--wrap=hipMalloc
     -Wl,--wrap=hipHostRegister -Wl,--wrap=hipMallocManaged
     -Wl,--wrap=hipStreamCreateWithFlags -Wl,--wrap=hipEventCreateWithFlags
-    -Wl,--wrap=hipMemcpyAsync -Wl,--wrap=hipEventRecord
-    -Wl,--wrap=hipEventQuery -Wl,--wrap=hipEventSynchronize
+    -Wl,--wrap=hipMemcpyAsync
     -Wl,--wrap=hipStreamSynchronize)
   add_test(NAME cache_backing_test COMMAND cache_backing_test)
   add_test(NAME cache_backing_restricted_test
@@ -44,6 +43,14 @@ add_test(NAME cache_host_allocations_test COMMAND cache_host_allocations_test)
 set_tests_properties(cache_host_allocations_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(cache_transfer_fatal_test transfer_fatal_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/core/hip/transfer_pool.cpp)
+  target_include_directories(cache_transfer_fatal_test BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/hip_stub ${PROJECT_SOURCE_DIR})
+  target_link_libraries(cache_transfer_fatal_test PRIVATE gufo_cache_fake)
+  add_test(NAME cache_transfer_fatal_test COMMAND cache_transfer_fatal_test)
+  set_tests_properties(cache_transfer_fatal_test PROPERTIES LABELS "cpu;cache" TIMEOUT 30)
+
   add_executable(cache_backing_platform_test backing_platform_test.cpp)
   target_link_libraries(cache_backing_platform_test PRIVATE gufo_cache)
   target_link_options(cache_backing_platform_test PRIVATE
