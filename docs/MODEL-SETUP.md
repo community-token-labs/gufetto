@@ -28,11 +28,13 @@ repositories use the same filename (for example, `mmproj-BF16.gguf`).
 
 `revision` must be a 40-character lowercase hexadecimal immutable revision;
 `sha256` must be 64 lowercase hexadecimal characters. `bytes` is an unsigned
-integer. Watch-only or unpinned rows are `NOT-EVALUATED`. All other existing
+integer. Watch-only rows or literal `unknown` pins are `NOT-EVALUATED`;
+other malformed revision/checksum pins are input errors (exit 2). All other existing
 regular files are checked for both exact size and SHA-256, even when the size
 is wrong. Missing files are reported, not acquired. The prose `fit` column is
 never admission evidence. Malformed headers, column counts, paths, or numbers
-are errors. Unknown additional columns are preserved in the printed manifest.
+are errors. Unknown column names are rejected rather than silently ignoring a
+misspelled budget. Optional numeric errors identify the row and column.
 
 Append optional numeric columns to describe the scenario:
 
@@ -75,15 +77,31 @@ loader and the **F16** KV rows at `context` from its existing CPU continuation
 layout. It omits recurrent/private state, separate mmproj/MTP files, executor,
 arena/workspace, retained cache, and persistence staging. The report names these
 omissions. Other local families cannot fall back to declared values to hide an
-unsupported derivation. A present corrupt file cannot be overridden by a budget.
+unsupported derivation. Split GGUFs are `NOT-EVALUATED`: the reader may open
+sibling shards, but only the manifest row's own file is size/hash verified; no
+unverified sibling contributes to a capacity bound. A present corrupt file
+cannot be overridden by a budget.
 
-All counted bytes are charged against UMA host RAM. Only KV is charged against
-the device heap lower bound: Qwen can register weights in host RAM instead of
-allocating them in the HIP heap. Reserves reuse
-`server::kHostSnapshotHeadroomBytes` (`ObserveHostSnapshotHeadroom`) and
-`hip::kDispatchReserve` (`ObserveExecutionCapacity`); arithmetic reuses
-`FitsMemoryBudget` and `FitsMeasuredExecution`. This is only a necessary-capacity
-check, not a substitute for the server's measured model/session admission.
+Weights prefer the device heap, with registered-host fallback
+(`src/models/qwen/hip/model_loader.cpp:206–215`); KV needs device allocation
+(`src/models/qwen/hip/arena.cpp:792–797`). A large BIOS VRAM carve-out must not be
+mistaken for host RAM. With available host bytes H and device bytes D after the
+HIP reserve, the placement lower bound fails only if KV > D, or if
+weights + KV > D **and** weights > H. Declared lane-unknown extras only enter an
+aggregate H + D necessary-capacity check. This optimistic combined capacity is
+not proof of extra capacity on shared UMA; it can only leave results UNPROVEN.
+
+`core::kHostExecutionReserveBytes` remains the single source of serve's 4-GiB
+post-loading host execution/cache reserve (re-exported as
+`server::kHostSnapshotHeadroomBytes`; used by `ObserveHostSnapshotHeadroom`).
+The weight loader does **not** enforce that host reserve before registration,
+so the negative weight-load proof uses raw host availability, not H minus that
+reserve. The report prints the post-load reserve but does not claim it was
+satisfied. Native execution/cache admission can still refuse a loading scenario
+left UNPROVEN here. Device capacity deducts `hip::kDispatchReserve`, as the loader
+and `ObserveExecutionCapacity` do. Overflow-safe arithmetic reuses
+`FitsMemoryBudget`. This is only a necessary-capacity check, not a substitute for
+the server's measured model/session admission.
 
 Exit status: `0` means a report was generated without a negative-capacity or
 artifact-verification failure, **not that a model fits**; `1` means such a failure
