@@ -7,11 +7,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.error import URLError
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("token_parity", ROOT / "tools/qwen-flash/token_parity.py")
@@ -67,6 +69,8 @@ class TokenParityTest(unittest.TestCase):
         a, b = row(), row([20, 11, 12, 13])
         a["top_logprobs"] = tops(gap=.8)
         self.assertEqual(self.compare(a, b)["status"], "NON_NEAR_TIE")
+        b["top_logprobs"] = tops(20, 10)
+        self.assertEqual(self.compare(a, b)["status"], "NON_NEAR_TIE")  # NO + YES stays NO.
 
     def test_missing_cross_winner_is_unknown_with_small_margin(self):
         a, b = row(), row([20, 11, 12, 13])
@@ -168,7 +172,7 @@ class TokenParityTest(unittest.TestCase):
             self.files(Path(tmp), right)
             self.assertEqual(self.invoke(args)[0], 3)
             left = row()
-            left["top_logprobs"] = tops(gap=1)
+            left["top_logprobs"] = tops(gap=1) + [[], [], []]
             p["gufo"].write_text(json.dumps({"config": config("gufo"), "requests": [left]}))
             self.assertEqual(self.invoke(args)[0], 1)
             right["prompt_token_ids"] = [999]
@@ -182,7 +186,7 @@ class TokenParityTest(unittest.TestCase):
             c = Path(tmp) / "config.json"
             c.write_text(json.dumps(config("gufo")))
             error = PARITY.HTTPError("http://127.0.0.1:1/completion", 400, "Bad Request", {}, None)
-            with patch.object(PARITY, "urlopen", side_effect=error) as network:
+            with patch.object(PARITY, "open_direct", side_effect=error) as network:
                 code, result = self.invoke(["--prompts", str(p["prompts"]),
                     "--gufo-url", "http://127.0.0.1:1", "--gufo-config", str(c),
                     "--llama-recorded", str(p["llama"]), "--tokens", "4", "--horizon", "4", "--margin", ".02"])
@@ -193,7 +197,7 @@ class TokenParityTest(unittest.TestCase):
             self.assertEqual(sent["prompt"], [100, 101])
 
     def test_live_missing_ids_and_unexpected_exception_are_invalid(self):
-        with patch.object(PARITY, "urlopen", return_value=io.BytesIO(b'{"content":"no IDs"}')):
+        with patch.object(PARITY, "open_direct", return_value=io.BytesIO(b'{"content":"no IDs"}')):
             with self.assertRaisesRegex(ValueError, "BLOCKED"):
                 PARITY.gufo_live("http://127.0.0.1:1", config("gufo"), PROMPTS, 4, 5, 2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,6 +206,36 @@ class TokenParityTest(unittest.TestCase):
                     "--llama-recorded", str(p["llama"]), "--margin", ".02"]
             with patch.object(PARITY, "load_recordings", side_effect=RecursionError("deep JSON")):
                 self.assertEqual(self.invoke(args)[0], 2)
+
+    def test_recorded_distribution_cardinality_and_eos_extra_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            p = self.files(directory)
+            for count in (1, 3, 5):
+                recorded = row()
+                recorded["top_logprobs"] = [[] for _ in range(count)]
+                p["gufo"].write_text(json.dumps({"config": config("gufo"), "requests": [recorded]}))
+                with self.assertRaisesRegex(ValueError, "positions"):
+                    PARITY.load_recordings(p["gufo"], PROMPTS, 4, "gufo")
+            recorded["stop_type"] = "eos"
+            p["gufo"].write_text(json.dumps({"config": config("gufo"), "requests": [recorded]}))
+            self.assertEqual(len(PARITY.load_recordings(p["gufo"], PROMPTS, 4, "gufo")[1]["tiny"]["top_logprobs"]), 5)
+
+    def test_endpoint_schemes_and_connection_error(self):
+        for url in ("file:///tmp/never-read", "ftp://localhost/never", "http://user:password@localhost/"):
+            with self.assertRaisesRegex(ValueError, "direct HTTP"):
+                PARITY.open_direct(PARITY.Request(url), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = self.files(Path(tmp))
+            c = Path(tmp) / "config.json"
+            c.write_text(json.dumps(config("gufo")))
+            args = ["--prompts", str(p["prompts"]), "--gufo-url", "http://127.0.0.1:1",
+                    "--gufo-config", str(c), "--llama-recorded", str(p["llama"]),
+                    "--tokens", "4", "--horizon", "4", "--margin", ".02"]
+            with patch.object(PARITY, "open_direct", side_effect=URLError("connection refused")):
+                code, result = self.invoke(args)
+            self.assertEqual(code, 2)
+            self.assertEqual(set(result["configs"]), {"gufo", "llama"})
 
     def test_config_identity_pin_and_mode(self):
         for field, value in (("revision", "wrong-pin"), ("mode", "mtp"),
@@ -221,12 +255,27 @@ class TokenParityTest(unittest.TestCase):
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
-                requests.append((self.path, json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
-                data = json.dumps(response).encode()
+                payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append((self.path, payload))
+                if response.get("_redirect"):
+                    self.send_response(302)
+                    self.send_header("Location", "/never-follow")
+                    self.end_headers()
+                    return
+                value = copy.deepcopy(response)
+                if value.pop("_short_prompt", None) == payload["prompt"][0]:
+                    value["completion_probabilities"] = value["completion_probabilities"][:1]
+                data = json.dumps(value).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+
+            def do_GET(self):
+                requests.append(("GET:" + self.path, {}))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps(response).encode())
 
             def log_message(self, *_):
                 pass
@@ -236,8 +285,36 @@ class TokenParityTest(unittest.TestCase):
             thread.start()
             try:
                 url = f"http://127.0.0.1:{server.server_port}/v1"
-                _, outputs = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
-                _, gufo_outputs = PARITY.gufo_live(url, config("gufo"), PROMPTS, 4, 5, 2)
+                with patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1", "https_proxy": "http://127.0.0.1:1",
+                                             "no_proxy": "", "NO_PROXY": ""}):
+                    _, outputs = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
+                    _, gufo_outputs = PARITY.gufo_live(url, config("gufo"), PROMPTS, 4, 5, 2)
+                # Pinned llama omits probability rows for incomplete UTF-8 pieces.
+                response.update(content="emoji 🦉", _short_prompt=100)
+                prompts = PROMPTS + [{"id": "other", "prompt_token_ids": [102, 103]}]
+                _, batch = PARITY.llama_live(url, config("llama"), prompts, 4, 5, 2)
+                self.assertTrue(batch["tiny"]["distributions_misaligned"])
+                self.assertEqual(batch["tiny"]["top_logprobs"], [])
+                self.assertEqual(batch["tiny"]["generated_token_ids"], [10, 11, 12, 13])
+                self.assertFalse(batch["other"]["distributions_misaligned"])
+                self.assertEqual(self.compare(row([20, 11, 12, 13]), batch["tiny"])["near_tie"], "UNKNOWN")
+                self.assertEqual(self.compare(row(), batch["other"])["status"], "NUMERIC_MATCH_REVIEW_REQUIRED")
+                response.pop("_short_prompt")
+                response["completion_probabilities"][0]["id"] = 999
+                _, shifted = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
+                self.assertTrue(shifted["tiny"]["distributions_misaligned"])
+                # Live EOS retains its EOG-position distribution after ID normalization.
+                response.update(tokens=[10, 99], stop_type="eos", completion_probabilities=[
+                    {"id": 10, "top_logprobs": []},
+                    {"id": 99, "top_logprobs": [{"id": 99, "logprob": -.5}, {"id": 20, "logprob": -.51}]}])
+                _, eos = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
+                gufo = row([10, 20, 12, 13])
+                gufo["top_logprobs"] = [[], [{"id": 20, "logprob": -.5}, {"id": 99, "logprob": -.51}], [], []]
+                self.assertEqual(self.compare(gufo, eos["tiny"])["near_tie"], "YES")
+                response["_redirect"] = True
+                with self.assertRaisesRegex(ValueError, "BLOCKED"):
+                    PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
+                self.assertFalse(any(path.startswith("GET:") for path, _ in requests))
             finally:
                 server.shutdown()
                 thread.join()

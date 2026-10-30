@@ -78,7 +78,9 @@ python3 tools/qwen-flash/token_parity.py \
 ```
 
 `--llama-url` is the server base (optional `/v1` suffix), **not** the completion
-route. Each live request sends the exact same numeric array registered for both sides,
+route. Connections are direct HTTP(S): environment proxies are disabled,
+redirects are rejected, and non-HTTP schemes/embedded credentials are invalid.
+Each live request sends the exact same numeric array registered for both sides,
 never visits a tokenizer/chat endpoint, does not retry, and disables prompt
 cache. Numeric arrays are essential: no inferred BOS, templates or text pass.
 A live Gufo URL uses exactly the same numeric-prompt protocol; rejection or
@@ -122,7 +124,10 @@ repeated digest characters below are placeholders, **not real provenance**):
 
 For this two-token example use `--tokens 2 --horizon 2`. `top_logprobs` is
 optional; omit it for today's Gufo recordings. Entries must be position-aligned
-actual observations, **not fabricated**. Preserve raw responses/traces and
+actual observations, **not fabricated**. Recorded arrays must be empty or match
+the raw emitted-ID count; an EOS capture may additionally contain one terminal
+decision position (Gufo excludes EOG from its emitted IDs). Other lengths are
+invalid rather than silently shifted. Preserve raw responses/traces and
 capture provenance alongside the normalized envelope. A live llama config
 file contains just the `config` object, with the exact pinned llama revision
 above. The tool requires matching model/tokenizer SHA256 values, declared AR
@@ -171,6 +176,16 @@ For **each prompt** output includes:
    Truncated top-k that omits the other winner gives UNKNOWN unless a large
    observed top1/top2 gap already proves NO. Missing Gufo top-k is UNKNOWN,
    never evidence of a near-tie or a pass.
+At the pinned llama revision, probability entries may be omitted when a token
+ends inside a multi-byte UTF-8 character. If live probability counts or their
+reported emitted IDs do not align, that request records
+`distributions_misaligned=true`, keeps every actual emitted ID/raw response,
+and clears its positional top-k rather than guessing alignment or aborting the
+batch. That engine's near-tie evidence is UNKNOWN; a proven NO from the other
+engine remains NO under the rule above. Other requests still retain their own
+available distributions. Exact-ID numeric matches remain human-review-required,
+never an automatic quality PASS.
+
 4. Same-index agreement over up to the **registered short horizon** (default32
    within a64-token budget), with denominator `min(horizon, common emitted
    length)` explicitly reported. Zero denominator gives null, not100%.

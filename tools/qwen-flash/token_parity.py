@@ -14,7 +14,8 @@ import re
 from pathlib import Path
 import sys
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 LLAMA_REVISION = "6d5ac3c8d5aae1831edf17c2d5cda11abe025bb3"
 SAMPLING = {"temperature": 0, "top_k": 1, "top_p": 1, "min_p": 0,
@@ -57,6 +58,18 @@ def validate_config(config, engine):
         raise ValueError("llama: expected pinned revision " + LLAMA_REVISION)
 
 
+def open_direct(request, timeout):
+    url = urlsplit(request.full_url)
+    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+        raise ValueError("endpoint must be a direct HTTP(S) URL without credentials")
+
+    class NoRedirects(HTTPRedirectHandler):
+        def redirect_request(self, *_):
+            return None
+
+    return build_opener(ProxyHandler({}), NoRedirects()).open(request, timeout=timeout)
+
+
 def load_recordings(path, prompts, count, engine):
     document = read_json(path)
     validate_config(document["config"], engine)
@@ -73,7 +86,12 @@ def load_recordings(path, prompts, count, engine):
             raise ValueError(f"{engine}: recordings must use registered greedy settings/count")
         if not isinstance(row["text"], str):
             raise ValueError(f"{engine}: continuation text required for human review")
-        for position in range(len(row.get("top_logprobs", []))):
+        top = row.get("top_logprobs", [])
+        length = len(row["generated_token_ids"])
+        eos = normalize_stop(row, engine)["stop_reason"] == "eos"
+        if not isinstance(top, list) or len(top) not in ({0, length, length + 1} if eos else {0, length}):
+            raise ValueError(f"{engine}: recorded top_logprobs positions do not match emitted IDs")
+        for position in range(len(top)):
             distribution(row, position)
     return document["config"], by_id
 
@@ -90,7 +108,7 @@ def native_live(url, config, prompts, count, top_k, timeout, engine):
                           headers={"Content-Type": "application/json"})
         # No retries, text-tokenization endpoints or endpoint fallback.
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with open_direct(request, timeout=timeout) as response:
                 result = json.load(response, parse_constant=reject_constant)
         except HTTPError as error:
             raise ValueError(f"BLOCKED: {engine} native token-ID /completion request rejected "
@@ -99,16 +117,21 @@ def native_live(url, config, prompts, count, top_k, timeout, engine):
             raise ValueError(f"BLOCKED: {engine} response has no emitted token IDs")
         generated = ids(result["tokens"], engine + " response tokens")
         if result.get("truncated"):
-            raise ValueError("llama: prompt/context truncated")
+            raise ValueError(engine + ": prompt/context truncated")
         probabilities = result.get("completion_probabilities", [])
-        if probabilities and (len(probabilities) != len(generated) or any(
-                entry["id"] != token for entry, token in zip(probabilities, generated))):
-            raise ValueError("llama: probability positions do not match emitted IDs")
+        if not isinstance(probabilities, list):
+            raise ValueError(engine + ": completion_probabilities must be an array")
+        misaligned = bool(probabilities) and (len(probabilities) != len(generated) or any(
+            entry["id"] != token for entry, token in zip(probabilities, generated)))
+        # Pinned llama omits probability entries for incomplete UTF-8 pieces.
+        # Keep all actual IDs/raw evidence, but never guess a positional mapping.
+        aligned_probabilities = [] if misaligned else probabilities
         rows[prompt["id"]] = dict(
             id=prompt["id"], prompt_token_ids=prompt["prompt_token_ids"],
             generated_token_ids=generated, text=result["content"],
             sampling=SAMPLING, max_tokens=count,
-            top_logprobs=[entry.get("top_logprobs", []) for entry in probabilities],
+            top_logprobs=[entry.get("top_logprobs", []) for entry in aligned_probabilities],
+            distributions_misaligned=misaligned,
             request=payload, generation_settings=result.get("generation_settings"),
             response=result,
             stop_type=result.get("stop_type"),
