@@ -1584,12 +1584,17 @@ void SharedPeerReusesTheCurrentStableCapture() {
          "an uncaptured partial pass cannot be offered to a peer");
   leader.Invalidate();
 }
-void SchedulerSharesAnExactPendingFrontier() {
+void SchedulerSharesAnExactPendingFrontier(bool fail_capture = false,
+                                           bool cancel_leader = false) {
   // Hold the first real component capture after allocation, outside the cache
   // mutex. An unrelated queued request releases it only after the scheduler
   // has considered the earlier follower: no arrival sleeps or race lottery.
   class PendingRunner final : public Runner {
   public:
+    explicit PendingRunner(bool fail_capture) : fail_capture(fail_capture) {}
+    const bool fail_capture;
+    std::function<void()> peer_action;
+    mutable std::atomic<bool> injected_failure{false};
     mutable std::binary_semaphore entered{0}, release{0};
     mutable std::atomic<bool> first{true}, resumed{false}, timed_out{false};
     mutable std::mutex mutex;
@@ -1626,6 +1631,11 @@ void SchedulerSharesAnExactPendingFrontier() {
             timed_out = true;
             throw std::runtime_error("pending component capture timed out");
           }
+          if (fail_capture) {
+            injected_failure = true;
+            throw std::runtime_error(
+                "injected pending component capture failure");
+          }
         }
         return stream();
       };
@@ -1635,12 +1645,15 @@ void SchedulerSharesAnExactPendingFrontier() {
                             std::span<const TextRunnerToken> prompt,
                             std::size_t offset,
                             std::size_t budget) const override {
-      if (prompt.front() == 999)
+      if (prompt.front() == 999) {
+        if (peer_action)
+          peer_action();
         Resume();
+      }
       return Runner::Prefill(state, prompt, offset, budget);
     }
   };
-  auto runner = std::make_shared<PendingRunner>();
+  auto runner = std::make_shared<PendingRunner>(fail_capture);
   auto pool = std::make_shared<TextRunnerPool>(runner, 3);
   TextGenerationScheduler scheduler(pool);
   struct ReleaseOnExit {
@@ -1654,17 +1667,45 @@ void SchedulerSharesAnExactPendingFrontier() {
   auto leader = scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata);
   if (!runner->entered.try_acquire_for(std::chrono::seconds(5)))
     throw std::runtime_error("leader did not enter pending capture window");
+  if (cancel_leader)
+    runner->peer_action = [&] { leader.Cancel(); };
   auto follower = scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata);
   auto unrelated = scheduler.Submit({999, 1000}, 1, 0.0f);
   const auto peer = unrelated.Wait();
   const auto a = leader.Wait();
   const auto b = follower.Wait();
-  assert(!runner->timed_out && runner->resumed);
-  assert(peer.tokens.size() == 1 && a.tokens.size() == 1 &&
-         a.tokens == b.tokens);
-  assert(a.prefill_tokens == prompt.size());
+  assert(!runner->timed_out && runner->resumed &&
+         runner->injected_failure == fail_capture);
+  assert(peer.tokens.size() == 1 && !b.cancelled && b.tokens.size() == 1);
+  assert(a.cancelled == cancel_leader);
+  if (cancel_leader)
+    assert(a.tokens.empty());
+  else
+    assert(a.tokens == b.tokens && a.prefill_tokens == prompt.size());
   assert(b.shared_prefix_wait_ms > 0);
-  assert(b.cached_prompt_tokens == prompt.size() - 1 && b.prefill_tokens == 1);
+  assert(b.cached_prompt_tokens + b.prefill_tokens == prompt.size());
+  if (!fail_capture && !cancel_leader)
+    assert(b.cached_prompt_tokens == prompt.size() - 1 &&
+           b.prefill_tokens == 1);
+  if (fail_capture && cancel_leader) {
+    // Cancel preserves the already executed live frontier even when its copy
+    // failed. The follower must reuse that state, not a nonexistent snapshot.
+    assert(a.component_cache && a.component_cache->captures == 0);
+    assert(b.cached_prompt_tokens == prompt.size() - 1 &&
+           b.prefill_tokens == 1 && b.cache_restore_bytes == 0);
+  }
+  // Cancellation may retain a completed safe checkpoint. Capture failure may
+  // fall back to a later coherent live frontier. Neither permits stale state.
+  auto cold_runner = std::make_shared<Runner>();
+  auto cold_pool = std::make_shared<TextRunnerPool>(cold_runner, 1);
+  TextGenerationScheduler cold(cold_pool);
+  const auto expected = cold.Submit(prompt, 1, 0.0f).Wait();
+  assert(b.tokens == expected.tokens);
+  const auto later =
+      scheduler.Submit(prompt, 1, 0.0f, {}, false, metadata).Wait();
+  assert(!later.cancelled && later.tokens == expected.tokens &&
+         later.cached_prompt_tokens >= prompt.size() - 1 &&
+         later.prefill_tokens <= 1);
 }
 void PrefillLookaheadReachesTheNextFrontier() {
   class LookaheadRunner final : public Runner {
@@ -3412,6 +3453,607 @@ void DiskDirectoryHasOneOwner() {
   }
   std::filesystem::remove_all(directory);
 }
+// Independent direct owners make safe creator withdrawal observable. The
+// ordinary fake pool shares one allocation and correctly refuses withdrawal.
+class PredictionRunner : public Runner {
+public:
+  std::size_t private_limit{1 << 20};
+  mutable std::size_t allocation_refusals{};
+  mutable cache::ResourceLedger* resource_ledger{};
+  mutable bool fail_reconcile{};
+  PredictionRunner() {
+    row_blocks = private_blocks = 0;
+    rows_per_chunk = 64;
+  }
+  std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger& ledger, std::size_t budget) const override {
+    auto resources = Runner::CreateComponentCacheResources(ledger, budget);
+    resource_ledger = &ledger;
+    resources->allocate = [this,
+                           &ledger](const cache::PayloadRequest& request) {
+      if (request.category == cache::ResourceCategory::kPrivateState &&
+          ledger.Snapshot().bytes[static_cast<std::size_t>(
+              cache::ResourceCategory::kPrivateState)] +
+                  request.bytes >
+              private_limit) {
+        ++allocation_refusals;
+        throw cache::ResourceExhausted();
+      }
+      auto bytes = std::make_shared<std::vector<std::byte>>(request.bytes);
+      auto backing =
+          ledger.Reserve(cache::ResourceCategory::kBackingFree, request.bytes)
+              .Convert();
+      auto reservation = std::make_shared<cache::ResourceReservation>(
+          backing.ReserveBacking(request.category));
+      return ComponentCaptureBuffer{
+          *bytes, [bytes, reservation] {
+            return cache::Payload::Committed(
+                reservation->Convert(),
+                std::shared_ptr<const void>(bytes, bytes->data()));
+          }};
+    };
+    return resources;
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    Runner::ReconcileComponentState(state, position);
+    if (fail_reconcile)
+      throw std::runtime_error("test later handoff failure");
+  }
+};
+
+void RequiredPublicationUsesOwnedPredictionUnderMetadataPressure() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const std::vector<TextRunnerToken> anchor{90, 91};
+  {
+    auto seed = cache.Acquire(anchor, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(seed->state());
+    runner->adapter->Append(state.slot, anchor, anchor);
+    assert(seed->TryReserveSnapshot(seed->CaptureBytes(), anchor.size(), false,
+                                    SnapshotPurpose::kContinuation, {}));
+    assert(seed->PublishSnapshot(anchor, seed->Capture(), false));
+  }
+  std::vector<TextRunnerToken> prompt(20);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto creator = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(creator->state());
+  const auto root = std::span(prompt).first(8);
+  runner->adapter->Append(state.slot, root, root);
+  assert(creator->TryReserveSnapshot(creator->CaptureBytes(), 8, true,
+                                     SnapshotPurpose::kHistory, {},
+                                     SnapshotOrigin::kPredicted));
+  assert(creator->PublishSnapshot({root.begin(), root.end()},
+                                  creator->Capture(), true));
+  const auto tail = std::span(prompt).subspan(8);
+  runner->adapter->Append(state.slot, tail, tail);
+  assert(creator->TryReserveSnapshot(creator->CaptureBytes(), prompt.size(),
+                                     true, SnapshotPurpose::kContinuation, {}));
+  auto required = creator->Capture();
+  // Real metadata failure occurs inside Admit, after capture and all root
+  // temporaries have gone. Zero headroom must not sacrifice the ordinary
+  // anchor.
+  auto& ledger = *runner->resource_ledger;
+  auto pressure =
+      ledger
+          .Reserve(cache::ResourceCategory::kBackingFree,
+                   ledger.Limits().ram_bytes - ledger.Snapshot().ram_bytes)
+          .Convert();
+  assert(creator->PublishSnapshot(prompt, std::move(required), true));
+  assert(creator->HasSnapshotFor(anchor) && creator->HasSnapshotFor(prompt));
+  assert(!creator->HasSnapshotFor(root));
+}
+
+void RequiredExactReplacementKeepsRootAtFullRecordCapacity() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 1, 1 << 24, {});
+  std::vector<TextRunnerToken> prompt(20);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  const auto seed = [&](std::vector<TextRunnerToken> tokens) {
+    auto lease = cache.Acquire(tokens, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, tokens, tokens);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), tokens.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     {}));
+    assert(lease->PublishSnapshot(tokens, lease->Capture(), false));
+  };
+  for (std::size_t i = 0; i < cache::RetentionPolicy::kRecordLimit - 2; ++i)
+    seed({static_cast<TextRunnerToken>(1000 + i), 9});
+  seed({prompt.begin(), prompt.begin() + 16});
+  // Cold creator can capture the structural root before the pre-existing
+  // stable point. Publishing it fills the table's final record.
+  auto creator = cache.Acquire(prompt, {}, {}, false, 0, true);
+  auto& state = dynamic_cast<State&>(creator->state());
+  const auto root = std::span(prompt).first(8);
+  runner->adapter->Append(state.slot, root, root);
+  assert(creator->TryReserveSnapshot(creator->CaptureBytes(), 8, true,
+                                     SnapshotPurpose::kHistory, {},
+                                     SnapshotOrigin::kPredicted));
+  assert(creator->PublishSnapshot({root.begin(), root.end()},
+                                  creator->Capture(), true));
+  for (const auto end : {16U, 17U}) {
+    const auto start = end == 16 ? 8 : 16;
+    const auto tail = std::span(prompt).subspan(start, end - start);
+    runner->adapter->Append(state.slot, tail, tail);
+    assert(creator->TryReserveSnapshot(creator->CaptureBytes(), end, true,
+                                       SnapshotPurpose::kContinuation, {}));
+    assert(creator->PublishSnapshot({prompt.begin(), prompt.begin() + end},
+                                    creator->Capture(), true));
+    // Exact replacement requires no extra record. Only the next new record
+    // invokes owner withdrawal, before any unrelated ordinary victim.
+    assert(creator->HasSnapshotFor(root) == (end == 16));
+    assert(creator->HasSnapshotFor(std::vector<TextRunnerToken>{1000, 9}));
+  }
+}
+
+void OptionalPlanningPressureDoesNotFailAdmittedRequest() {
+  for (const auto root :
+       {std::optional<std::size_t>{}, std::optional<std::size_t>{120}}) {
+    auto runner = std::make_shared<PredictionRunner>();
+    runner->max_context = 2048;
+    TextRunnerPool pool(runner, 1);
+    std::vector<TextRunnerToken> prompt(256);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    // Many matching short checkpoints make Lookup's candidate inventory
+    // larger than the remaining headroom, although a cold lease still fits.
+    for (std::size_t end = 16; end < 80; ++end) {
+      auto request = pool.Acquire({prompt.begin(), prompt.begin() + end},
+                                  sampling::SamplingConfig{}, {}, {}, false);
+      Prefill(request);
+      (void)Generate(request);
+      assert(request.Commit().snapshot_bytes);
+    }
+    auto& ledger = *runner->resource_ledger;
+    auto pressure = ledger
+                        .Reserve(cache::ResourceCategory::kBackingFree,
+                                 ledger.Limits().ram_bytes -
+                                     ledger.Snapshot().ram_bytes - 4096)
+                        .Convert();
+    // Exercise the actual request constructor, both without any optional
+    // capture and with a structural root. Planning must not fail generation.
+    auto request = pool.Acquire(prompt, sampling::SamplingConfig{}, {}, {},
+                                false, 200, true, true, {}, root);
+    assert(request.cached_prompt_tokens() == 0);
+    pressure = {};
+    Prefill(request);
+    const auto actual = Generate(request);
+    assert(request.Commit().snapshot_bytes);
+    auto oracle_runner = std::make_shared<PredictionRunner>();
+    oracle_runner->max_context = 2048;
+    TextRunnerPool oracle_pool(oracle_runner, 1);
+    auto oracle = oracle_pool.Acquire(prompt);
+    Prefill(oracle);
+    assert(Generate(oracle) == actual);
+  }
+}
+
+void PredictionPlannerSharesQuotaAndDeduplicatesPending() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 5, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(16000);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto lease = cache.Acquire(prompt, {}, {}, true, 15000, true);
+  const auto original = lease->PlannedCaptures(15000);
+  assert(original.size() == 4);
+  const auto plan = lease->PlannedCaptures(15000, 3000);
+  assert(plan.size() == original.size());
+  const auto root =
+      std::ranges::find(plan, 3000, &PlannedSnapshotCapture::boundary);
+  assert(root != plan.end() &&
+         root->capture_origin == SnapshotOrigin::kPredicted);
+  assert(plan.front().boundary == original.front().boundary &&
+         plan.front().boundary < 3000);  // earlier fallback is never advanced
+  for (const auto omitted : {0U, 15000U, 16000U, 17000U}) {
+    const auto invalid = lease->PlannedCaptures(15000, omitted);
+    assert(std::ranges::none_of(invalid, [](const auto& capture) {
+      return capture.capture_origin == SnapshotOrigin::kPredicted;
+    }));
+  }
+  std::vector<std::unique_ptr<ComponentTextCache::Lease>> peers;
+  for (const auto point : {100U, 200U, 300U, 400U}) {
+    auto peer = cache.Acquire(prompt, {}, {}, true, 15000, true);
+    assert(peer->TryReserveSnapshot(0, point, true, SnapshotPurpose::kHistory,
+                                    {}, SnapshotOrigin::kPredicted));
+    peers.push_back(std::move(peer));
+  }
+  // Pending points consume the shared four-point allowance even if none is on
+  // this lease's grid. No extra root, no eviction/replacement of a pending
+  // point.
+  assert(lease->PlannedCaptures(15000, 3000).empty());
+  assert(!lease->TryReserveSnapshot(0, 100, true, SnapshotPurpose::kHistory, {},
+                                    SnapshotOrigin::kPredicted));
+  peers.clear();  // invalidation clears all non-owning pending identities
+  assert(lease->TryReserveSnapshot(0, 100, true, SnapshotPurpose::kHistory, {},
+                                   SnapshotOrigin::kPredicted));
+  const auto duplicate = lease->PlannedCaptures(15000, 100);
+  assert(std::ranges::none_of(
+      duplicate, [](const auto& capture) { return capture.boundary == 100; }));
+  // Required demand can supersede a pending predicted reservation exactly.
+  assert(lease->TryReserveSnapshot(0, 100, true, SnapshotPurpose::kContinuation,
+                                   {}));
+}
+
+void SchedulerCarriesStructuralRootMetadata() {
+  auto runner = std::make_shared<PredictionRunner>();
+  runner->max_context = 2048;
+  auto pool = std::make_shared<TextRunnerPool>(runner, 1);
+  TextGenerationScheduler scheduler(pool);
+  std::vector<TextRunnerToken> seed(1000);
+  std::iota(seed.begin(), seed.end(), 10);
+  TextRequestMetadata metadata;
+  metadata.cache_prefix_tokens = 900;
+  metadata.root_prefix_tokens = 600;
+  const auto first =
+      scheduler.Submit(seed, 1, 0.0f, {}, false, metadata).Wait();
+  assert(first.cached_prompt_tokens == 0 &&
+         first.prefill_tokens == seed.size());
+  seed[606] += 10000;
+  const auto next = scheduler.Submit(seed, 1, 0.0f, {}, false, metadata).Wait();
+  assert(next.cached_prompt_tokens == 600 && next.prefill_tokens == 400);
+}
+
+void UnreadyPredictionDoesNotObserveOrTaintFallback() {
+  class UnreadyRunner final : public PredictionRunner {
+  public:
+    bool LookupFullCheckpointReady() const override { return false; }
+    bool HasDecodeFrontier(const TextRunnerState&) const override {
+      return false;
+    }
+  };
+  auto runner = std::make_shared<UnreadyRunner>();
+  ComponentTextCache cache(runner, 2, 1 << 22, {});
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 4, 5, 6, 7, 8, 9};
+  auto creator = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(creator->state());
+  for (const auto count : {4U, 8U}) {
+    const auto part = std::span(prompt).subspan(count - 4, 4);
+    runner->adapter->Append(state.slot, part, part);
+    assert(creator->TryReserveSnapshot(
+        creator->CaptureBytes(), count, false, SnapshotPurpose::kHistory, {},
+        count == 8 ? SnapshotOrigin::kPredicted : SnapshotOrigin::kOrdinary));
+    assert(creator->PublishSnapshot({prompt.begin(), prompt.begin() + count},
+                                    creator->Capture(), false));
+  }
+  {
+    auto fallback =
+        cache.Acquire(std::span(prompt).first(8), {}, {}, true, 0, true);
+    assert(fallback->cached_tokens() == 4 && !fallback->reused_prediction());
+    assert(fallback->ordinary_cached_tokens() == 4 &&
+           fallback->Metrics().unready_frontiers == 1);
+  }
+  auto actual = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(actual->cached_tokens() == 8 && actual->reused_prediction() &&
+         actual->ordinary_cached_tokens() == 4);
+}
+
+void PredictionPublicationBudgetIsNotMarginalQuota() {
+  auto runner = std::make_shared<PredictionRunner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(40001);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  const auto ordinary = std::span(prompt).first(prompt.size() - 1);
+  runner->adapter->Append(state.slot, ordinary, ordinary);
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), ordinary.size(),
+                                   false, SnapshotPurpose::kContinuation, {}));
+  assert(lease->PublishSnapshot({ordinary.begin(), ordinary.end()},
+                                lease->Capture(), false));
+  const auto last = std::span(prompt).last(1);
+  runner->adapter->Append(state.slot, last, last);
+  const auto marginal = lease->CaptureBytes();
+  assert(marginal < (1 << 22) / 12);
+  assert(lease->TryReserveSnapshot(marginal, prompt.size(), false,
+                                   SnapshotPurpose::kHistory, {},
+                                   SnapshotOrigin::kPredicted));
+  // Most rows are shared with the ordinary capture, but the prediction cap
+  // charges their full capacities, not this small new-payload estimate.
+  assert(lease->PublishSnapshot(prompt, lease->Capture(), false) == 0);
+  assert(lease->HasSnapshotFor(ordinary) && !lease->HasSnapshotFor(prompt));
+}
+
+void PredictionProducerPreservesNearbyLearnedBoundary() {
+  auto runner = std::make_shared<PredictionRunner>();
+  runner->max_context = 2048;
+  TextRunnerPool pool(runner, 1);
+  std::vector<TextRunnerToken> seed(1000);
+  std::iota(seed.begin(), seed.end(), 10);
+  {
+    auto request = pool.Acquire(seed, sampling::SamplingConfig{}, {}, {}, true,
+                                900, true, true, {}, 600);
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  auto branch = seed;
+  for (std::size_t i = 606; i < branch.size(); ++i)
+    branch[i] += 2000;
+  {
+    auto request = pool.Acquire(branch, sampling::SamplingConfig{}, {}, {},
+                                true, 900, true, true, {}, 600);
+    assert(request.cached_prompt_tokens() == 600);
+    // Learning's 512-token gate must use ordinary coverage (zero), not the
+    // prediction at 600. Coalescing must not replace the actual 606 with 600.
+    Prefill(request);
+    (void)Generate(request);
+    (void)request.Commit();
+  }
+  auto next = branch;
+  next[606] += 4000;
+  auto restored = pool.Acquire(next, sampling::SamplingConfig{}, {}, {}, true,
+                               900, true, true, {}, 600);
+  assert(restored.cached_prompt_tokens() == 606);
+  Prefill(restored);
+  const auto actual = Generate(restored);
+  auto oracle_runner = std::make_shared<PredictionRunner>();
+  oracle_runner->max_context = 2048;
+  TextRunnerPool oracle_pool(oracle_runner, 1);
+  auto oracle = oracle_pool.Acquire(next);
+  Prefill(oracle);
+  assert(Generate(oracle) == actual);
+
+  auto planned_runner = std::make_shared<PredictionRunner>();
+  planned_runner->max_context = 2048;
+  TextRunnerPool planned_pool(planned_runner, 1);
+  auto planned = planned_pool.Acquire(seed, sampling::SamplingConfig{}, {}, {},
+                                      true, 900, true, true, {}, 600);
+  assert(planned.ShareCheckpoint(606) == 606);  // not the planned root at 600
+}
+
+void PredictionWithdrawalIsPressureOnly() {
+  for (const bool pressure : {false, true}) {
+    for (const bool external_owner : {false, true}) {
+      auto runner = std::make_shared<PredictionRunner>();
+      runner->private_limit = pressure ? 32 : 64;
+      ComponentTextCache cache(runner, 1, 1 << 22, {});
+      std::vector<TextRunnerToken> prompt(20);
+      std::iota(prompt.begin(), prompt.end(), 10);
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, std::span(prompt).first(8),
+                              std::span(prompt).first(8));
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 8, true,
+                                       SnapshotPurpose::kHistory, {},
+                                       SnapshotOrigin::kPredicted));
+      std::shared_ptr<const TextRunnerSnapshot> root = lease->Capture();
+      assert(lease->PublishSnapshot({prompt.begin(), prompt.begin() + 8}, root,
+                                    true));
+      // The creator finishing prefill is never an actual reuse observation.
+      assert(!lease->ObserveSnapshotFor(std::span(prompt).first(8)));
+      if (!external_owner)
+        root.reset();
+      runner->adapter->Append(state.slot, std::span(prompt).subspan(8),
+                              std::span(prompt).subspan(8));
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                       true, SnapshotPurpose::kContinuation,
+                                       {}));
+      bool refused = false;
+      try {
+        auto full = lease->Capture();
+        assert(lease->PublishSnapshot(prompt, std::move(full), true));
+      } catch (const cache::ResourceExhausted&) {
+        refused = true;
+      }
+      assert(refused == (pressure && external_owner));
+      const auto metrics = lease->Metrics();
+      const auto private_bytes = metrics.ledger.bytes[static_cast<std::size_t>(
+          cache::ResourceCategory::kPrivateState)];
+      if (!pressure) {
+        assert(lease->HasSnapshotFor(std::span(prompt).first(8)));
+        assert(lease->HasSnapshotFor(prompt));
+        assert(private_bytes == 64 && runner->allocation_refusals == 0);
+      } else {
+        assert(runner->allocation_refusals > 0);
+        // Even logical removal cannot spend the escaped payload's bytes.
+        assert(private_bytes == 32);
+        assert(lease->HasSnapshotFor(prompt) == !external_owner);
+        assert(metrics.captures == (external_owner ? 1 : 2));
+      }
+    }
+  }
+}
+
+void PredictionNeverReclaimsOrdinaryCapture() {
+  auto runner = std::make_shared<PredictionRunner>();
+  runner->private_limit = 32;
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  std::vector<TextRunnerToken> prompt(20, 10);
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  runner->adapter->Append(state.slot, std::span(prompt).first(8),
+                          std::span(prompt).first(8));
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 8, false,
+                                   SnapshotPurpose::kContinuation, {}));
+  assert(lease->PublishSnapshot({prompt.begin(), prompt.begin() + 8},
+                                lease->Capture(), false));
+  runner->adapter->Append(state.slot, std::span(prompt).subspan(8),
+                          std::span(prompt).subspan(8));
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), 20, false,
+                                   SnapshotPurpose::kHistory, {},
+                                   SnapshotOrigin::kPredicted));
+  bool refused = false;
+  try {
+    (void)lease->Capture();
+  } catch (const cache::ResourceExhausted&) {
+    refused = true;
+  }
+  assert(refused && runner->allocation_refusals);
+  assert(lease->HasSnapshotFor(std::span(prompt).first(8)));
+  assert(lease->Metrics().captures == 1);
+}
+
+void PredictionObservationFollowsSuccessfulHandoff() {
+  enum class Attempt {
+    kSuccess,
+    kFailedRestore,
+    kLaterException,
+    kDisabled,
+    kCancelled
+  };
+  for (const auto attempt :
+       {Attempt::kSuccess, Attempt::kFailedRestore, Attempt::kLaterException,
+        Attempt::kDisabled, Attempt::kCancelled}) {
+    auto runner = std::make_shared<PredictionRunner>();
+    ComponentTextCache cache(runner, 2, 1 << 22, {});
+    std::vector<TextRunnerToken> prompt(20);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto creator = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(creator->state());
+    // Ordinary fallback at four, predicted source at eight.
+    for (const auto count : {4U, 8U}) {
+      const auto start = count == 4 ? 0 : 4;
+      const auto part = std::span(prompt).subspan(start, 4);
+      runner->adapter->Append(state.slot, part, part);
+      assert(creator->TryReserveSnapshot(
+          creator->CaptureBytes(), count, false, SnapshotPurpose::kHistory, {},
+          count == 8 ? SnapshotOrigin::kPredicted : SnapshotOrigin::kOrdinary));
+      assert(creator->PublishSnapshot({prompt.begin(), prompt.begin() + count},
+                                      creator->Capture(), false));
+    }
+    assert(cache.Lookup(prompt, nullptr, true, 0)->matched_tokens == 8);
+    if (attempt == Attempt::kFailedRestore)
+      runner->adapter->FailNextTransfer();
+    runner->fail_reconcile = attempt == Attempt::kLaterException;
+    bool threw = false;
+    std::unique_ptr<ComponentTextCache::Lease> reuse;
+    try {
+      reuse = cache.Acquire(
+          prompt, [attempt] { return attempt == Attempt::kCancelled; }, {},
+          attempt != Attempt::kDisabled, 0, true);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    assert(threw == (attempt == Attempt::kLaterException));
+    if (attempt == Attempt::kCancelled)
+      assert(!reuse);
+    if (reuse) {
+      assert(reuse->cached_tokens() == (attempt == Attempt::kSuccess ? 8
+                                        : attempt == Attempt::kFailedRestore
+                                            ? 4
+                                            : 0));
+      assert(reuse->reused_prediction() == (attempt == Attempt::kSuccess));
+      assert(reuse->ordinary_cached_tokens() ==
+             (attempt == Attempt::kDisabled ? 0 : 4));
+      reuse->Invalidate();
+      reuse.reset();
+    }
+    runner->fail_reconcile = false;
+    // Only success upgraded logical provenance. A later successful reader of
+    // an unobserved source still reports prediction, despite a previous lookup
+    // or exception after restore.
+    if (attempt != Attempt::kFailedRestore) {
+      auto next = cache.Acquire(prompt, {}, {}, true, 0, true);
+      assert(next->cached_tokens() == 8);
+      assert(next->reused_prediction() == (attempt != Attempt::kSuccess));
+      assert(next->ordinary_cached_tokens() ==
+             (attempt == Attempt::kSuccess ? 8 : 4));
+    }
+  }
+}
+
+void PredictedSnapshotsRemainRamOnly() {
+  const TemporaryDirectory temp("gufo-predicted-ram-only");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  {
+    auto runner = std::make_shared<Runner>();
+    ComponentTextCache cache(runner, 1, 1 << 22, disk);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    // Use an otherwise durable purpose: origin, not the grid-purpose filter,
+    // must prevent publication. No producer plans predictions in this slice.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt, SnapshotOrigin::kPredicted));
+    auto predicted = lease->Capture();
+    assert(predicted);
+    // A later ordinary reservation must not upgrade the captured origin.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                     false, SnapshotPurpose::kContinuation,
+                                     prompt));
+    assert(lease->PublishSnapshot(prompt, std::move(predicted), false) > 0);
+    assert(lease->HasSnapshotFor(prompt));
+    const auto before = lease->Metrics();
+    assert(before.disk_queued_bytes == 0 && before.persistence &&
+           before.persistence->accepted == 0 &&
+           before.persistence->timing.private_write_bytes == 0 &&
+           before.persistence->timing.shared_write_bytes == 0 &&
+           before.persistence->timing.manifest_write_bytes == 0);
+    assert(ManagedBytes(temp.path()) == 0);
+    auto ordinary = lease->Capture();
+    assert(ordinary);
+    // Nor may a later prediction downgrade an already ordinary payload.
+    // Use another boundary: exact published predictions are deduplicated.
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size() - 1,
+                                     false, SnapshotPurpose::kContinuation,
+                                     std::span(prompt).first(prompt.size() - 1),
+                                     SnapshotOrigin::kPredicted));
+    assert(lease->PublishSnapshot(prompt, std::move(ordinary), false) > 0);
+    const auto after = lease->Metrics();
+    assert(after.disk_queued_bytes > 0 && after.persistence &&
+           after.persistence->accepted == 1);
+    lease->Invalidate();
+  }
+  // Positive control: the ordinary payload really persisted, not just queued.
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache restarted(runner, 1, 1 << 22, disk);
+  const auto lease = restarted.Acquire(prompt, {}, {}, true, 0, true);
+  assert(lease->restored_from_disk() &&
+         lease->cached_tokens() == prompt.size());
+}
+
+void PredictedCaptureRefusesBothDurableFallbacks() {
+  for (const bool over_budget : {false, true}) {
+    const TemporaryDirectory temp("gufo-predicted-no-fallback");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                          .capacity_bytes = 1 << 20,
+                                          .min_checkpoint_step_tokens = 1};
+    auto runner = std::make_shared<Runner>();
+    runner->row_blocks = 0;
+    runner->private_blocks = 2;
+    runner->rows_per_chunk = over_budget ? 4096 : 256;
+    const std::size_t budget = over_budget ? 448 << 10 : 1 << 20;
+    ComponentTextCache cache(runner, 1, budget, disk);
+    std::vector<TextRunnerToken> prompt(over_budget ? 65536 : 4096);
+    std::iota(prompt.begin(), prompt.end(), 10);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    assert((lease->CaptureBytes() > budget) == over_budget);
+    if (over_budget)
+      assert(!lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                        false, SnapshotPurpose::kContinuation,
+                                        prompt, SnapshotOrigin::kPredicted));
+    // Reservation is intent, not final geometry. Force a stale low estimate
+    // to exercise Capture's own over-budget defense as well as allocation fail.
+    assert(lease->TryReserveSnapshot(0, prompt.size(), false,
+                                     SnapshotPurpose::kContinuation, prompt,
+                                     SnapshotOrigin::kPredicted));
+    bool refused = false;
+    try {
+      (void)lease->Capture();
+    } catch (const cache::ResourceExhausted&) {
+      refused = true;
+    }
+    assert(refused);
+    const auto metrics = lease->Metrics();
+    assert(metrics.captures == 0 && metrics.disk_queued_bytes == 0 &&
+           metrics.persistence && metrics.persistence->accepted == 0 &&
+           metrics.persistence->timing.private_write_bytes == 0 &&
+           metrics.persistence->timing.shared_write_bytes == 0 &&
+           metrics.persistence->timing.manifest_write_bytes == 0);
+    const auto report = ComponentCacheJson(metrics);
+    assert(report.find("last_capture_refusal")->member_str("route") == "ram");
+    assert(ManagedBytes(temp.path()) == 0);
+    lease->Invalidate();
+  }
+}
+
 void GridDoesNotSuppressFirstDiskPrompt() {
   const TemporaryDirectory temp("gufo-component-spacing-test");
   const std::filesystem::path directory = temp.path();
@@ -5794,6 +6436,12 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
     auto& state = dynamic_cast<State&>(lease->state());
     runner->adapter->Append(state.slot, prompt, prompt);
     hash = runner->adapter->RecurrentHash(state.slot);
+    for (const auto purpose :
+         {SnapshotPurpose::kContinuation, SnapshotPurpose::kHistory,
+          SnapshotPurpose::kBranchPoint})
+      assert(!lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                        false, purpose, prompt,
+                                        SnapshotOrigin::kPredicted));
     assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
                                      false, SnapshotPurpose::kContinuation,
                                      prompt));
@@ -6166,7 +6814,9 @@ int main(int argc, char* argv[]) {
     completion_fanout::Check();
     PublishedResidentCheckpointKeepsDiskStep();
     CancelledPrefillKeepsCompletedSteps();
-    SchedulerSharesAnExactPendingFrontier();
+    for (const bool fail_capture : {false, true})
+      for (const bool cancel_leader : {false, true})
+        SchedulerSharesAnExactPendingFrontier(fail_capture, cancel_leader);
     SharedPeerReusesTheCurrentStableCapture();
     BackingPreparationFollowsCaptures();
     PrefillLookaheadReachesTheNextFrontier();
@@ -6226,6 +6876,19 @@ int main(int argc, char* argv[]) {
     PinnedSlotBytesCountOnce();
     UnpinnedRunnersKeepTheirLimit();
     DiskDirectoryHasOneOwner();
+    PredictedSnapshotsRemainRamOnly();
+    RequiredPublicationUsesOwnedPredictionUnderMetadataPressure();
+    RequiredExactReplacementKeepsRootAtFullRecordCapacity();
+    OptionalPlanningPressureDoesNotFailAdmittedRequest();
+    PredictionPlannerSharesQuotaAndDeduplicatesPending();
+    SchedulerCarriesStructuralRootMetadata();
+    UnreadyPredictionDoesNotObserveOrTaintFallback();
+    PredictionPublicationBudgetIsNotMarginalQuota();
+    PredictionProducerPreservesNearbyLearnedBoundary();
+    PredictionWithdrawalIsPressureOnly();
+    PredictionNeverReclaimsOrdinaryCapture();
+    PredictionObservationFollowsSuccessfulHandoff();
+    PredictedCaptureRefusesBothDurableFallbacks();
     GridDoesNotSuppressFirstDiskPrompt();
     NearTailDiskBranchSurvivesRestart();
     UnbackedDeepRowsSurviveDiskRestart();

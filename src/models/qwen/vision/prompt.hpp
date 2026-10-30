@@ -56,6 +56,11 @@ struct Prompt {
   std::vector<tokenization::TokenId> tokens;
   /// Frontier unchanged when an interrupted assistant is followed by a user.
   std::size_t stable_prefix_tokens{0};
+  /// Exact token prefix ending the rendered system/developer/tool preamble.
+  /// At most stable_prefix_tokens; omitted if absent, inexact or
+  /// image-crossing. Consumers must still use IdentityForPrefix when capturing
+  /// this boundary.
+  std::optional<std::size_t> root_prefix_tokens;
   RopeLayout rope;
   std::vector<PreparedImage> images;
   [[nodiscard]] bool IntersectsImages(std::uint32_t position,

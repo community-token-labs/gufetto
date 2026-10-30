@@ -249,12 +249,16 @@ public:
       const ChatTemplateOptions& options = {},
       std::string* error_msg = nullptr);
 
+  /// Optional root_prefix_bytes ends the rendered system/developer/tool
+  /// preamble, before conversational messages; zero means absent. This byte
+  /// boundary is at most stable_prefix_bytes, not a guaranteed token boundary.
   [[nodiscard]] static std::optional<std::string> Render(
       std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
       const ChatTemplateOptions& options = {}, std::string* error_msg = nullptr,
       std::vector<std::size_t>* image_offsets = nullptr,
       std::size_t* stable_prefix_bytes = nullptr,
-      std::vector<ContentSpan>* content_spans = nullptr);
+      std::vector<ContentSpan>* content_spans = nullptr,
+      std::size_t* root_prefix_bytes = nullptr);
 
   /// Formats messages and tokenizes the rendered prompt with the given
   /// tokenizer.

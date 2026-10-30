@@ -56,6 +56,8 @@ struct TextPreparedPrompt {
   std::shared_ptr<const TextPromptContext> context;
   /// Snapshot before mutable assistant framing. Zero uses the complete prompt.
   std::size_t cache_prefix_tokens{0};
+  /// Optional exact renderer-issued system/tool root; never a stable override.
+  std::optional<std::size_t> root_prefix_tokens;
 };
 
 struct TextRunnerRamCacheOptions {
@@ -719,7 +721,8 @@ public:
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
       bool stop_at_eos = true, bool persist = true,
-      std::optional<TextPromptAdmission> reserved_resources = std::nullopt);
+      std::optional<TextPromptAdmission> reserved_resources = std::nullopt,
+      std::optional<std::size_t> root_prefix_tokens = std::nullopt);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Read-only published Acquire inventory. Never waits for admission,

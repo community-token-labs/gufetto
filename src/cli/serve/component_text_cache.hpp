@@ -130,14 +130,20 @@ public:
     [[nodiscard]] ContinuationState& state() const;
     [[nodiscard]] bool cache_hit() const noexcept;
     [[nodiscard]] std::size_t cached_tokens() const noexcept;
+    [[nodiscard]] std::size_t ordinary_cached_tokens() const noexcept;
+    [[nodiscard]] bool reused_prediction() const noexcept;
     [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
     [[nodiscard]] double restore_ms() const noexcept;
     [[nodiscard]] bool restored_from_disk() const noexcept;
     [[nodiscard]] ContinuationLookup lookup() const noexcept;
     [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
-    [[nodiscard]] bool TryReserveSnapshot(std::size_t, std::size_t, bool,
-                                          SnapshotPurpose,
-                                          std::span<const ContinuationToken>);
+    // Only the actual successful acquisition source can be observed, never a
+    // matching lookup or this lease's own prefill/capture.
+    bool ObserveSnapshotFor(std::span<const ContinuationToken>);
+    [[nodiscard]] bool TryReserveSnapshot(
+        std::size_t, std::size_t, bool, SnapshotPurpose,
+        std::span<const ContinuationToken>,
+        SnapshotOrigin = SnapshotOrigin::kOrdinary);
     void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
     std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                                 std::shared_ptr<const ContinuationSnapshot>,
@@ -151,8 +157,8 @@ public:
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
-    [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-        std::size_t stable) const;
+    [[nodiscard]] std::vector<PlannedSnapshotCapture> PlannedCaptures(
+        std::size_t stable, std::optional<std::size_t> root = {}) const;
 
   private:
     friend class ComponentTextCache;
@@ -222,16 +228,20 @@ public:
   [[nodiscard]] ContinuationState& state() const;
   [[nodiscard]] bool cache_hit() const noexcept;
   [[nodiscard]] std::size_t cached_tokens() const noexcept;
+  [[nodiscard]] std::size_t ordinary_cached_tokens() const noexcept;
+  [[nodiscard]] bool reused_prediction() const noexcept;
   [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
   [[nodiscard]] double restore_ms() const noexcept;
   [[nodiscard]] bool restored_from_disk() const noexcept;
   [[nodiscard]] ContinuationLookup lookup() const noexcept;
   [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
+  bool ObserveSnapshotFor(std::span<const ContinuationToken>);
   void AdoptRestoredPrefix(std::size_t, std::size_t, double);
   [[nodiscard]] bool TryReserveSnapshot(
       std::size_t, std::size_t, bool = false,
       SnapshotPurpose = SnapshotPurpose::kContinuation,
-      std::span<const ContinuationToken> = {});
+      std::span<const ContinuationToken> = {},
+      SnapshotOrigin = SnapshotOrigin::kOrdinary);
   void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
   std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                               std::shared_ptr<const ContinuationSnapshot>,
@@ -245,8 +255,8 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
   void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
-  [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-      std::size_t stable) const;
+  [[nodiscard]] std::vector<PlannedSnapshotCapture> PlannedCaptures(
+      std::size_t stable, std::optional<std::size_t> root = {}) const;
 
 private:
   ContinuationCache::Lease legacy_;

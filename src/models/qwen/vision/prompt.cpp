@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -288,12 +289,13 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   ImageTokenBudget image_budget(
       ImageTokenLimit(max_context, max_image_tokens.value_or(0)));
   std::vector<std::size_t> offsets;
+  std::size_t root_prefix_bytes = 0;
   std::vector<tokenization::ContentSpan> content_spans;
   std::size_t stable_prefix_bytes = 0;
   std::string error;
   const auto rendered = tokenization::QwenChatTemplate::Render(
       messages, tools, options, &error, &offsets, &stable_prefix_bytes,
-      &content_spans);
+      &content_spans, &root_prefix_bytes);
   if (!rendered)
     throw std::invalid_argument(error);
   Prompt prompt;
@@ -363,6 +365,26 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       !std::ranges::equal(suffix, std::span(prompt.tokens).last(suffix.size())))
     throw std::logic_error("Qwen stable prefix is not a token boundary");
   prompt.stable_prefix_tokens = prompt.tokens.size() - suffix.size();
+  // A byte prefix cannot describe expanded image tokens. Keep only a root
+  // before any image; never split/rewrite the actual prepared token sequence.
+  if (root_prefix_bytes != 0 &&
+      (offsets.empty() || root_prefix_bytes < offsets.front())) {
+    try {
+      const auto prefix = tokenization::QwenChatTemplate::EncodeRendered(
+          tokenizer, *rendered, 0, root_prefix_bytes, content_spans,
+          tok_options);
+      // A semantic boundary can fall inside a BPE merge. Check against the
+      // FULL actual prepared vector, never a separately tokenized prompt or
+      // a prompt split at optional boundaries (which would change token IDs).
+      if (!prefix.empty() && prefix.size() <= prompt.stable_prefix_tokens &&
+          std::ranges::equal(prefix,
+                             std::span(prompt.tokens).first(prefix.size()))) {
+        prompt.root_prefix_tokens = prefix.size();
+      }
+    } catch (const std::exception&) {
+      // Optional reuse hints must not reject an otherwise valid prompt.
+    }
+  }
   prompt.rope.Validate(max_context);
   if (!prompt.images.empty()) {
     const auto digest = identity.Finish();
