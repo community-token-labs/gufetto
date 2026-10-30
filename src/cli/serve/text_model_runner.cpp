@@ -2013,6 +2013,14 @@ std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->component_cache ? impl_->component_cache->capacity()
                                 : impl_->cache->capacity();
 }
+std::size_t TextRunnerPool::usable_capacity() const noexcept {
+  return impl_->component_cache ? impl_->component_cache->usable_capacity()
+                                : capacity();
+}
+void TextRunnerPool::SetAvailabilityCallback(std::function<void()> callback) {
+  if (impl_->component_cache)
+    impl_->component_cache->SetAvailabilityCallback(std::move(callback));
+}
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(
     std::size_t ready_requests) const {

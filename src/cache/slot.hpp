@@ -133,7 +133,8 @@ public:
       const std::function<bool(const Slot&)>& ready) const;
   DiagnosticDiscardResult Discard(
       const std::function<bool(const Slot&)>& ready,
-      const std::function<DiagnosticDiscardResult(Slot&)>& reset);
+      const std::function<DiagnosticDiscardResult(Slot&)>& reset,
+      const std::function<void()>& before_release = {});
   void Quarantine() noexcept;
 
 private:

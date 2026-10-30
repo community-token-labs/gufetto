@@ -184,6 +184,9 @@ public:
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t usable_capacity() const noexcept;
+  // One scheduler observer; must not throw. Invoked outside publication locks.
+  void SetAvailabilityCallback(std::function<void()>);
 
 private:
   void InitializePins(const TextRunnerPinnedPrefixOptions&);

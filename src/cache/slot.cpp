@@ -920,7 +920,8 @@ void DiagnosticSlotLease::Quarantine() noexcept {
 }
 DiagnosticDiscardResult DiagnosticSlotLease::Discard(
     const std::function<bool(const Slot&)>& ready,
-    const std::function<DiagnosticDiscardResult(Slot&)>& reset) {
+    const std::function<DiagnosticDiscardResult(Slot&)>& reset,
+    const std::function<void()>& before_release) {
   if (!state_)
     return result_;
   try {
@@ -932,6 +933,8 @@ DiagnosticDiscardResult DiagnosticSlotLease::Discard(
       Quarantine();
       return result_;
     }
+    if (before_release)
+      before_release();  // Final verification precedes facade destruction.
     {
       const std::lock_guard lock(state_->mutex);
       state_->stop = {};

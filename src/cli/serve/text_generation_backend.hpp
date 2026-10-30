@@ -95,7 +95,8 @@ public:
   [[nodiscard]] bool retryable() const noexcept {
     return code_ != TextGenerationErrorCode::kOutputLimit &&
            code_ != TextGenerationErrorCode::kToolChoiceUnsatisfied &&
-           code_ != TextGenerationErrorCode::kDeviceLost;
+           code_ != TextGenerationErrorCode::kDeviceLost &&
+           code_ != TextGenerationErrorCode::kCacheUnavailable;
   }
 
 private:

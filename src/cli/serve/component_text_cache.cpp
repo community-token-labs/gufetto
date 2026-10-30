@@ -312,6 +312,7 @@ struct ComponentTextCache::Impl {
       std::make_shared<std::atomic<bool>>(false);
   std::vector<std::unique_ptr<Entry>> entries;
   std::atomic<std::size_t> quarantined_slots{}, diagnostic_leases{};
+  std::shared_ptr<const std::function<void()>> availability_changed;
   std::uint64_t clock{};
   struct Readiness {
     std::weak_ptr<const cache::Checkpoint> checkpoint;
@@ -942,14 +943,20 @@ struct ComponentTextCache::Impl {
   }
   void SettleDiagnostic(Entry& entry, bool quarantine,
                         std::unique_ptr<TextRunnerState> state = {}) {
-    const std::lock_guard lock(mutex.native);
-    if (quarantine) {
-      assert(!entry.quarantined);
-      entry.diagnostic_quarantine = std::move(state);
-      entry.quarantined = true;
-      ++quarantined_slots;
+    std::shared_ptr<const std::function<void()>> notify;
+    {
+      const std::lock_guard lock(mutex.native);
+      if (quarantine) {
+        assert(!entry.quarantined);
+        entry.diagnostic_quarantine = std::move(state);
+        entry.quarantined = true;
+        ++quarantined_slots;
+        notify = availability_changed;
+      }
+      entry.busy = false;
     }
-    entry.busy = false;
+    if (notify && *notify)
+      (*notify)();
   }
   ~Impl() {
     assert(diagnostic_leases == 0 && "diagnostic lease outlived its pool");
@@ -1228,16 +1235,12 @@ private:
   DiscardResult Finish(bool untouched) {
     if (!active_)
       return result_;
-    result_ =
-        slot_.Discard(cache_.resources->diagnostic_ready,
-                      [this, untouched](cache::Slot& slot) {
-                        const auto result =
-                            untouched ? DiscardResult::kComplete : Reset(slot);
-                        if (result == DiscardResult::kComplete)
-                          state_.reset();  // Facade destruction precedes
-                                           // availability to the next user.
-                        return result;
-                      });
+    result_ = slot_.Discard(
+        cache_.resources->diagnostic_ready,
+        [this, untouched](cache::Slot& slot) {
+          return untouched ? DiscardResult::kComplete : Reset(slot);
+        },
+        [this] { state_.reset(); });
     if (result_ == DiscardResult::kComplete) {
       cache_.SettleDiagnostic(entry_, false);
       active_ = false;
@@ -1308,12 +1311,13 @@ std::unique_ptr<TextDiagnosticLease> ComponentTextCache::TryAcquireDiagnostic(
         return {};  // Reset started: its destructor conservatively quarantines.
     }
     // Binding/allocation failed before reset. No native work was started.
-    state.reset();
     const auto settled = slot->Discard(
         impl_->resources->diagnostic_ready,
-        [](cache::Slot&) { return cache::DiagnosticDiscardResult::kComplete; });
+        [](cache::Slot&) { return cache::DiagnosticDiscardResult::kComplete; },
+        [&] { state.reset(); });
     impl_->SettleDiagnostic(
-        *entry, settled != cache::DiagnosticDiscardResult::kComplete);
+        *entry, settled != cache::DiagnosticDiscardResult::kComplete,
+        std::move(state));
     return {};
   }
   return {};
@@ -1921,7 +1925,17 @@ void ComponentTextCache::InitializePins(
 }
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
-  return impl_->entries.size() - impl_->quarantined_slots.load();
+  return impl_->entries.size();
+}
+std::size_t ComponentTextCache::usable_capacity() const noexcept {
+  return capacity() - impl_->quarantined_slots.load();
+}
+void ComponentTextCache::SetAvailabilityCallback(
+    std::function<void()> callback) {
+  auto shared =
+      std::make_shared<const std::function<void()>>(std::move(callback));
+  const std::lock_guard lock(impl_->mutex.native);
+  impl_->availability_changed = std::move(shared);
 }
 
 std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
@@ -2086,7 +2100,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
       }
     }
     if (!entry) {
-      if (capacity() == 0)
+      if (usable_capacity() == 0)
         throw TextGenerationError(TextGenerationErrorCode::kCacheUnavailable,
                                   "no usable cache slots; reload the model");
       throw cache::SlotBusy();

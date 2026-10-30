@@ -701,6 +701,8 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t usable_capacity() const noexcept;
+  void SetAvailabilityCallback(std::function<void()>);
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
