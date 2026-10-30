@@ -348,6 +348,10 @@ target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
   Threads::Threads PNG::PNG JPEG::JPEG PkgConfig::WEBP CURL::libcurl
   OpenSSL::Crypto)
 
+# CPU expert-streaming policy: read plans and slot leases, no I/O or HIP.
+add_library(gufo_expert_stream STATIC src/core/expert_stream/policy.cpp)
+target_include_directories(gufo_expert_stream PUBLIC ${CMAKE_SOURCE_DIR})
+
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
 
@@ -1095,6 +1099,14 @@ if (BUILD_TESTING)
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
   endif()
+
+  add_executable(expert_stream_test tests/core/expert_stream_test.cpp)
+  target_link_libraries(expert_stream_test PRIVATE gufo_expert_stream)
+  add_test(NAME expert_stream_test COMMAND expert_stream_test)
+  set_tests_properties(expert_stream_test PROPERTIES LABELS "cpu;core;expert_stream")
+  # Replay driver for tools/bench/expert_trace.py.
+  add_executable(expert_stream_replay tools/bench/expert_stream_replay.cpp)
+  target_link_libraries(expert_stream_replay PRIVATE gufo_expert_stream)
 
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)
