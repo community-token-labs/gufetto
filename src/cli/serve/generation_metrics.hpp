@@ -105,13 +105,13 @@ inline auto& CacheMissCounts() {
 }
 
 /// Fixed-bucket speed histogram per context-depth band. Buckets hold
-/// per-band counts; the exposition makes them cumulative. Recording is a few
-/// relaxed atomic adds, so a scrape may see one request's sample partly added.
+/// per-band counts; the exposition makes them cumulative and reports `_count`
+/// as the `+Inf` total of the same reads, so the two always agree. Recording
+/// is relaxed atomic adds, so `_sum` may lag or lead a concurrent sample.
 template<std::size_t Bounds>
 struct SpeedHistogram {
   std::array<double, Bounds> bounds;
   std::array<std::array<std::atomic<std::uint64_t>, Bounds + 1>, 6> buckets{};
-  std::array<std::atomic<std::uint64_t>, 6> counts{};
   std::array<std::atomic<double>, 6> sums{};
 };
 // Upper bounds of the context-depth bands, in prompt tokens; the last band is
@@ -147,7 +147,6 @@ void RecordSpeed(detail::SpeedHistogram<Bounds>& histogram, std::size_t band,
       std::ranges::lower_bound(histogram.bounds, tokens_per_second) -
       histogram.bounds.begin());
   histogram.buckets[band][bucket].fetch_add(1, std::memory_order_relaxed);
-  histogram.counts[band].fetch_add(1, std::memory_order_relaxed);
   auto& sum = histogram.sums[band];
   double current = sum.load(std::memory_order_relaxed);
   while (!sum.compare_exchange_weak(current, current + tokens_per_second,
@@ -237,6 +236,10 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
   else if (!result.cache_miss_reason.empty())
     detail::CacheMissCounts()[CacheMissReasonIndex(result.cache_miss_reason)]
         .fetch_add(1, std::memory_order_relaxed);
+  // A cancelled request's phases stop early, so its speeds are not
+  // representative; its cache outcome above still counts.
+  if (result.cancelled)
+    return;
   const std::size_t band = ContextDepthBand(result.prompt_tokens);
   if (prompt_per_second > 0.0 &&
       result.prefill_tokens >= detail::kMinPrefillSpeedTokens)
@@ -265,8 +268,8 @@ void WriteSpeedHistogram(std::ostream& out, std::string_view name,
     }
     out << name << "_sum{context=\"" << context << "\"} "
         << histogram.sums[band].load(std::memory_order_relaxed) << '\n'
-        << name << "_count{context=\"" << context << "\"} "
-        << histogram.counts[band].load(std::memory_order_relaxed) << '\n';
+        << name << "_count{context=\"" << context << "\"} " << cumulative
+        << '\n';
   }
 }
 

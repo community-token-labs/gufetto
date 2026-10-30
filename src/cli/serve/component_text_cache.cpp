@@ -2790,6 +2790,8 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     request.metrics.indexed_common_tokens = std::max(common, request.cached);
     request.metrics.indexed_gap_tokens =
         request.metrics.indexed_common_tokens - request.cached;
+    // Every reused prefix names its source tier; `/metrics` relies on it.
+    assert(!request.cached || request.metrics.hit_tier != CacheHitTier::kNone);
     auto& reason = request.metrics.reuse_reason;
     if (!reuse) {
       reason = CacheReuseReason::kDisabled;

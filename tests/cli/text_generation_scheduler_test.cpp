@@ -2718,10 +2718,35 @@ void TestQueuedAndPrefillCancellation() {
   }
 }
 
+// Speed samples across every context band of both `/metrics` histograms.
+std::uint64_t SpeedSamples() {
+  namespace metrics = gufo::server::detail;
+  std::uint64_t total = 0;
+  for (const auto& band : metrics::DecodeSpeedHistogram().buckets)
+    for (const auto& bucket : band)
+      total += bucket.load();
+  for (const auto& band : metrics::PrefillSpeedHistogram().buckets)
+    for (const auto& bucket : band)
+      total += bucket.load();
+  return total;
+}
+
+std::uint64_t CacheOutcomes() {
+  namespace metrics = gufo::server::detail;
+  std::uint64_t total = 0;
+  for (const auto& count : metrics::CacheHitCounts())
+    total += count.load();
+  for (const auto& count : metrics::CacheMissCounts())
+    total += count.load();
+  return total;
+}
+
 void TestDecodeCancellationAndStateReclamation() {
   auto control = std::make_shared<FakeControl>();
   control->block_advance_label = 5;
   auto scheduler = MakeScheduler(control, 1);
+  const auto samples_before = SpeedSamples();
+  const auto outcomes_before = CacheOutcomes();
 
   auto cancelled = scheduler->Submit({5, 50}, 5, 0.0F, {}, true);
   std::size_t delivered_pieces = 0;
@@ -2734,6 +2759,11 @@ void TestDecodeCancellationAndStateReclamation() {
          "callback cancellation reaches the scheduler");
   Expect(delivered_pieces == 1,
          "no token is published after callback cancellation");
+  // The scheduler records a cancelled request before publishing it.
+  Expect(SpeedSamples() == samples_before,
+         "a cancelled request adds no speed sample");
+  Expect(CacheOutcomes() == outcomes_before + 1,
+         "a cancelled request still counts its cache outcome");
 
   auto replacement = scheduler->Submit({6, 60}, 2, 0.0F);
   const auto replacement_result = replacement.Wait();

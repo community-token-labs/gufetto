@@ -990,6 +990,15 @@ void TestCacheAndSpeedMetrics() {
   RecordRequestMetrics(timed(300000, 1000, 10, 500, 1000));  // 1e5, 500
   RecordRequestMetrics(timed(5000, 63, 1, 0, 0));            // too short
   RecordRequestMetrics(timed(5000, 64, 1000, 0, 0));         // 64 tok/s
+  // Cumulative buckets within one band: 1, 3, 3, 60 and 500 decode tok/s.
+  for (const double tokens_per_second : {1.0, 3.0, 3.0, 60.0, 500.0})
+    RecordRequestMetrics(timed(
+        20000, 0, 0, static_cast<std::size_t>(tokens_per_second * 10), 10000));
+  // A cancelled request adds no speed sample but its cache outcome counts.
+  auto cancelled = timed(20000, 1000, 1000, 50, 1000);
+  cancelled.cancelled = true;
+  cancelled.cache_miss_reason = "disabled";
+  RecordRequestMetrics(cancelled);
 
   const auto after = scrape();
   for (const auto& [tier, count] : std::vector<std::pair<std::string, double>>{
@@ -999,7 +1008,7 @@ void TestCacheAndSpeedMetrics() {
   assert(after.find("tier=\"none\"") == std::string::npos);
   for (const auto& [reason, count] :
        std::vector<std::pair<std::string, double>>{
-           {"disabled", 1},
+           {"disabled", 2},
            {"no_checkpoint", 2},
            {"no_compatible_boundary", 1},
            {"prefix_changed", 1},
@@ -1048,6 +1057,25 @@ void TestCacheAndSpeedMetrics() {
   assert(delta(after, decode + "_sum{context=\"256k_plus\"}") == 500);
   // Requests without decode work add no decode sample.
   assert(count(decode, "4k_16k") == 0);
+  // Buckets are cumulative and `_count` is the `+Inf` bucket; the cancelled
+  // request in this band is absent from both histograms.
+  const std::vector<std::pair<std::string, double>> cumulative{
+      {"1", 1},  {"2", 1},  {"5", 3},   {"10", 3},  {"20", 3},  {"30", 3},
+      {"50", 3}, {"75", 4}, {"100", 4}, {"150", 4}, {"200", 4}, {"+Inf", 5}};
+  double previous = 0;
+  for (const auto& [le, expected] : cumulative) {
+    const double value = bucket(decode, "16k_64k", le);
+    assert(value == expected && value >= previous);
+    previous = value;
+  }
+  assert(count(decode, "16k_64k") == 5 && count(prefill, "16k_64k") == 0);
+  assert(delta(after, decode + "_sum{context=\"16k_64k\"}") == 567);
+  for (const auto& band : gufo::server::detail::kContextDepthNames)
+    for (const auto& name : {prefill, decode})
+      assert(SampleValue(after, name + "_count{context=\"" + std::string(band) +
+                                    "\"}") ==
+             SampleValue(after, name + "_bucket{context=\"" +
+                                    std::string(band) + "\",le=\"+Inf\"}"));
   for (const auto& name : {prefill, decode}) {
     assert(after.find("# TYPE " + name + " histogram\n") != std::string::npos);
     assert(after.find("# HELP " + name + " ") != std::string::npos);

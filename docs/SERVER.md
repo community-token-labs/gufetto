@@ -1548,10 +1548,12 @@ counts once:
 
 - `gufo_cache_hits_total{tier}` counts requests that reused a cached prefix,
   by where it came from. Provenance outranks storage: `pinned` is a
-  [registered pinned prefix](fork/PINNED-PREFIX.md) restored from RAM or disk,
-  and `root` a predicted system/tool root checkpoint. Otherwise `live` is a
-  session that still held the prefix, `ram` a RAM checkpoint and `disk` a
-  `--cache-disk` restore.
+  [registered pinned prefix](fork/PINNED-PREFIX.md) restored from RAM or disk.
+  `root` is a RAM checkpoint that Gufo captured on its own at the end of the
+  rendered system, developer and tool preamble, so a new conversation with
+  the same preamble reuses it; it counts as `root` on every hit, not only the
+  first. Otherwise `live` is a session that still held the prefix, `ram` a RAM
+  checkpoint and `disk` a `--cache-disk` restore.
 - `gufo_cache_misses_total{reason}` counts requests that reused nothing, by
   the same `usage.gufo.cache_miss_reason` values: `disabled`, `no_checkpoint`,
   `no_compatible_boundary`, `prefix_changed`, `input_changed`, and `unknown`
@@ -1567,8 +1569,10 @@ counts once:
   `64k_256k` (at most 262144) and `256k_plus`. Prefill buckets run from 50 to
   20000 tokens/s and count requests that prefilled at least 64 tokens, since
   shorter prefills mostly measure launch latency; decode buckets run from 1 to
-  200 tokens/s and count requests that generated tokens. A scrape can see one
-  request's sample partly added.
+  200 tokens/s and count requests that generated tokens. Cancelled requests
+  add no speed samples, though their cache outcome counts. `_count` always
+  equals the `+Inf` bucket; `_sum` can briefly lag or lead it while a request
+  is being recorded.
 
 For example, `rate(gufo_cache_hits_total[5m])` over all tiers divided by the
 same rate plus `rate(gufo_cache_misses_total[5m])` is the request hit rate, and
