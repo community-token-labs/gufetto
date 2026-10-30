@@ -220,6 +220,12 @@ class TokenParityTest(unittest.TestCase):
             recorded["stop_type"] = "eos"
             p["gufo"].write_text(json.dumps({"config": config("gufo"), "requests": [recorded]}))
             self.assertEqual(len(PARITY.load_recordings(p["gufo"], PROMPTS, 4, "gufo")[1]["tiny"]["top_logprobs"]), 5)
+            p["llama"].write_text(json.dumps({"config": config("llama"), "requests": [recorded]}))
+            with self.assertRaisesRegex(ValueError, "positions"):
+                PARITY.load_recordings(p["llama"], PROMPTS, 4, "llama")
+            recorded["top_logprobs"].pop()
+            p["llama"].write_text(json.dumps({"config": config("llama"), "requests": [recorded]}))
+            self.assertEqual(len(PARITY.load_recordings(p["llama"], PROMPTS, 4, "llama")[1]["tiny"]["top_logprobs"]), 4)
 
     def test_endpoint_schemes_and_connection_error(self):
         for url in ("file:///tmp/never-read", "ftp://localhost/never", "http://user:password@localhost/"):
@@ -303,6 +309,10 @@ class TokenParityTest(unittest.TestCase):
                 response["completion_probabilities"][0]["id"] = 999
                 _, shifted = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
                 self.assertTrue(shifted["tiny"]["distributions_misaligned"])
+                response["completion_probabilities"] = []
+                _, missing = PARITY.llama_live(url, config("llama"), PROMPTS, 4, 5, 2)
+                self.assertTrue(missing["tiny"]["distributions_misaligned"])
+                self.assertEqual(missing["tiny"]["generated_token_ids"], [10, 11, 12, 13])
                 # Live EOS retains its EOG-position distribution after ID normalization.
                 response.update(tokens=[10, 99], stop_type="eos", completion_probabilities=[
                     {"id": 10, "top_logprobs": []},

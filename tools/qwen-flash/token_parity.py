@@ -89,7 +89,7 @@ def load_recordings(path, prompts, count, engine):
         top = row.get("top_logprobs", [])
         length = len(row["generated_token_ids"])
         eos = normalize_stop(row, engine)["stop_reason"] == "eos"
-        if not isinstance(top, list) or len(top) not in ({0, length, length + 1} if eos else {0, length}):
+        if not isinstance(top, list) or len(top) not in ({0, length, length + 1} if eos and engine == "gufo" else {0, length}):
             raise ValueError(f"{engine}: recorded top_logprobs positions do not match emitted IDs")
         for position in range(len(top)):
             distribution(row, position)
@@ -121,8 +121,8 @@ def native_live(url, config, prompts, count, top_k, timeout, engine):
         probabilities = result.get("completion_probabilities", [])
         if not isinstance(probabilities, list):
             raise ValueError(engine + ": completion_probabilities must be an array")
-        misaligned = bool(probabilities) and (len(probabilities) != len(generated) or any(
-            entry["id"] != token for entry, token in zip(probabilities, generated)))
+        misaligned = len(probabilities) != len(generated) or any(
+            entry["id"] != token for entry, token in zip(probabilities, generated))
         # Pinned llama omits probability entries for incomplete UTF-8 pieces.
         # Keep all actual IDs/raw evidence, but never guess a positional mapping.
         aligned_probabilities = [] if misaligned else probabilities

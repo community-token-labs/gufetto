@@ -125,8 +125,9 @@ repeated digest characters below are placeholders, **not real provenance**):
 For this two-token example use `--tokens 2 --horizon 2`. `top_logprobs` is
 optional; omit it for today's Gufo recordings. Entries must be position-aligned
 actual observations, **not fabricated**. Recorded arrays must be empty or match
-the raw emitted-ID count; an EOS capture may additionally contain one terminal
-decision position (Gufo excludes EOG from its emitted IDs). Other lengths are
+the raw emitted-ID count; a **Gufo-only** EOS capture may additionally contain
+one terminal decision position (Gufo excludes EOG from its emitted IDs).
+Llama recordings already include EOG and must have zero or exactly L positions. Other lengths are
 invalid rather than silently shifted. Preserve raw responses/traces and
 capture provenance alongside the normalized envelope. A live llama config
 file contains just the `config` object, with the exact pinned llama revision
@@ -178,7 +179,8 @@ For **each prompt** output includes:
    never evidence of a near-tie or a pass.
 At the pinned llama revision, probability entries may be omitted when a token
 ends inside a multi-byte UTF-8 character. If live probability counts or their
-reported emitted IDs do not align, that request records
+reported emitted IDs do not align (including empty probabilities with nonempty
+emitted IDs), that request records
 `distributions_misaligned=true`, keeps every actual emitted ID/raw response,
 and clears its positional top-k rather than guessing alignment or aborting the
 batch. That engine's near-tie evidence is UNKNOWN; a proven NO from the other
