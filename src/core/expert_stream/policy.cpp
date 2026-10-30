@@ -152,7 +152,9 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     first = std::min(first, route.step);
     last = std::max(last, route.step);
   }
-  const std::uint64_t tokens = last - first + 1;
+  const std::uint64_t span = last - first;
+  const std::uint64_t tokens =
+      span == std::numeric_limits<std::uint64_t>::max() ? span : span + 1;
   std::map<std::uint32_t, Use> uses;  // ordered: deterministic plans
   for (const ExpertRoute& route : routes) {
     Use& use = uses[route.expert];
@@ -161,7 +163,14 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     }
     use.route = &route;
     ++use.count;
-    use.recent |= tokens > kRecentRows && route.step + kRecentRows > last;
+    use.recent |= tokens > kRecentRows && last - route.step < kRecentRows;
+  }
+  for (const auto& [expert, use] : uses) {
+    const auto it = entries_.find(Key(layer, expert));
+    if (it != entries_.end() && it->second.source &&
+        !SameSource(*it->second.source, *use.route)) {
+      return PlanError::kBadRange;
+    }
   }
 
   ++tick_;
@@ -171,6 +180,9 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     const std::uint64_t key = Key(layer, expert);
     const std::uint64_t bytes = use.route->encoded_bytes;
     Entry& entry = entries_[key];
+    if (!entry.source) {
+      entry.source = *use.route;
+    }
     if (!optional) {
       (entry.slot ? stats_.route_hits : stats_.route_misses) += use.count;
       entry.score = Decayed(entry) +
@@ -185,7 +197,7 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
       }
       continue;
     }
-    if (filling_.contains(key)) {
+    if (in_flight_.contains(key)) {
       if (!optional) {
         plan->deferred.push_back({expert, DeferReason::kInFlight});
         ++stats_.deferred;
@@ -211,13 +223,14 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
       s.key = key;
       s.encoded_bytes = bytes;
       s.pins = 1;
-      filling_[key] = *slot;
+      in_flight_.insert(key);
       plan->leases.push_back({LeaseKind::kFill, expert, *slot, bytes});
     } else if (optional) {
       continue;
     } else if (bytes <= config_.stage_bytes - stats_.stage_in_use_bytes) {
       stats_.stage_in_use_bytes += bytes;
       open.stage_bytes += bytes;
+      in_flight_.insert(key);
       plan->leases.push_back({LeaseKind::kStage, expert, 0, bytes});
     } else {
       const bool oversized =
@@ -228,7 +241,8 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     }
   }
 
-  // Coalesce file-adjacent projections of missing experts, by shard/offset.
+  // Coalesce file-adjacent projections of missing experts, by shard/offset;
+  // split any projection larger than max_read_bytes.
   struct Piece {
     std::uint32_t projection;
     SourceRange range;
@@ -249,21 +263,29 @@ PlanError ExpertPool::Prepare(std::span<const ExpertRoute> routes,
     return std::tie(a.projection, a.range.shard, a.range.offset) <
            std::tie(b.projection, b.range.shard, b.range.offset);
   });
+  const std::uint64_t max_read = config_.max_read_bytes;
   std::uint64_t read_bytes = 0;
   for (const Piece& piece : pieces) {
     read_bytes += piece.range.bytes;
     if (!plan->reads.empty()) {
       ReadTask& task = plan->reads.back();
       if (task.projection == piece.projection &&
-          task.range.shard == piece.range.shard &&
+          task.range.shard == piece.range.shard && task.skip == 0 &&
           task.range.offset + task.range.bytes == piece.range.offset &&
-          task.range.bytes + piece.range.bytes <= config_.max_read_bytes) {
+          piece.range.bytes <= max_read - task.range.bytes) {
         task.range.bytes += piece.range.bytes;
         task.leases.push_back(piece.lease);
         continue;
       }
     }
-    plan->reads.push_back({piece.projection, piece.range, {piece.lease}});
+    for (std::uint64_t skip = 0; skip < piece.range.bytes; skip += max_read) {
+      const std::uint64_t bytes = std::min(max_read, piece.range.bytes - skip);
+      plan->reads.push_back(
+          {piece.projection,
+           {piece.range.shard, piece.range.offset + skip, bytes},
+           {piece.lease},
+           skip});
+    }
   }
   (optional ? stats_.optional_read_bytes : stats_.demand_read_bytes) +=
       read_bytes;
@@ -280,7 +302,9 @@ PlanError ExpertPool::Finish(std::uint64_t plan_id, bool publish) {
   }
   const Open& open = it->second;
   for (const Lease& lease : open.leases) {
+    const std::uint64_t key = Key(open.layer, lease.expert);
     if (lease.kind == LeaseKind::kStage) {
+      in_flight_.erase(key);
       continue;
     }
     Slot& slot = slots_[lease.slot];
@@ -288,8 +312,7 @@ PlanError ExpertPool::Finish(std::uint64_t plan_id, bool publish) {
     if (lease.kind != LeaseKind::kFill) {
       continue;
     }
-    const std::uint64_t key = Key(open.layer, lease.expert);
-    filling_.erase(key);
+    in_flight_.erase(key);
     if (publish) {
       entries_[key].slot = lease.slot;
       stats_.resident_encoded_bytes += slot.encoded_bytes;

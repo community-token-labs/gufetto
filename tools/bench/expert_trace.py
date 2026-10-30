@@ -134,16 +134,18 @@ def replay(binary, text):
     proc = subprocess.run([binary], input=text, capture_output=True, text=True, check=False)
     if proc.returncode:
         raise RuntimeError(f"replay failed: {proc.stderr.strip()}")
-    plans, stats = [], None
+    plans, seed, stats = [], [], None
     for line in proc.stdout.splitlines():
         f = line.split()
-        if f[0] == "plan":
+        if f[0] == "reset":  # everything before the reset was the seed
+            seed, plans = plans, []
+        elif f[0] == "plan":
             plans.append(dict(zip(("layer", "step", "hits", "misses", "demand", "optional",
                                    "reads", "deferred", "staged"), map(int, f[1:]))))
         elif f[0] == "stats":
             stats = dict(zip(("allocated", "peak_allocated", "resident_payload",
                               "fragmentation", "evictions"), map(int, f[1:])))
-    return plans, stats
+    return plans, seed, stats
 
 
 def summarize(plans, segments, layers, bucket):
@@ -155,6 +157,7 @@ def summarize(plans, segments, layers, bucket):
                     "route_hits": hits, "route_misses": misses,
                     "hit_rate": hits / (hits + misses) if hits + misses else None,
                     "demand_bytes": sum(p["demand"] for p in sel),
+                    "optional_bytes": sum(p["optional"] for p in sel),
                     "read_tasks": sum(p["reads"] for p in sel),
                     "staged": sum(p["staged"] for p in sel),
                     "deferred": sum(p["deferred"] for p in sel)})
@@ -236,9 +239,11 @@ def main():
     for policy in args.policy or ["scored"]:
         for cap_gib in args.cap_gib or [64.0]:
             text = build_input(trace, args, int(cap_gib * GiB), policy, segments, rank)
-            plans, stats = replay(args.replay, text)
+            plans, seed, stats = replay(args.replay, text)
             segs, heat = summarize(plans, segments, layers, args.bucket)
-            run = {"policy": policy, "cap_gib": cap_gib, "segments": segs,
+            seeded = {"experts": len(seed), "optional_bytes": sum(p["optional"] for p in seed),
+                      "read_tasks": sum(p["reads"] for p in seed)}
+            run = {"policy": policy, "cap_gib": cap_gib, "seed": seeded, "segments": segs,
                    "allocation": stats, "heatmap_misses": heat, "projection": []}
             _, first, last = segments[-1]
             for m in models:
@@ -247,6 +252,9 @@ def main():
                               m["bandwidth"], m["latency"])})
             report["runs"].append(run)
             print(f"== {policy} cap {cap_gib:g} GiB seeded={bool(rank)}")
+            if seed:
+                print(f"  seed    {seeded['experts']} experts optional "
+                      f"{seeded['optional_bytes'] / GiB:.2f} GiB reads {seeded['read_tasks']}")
             for s in segs:
                 print(f"  {s['phase']:7} {s['tokens']}: hit {100 * (s['hit_rate'] or 0):.2f}% "
                       f"demand {s['demand_bytes'] / GiB:.2f} GiB reads {s['read_tasks']} "

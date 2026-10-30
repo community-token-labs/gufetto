@@ -3,7 +3,7 @@
 //   config <lru|scored> <cap> <chunk> <stage> <max_read> <class>[,<class>...]
 //   plan <optional 0|1> <routes>   followed by <routes> lines of
 //     <step> <d|p> <layer> <expert> <shard> <off0> <len0> <off1> <len1> <off2> <len2>
-//   reset                          (zero counters; keep the cache)
+//   reset                          (zero counters; keep the cache; echoed)
 // Every plan is completed at once. Output, one line per plan:
 //   plan <layer> <first step> <hits> <misses> <demand bytes> <optional bytes>
 //        <reads> <deferred> <staged>
@@ -42,6 +42,7 @@ int main() {
       }
     } else if (word == "reset" && pool) {
       pool->ResetCounters();
+      std::cout << "reset\n";
     } else if (word == "plan" && pool) {
       int optional = 0;
       std::size_t count = 0;

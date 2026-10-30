@@ -5,16 +5,22 @@
 // pool. It plans reads and pins slots; it performs no I/O and owns no memory.
 // The caller issues the planned reads and later completes or cancels the plan.
 //
-// Contracts compared with franzmoca/gufo feat/ds41 110594c9
-// runtime/expert_store.cpp (MIT): slots per size class grown in chunks, a
-// larger expert never takes a smaller slot, scan-resistant admission of large
-// prefill batches, and per-projection read coalescing. No code is copied.
+// Adapted from franzmoca/gufo feat/ds41 110594c9 runtime/expert_store.cpp
+// (MIT, gufo contributors): slots per size class grown in chunks, the
+// smallest-larger-free-slot fallback (a larger expert never takes a smaller
+// slot), and the scan-resistant admission and decayed-score expressions and
+// constants. The plan/lease state machine and range-based read planner are
+// new; the donor's HIP and POSIX I/O are not used.
+//
+// Precondition: an expert's source ranges and size are fixed for the pool's
+// lifetime; a Prepare whose metadata conflicts with an earlier one is refused.
 
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gufo::core::expert_stream {
@@ -45,8 +51,8 @@ struct PoolConfig {
   std::vector<std::uint64_t> class_bytes;  // strictly ascending slot sizes
   std::uint64_t cap_bytes = 0;             // total slot backing
   std::uint64_t chunk_bytes = 0;           // growth granularity per class
-  std::uint64_t stage_bytes = 0;           // read-through staging per plan
-  std::uint64_t max_read_bytes = 32ull << 20;
+  std::uint64_t stage_bytes = 0;           // read-through staging, all plans
+  std::uint64_t max_read_bytes = 32ull << 20;  // every ReadTask is <= this
   Policy policy = Policy::kScanResistant;
 };
 
@@ -65,7 +71,7 @@ struct Lease {
 
 enum class DeferReason : std::uint8_t {
   kNoSlot,     // every eligible slot is pinned and staging is full
-  kInFlight,   // another open plan is still filling this expert
+  kInFlight,   // another open plan is still filling or staging this expert
   kOversized,  // larger than the largest slot class and the stage
 };
 
@@ -74,11 +80,15 @@ struct Deferred {
   DeferReason reason = DeferReason::kNoSlot;
 };
 
-/// One read of adjacent expert projections; `leases` index Plan::leases.
+/// One read of adjacent expert projections; `leases` index Plan::leases in
+/// file order. A projection larger than max_read_bytes is split into several
+/// one-lease tasks; `skip` is the task's byte offset within that projection
+/// (0 for whole or merged projections).
 struct ReadTask {
   std::uint32_t projection = 0;
   SourceRange range;
   std::vector<std::uint32_t> leases;
+  std::uint64_t skip = 0;
 };
 
 struct Plan {
@@ -95,7 +105,8 @@ enum class PlanError : std::uint8_t {
   kInvalidPool,
   kEmpty,
   kMixedLayers,
-  kBadRange,  // overflow, or encoded_bytes != sum of source bytes
+  kBadRange,  // overflow, size mismatch, or metadata conflicting with an
+              // earlier plan for the same expert
   kUnknownPlan,
 };
 
@@ -147,6 +158,7 @@ private:
     double score = 0;
     std::uint64_t last = 0;
     std::optional<std::uint32_t> slot;  // published only
+    std::optional<ExpertRoute> source;  // first metadata seen (step unused)
   };
   struct Open {
     std::vector<Lease> leases;
@@ -169,7 +181,7 @@ private:
   std::vector<std::vector<std::uint32_t>> free_;  // per class
   std::unordered_map<std::uint64_t, Entry> entries_;
   std::unordered_map<std::uint64_t, Open> open_;
-  std::unordered_map<std::uint64_t, std::uint32_t> filling_;  // key -> slot
+  std::unordered_set<std::uint64_t> in_flight_;  // open fills and stages
   std::uint64_t tick_ = 0;
   std::uint64_t next_plan_ = 1;
   Stats stats_;
