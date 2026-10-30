@@ -62,6 +62,17 @@ struct block_q5_0 {
 };
 static_assert(sizeof(block_q5_0) == 22);
 
+// Q5_1: fp16 scale and minimum, 32 fifth bits, 32 low nibbles (QK=32),
+// value = d * q + m. Low nibbles give the first 16 elements (fifth bits
+// 0-15), high nibbles the second 16 (bits 16-31).
+struct block_q5_1 {
+  std::uint16_t d;
+  std::uint16_t m;
+  std::uint8_t qh[4];
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(block_q5_1) == 24);
+
 // Q8_0: fp16 scale + 32 int8 quantized values (QK=32).
 struct block_q8_0 {
   std::uint16_t d;
@@ -183,6 +194,9 @@ float DotProductQ8_K(const void* row_data, std::span<const float> vec,
 
 // Dequantize row of Q8_0 to float
 void DequantizeQ5_0(const void* src, float* dst, std::size_t k);
+void DequantizeQ5_1(const void* src, float* dst, std::size_t k);
+float DotProductQ5_1(const void* row_data, std::span<const float> vec,
+                     std::size_t k);
 
 void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
 
