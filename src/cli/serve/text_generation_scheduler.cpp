@@ -95,6 +95,7 @@ struct ScheduledRequest {
   bool cache_prompt{true};
   bool cache_persist{true};
   std::size_t cache_prefix_tokens{0};
+  std::optional<std::size_t> root_prefix_tokens;
   bool stop_at_eos{true};
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
@@ -616,6 +617,10 @@ struct TextGenerationScheduler::Impl {
 #endif
     device_lost_requests.reserve(runner_pool->capacity());
     PrepareStructuredOutput(runner_pool->runner());
+    runner_pool->SetAvailabilityCallback([signal = queue_signal] {
+      const std::lock_guard lock(signal->mutex);
+      signal->condition.notify_all();
+    });
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
     if (scheduler_policy.stall_timeout.count() > 0) {
@@ -1084,7 +1089,7 @@ struct TextGenerationScheduler::Impl {
         !request->cache_prompt ||
         // Parked requests hold no runner lease; bound their reservations like
         // admitted ones.
-        waiting + 1 >= runner_pool->capacity())
+        waiting + 1 >= runner_pool->usable_capacity())
       return false;
     std::shared_ptr<ScheduledRequest> leader;
     std::size_t common = 0;
@@ -1237,13 +1242,24 @@ struct TextGenerationScheduler::Impl {
              std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
              std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
              const std::stop_token& stop_token) {
+    if (runner_pool->usable_capacity() == 0) {
+      const auto failure = std::make_exception_ptr(
+          TextGenerationError(TextGenerationErrorCode::kCacheUnavailable,
+                              "no usable cache slots; reload the model"));
+      while (auto request = PopQueued())
+        CompleteFailure(request, failure);
+      for (const auto& request : waiting)
+        CompleteFailure(request, failure);
+      waiting.clear();
+      return;
+    }
     UpdateWaiting(waiting);
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 2>
         residents{&prefilling, &capturing};
     // Captures retain their runner lease until decoding resumes.
     while (!stop_token.stop_requested() &&
            prefilling.size() + decoding.size() + capturing.size() <
-               runner_pool->capacity()) {
+               runner_pool->usable_capacity()) {
       auto request = PopReleased(waiting);
       if (request == nullptr) {
         // Parked followers already reserve a visible admission session. They
@@ -1251,7 +1267,7 @@ struct TextGenerationScheduler::Impl {
         // reservations.
         if (prefilling.size() + decoding.size() + capturing.size() +
                 waiting.size() >=
-            runner_pool->capacity())
+            runner_pool->usable_capacity())
           return;
         request = PopQueued();
       }
@@ -1320,7 +1336,8 @@ struct TextGenerationScheduler::Impl {
             },
             std::move(request->prompt_context), request->cache_prompt,
             request->cache_prefix_tokens, request->stop_at_eos,
-            request->cache_persist, std::move(resources));
+            request->cache_persist, std::move(resources),
+            request->root_prefix_tokens);
         acquisition.Finish();
         // Each admission may restore or capture a checkpoint of its own.
         progress.fetch_add(1, std::memory_order_relaxed);
@@ -2288,9 +2305,11 @@ struct TextGenerationScheduler::Impl {
         trace_queue(perf_wait);
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
+          const auto usable = runner_pool->usable_capacity();
           return stop_token.stop_requested() || stopping ||
+                 (usable == 0 && (queued_count != 0 || !waiting.empty())) ||
                  (queued_count != 0 &&
-                  capturing.size() + waiting.size() < runner_pool->capacity());
+                  capturing.size() + waiting.size() < usable);
         };
         if (capturing.empty() && waiting.empty()) {
           // Only the idle wait has a timer. Arrival interrupts it immediately;
@@ -2456,8 +2475,14 @@ struct TextGenerationScheduler::Impl {
   bool multi_token_decode{false};
   bool batched_multi_token_decode{false};
   std::size_t batched_multi_token_decode_max_width{0};
-  mutable std::mutex queue_mutex;
-  std::condition_variable queue_condition;
+  struct QueueSignal {
+    std::mutex mutex;
+    std::condition_variable condition;
+  };
+  // The cache notification retains only this signal, never a scheduler pointer.
+  std::shared_ptr<QueueSignal> queue_signal = std::make_shared<QueueSignal>();
+  std::mutex& queue_mutex = queue_signal->mutex;
+  std::condition_variable& queue_condition = queue_signal->condition;
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
   bool stopping{false};
@@ -2727,6 +2752,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->cache_prompt = metadata.cache_prompt;
   request->cache_persist = metadata.cache_persist;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+  request->root_prefix_tokens = metadata.root_prefix_tokens;
   request->stop_at_eos = metadata.stop_at_eos;
   request->token_limit =
       max_tokens > 0 ? std::min(max_tokens, available) : available;
@@ -2785,6 +2811,9 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       throw TextGenerationError(TextGenerationErrorCode::kDeviceLost,
                                 kDeviceLostMessage);
     }
+    if (impl_->runner_pool->usable_capacity() == 0)
+      throw TextGenerationError(TextGenerationErrorCode::kCacheUnavailable,
+                                "no usable cache slots; reload the model");
     if (impl_->queued_count >= impl_->scheduler_policy.max_pending_requests) {
       refused = true;
       refusal_code = TextGenerationErrorCode::kQueueFull;

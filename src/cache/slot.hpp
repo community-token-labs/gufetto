@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <thread>
+#include <utility>
 
 #include "src/cache/adapter.hpp"
 #include "src/cache/ledger.hpp"
@@ -19,6 +20,7 @@ struct RowState;
 struct LeaseState;
 }  // namespace detail
 class BorrowedRows;
+enum class DiagnosticDiscardResult { kComplete, kPending, kQuarantined };
 // Move-only source pin. A borrowed Location uses the leased slot; a committed
 // Owner uses backing. Retain the pin through completion on every stream.
 class RowPin {
@@ -119,6 +121,29 @@ private:
   std::shared_ptr<detail::LeaseState> state_;
   bool committed_{false};
 };
+// A diagnostic claim cannot borrow, publish, commit or preserve. Dropping an
+// unsettled claim leaves the slot leased in its existing owner (quarantined).
+class DiagnosticSlotLease {
+public:
+  DiagnosticSlotLease(DiagnosticSlotLease&&) noexcept = default;
+  DiagnosticSlotLease(const DiagnosticSlotLease&) = delete;
+  ~DiagnosticSlotLease() { Quarantine(); }
+  [[nodiscard]] Slot& Execution() const;
+  [[nodiscard]] bool VerifiedEmpty(
+      const std::function<bool(const Slot&)>& ready) const;
+  DiagnosticDiscardResult Discard(
+      const std::function<bool(const Slot&)>& ready,
+      const std::function<DiagnosticDiscardResult(Slot&)>& reset,
+      const std::function<void()>& before_release = {});
+  void Quarantine() noexcept;
+
+private:
+  friend class LeasedSlot;
+  explicit DiagnosticSlotLease(std::shared_ptr<detail::LeaseState> state)
+      : state_(std::move(state)) {}
+  std::shared_ptr<detail::LeaseState> state_;
+  DiagnosticDiscardResult result_{DiagnosticDiscardResult::kPending};
+};
 struct IdleSpillConfig {
   // At least one complete row must fit. Each piece leases a fresh stream;
   // null means the pool is busy. Callbacks run outside metadata locks and must
@@ -161,6 +186,9 @@ public:
   // throws.
   [[nodiscard]] SlotLease Acquire(std::optional<BorrowedLocation> live = {},
                                   std::stop_token = {});
+
+  [[nodiscard]] std::optional<DiagnosticSlotLease> TryAcquireDiagnostic(
+      const std::function<bool(const Slot&)>& ready, std::stop_token = {});
 
   // Snapshot only: another acquirer may win before Acquire. Busy slots return
   // false; successful acquisitions still enforce exclusive generation checks.

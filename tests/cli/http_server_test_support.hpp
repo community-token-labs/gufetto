@@ -87,7 +87,8 @@ public:
   std::string model_id() const override { return "test"; }
   std::vector<std::string> model_ids() const override { return names; }
   std::vector<std::string> names{"test"};
-  bool ready() const override { return true; }
+  std::atomic<bool> is_ready{true};
+  bool ready() const override { return is_ready.load(); }
   bool device_lost() const override { return lost.load(); }
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
@@ -187,6 +188,10 @@ public:
     ++calls;
     last_cache_prompt = cache_prompt;
     last_cache_persist = cache_persist;
+    if (failure == 9)
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kCacheUnavailable,
+          "no usable cache slots; reload the model");
     if (failure == 1)
       throw std::length_error("context exceeded");
     if (failure == 2)

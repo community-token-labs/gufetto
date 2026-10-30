@@ -19,6 +19,7 @@ namespace gufo::server {
 class TextModelRunner;
 class TextRunnerState;
 class TextRunnerSnapshot;
+class TextDiagnosticLease;
 struct TextRunnerDiskCacheOptions;
 struct TextPromptContext;
 
@@ -72,6 +73,15 @@ struct ComponentCacheResources {
   cache::StreamLease stream;
   std::function<ComponentCaptureBuffer(const cache::PayloadRequest&)> allocate;
   cache::StagingAllocator staging;
+  // Opt-in diagnostic witnesses; absent means immediate refusal. Called only
+  // with exclusive slot ownership (ready also participates in atomic claim).
+  // Ready is strong, nonblocking native quiescence +
+  // healthy/materialized/empty, not Slot::ExecutionComplete's hint. Reset
+  // returns pending without mutation, or clears native/bound-state residue and
+  // fences before reporting complete.
+  std::function<bool(const cache::Slot&)> diagnostic_ready;
+  std::function<cache::DiagnosticDiscardResult(cache::Slot&, TextRunnerState&)>
+      diagnostic_reset;
   // Prepare on-demand backing immediately before the next prefill chunk.
   std::function<void(std::size_t)> prepare_prefill;
   // Optional capacity bound before assigning a complete capture. False takes
@@ -130,14 +140,20 @@ public:
     [[nodiscard]] ContinuationState& state() const;
     [[nodiscard]] bool cache_hit() const noexcept;
     [[nodiscard]] std::size_t cached_tokens() const noexcept;
+    [[nodiscard]] std::size_t ordinary_cached_tokens() const noexcept;
+    [[nodiscard]] bool reused_prediction() const noexcept;
     [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
     [[nodiscard]] double restore_ms() const noexcept;
     [[nodiscard]] bool restored_from_disk() const noexcept;
     [[nodiscard]] ContinuationLookup lookup() const noexcept;
     [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
-    [[nodiscard]] bool TryReserveSnapshot(std::size_t, std::size_t, bool,
-                                          SnapshotPurpose,
-                                          std::span<const ContinuationToken>);
+    // Only the actual successful acquisition source can be observed, never a
+    // matching lookup or this lease's own prefill/capture.
+    bool ObserveSnapshotFor(std::span<const ContinuationToken>);
+    [[nodiscard]] bool TryReserveSnapshot(
+        std::size_t, std::size_t, bool, SnapshotPurpose,
+        std::span<const ContinuationToken>,
+        SnapshotOrigin = SnapshotOrigin::kOrdinary);
     void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
     std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                                 std::shared_ptr<const ContinuationSnapshot>,
@@ -151,8 +167,8 @@ public:
     [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
-    [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-        std::size_t stable) const;
+    [[nodiscard]] std::vector<PlannedSnapshotCapture> PlannedCaptures(
+        std::size_t stable, std::optional<std::size_t> root = {}) const;
 
   private:
     friend class ComponentTextCache;
@@ -175,6 +191,13 @@ public:
       const ContinuationCache::CancellationCheck&,
       std::shared_ptr<const TextPromptContext>, bool, std::size_t, bool,
       bool persist = true);
+  // Full concrete fixed lease object (not the interface base), with no
+  // allocation. Provider-owned BindComponentState heap storage is separate and
+  // must also be booked by the provider; this object owns no
+  // vectors/strings/functions.
+  [[nodiscard]] static std::size_t DiagnosticRequestBytes() noexcept;
+  [[nodiscard]] std::unique_ptr<TextDiagnosticLease> TryAcquireDiagnostic(
+      const ContinuationCache::CancellationCheck& = {});
   [[nodiscard]] std::optional<ContinuationReuse> Lookup(
       std::span<const ContinuationToken>, const TextPromptContext*, bool reuse,
       std::size_t stable) const;
@@ -199,6 +222,10 @@ public:
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t usable_capacity() const noexcept;
+  // One scheduler observer; must not throw. Invoked outside publication locks.
+  // Callers settling a diagnostic lease must not hold the scheduler queue lock.
+  void SetAvailabilityCallback(std::function<void()>);
 
 private:
   void InitializePins(const TextRunnerPinnedPrefixOptions&);
@@ -222,16 +249,20 @@ public:
   [[nodiscard]] ContinuationState& state() const;
   [[nodiscard]] bool cache_hit() const noexcept;
   [[nodiscard]] std::size_t cached_tokens() const noexcept;
+  [[nodiscard]] std::size_t ordinary_cached_tokens() const noexcept;
+  [[nodiscard]] bool reused_prediction() const noexcept;
   [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept;
   [[nodiscard]] double restore_ms() const noexcept;
   [[nodiscard]] bool restored_from_disk() const noexcept;
   [[nodiscard]] ContinuationLookup lookup() const noexcept;
   [[nodiscard]] bool HasSnapshotFor(std::span<const ContinuationToken>) const;
+  bool ObserveSnapshotFor(std::span<const ContinuationToken>);
   void AdoptRestoredPrefix(std::size_t, std::size_t, double);
   [[nodiscard]] bool TryReserveSnapshot(
       std::size_t, std::size_t, bool = false,
       SnapshotPurpose = SnapshotPurpose::kContinuation,
-      std::span<const ContinuationToken> = {});
+      std::span<const ContinuationToken> = {},
+      SnapshotOrigin = SnapshotOrigin::kOrdinary);
   void SkipSnapshot(SnapshotEventReason, std::size_t, std::size_t) noexcept;
   std::size_t PublishSnapshot(std::vector<ContinuationToken>,
                               std::shared_ptr<const ContinuationSnapshot>,
@@ -245,8 +276,8 @@ public:
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
   void PreparePrefill(std::size_t tokens);
   [[nodiscard]] std::optional<ComponentCacheMetrics> Metrics() const;
-  [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
-      std::size_t stable) const;
+  [[nodiscard]] std::vector<PlannedSnapshotCapture> PlannedCaptures(
+      std::size_t stable, std::optional<std::size_t> root = {}) const;
 
 private:
   ContinuationCache::Lease legacy_;

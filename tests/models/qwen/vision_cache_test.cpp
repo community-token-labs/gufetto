@@ -116,6 +116,7 @@ void TestConcurrentMisses() {
 void EqualPrompts(const Prompt& a, const Prompt& b) {
   assert(a.tokens == b.tokens && a.rope == b.rope &&
          a.stable_prefix_tokens == b.stable_prefix_tokens &&
+         a.root_prefix_tokens == b.root_prefix_tokens &&
          a.cache_identity == b.cache_identity &&
          a.images.size() == b.images.size());
   for (std::size_t i = 0; i < a.images.size(); ++i) {
@@ -206,6 +207,34 @@ void TestPromptIdentities() {
     rejected = true;
   }
   assert(rejected);
+}
+
+void TestRootBeforeImage() {
+  using namespace gufo::tokenization;
+  const auto tokenizer = MakeTokenizer();
+  std::vector<ChatMessage> messages{{ChatRole::kSystem, "Describe the image."},
+                                    {ChatRole::kUser, "Picture"}};
+  messages.back().images = {{0, Encoded(17)}};
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  ImageCache cache;
+  const auto prepare = [&](ImageCache* reuse) {
+    return Prepare(*tokenizer, messages, {}, options, "encoder", 8192, reuse);
+  };
+  const auto first = prepare(&cache);
+  EqualPrompts(first, prepare(nullptr));
+  assert(first.root_prefix_tokens &&
+         *first.root_prefix_tokens < first.images.front().grid.offset &&
+         first.IdentityForPrefix(*first.root_prefix_tokens).empty());
+  messages.back().images.front().bytes = Encoded(42);
+  const auto changed = prepare(&cache);
+  assert(changed.root_prefix_tokens == first.root_prefix_tokens &&
+         std::ranges::equal(
+             std::span(first.tokens).first(*first.root_prefix_tokens),
+             std::span(changed.tokens).first(*changed.root_prefix_tokens)) &&
+         changed.cache_identity != first.cache_identity);
+  messages.erase(messages.begin());
+  assert(!prepare(&cache).root_prefix_tokens);
 }
 
 void TestDetailKeysCache() {
@@ -342,6 +371,7 @@ int main(int argc, char** argv) {
   TestReuseAndEviction();
   TestConcurrentMisses();
   TestPromptIdentities();
+  TestRootBeforeImage();
   TestDetailKeysCache();
   TestDetailPrompts();
   TestLegacyDefaultBound();

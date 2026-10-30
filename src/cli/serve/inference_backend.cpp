@@ -244,7 +244,10 @@ TextPreparedPrompt PrepareQwenPrompt(
   }
   const auto cache_prefix = prompt->stable_prefix_tokens;
   if (prompt->images.empty())
-    return {std::move(prompt->tokens), {}, cache_prefix};
+    return {std::move(prompt->tokens),
+            {},
+            cache_prefix,
+            prompt->root_prefix_tokens};
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");
@@ -264,7 +267,8 @@ TextPreparedPrompt PrepareQwenPrompt(
                                             prompt->cache_identity.end()),
                                 prompt->ImageRows());
 
-  return {prompt->tokens, std::move(context), cache_prefix};
+  return {prompt->tokens, std::move(context), cache_prefix,
+          prompt->root_prefix_tokens};
 }
 
 std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
@@ -4143,7 +4147,8 @@ std::vector<std::string> InferenceBackend::model_ids() const {
 
 bool InferenceBackend::ready() const {
 #if defined(ENGINE_ENABLE_HIP)
-  return impl_->Snapshot() != nullptr;
+  const auto state = impl_->Snapshot();
+  return state != nullptr && state->runner_pool->usable_capacity() != 0;
 #else
   return false;
 #endif
@@ -4468,6 +4473,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prompt = request.cache_prompt,
           .cache_persist = request.cache_persist,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
+          .root_prefix_tokens = prompt->root_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
       });

@@ -880,7 +880,8 @@ struct TextRunnerPool::Request::Impl {
        std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
        std::shared_ptr<const TextPromptContext> prompt_context,
-       std::size_t cache_prefix_tokens, bool overlap_snapshots)
+       std::size_t cache_prefix_tokens, bool overlap_snapshots,
+       std::optional<std::size_t> root_prefix_tokens = {})
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
@@ -968,7 +969,12 @@ struct TextRunnerPool::Request::Impl {
       }
     }
     if (lease.component())
-      checkpoints = lease.PlannedCaptures(cache_prefix_tokens);
+      for (const auto& capture :
+           lease.PlannedCaptures(cache_prefix_tokens, root_prefix_tokens)) {
+        checkpoints.push_back(capture.boundary);
+        if (capture.capture_origin == SnapshotOrigin::kPredicted)
+          predicted_checkpoint = capture.boundary;
+      }
   }
 
   ~Impl() {
@@ -1192,22 +1198,25 @@ struct TextRunnerPool::Request::Impl {
 
   void CaptureBoundarySnapshot(
       std::size_t position, bool history, bool shared,
-      SnapshotPurpose purpose = SnapshotPurpose::kHistory) noexcept {
+      SnapshotPurpose purpose = SnapshotPurpose::kHistory,
+      SnapshotOrigin origin = SnapshotOrigin::kOrdinary) noexcept {
     if (!overlap_snapshots) {
       // A single execution slot has no peer work to overlap with the copy.
-      CaptureBoundarySnapshotNow(position, history, shared, purpose);
+      CaptureBoundarySnapshotNow(position, history, shared, purpose, origin);
       return;
     }
     // The scheduler already parks leases with a pending snapshot. Reuse that
     // path so allocation, eviction and copying do not stall unrelated users.
     // Direct callers and cancellation join before touching this lease again.
     try {
-      snapshot_future = std::async(
-          std::launch::async, [this, position, history, shared, purpose] {
-            CaptureBoundarySnapshotNow(position, history, shared, purpose);
-            return std::unique_ptr<TextRunnerSnapshot>{};
-          });
+      snapshot_future = std::async(std::launch::async, [this, position, history,
+                                                        shared, purpose,
+                                                        origin] {
+        CaptureBoundarySnapshotNow(position, history, shared, purpose, origin);
+        return std::unique_ptr<TextRunnerSnapshot>{};
+      });
       boundary_capture = true;
+      boundary_origin = origin;
     } catch (...) {
       // Optional caching must not fail the request if a worker cannot start.
     }
@@ -1215,7 +1224,8 @@ struct TextRunnerPool::Request::Impl {
 
   void CaptureBoundarySnapshotNow(
       std::size_t position, bool history, bool shared,
-      SnapshotPurpose purpose = SnapshotPurpose::kHistory) noexcept {
+      SnapshotPurpose purpose = SnapshotPurpose::kHistory,
+      SnapshotOrigin origin = SnapshotOrigin::kOrdinary) noexcept {
     const auto started = std::chrono::steady_clock::now();
     std::size_t bytes = 0;
     bool reserved = false;
@@ -1238,7 +1248,8 @@ struct TextRunnerPool::Request::Impl {
       // Copies other requests depend on compete like continuation
       // boundaries; the rest give way under pressure.
       if (history && !lease.HasSnapshotFor(prefix))
-        reserved = lease.TryReserveSnapshot(bytes, position, true, purpose);
+        reserved = lease.TryReserveSnapshot(bytes, position, true, purpose, {},
+                                            origin);
       std::unique_ptr<ContinuationDiskStore::CaptureReservation> persistence;
       if (shared && disk_store && !disk_store->Touch(*runner, prefix, identity))
         persistence =
@@ -1299,7 +1310,13 @@ struct TextRunnerPool::Request::Impl {
   std::vector<std::size_t> checkpoints;
   /// Checkpoints shared with other requests, retained like continuations.
   std::vector<std::size_t> shared_checkpoints;
+  std::optional<std::size_t> predicted_checkpoint;
+  SnapshotOrigin boundary_origin{SnapshotOrigin::kOrdinary};
   bool boundary_capture{false};
+  bool PredictedBoundary(std::size_t position) const {
+    return predicted_checkpoint == position ||
+           (lease.reused_prediction() && lease.cached_tokens() == position);
+  }
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
@@ -1474,11 +1491,13 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   // That includes a frontier at the target itself: a peer whose prompt ends
   // one token past the leader's stable boundary arrives while the leader
   // waits there for the copy.
-  if (offset && impl_->lease.component() &&
+  if (offset && impl_->lease.component() && !impl_->PredictedBoundary(offset) &&
       target - offset <= kSharedCheckpointSlack) {
     const bool capturing =
         impl_->snapshot_future.valid() &&
-        (impl_->boundary_capture || impl_->snapshot_tokens.size() == offset);
+        ((impl_->boundary_capture &&
+          impl_->boundary_origin == SnapshotOrigin::kOrdinary) ||
+         impl_->snapshot_tokens.size() == offset);
     const bool published =
         impl_->fallback_position == offset &&
         impl_->lease.HasSnapshotFor(
@@ -1499,13 +1518,17 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
     consider(impl_->snapshot_tokens.size());
   consider(impl_->stable_prefix_position);
   for (const auto position : impl_->checkpoints)
-    consider(position);
+    if (!impl_->PredictedBoundary(position))
+      consider(position);
   auto& checkpoints = impl_->checkpoints;
   const auto position =
       planned != 0 && target - planned <= kSharedCheckpointSlack ? planned
                                                                  : target;
   if (position == target && !std::ranges::binary_search(checkpoints, target))
     checkpoints.insert(std::ranges::upper_bound(checkpoints, target), target);
+  // Actual peer demand takes precedence over an optional planned prediction.
+  if (impl_->predicted_checkpoint == position)
+    impl_->predicted_checkpoint.reset();
   // Prompt snapshots are retained as continuation boundaries already.
   if (std::ranges::binary_search(checkpoints, position))
     impl_->shared_checkpoints.push_back(position);
@@ -1776,10 +1799,13 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
       std::ranges::find(impl_->shared_checkpoints, impl_->prefill_offset) !=
           impl_->shared_checkpoints.end();
   if ((history || shared) && impl_->prefill_offset != snapshot_position)
-    impl_->CaptureBoundarySnapshot(impl_->prefill_offset, history, shared,
-                                   shared_with_peers
-                                       ? SnapshotPurpose::kBranchPoint
-                                       : SnapshotPurpose::kHistory);
+    impl_->CaptureBoundarySnapshot(
+        impl_->prefill_offset, history, shared,
+        shared_with_peers ? SnapshotPurpose::kBranchPoint
+                          : SnapshotPurpose::kHistory,
+        impl_->predicted_checkpoint == impl_->prefill_offset
+            ? SnapshotOrigin::kPredicted
+            : SnapshotOrigin::kOrdinary);
   return step;
 }
 
@@ -2024,6 +2050,14 @@ std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->component_cache ? impl_->component_cache->capacity()
                                 : impl_->cache->capacity();
 }
+std::size_t TextRunnerPool::usable_capacity() const noexcept {
+  return impl_->component_cache ? impl_->component_cache->usable_capacity()
+                                : capacity();
+}
+void TextRunnerPool::SetAvailabilityCallback(std::function<void()> callback) {
+  if (impl_->component_cache)
+    impl_->component_cache->SetAvailabilityCallback(std::move(callback));
+}
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(
     std::size_t ready_requests) const {
@@ -2194,13 +2228,21 @@ std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
   return steps;
 }
 
+std::unique_ptr<TextRunnerPool::DiagnosticLease>
+TextRunnerPool::TryAcquireDiagnostic(const CancellationCheck& cancelled) {
+  return impl_->component_cache
+             ? impl_->component_cache->TryAcquireDiagnostic(cancelled)
+             : nullptr;
+}
+
 TextRunnerPool::Request TextRunnerPool::Acquire(
     std::vector<TextRunnerToken> prompt,
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
     std::size_t cache_prefix_tokens, bool stop_at_eos, bool persist,
-    std::optional<TextPromptAdmission> reserved_resources) {
+    std::optional<TextPromptAdmission> reserved_resources,
+    std::optional<std::size_t> root_prefix_tokens) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -2242,7 +2284,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     Request request(std::make_unique<Request::Impl>(
         impl_->validated.runner, nullptr, ServingCacheLease(std::move(lease)),
         std::move(prompt), std::vector<std::size_t>{}, sampling_config,
-        std::move(context), cache_prefix_tokens, capacity() > 1));
+        std::move(context), cache_prefix_tokens, capacity() > 1,
+        root_prefix_tokens));
     request.impl_->prompt_resources = std::move(resources.lease);
     request.impl_->cancelled = is_cancelled;
     request.impl_->lookup_timings = impl_->lookup_timings;
@@ -2256,8 +2299,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     if (reuse_prompt) {
       const auto common = impl_->component_cache->CachedPrefixTokens(
           request.prompt(), request.impl_->context.get(), true);
-      if (common >=
-              request.prefill_position() + Request::kSharedPrefixMinTokens &&
+      const auto ordinary = request.impl_->lease.reused_prediction()
+                                ? request.impl_->lease.ordinary_cached_tokens()
+                                : request.prefill_position();
+      if (common >= ordinary + Request::kSharedPrefixMinTokens &&
           (common + Request::kSharedCheckpointSlack < request.prompt_tokens() ||
            (impl_->shared_prefix_max_boundaries &&
             common >= impl_->shared_prefix_min_tokens &&

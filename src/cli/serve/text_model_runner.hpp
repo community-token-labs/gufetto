@@ -20,6 +20,7 @@
 #include "src/cache/ledger.hpp"
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/pinned_prefix.hpp"
+#include "src/cli/serve/text_diagnostic_lease.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
 #include "src/core/memory_budget.hpp"
@@ -56,6 +57,8 @@ struct TextPreparedPrompt {
   std::shared_ptr<const TextPromptContext> context;
   /// Snapshot before mutable assistant framing. Zero uses the complete prompt.
   std::size_t cache_prefix_tokens{0};
+  /// Optional exact renderer-issued system/tool root; never a stable override.
+  std::optional<std::size_t> root_prefix_tokens;
 };
 
 struct TextRunnerRamCacheOptions {
@@ -594,6 +597,10 @@ class TextRunnerPool {
 public:
   using CancellationCheck = std::function<bool()>;
 
+  using DiagnosticLease = TextDiagnosticLease;
+  [[nodiscard]] std::unique_ptr<DiagnosticLease> TryAcquireDiagnostic(
+      const CancellationCheck& is_cancelled = {});
+
   class Request {
   public:
     struct CommitMetrics {
@@ -705,6 +712,8 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] std::size_t usable_capacity() const noexcept;
+  void SetAvailabilityCallback(std::function<void()>);
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(
       std::size_t ready_requests) const;
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
@@ -719,7 +728,8 @@ public:
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
       bool stop_at_eos = true, bool persist = true,
-      std::optional<TextPromptAdmission> reserved_resources = std::nullopt);
+      std::optional<TextPromptAdmission> reserved_resources = std::nullopt,
+      std::optional<std::size_t> root_prefix_tokens = std::nullopt);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Read-only published Acquire inventory. Never waits for admission,
