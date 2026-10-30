@@ -86,6 +86,12 @@ struct Gguf {
     Pod(metadata, value);
     ++metadata_count;
   }
+  void Number64(const std::string& key, std::uint64_t value) {
+    String(metadata, key);
+    Pod(metadata, std::uint32_t{10});
+    Pod(metadata, value);
+    ++metadata_count;
+  }
   void Tensor(const std::string& name, std::uint64_t elements) {
     payload.resize((payload.size() + 31) / 32 * 32);
     String(tensors, name);
@@ -165,13 +171,111 @@ void LocalLowerBound(Fixture& fixture) {
   assert(report.text.find("derived weights=mapped-file-regions") !=
          std::string::npos);
   report = fixture.Run(h + row + "\t32\t4294967297\t8589934592\n");
-  assert(report.has_failures);
-  assert(report.text.find(": DOES-NOT-FIT:") != std::string::npos);
+  assert(!report.has_failures);  // Device-first weights do not consume host
+                                 // capacity.
+  assert(report.text.find(": UNPROVEN:") != std::string::npos);
   // Device needs KV, not host-registerable weights: 256 bytes is sufficient
   // for the lower bound even when the complete file is larger than 256 bytes.
   report = fixture.Run(h + row + "\t32\t8589934592\t4294967552\n");
   assert(!report.has_failures);
+  report = fixture.Run(h + row + "\t32\t8589934592\t4294967551\n");
+  assert(report.has_failures);  // One byte below the device KV boundary.
+  report = fixture.Run(h + row + "\t32\t8589934592\t4294967295\n");
+  assert(report.has_failures);  // Below the dispatch reserve itself.
   report = fixture.Run(h + row + "\t33\t8589934592\t8589934592\n");
+  assert(report.text.find(": NOT-EVALUATED:") != std::string::npos);
+}
+void NegativeCases(Fixture& fixture) {
+  const auto complete_header = header + "\t" + budgets + "\n";
+  constexpr std::uint64_t gib = 1ULL << 30;
+  const auto carveout =
+      "\t32\t" + std::to_string(28 * gib) + "\t" + std::to_string(96 * gib) +
+      "\t" + std::to_string(4 * gib) + "\t" + std::to_string(60 * gib) + "\t" +
+      std::to_string(gib) + "\t0\t0\t0\t0\t0\n";
+  auto report = fixture.Run(complete_header + Row("absent.gguf") + carveout);
+  assert(!report.has_failures);
+  assert(report.text.find(": UNPROVEN:") != std::string::npos);
+  for (const auto& device : {"4294967296", "4294967295"}) {
+    report = fixture.Run(complete_header + Row("absent.gguf") +
+                         "\t32\t4294967296\t" + device +
+                         "\t4294967296\t3\t0\t0\t0\t0\t0\t0\n");
+    assert(report.has_failures == (std::string(device) == "4294967295"));
+  }
+  auto watch = Row();
+  watch.replace(watch.find("candidate"), 9, "watch-only-no-download");
+  report = fixture.Run(header + "\n" + watch + "\n");
+  assert(report.text.find(": NOT-EVALUATED:") != std::string::npos);
+  Reject(fixture, header + "\n" + Row("model.gguf", "3", "bad") + "\n");
+  Reject(fixture,
+         header + "\n" + Row("model.gguf", "3", std::string(40, 'A')) + "\n");
+  for (const auto& digest : {std::string(63, 'a'), std::string(64, 'A')})
+    Reject(fixture, header + "\n" +
+                        Row("model.gguf", "3", std::string(40, 'a'), digest) +
+                        "\n");
+  Reject(fixture, header + "\thost_available\n" + Row() + "\t32\n");
+  for (const auto* name :
+       {"context", "device_available_bytes", "cache_bytes"}) {
+    try {
+      (void)fixture.Run(header + "\t" + name + "\n" + Row() + "\t32K\n");
+      assert(false);
+    } catch (const std::invalid_argument& error) {
+      assert(
+          std::string(error.what()).find("row 2 column " + std::string(name)) !=
+          std::string::npos);
+    }
+  }
+  Reject(fixture, header + "\tos_reserve_bytes\n" + Row() + "\t1\n");
+  std::filesystem::create_directory(fixture.root / "directory.gguf");
+  report = fixture.Run(header + "\n" + Row("directory.gguf") + "\n");
+  assert(report.has_failures &&
+         report.text.find("not a regular file") != std::string::npos);
+  std::error_code error;
+  std::filesystem::create_symlink(fixture.root / "model.gguf",
+                                  fixture.root / "link.gguf", error);
+  if (!error) {
+    report = fixture.Run(header + "\n" + Row("link.gguf") + "\n");
+    assert(report.has_failures &&
+           report.text.find("not a regular file") != std::string::npos);
+  }
+  const auto unreadable = fixture.root / "unreadable.gguf";
+  std::ofstream(unreadable) << "abc";
+  std::filesystem::permissions(unreadable, std::filesystem::perms::none, error);
+  if (!error && !std::ifstream(unreadable).is_open()) {
+    report = fixture.Run(header + "\n" + Row("unreadable.gguf") + "\n");
+    assert(report.has_failures &&
+           report.text.find("local=ERROR:") != std::string::npos);
+  }
+  std::filesystem::permissions(unreadable, std::filesystem::perms::owner_all,
+                               error);
+  Gguf unsupported;
+  unsupported.Text("general.architecture", "llama");
+  const auto path = fixture.root / "unsupported.gguf";
+  unsupported.Save(path);
+  const auto artifact_row = [&](const std::filesystem::path& p) {
+    return Row(p.filename().string(),
+               std::to_string(std::filesystem::file_size(p)),
+               std::string(40, 'a'), gufo::crypto::Sha256FileHex(p));
+  };
+  report = fixture.Run(header + "\n" + artifact_row(path) + "\n");
+  assert(report.text.find("NOT-EVALUATED: unsupported metadata-only family") !=
+         std::string::npos);
+  for (int shard = 0; shard < 2; ++shard) {
+    Gguf split;
+    split.Text("general.architecture", "qwen35");
+    split.Number("split.count", 2);
+    split.Number("split.no", shard);
+    split.Number64("split.tensors.count", 0);
+    split.Save(fixture.root / (shard == 0 ? "split-00001-of-00002.gguf"
+                                          : "split-00002-of-00002.gguf"));
+  }
+  const auto first = fixture.root / "split-00001-of-00002.gguf";
+  report = fixture.Run(header + "\n" + artifact_row(first) + "\n");
+  assert(report.text.find("NOT-EVALUATED: split GGUF") != std::string::npos);
+  assert(report.text.find("sibling shards are not evaluated") !=
+         std::string::npos);
+  std::filesystem::rename(fixture.root / "split-00002-of-00002.gguf",
+                          fixture.root / "other.gguf");
+  report = fixture.Run(header + "\n" + artifact_row(first) + "\n");
   assert(report.text.find(": NOT-EVALUATED:") != std::string::npos);
 }
 }  // namespace
@@ -191,7 +295,7 @@ int main() {
   assert(!report.has_failures);
   assert(report.text.find(": UNPROVEN: lower_bound_bytes=4") !=
          std::string::npos);
-  report = fixture.Run(complete_header + Row() + Budget("2") + "\n");
+  report = fixture.Run(complete_header + Row() + Budget("5") + "\n");
   assert(report.has_failures);
   assert(report.text.find("lower bound alone exceeds reserved capacity") !=
          std::string::npos);
@@ -221,6 +325,7 @@ int main() {
   Reject(fixture, complete_header + Row("missing.gguf") +
                       Budget("18446744073709551615") + "\n");
   LocalLowerBound(fixture);
+  NegativeCases(fixture);
   report = fixture.Run(header + "\r\n" + Row() + "\r\n");
   assert(report.has_failures);
   std::cout << "model_plan_test passed\n";

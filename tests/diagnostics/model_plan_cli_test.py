@@ -42,6 +42,17 @@ def main():
         ]:
             result = run(*args)
             assert result.returncode == 2, (args, result.stdout, result.stderr)
+        manifest.write_text(initial.decode().replace("b" * 64, "B" * 64))
+        malformed = run("--plan", str(manifest))
+        assert malformed.returncode == 2
+        assert "row 2 column sha256" in malformed.stderr
+        for column in ("context", "cache_bytes"):
+            lines = initial.decode().splitlines()
+            manifest.write_text(lines[0] + "\t" + column + "\n" + lines[1] + "\t32K\n")
+            malformed = run("--plan", str(manifest))
+            assert malformed.returncode == 2
+            assert f"row 2 column {column}" in malformed.stderr
+        manifest.write_bytes(initial)
         assert sorted(p.name for p in root.iterdir()) == ["models.tsv"]
         assert manifest.read_bytes() == initial
     print("model_plan_cli_test passed")
