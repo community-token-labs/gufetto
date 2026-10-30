@@ -2342,6 +2342,7 @@ void ReuseAndBranches() {
   auto retry = pool.Acquire(prompt);
   assert(retry.component_cache_metrics()->reuse_reason ==
          CacheReuseReason::kRam);
+  assert(retry.component_cache_metrics()->hit_tier == CacheHitTier::kRam);
   assert(retry.cached_prompt_tokens() == prompt.size());
   assert(retry.cache_restore_bytes() > 0);
   assert(Generate(retry) == token);
@@ -2366,6 +2367,7 @@ void ReuseAndBranches() {
   assert(continued.cache_restore_bytes() == 0);
   assert(continued.component_cache_metrics()->reuse_reason ==
          CacheReuseReason::kLive);
+  assert(continued.component_cache_metrics()->hit_tier == CacheHitTier::kLive);
   assert(continued.component_cache_metrics()->indexed_gap_tokens == 0);
   (void)continued.Cancel();
   history.back() += 1;
@@ -2488,6 +2490,7 @@ void RestartAndCorruption() {
     auto retry = pool.Acquire(prompt);
     assert(retry.cached_prompt_tokens() == lookup.matched_tokens);
     assert(retry.cache_disk_hit());
+    assert(retry.component_cache_metrics()->hit_tier == CacheHitTier::kDisk);
     assert(retry.cached_prompt_tokens() == prompt.size());
     assert(Generate(retry) == token);
     (void)retry.Commit();
@@ -4335,12 +4338,23 @@ void UnreadyPredictionDoesNotObserveOrTaintFallback() {
     auto fallback =
         cache.Acquire(std::span(prompt).first(8), {}, {}, true, 0, true);
     assert(fallback->cached_tokens() == 4 && !fallback->reused_prediction());
+    assert(fallback->Metrics().hit_tier == CacheHitTier::kRam);
     assert(fallback->ordinary_cached_tokens() == 4 &&
            fallback->Metrics().unready_frontiers == 1);
   }
   auto actual = cache.Acquire(prompt, {}, {}, true, 0, true);
   assert(actual->cached_tokens() == 8 && actual->reused_prediction() &&
          actual->ordinary_cached_tokens() == 4);
+  // A predicted root counts as `root` on every hit, observed or not.
+  assert(actual->Metrics().hit_tier == CacheHitTier::kRoot);
+  (void)actual->Commit({}, {}, prompt);
+  actual.reset();
+  // A branch after the root restores it again, now as an observed root.
+  auto branch = std::vector(prompt.begin(), prompt.begin() + 8);
+  branch.insert(branch.end(), {900, 901, 902, 903});
+  auto again = cache.Acquire(branch, {}, {}, true, 0, true);
+  assert(again->cached_tokens() == 8 && !again->reused_prediction());
+  assert(again->Metrics().hit_tier == CacheHitTier::kRoot);
 }
 
 void PredictionPublicationBudgetIsNotMarginalQuota() {
@@ -6016,6 +6030,8 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
             prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
         assert(request.cached_prompt_tokens() == fixture.tokens.size());
         assert(!request.cache_disk_hit());
+        assert(request.component_cache_metrics()->hit_tier ==
+               CacheHitTier::kPinned);
         Prefill(request);
         for (const auto token : expected[mode])
           assert(Generate(request) == token);
@@ -6038,6 +6054,9 @@ void PinnedPrefixRestartReplayAndNoRewrite() {
             prompt, {.temperature = mode ? 0.8F : 0.0F, .seed = 1234});
         assert(request.cached_prompt_tokens() == fixture.tokens.size());
         assert(request.cache_disk_hit() == (lazy && mode == 0));
+        // A pin counts as `pinned` from RAM and from disk alike.
+        assert(request.component_cache_metrics()->hit_tier ==
+               CacheHitTier::kPinned);
         Prefill(request);
         for (const auto token : expected[mode])
           assert(Generate(request) == token);

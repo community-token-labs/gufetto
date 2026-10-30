@@ -2,6 +2,7 @@
 
 import base64
 from collections import OrderedDict
+from concurrent.futures import Future
 from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,8 +14,12 @@ import struct
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import zlib
+
+import cache_lookup
 
 from cache_lookup import (Client, Config, Harness, ProbeError, distribution,
                           bracketed_tasks, generation_metrics, lookup_metrics, main,
@@ -555,13 +560,53 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(latency["http_200_wall"]["n"], 0)
         self.assertEqual(latency["engine_lookup"]["n"], 0)
 
-    def test_fixed_cadence_dispatches_slow_http_concurrently(self):
+    def test_fixed_cadence_uses_scheduled_slots(self):
+        # Test the launch clock independently of OS scheduling. Real HTTP
+        # concurrency is checked below with a rendezvous, not a sleep duration.
+        now = 0.0
+
+        class ClockEvent:
+            stopped = False
+
+            def wait(self, timeout):
+                nonlocal now
+                if not self.stopped:
+                    now += timeout
+                return self.stopped
+
+            def set(self):
+                self.stopped = True
+
+            def is_set(self):
+                return self.stopped
+
+        class InlineExecutor:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def submit(self, fn, *args):
+                future = Future()
+                try:
+                    future.set_result(fn(*args))
+                except Exception as error:
+                    future.set_exception(error)
+                return future
+
         engine = Engine()
-        engine.lookup_delay = .12
         config = Config("fixture", clients=0, latency_lookups=12, lookup_workers=8,
                         lookup_interval_ms=25, load_timeout=3)
-        with fake_http(engine) as url:
-            runner = Harness(Client(url, timeout=2), config)
+        clock_threads = SimpleNamespace(**vars(threading))
+        clock_threads.Event = ClockEvent
+        with patch.object(cache_lookup, "time", SimpleNamespace(perf_counter=lambda: now)), \
+                patch.object(cache_lookup, "threading", clock_threads), \
+                patch.object(cache_lookup, "ThreadPoolExecutor", InlineExecutor):
+            runner = Harness(engine, config)
             report = runner.run("load")
         cadence = report["load"]["cadence"]
         self.assertEqual(cadence["scheduled_slots"], 12)
@@ -569,12 +614,35 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(cadence["missed_slots"], 0)
         self.assertEqual(cadence["unlaunched_slots"], 0)
         self.assertEqual(cadence["target_hz"], 40)
-        self.assertLess(cadence["observed_launch_intervals_ms"]["p50"], 70)
-        self.assertGreater(report["load"]["latency_all_samples_ms"]["http_200_wall"]["p50"], 100)
+        self.assertAlmostEqual(cadence["observed_launch_intervals_ms"]["p50"], 25)
         self.assertEqual([row["scheduled_offset_ms"] for row in runner.rows], list(range(0, 300, 25)))
+        self.assertEqual(len(engine.calls), 12)
         self.assertTrue(all(endpoint == "/v1/cache/lookup" for endpoint, _ in engine.calls))
         self.assertTrue(report["load"]["external_load_overlap_unverified"])
         self.assertEqual(report["load"]["samples_fully_covered_by_all_generations"], 0)
+
+    def test_lookup_http_requests_can_be_in_flight_together(self):
+        rendezvous = threading.Barrier(2)
+
+        class ConcurrentEngine(Engine):
+            def post(self, endpoint, body):
+                # Neither response may complete until both requests arrive.
+                # The timeout is only a deadlock guard, not an expected latency.
+                rendezvous.wait(timeout=10)
+                return super().post(endpoint, body)
+
+        engine = ConcurrentEngine()
+        config = Config("fixture", clients=0, latency_lookups=2, lookup_workers=2,
+                        lookup_interval_ms=0, load_timeout=30)
+        with fake_http(engine) as url:
+            try:
+                report = Harness(Client(url, timeout=15), config).run("load")
+            finally:
+                rendezvous.abort()
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(report["load"]["cadence"]["attempted_slots"], 2)
+        self.assertEqual(report["load"]["cadence"]["missed_slots"], 0)
 
     def test_client_capacity_missed_slots_are_counted_not_queued(self):
         engine = Engine()
