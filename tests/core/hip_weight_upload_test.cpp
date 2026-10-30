@@ -259,8 +259,7 @@ int main() {
                      expected.begin() + first.destination),
           "a short direct read followed by a failure still yields exact bytes");
   Require(hipMemcpy(fallback.data(),
-                    static_cast<char*>(device.data) + first.destination -
-                        guard,
+                    static_cast<char*>(device.data) + first.destination - guard,
                     guard, hipMemcpyDeviceToHost) == hipSuccess &&
               std::all_of(fallback.begin(), fallback.begin() + guard,
                           [](std::uint8_t b) { return b == 0; }),
@@ -277,10 +276,10 @@ int main() {
   upload = WeightUpload::Create(std::span(regions).first(1), &error);
   Require(upload != nullptr, error);
   fail_all_reads = true;
-  Require(upload->Copy(first.shard, first.offset, first.size,
-                       static_cast<char*>(device.data) + first.destination,
-                       &error),
-          error);
+  Require(
+      upload->Copy(first.shard, first.offset, first.size,
+                   static_cast<char*>(device.data) + first.destination, &error),
+      error);
   const bool finished = upload->Finish(&error);
   fail_all_reads = false;
   Require(!finished, "a failed buffered retry fails the upload");
