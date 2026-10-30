@@ -272,6 +272,34 @@ void TestStopTokensFollowVocabulary() {
          "GGUF padding is not a generation terminator");
 }
 
+void TestStopMarkerPiecesAreNotEos() {
+  // Byte goldens are independent of the shared catalogue under test.
+  Expect(kImEnd == "<|im_end|>" && kEndOfText == "<|endoftext|>",
+         "Qwen generation terminator spellings");
+  for (const std::string arch : {"", "unknown", "qwen35", "qwen4exp"}) {
+    GgufTokenizerBuilder builder;
+    if (!arch.empty())
+      builder.AddMetadataString("general.architecture", arch);
+    builder.AddMetadataStringArray(
+        "tokenizer.ggml.tokens", {"Neraz", "im", "|", ">", "<", "_end", "text",
+                                  "<|im_end|>", "<|endoftext|>"});
+    builder.AddMetadataUint32("tokenizer.ggml.eos_token_id", 7);
+    auto bytes = builder.Build();
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(bytes.data(), bytes.size());
+    Expect(reader != nullptr, "marker-piece GGUF opens");
+    auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader);
+    Expect(tokenizer != nullptr, "marker-piece tokenizer loads");
+    for (gufo::tokenization::TokenId id = 0; id < 9; ++id)
+      Expect(
+          tokenizer->IsStopToken(id) == (id == 7 || id == 8),
+          "only complete vocabulary terminators are EOS, regardless of arch");
+    const std::vector<gufo::tokenization::TokenId> content{0, 1, 2, 3};
+    Expect(tokenizer->Decode(content) == "Nerazim|>",
+           "marker fragments in ordinary content remain intact");
+  }
+}
+
 void TestUnicodeContractionBoundary() {
   GgufTokenizerBuilder builder;
   builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
@@ -368,6 +396,7 @@ int main() {
   TestDirectVocabularyTokenizer();
   TestGgufTokenizerLoading();
   TestStopTokensFollowVocabulary();
+  TestStopMarkerPiecesAreNotEos();
   TestUnicodeContractionBoundary();
   TestEmptyAndSpecialEdgeCases();
   TestCorpusConformance();

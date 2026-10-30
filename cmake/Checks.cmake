@@ -15,6 +15,7 @@ set(gufo_pr_targets
   cache_retention_test
   cache_model_capabilities_test
   arg_parser_test json_test json_constraint_test gguf_reader_test gguf_identity_test
+  expert_stream_test
   heap_placement_test startup_admission_test diagnostic_memory_test model_plan_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test
@@ -33,6 +34,7 @@ set(gufo_pr_targets
   qwen_vision_memory_budget_test
   qwen_vision_output_pool_test
   qwen27b_continuation_layout_test
+  qwen38_flash_next_attention_geometry_test
   qwen38_flash_next_npu_contracts_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
@@ -51,6 +53,7 @@ set(gufo_pr_targets
   vision_ref_math_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
+  qwen38_flash_next_attention_geometry_test
   qwen38_flash_next_npu_contracts_test
   component_text_cache_test
   qwen38_flash_next_kv_cache_test
@@ -64,17 +67,19 @@ list(APPEND gufo_pr_tests
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
   text_model_runner_test_diagnostic_refusal_auto
   text_model_runner_test_diagnostic_refusal_explicit
+  "qwen38_flash_next\\.attention_geometry"
   "qwen38_flash_next\\.npu_contracts"
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
+  "qwen38_flash_next\\.tokenizer_diff"
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.kv_cache" "qwen38_flash_next\\.target_probe"
   "qwen38_flash_next\\.continuation_identity"
   pd_attribution_scheduler_test pd_attribution_analyzer_test
   perf_trace_disabled_test perf_trace_phase_limit_test
   pinned_prefix_harness_test cache_lookup_harness_test
-  cache_lookup_classify_harness_test
+  cache_lookup_classify_harness_test token_parity_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
   gufo_version gufo_help model_plan_cli_test model_admission_cli_test serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test

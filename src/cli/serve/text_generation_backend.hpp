@@ -382,6 +382,29 @@ public:
                           bool cache_prompt = true,
                           bool cache_persist = true) = 0;
 
+  /// Pretokenized completion: no decoding, retokenization or implicit BOS.
+  virtual Result complete_tokens(const std::vector<tokenization::TokenId>&,
+                                 std::size_t, const sampling::SamplingConfig&,
+                                 const CancellationCheck& = {},
+                                 const TokenCallback& = {},
+                                 std::string_view = "anonymous",
+                                 const std::vector<std::string>& = {},
+                                 bool = true, bool = true) {
+    throw std::invalid_argument("backend does not support token ID prompts");
+  }
+
+  static void ValidatePromptTokens(
+      const std::vector<tokenization::TokenId>& tokens,
+      std::uint32_t vocabulary_size) {
+    if (tokens.empty() ||
+        std::any_of(tokens.begin(), tokens.end(), [vocabulary_size](auto id) {
+          return id >= vocabulary_size;
+        }))
+      throw std::invalid_argument(
+          "'prompt' must be a nonempty array of in-vocabulary integer token "
+          "IDs");
+  }
+
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
                       const sampling::SamplingConfig& sampling,
                       const CancellationCheck& is_cancelled = {},

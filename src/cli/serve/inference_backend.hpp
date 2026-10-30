@@ -180,6 +180,16 @@ public:
                   const std::vector<std::string>& stop_sequences = {},
                   bool cache_prompt = true, bool cache_persist = true) override;
 
+  Result complete_tokens(const std::vector<tokenization::TokenId>& prompt,
+                         std::size_t max_tokens,
+                         const sampling::SamplingConfig& sampling,
+                         const CancellationCheck& is_cancelled = {},
+                         const TokenCallback& on_token = {},
+                         std::string_view client_id = "anonymous",
+                         const std::vector<std::string>& stop_sequences = {},
+                         bool cache_prompt = true,
+                         bool cache_persist = true) override;
+
   /// Framed chat conversation; returns the assistant reply.
   Result chat(const ChatRequest& request, std::size_t max_tokens,
               const sampling::SamplingConfig& sampling,

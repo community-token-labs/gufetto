@@ -1,0 +1,645 @@
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <string_view>
+#include <vector>
+
+#include "src/core/expert_stream/policy.hpp"
+
+namespace {
+
+using namespace gufo::core::expert_stream;
+
+void Expect(bool condition, std::string_view msg) {
+  if (!condition) {
+    std::cerr << "Assertion failed: " << msg << "\n";
+    std::exit(1);
+  }
+}
+
+// Projection-major layout: projection p of expert e of size `bytes` starts at
+// p * kBlock + e * bytes / 3, so consecutive experts are file-adjacent.
+constexpr std::uint64_t kBlock = 1ull << 30;
+
+ExpertRoute Route(std::uint32_t expert, std::uint64_t bytes,
+                  std::uint64_t step = 0, Phase phase = Phase::kDecode,
+                  std::uint32_t layer = 0) {
+  ExpertRoute route;
+  route.step = step;
+  route.phase = phase;
+  route.layer = layer;
+  route.expert = expert;
+  route.encoded_bytes = bytes;
+  for (std::uint32_t p = 0; p < kProjections; ++p) {
+    route.source[p] = {0, p * kBlock + expert * (bytes / 3), bytes / 3};
+  }
+  return route;
+}
+
+PoolConfig TwoSlots(Policy policy = Policy::kScanResistant) {
+  PoolConfig config;
+  config.class_bytes = {150, 300};
+  config.cap_bytes = 600;  // two 300-byte slots
+  config.chunk_bytes = 300;
+  config.policy = policy;
+  return config;
+}
+
+Plan Prepare(ExpertPool& pool, std::vector<ExpertRoute> routes,
+             bool optional = false) {
+  Plan plan;
+  Expect(pool.Prepare(routes, optional, &plan) == PlanError::kNone,
+         "prepare succeeds");
+  return plan;
+}
+
+void TestDuplicateRoutesDedupe() {
+  ExpertPool pool(TwoSlots());
+  const Plan plan = Prepare(pool, {Route(5, 300, 0, Phase::kPrefill),
+                                   Route(5, 300, 1, Phase::kPrefill),
+                                   Route(5, 300, 2, Phase::kPrefill)});
+  Expect(plan.leases.size() == 1, "one lease for one expert");
+  Expect(plan.leases[0].kind == LeaseKind::kFill, "miss fills a slot");
+  Expect(plan.reads.size() == 3, "one read per projection");
+  Expect(pool.stats().demand_read_bytes == 300, "expert read once");
+  Expect(pool.stats().route_misses == 3, "every route counted");
+  Expect(pool.stats().allocated_bytes == 300, "one backing slot");
+  Expect(pool.Complete(plan.id) == PlanError::kNone, "complete");
+  Expect(pool.Resident(0, 5), "published");
+  const Plan hit = Prepare(pool, {Route(5, 300)});
+  Expect(hit.leases[0].kind == LeaseKind::kHit && hit.reads.empty(),
+         "resident expert is a hit without reads");
+  Expect(pool.Complete(hit.id) == PlanError::kNone, "complete hit");
+  Expect(pool.stats().route_hits == 1, "hit counted");
+}
+
+void TestPinnedSlotsRefuseThenRetry() {
+  ExpertPool pool(TwoSlots());
+  const Plan a = Prepare(pool, {Route(1, 300)});
+  const Plan b = Prepare(pool, {Route(2, 300)});
+  Expect(pool.stats().allocated_bytes == 600, "cap reached");
+
+  // Both slots are pinned by held completions: the third expert is deferred.
+  const Plan c = Prepare(pool, {Route(3, 300)});
+  Expect(c.leases.empty() && c.reads.empty(), "no lease past the cap");
+  Expect(c.deferred.size() == 1 && c.deferred[0].reason == DeferReason::kNoSlot,
+         "third expert deferred");
+  Expect(pool.stats().allocated_bytes == 600 &&
+             pool.stats().peak_allocated_bytes == 600,
+         "cap never exceeded");
+  // A second plan for an expert still being filled waits for that fill.
+  const Plan dup = Prepare(pool, {Route(1, 300)});
+  Expect(dup.deferred.size() == 1 &&
+             dup.deferred[0].reason == DeferReason::kInFlight,
+         "in-flight fill is not read twice");
+  Expect(pool.stats().deferred == 2, "both deferrals counted");
+  Expect(pool.Complete(c.id) == PlanError::kNone, "empty plan completes");
+  Expect(pool.Complete(dup.id) == PlanError::kNone, "deferred plan completes");
+
+  // Cancel releases b's slot unpublished; complete publishes a.
+  Expect(pool.Cancel(b.id) == PlanError::kNone, "cancel");
+  Expect(!pool.Resident(0, 2), "cancelled fill not published");
+  Expect(pool.Complete(a.id) == PlanError::kNone, "complete");
+  Expect(pool.Resident(0, 1), "completed fill published");
+  Expect(pool.Complete(a.id) == PlanError::kUnknownPlan, "complete once");
+  Expect(pool.Cancel(b.id) == PlanError::kUnknownPlan, "cancel once");
+  Expect(pool.stats().resident_encoded_bytes == 300, "exact resident bytes");
+  Expect(pool.FragmentationBytes() == 300, "one free slot");
+
+  // Retry: the free slot serves; then a hotter fourth expert (four routes)
+  // evicts an unpinned resident one rather than growing.
+  const Plan retry = Prepare(pool, {Route(3, 300)});
+  Expect(retry.leases.size() == 1 && retry.leases[0].kind == LeaseKind::kFill,
+         "retry fills");
+  Expect(pool.Complete(retry.id) == PlanError::kNone, "complete retry");
+  const Plan weak = Prepare(pool, {Route(4, 300)});
+  Expect(weak.deferred.size() == 1 && pool.stats().evictions == 0,
+         "a colder newcomer does not displace the working set");
+  Expect(pool.Complete(weak.id) == PlanError::kNone, "complete weak");
+  const Plan fourth = Prepare(
+      pool,
+      {Route(4, 300, 10, Phase::kPrefill), Route(4, 300, 11, Phase::kPrefill),
+       Route(4, 300, 12, Phase::kPrefill), Route(4, 300, 13, Phase::kPrefill)});
+  Expect(fourth.leases.size() == 1 && pool.stats().evictions == 1,
+         "unpinned resident slot evicted");
+  Expect(pool.Complete(fourth.id) == PlanError::kNone, "complete fourth");
+  Expect(pool.stats().allocated_bytes == 600, "still at cap");
+}
+
+void TestStageReadThrough() {
+  PoolConfig config = TwoSlots();
+  config.stage_bytes = 300;
+  ExpertPool pool(config);
+  const Plan a = Prepare(pool, {Route(1, 300), Route(2, 300)});
+  const Plan b = Prepare(pool, {Route(3, 300), Route(4, 300)});
+  Expect(b.leases.size() == 1 && b.leases[0].kind == LeaseKind::kStage,
+         "pinned cap stages one expert");
+  Expect(b.deferred.size() == 1, "stage full defers the other");
+  Expect(pool.stats().stage_in_use_bytes == 300, "stage accounted");
+  Expect(pool.Complete(b.id) == PlanError::kNone, "complete");
+  Expect(pool.stats().stage_in_use_bytes == 0, "stage released");
+  Expect(!pool.Resident(0, 3), "staged expert not cached");
+  Expect(pool.Complete(a.id) == PlanError::kNone, "complete");
+}
+
+void TestSizeClasses() {
+  PoolConfig config = TwoSlots();
+  config.chunk_bytes = 150;  // one slot per growth step
+  ExpertPool pool(config);
+  const Plan small = Prepare(pool, {Route(1, 150)});
+  Expect(small.leases[0].kind == LeaseKind::kFill,
+         "small expert in its own class");
+  const Plan big = Prepare(pool, {Route(2, 300)});
+  Expect(pool.stats().allocated_bytes == 450, "two classes allocated");
+  Expect(pool.FragmentationBytes() == 0, "no slack");
+  // Only 150 bytes of cap remain: a large expert cannot grow or use a smaller
+  // slot; a small one can grow its own class.
+  const Plan big2 = Prepare(pool, {Route(3, 300)});
+  Expect(big2.deferred.size() == 1, "large never takes a small slot");
+  const Plan small2 = Prepare(pool, {Route(4, 150)});
+  Expect(small2.leases.size() == 1 && pool.stats().allocated_bytes == 600,
+         "small class grows to the cap");
+  for (const Plan* plan : {&small, &big, &big2, &small2}) {
+    Expect(pool.Complete(plan->id) == PlanError::kNone, "complete");
+  }
+  // Cap exhausted and the small class has no free slot: once the large slot
+  // is free, a small expert may take it.
+  ExpertPool spill(TwoSlots());
+  const Plan l1 = Prepare(spill, {Route(1, 300)});
+  const Plan l2 = Prepare(spill, {Route(2, 300)});
+  Expect(spill.Cancel(l2.id) == PlanError::kNone, "free one large slot");
+  const Plan s = Prepare(spill, {Route(3, 150)});
+  Expect(s.leases.size() == 1 && spill.FragmentationBytes() == 150,
+         "small expert takes the smallest larger free slot");
+  Expect(spill.Complete(l1.id) == PlanError::kNone &&
+             spill.Complete(s.id) == PlanError::kNone,
+         "complete");
+}
+
+void TestCoalescing() {
+  PoolConfig config = TwoSlots();
+  config.cap_bytes = 3000;
+  ExpertPool pool(config);
+  const Plan plan =
+      Prepare(pool, {Route(4, 300), Route(5, 300), Route(9, 300)});
+  Expect(plan.reads.size() == 6, "4+5 coalesce per projection, 9 separate");
+  for (const ReadTask& read : plan.reads) {
+    Expect(read.range.bytes == (read.leases.size() == 2 ? 200u : 100u),
+           "coalesced range covers both experts");
+  }
+  Expect(pool.stats().demand_read_bytes == 900, "bytes unchanged by merging");
+  Expect(pool.Complete(plan.id) == PlanError::kNone, "complete");
+
+  config.max_read_bytes = 150;
+  ExpertPool capped(config);
+  const Plan split = Prepare(capped, {Route(4, 300), Route(5, 300)});
+  Expect(split.reads.size() == 6, "merge cap splits adjacent reads");
+  Expect(capped.Complete(split.id) == PlanError::kNone, "complete");
+}
+
+void TestRefusals() {
+  PoolConfig config = TwoSlots();
+  config.stage_bytes = 500;
+  ExpertPool pool(config);
+  const Plan big = Prepare(pool, {Route(1, 450)});
+  Expect(big.leases.size() == 1 && big.leases[0].kind == LeaseKind::kStage,
+         "larger than every class stages");
+  Expect(pool.Complete(big.id) == PlanError::kNone, "complete");
+  const Plan huge = Prepare(pool, {Route(2, 900)});
+  Expect(huge.deferred.size() == 1 &&
+             huge.deferred[0].reason == DeferReason::kOversized,
+         "oversized refused");
+  Expect(pool.Complete(huge.id) == PlanError::kNone, "complete");
+
+  Plan plan;
+  ExpertRoute overflow = Route(3, 300);
+  overflow.source[1].offset = std::numeric_limits<std::uint64_t>::max() - 10;
+  Expect(
+      pool.Prepare(std::vector{overflow}, false, &plan) == PlanError::kBadRange,
+      "offset overflow refused");
+  ExpertRoute mismatch = Route(3, 300);
+  mismatch.encoded_bytes = 301;
+  Expect(
+      pool.Prepare(std::vector{mismatch}, false, &plan) == PlanError::kBadRange,
+      "encoded bytes must match ranges");
+  ExpertRoute alias = Route(3, 300);
+  alias.source[0].offset += 3;
+  Expect(pool.Prepare(std::vector{Route(3, 300), alias}, false, &plan) ==
+             PlanError::kBadRange,
+         "one expert, one source");
+  Expect(pool.Prepare(
+             std::vector{Route(3, 300), Route(4, 300, 0, Phase::kDecode, 1)},
+             false, &plan) == PlanError::kMixedLayers,
+         "one layer per plan");
+  Expect(pool.Prepare({}, false, &plan) == PlanError::kEmpty, "empty");
+  Expect(pool.Cancel(12345) == PlanError::kUnknownPlan, "unknown plan");
+
+  PoolConfig bad = TwoSlots();
+  bad.class_bytes = {300, 300};
+  ExpertPool invalid(bad);
+  Expect(!invalid.Valid(), "classes must ascend");
+  Expect(invalid.Prepare(std::vector{Route(1, 300)}, false, &plan) ==
+             PlanError::kInvalidPool,
+         "invalid pool refuses");
+  Expect(pool.stats().allocated_bytes == 0, "refusals allocate nothing");
+}
+
+// A hot decode working set (eight rounds), then a 64-token prefill scan of new
+// experts, then the working set again. The scan's final 16 rows are admitted
+// (score 5) but cannot displace the hotter working set.
+std::uint64_t WorkingSetHitsAfterScan(Policy policy) {
+  PoolConfig config = TwoSlots(policy);
+  config.cap_bytes = 1200;  // four slots
+  config.stage_bytes = 300 * 64;
+  ExpertPool pool(config);
+  std::uint64_t step = 0;
+  auto decode = [&] {
+    for (std::uint32_t e = 0; e < 4; ++e) {
+      const Plan plan = Prepare(pool, {Route(e, 300, step++)});
+      Expect(pool.Complete(plan.id) == PlanError::kNone, "complete decode");
+    }
+  };
+  for (int round = 0; round < 8; ++round) {
+    decode();
+  }
+  std::vector<ExpertRoute> scan;
+  for (std::uint32_t t = 0; t < 64; ++t) {
+    scan.push_back(Route(100 + t, 300, step + t, Phase::kPrefill));
+  }
+  step += 64;
+  const Plan plan = Prepare(pool, scan);
+  Expect(pool.Complete(plan.id) == PlanError::kNone, "complete scan");
+  const std::uint64_t before = pool.stats().route_hits;
+  decode();
+  return pool.stats().route_hits - before;
+}
+
+void TestScanResistance() {
+  Expect(WorkingSetHitsAfterScan(Policy::kScanResistant) == 4,
+         "scored policy keeps the decode working set");
+  Expect(WorkingSetHitsAfterScan(Policy::kLru) == 0,
+         "LRU baseline loses it to the scan");
+}
+
+void TestOptionalNeverEvicts() {
+  ExpertPool pool(TwoSlots());
+  const Plan seed = Prepare(pool, {Route(1, 300), Route(2, 300)}, true);
+  Expect(seed.leases.size() == 2, "optional fills free capacity");
+  Expect(pool.stats().optional_read_bytes == 600 &&
+             pool.stats().demand_read_bytes == 0,
+         "optional bytes reported separately");
+  Expect(pool.stats().route_misses == 0, "optional routes not counted");
+  Expect(pool.Complete(seed.id) == PlanError::kNone, "complete seed");
+  const Plan extra = Prepare(pool, {Route(3, 300)}, true);
+  Expect(extra.leases.empty() && extra.deferred.empty() &&
+             pool.stats().evictions == 0,
+         "optional plan drops instead of evicting");
+  Expect(pool.Complete(extra.id) == PlanError::kNone, "complete");
+  pool.ResetCounters();
+  Expect(pool.stats().optional_read_bytes == 0 &&
+             pool.stats().allocated_bytes == 600 &&
+             pool.stats().resident_encoded_bytes == 600,
+         "reset keeps gauges");
+}
+
+bool SameStats(const Stats& a, const Stats& b) {
+  return a.route_hits == b.route_hits && a.route_misses == b.route_misses &&
+         a.demand_read_bytes == b.demand_read_bytes &&
+         a.optional_read_bytes == b.optional_read_bytes &&
+         a.read_tasks == b.read_tasks && a.evictions == b.evictions &&
+         a.deferred == b.deferred && a.allocated_bytes == b.allocated_bytes &&
+         a.peak_allocated_bytes == b.peak_allocated_bytes &&
+         a.resident_encoded_bytes == b.resident_encoded_bytes &&
+         a.stage_in_use_bytes == b.stage_in_use_bytes;
+}
+
+void Done(ExpertPool& pool, const Plan& plan) {
+  Expect(pool.Complete(plan.id) == PlanError::kNone, "complete");
+}
+
+// Two overlapping hit leases pin a resident slot that LRU would otherwise
+// evict first; it becomes evictable only after both are released.
+void TestHeldResidentHits(bool release_first_lease_first) {
+  ExpertPool pool(TwoSlots(Policy::kLru));
+  Done(pool, Prepare(pool, {Route(1, 300)}));
+  Done(pool, Prepare(pool, {Route(2, 300)}));
+  const Plan h1 = Prepare(pool, {Route(1, 300)});
+  const Plan h2 = Prepare(pool, {Route(1, 300)});
+  Expect(h1.leases[0].kind == LeaseKind::kHit &&
+             h2.leases[0].kind == LeaseKind::kHit,
+         "held resident hits");
+  Done(pool, Prepare(pool, {Route(2, 300)}));  // expert 1 is now the LRU
+  Done(pool, Prepare(pool, {Route(3, 300)}));
+  Expect(pool.Resident(0, 1) && !pool.Resident(0, 2),
+         "held resident slot is not evicted; the unpinned one is");
+  Done(pool, Prepare(pool, {Route(3, 300)}));  // expert 1 is the LRU again
+  Done(pool, release_first_lease_first ? h1 : h2);
+  Done(pool, Prepare(pool, {Route(4, 300)}));
+  Expect(pool.Resident(0, 1) && !pool.Resident(0, 3),
+         "one remaining hit lease still pins the slot");
+  Done(pool, Prepare(pool, {Route(4, 300)}));
+  Done(pool, release_first_lease_first ? h2 : h1);
+  Done(pool, Prepare(pool, {Route(5, 300)}));
+  Expect(!pool.Resident(0, 1) && pool.Resident(0, 4) && pool.Resident(0, 5),
+         "released slot becomes the LRU victim");
+}
+
+void TestStageCancelAndExhaustion() {
+  PoolConfig config = TwoSlots();
+  config.stage_bytes = 600;
+  ExpertPool pool(config);
+  const Plan a = Prepare(pool, {Route(1, 300)});
+  const Plan b = Prepare(pool, {Route(2, 300)});
+  const Plan s = Prepare(pool, {Route(3, 300)});
+  Expect(s.leases.size() == 1 && s.leases[0].kind == LeaseKind::kStage,
+         "pinned cap stages");
+  Expect(pool.Cancel(s.id) == PlanError::kNone, "cancel stage");
+  Expect(pool.stats().stage_in_use_bytes == 0 && !pool.Resident(0, 3),
+         "cancel releases stage bytes exactly");
+  Expect(pool.Cancel(s.id) == PlanError::kUnknownPlan &&
+             pool.Complete(s.id) == PlanError::kUnknownPlan,
+         "cancelled plan finishes once");
+  const Plan retry = Prepare(pool, {Route(3, 300)});
+  Expect(retry.leases.size() == 1 && retry.leases[0].kind == LeaseKind::kStage,
+         "stage retry after cancel");
+  Done(pool, retry);
+  Expect(pool.Cancel(retry.id) == PlanError::kUnknownPlan,
+         "completed plan finishes once");
+  // Exact exhaustion across open plans, then release by cancel.
+  const Plan s1 = Prepare(pool, {Route(4, 300)});
+  const Plan s2 = Prepare(pool, {Route(5, 300)});
+  Expect(pool.stats().stage_in_use_bytes == 600, "stage exactly full");
+  const Plan s3 = Prepare(pool, {Route(6, 300)});
+  Expect(s3.leases.empty() && s3.deferred.size() == 1 &&
+             s3.deferred[0].reason == DeferReason::kNoSlot,
+         "full stage defers");
+  Expect(pool.Cancel(s1.id) == PlanError::kNone, "cancel one stage");
+  const Plan s4 = Prepare(pool, {Route(6, 300)});
+  Expect(s4.leases.size() == 1 && s4.leases[0].kind == LeaseKind::kStage,
+         "released stage bytes are reusable");
+  for (const Plan* plan : {&a, &b, &s2, &s3, &s4}) {
+    Done(pool, *plan);
+  }
+  Expect(pool.stats().stage_in_use_bytes == 0, "stage drained");
+}
+
+// R1: a staged expert is in flight like a fill, even once cache capacity
+// frees up, until its plan finishes either way.
+void TestConcurrentStageDedupe(bool complete) {
+  PoolConfig config = TwoSlots(Policy::kLru);
+  config.stage_bytes = 900;
+  ExpertPool pool(config);
+  const Plan a = Prepare(pool, {Route(1, 300)});
+  const Plan b = Prepare(pool, {Route(2, 300)});
+  const Plan s = Prepare(pool, {Route(3, 300)});
+  Expect(s.leases.size() == 1 && s.leases[0].kind == LeaseKind::kStage,
+         "staged");
+  const std::uint64_t demand = pool.stats().demand_read_bytes;
+  const Plan dup = Prepare(pool, {Route(3, 300)});
+  Expect(dup.leases.empty() && dup.reads.empty() && dup.deferred.size() == 1 &&
+             dup.deferred[0].reason == DeferReason::kInFlight,
+         "duplicate stage deferred, not read again");
+  Expect(pool.stats().stage_in_use_bytes == 300 &&
+             pool.stats().demand_read_bytes == demand,
+         "no second stage reservation or read");
+  Done(pool, dup);
+  Done(pool, a);
+  Done(pool, b);
+  const Plan early = Prepare(pool, {Route(3, 300)});
+  Expect(early.leases.empty() && early.deferred.size() == 1 &&
+             early.deferred[0].reason == DeferReason::kInFlight,
+         "still in flight after cache capacity frees");
+  Done(pool, early);
+  Expect(
+      (complete ? pool.Complete(s.id) : pool.Cancel(s.id)) == PlanError::kNone,
+      "finish staged plan");
+  const Plan retry = Prepare(pool, {Route(3, 300)});
+  Expect(retry.leases.size() == 1 && retry.leases[0].kind == LeaseKind::kFill,
+         "retry fills once the stage is finished");
+  Done(pool, retry);
+  Expect(pool.stats().stage_in_use_bytes == 0, "stage released");
+}
+
+void TestNoMergeAcrossShards() {
+  PoolConfig config = TwoSlots();
+  config.cap_bytes = 3000;
+  ExpertPool pool(config);
+  ExpertRoute other = Route(5, 300);
+  for (SourceRange& range : other.source) {
+    range.shard = 1;  // same offsets as an adjacent expert, other file
+  }
+  const Plan plan = Prepare(pool, {Route(4, 300), other});
+  Expect(plan.reads.size() == 6, "adjacent offsets in different shards");
+  for (const ReadTask& read : plan.reads) {
+    Expect(read.leases.size() == 1 && read.range.bytes == 100,
+           "no cross-shard merge");
+  }
+  Done(pool, plan);
+}
+
+// R2: every task respects max_read_bytes, merged or split, and reads the
+// right file bytes: shard, offset = projection offset + skip, full coverage.
+void ExpectBoundedSplit(const Plan& plan, std::uint64_t max_read,
+                        const std::vector<ExpertRoute>& routes) {
+  auto source = [&](std::uint32_t lease, std::uint32_t p) {
+    for (const ExpertRoute& route : routes) {
+      if (route.expert == plan.leases[lease].expert) {
+        return route.source[p];
+      }
+    }
+    Expect(false, "lease has a route");
+    return SourceRange{};
+  };
+  std::vector<std::uint64_t> covered(plan.leases.size() * kProjections, 0);
+  for (const ReadTask& read : plan.reads) {
+    Expect(read.range.bytes > 0 && read.range.bytes <= max_read,
+           "every task within max_read_bytes");
+    const SourceRange first = source(read.leases[0], read.projection);
+    Expect(read.range.shard == first.shard &&
+               read.range.offset == first.offset + read.skip,
+           "task reads from projection offset + skip");
+    if (read.leases.size() == 1) {
+      std::uint64_t& seen =
+          covered[read.leases[0] * kProjections + read.projection];
+      Expect(read.skip == seen, "split pieces are contiguous");
+      seen += read.range.bytes;
+    } else {
+      Expect(read.skip == 0, "merged tasks start at a projection");
+      for (const std::uint32_t lease : read.leases) {
+        covered[lease * kProjections + read.projection] +=
+            source(lease, read.projection).bytes;
+      }
+    }
+  }
+  for (std::uint32_t lease = 0; lease < plan.leases.size(); ++lease) {
+    for (std::uint32_t p = 0; p < kProjections; ++p) {
+      Expect(covered[lease * kProjections + p] == source(lease, p).bytes,
+             "split pieces cover the projection");
+    }
+  }
+}
+
+void TestReadSplit() {
+  PoolConfig config;
+  config.class_bytes = {400};
+  config.cap_bytes = 4000;
+  config.chunk_bytes = 400;
+  config.max_read_bytes = 100;
+  ExpertPool exact(config);
+  const std::vector<ExpertRoute> pair = {Route(4, 300), Route(5, 300)};
+  const Plan at = Prepare(exact, pair);
+  Expect(at.reads.size() == 6, "exact boundary: one task each, no merge");
+  ExpectBoundedSplit(at, 100, pair);
+  Done(exact, at);
+
+  ExpertPool over(config);
+  const std::vector<ExpertRoute> odd = {Route(4, 303)};
+  const Plan split = Prepare(over, odd);
+  Expect(split.reads.size() == 6, "101-byte projections split in two");
+  ExpectBoundedSplit(split, 100, odd);
+  Done(over, split);
+
+  config.max_read_bytes = 1000;
+  ExpertPool merged(config);
+  const std::vector<ExpertRoute> adjacent = {Route(4, 300), Route(5, 300)};
+  const Plan joined = Prepare(merged, adjacent);
+  Expect(joined.reads.size() == 3, "adjacent projections merge");
+  ExpectBoundedSplit(joined, 1000, adjacent);
+  Done(merged, joined);
+
+  config.class_bytes = {120ull << 20};
+  config.cap_bytes = 240ull << 20;
+  config.chunk_bytes = 120ull << 20;
+  config.max_read_bytes = 32ull << 20;
+  ExpertPool big(config);
+  const std::vector<ExpertRoute> large_routes = {Route(1, 120ull << 20)};
+  const Plan large = Prepare(big, large_routes);
+  Expect(large.reads.size() == 6, "40 MiB projections: 32 + 8 MiB");
+  ExpectBoundedSplit(large, 32ull << 20, large_routes);
+  Expect(big.stats().demand_read_bytes == 120ull << 20,
+         "split does not change bytes");
+  Done(big, large);
+}
+
+// F1: a final short chunk must not advance skip past the projection; at
+// max_read_bytes = 2^63 that wrapped and emitted tasks forever.
+void TestSplitNearMaxRead() {
+  constexpr std::uint64_t kHalf = 1ull << 63;
+  PoolConfig config;
+  config.class_bytes = {kHalf + 3};
+  config.cap_bytes = kHalf + 3;
+  config.chunk_bytes = kHalf + 3;
+  config.max_read_bytes = kHalf;
+  ExpertPool pool(config);
+  ExpertRoute route;
+  route.expert = 1;
+  route.encoded_bytes = kHalf + 3;
+  route.source = {SourceRange{0, 0, kHalf + 1}, SourceRange{1, 0, 1},
+                  SourceRange{2, 0, 1}};
+  const Plan plan = Prepare(pool, {route});
+  Expect(plan.reads.size() == 4, "four tasks, no wrap");
+  ExpectBoundedSplit(plan, kHalf, {route});
+  Expect(plan.reads[0].range.bytes == kHalf && plan.reads[1].skip == kHalf &&
+             plan.reads[1].range.offset == kHalf &&
+             plan.reads[1].range.bytes == 1,
+         "2^63 + 1 splits into 2^63 and 1");
+  Done(pool, plan);
+
+  // A plan needing more than 2^20 tasks is refused before any mutation.
+  PoolConfig tiny = TwoSlots();
+  tiny.class_bytes = {3ull << 20};
+  tiny.cap_bytes = 6ull << 20;
+  tiny.chunk_bytes = 3ull << 20;
+  tiny.max_read_bytes = 1;
+  ExpertPool refuse(tiny);
+  const Plan first = Prepare(refuse, {Route(1, 3)});
+  Done(refuse, first);
+  const Stats before = refuse.stats();
+  Plan untouched;
+  untouched.id = 777;
+  Expect(refuse.Prepare(std::vector{Route(2, 3ull << 20)}, false, &untouched) ==
+             PlanError::kTooManyReads,
+         "too many read tasks refused");
+  Expect(untouched.id == 777 && SameStats(before, refuse.stats()) &&
+             !refuse.Resident(0, 2),
+         "task-count refusal is atomic");
+  const Plan next = Prepare(refuse, {Route(3, 3)});
+  Expect(next.id == first.id + 1, "refusal consumes no plan id");
+  Done(refuse, next);
+}
+
+void TestMoreNegatives() {
+  using Mutate = void (*)(PoolConfig&);
+  for (const Mutate mutate :
+       std::vector<Mutate>{[](PoolConfig& c) { c.class_bytes = {}; },
+                           [](PoolConfig& c) { c.class_bytes = {0, 300}; },
+                           [](PoolConfig& c) { c.class_bytes = {300, 150}; },
+                           [](PoolConfig& c) { c.cap_bytes = 0; },
+                           [](PoolConfig& c) { c.max_read_bytes = 0; }}) {
+    PoolConfig bad = TwoSlots();
+    mutate(bad);
+    Expect(!ExpertPool(bad).Valid(), "invalid pool variant refused");
+  }
+
+  ExpertPool pool(TwoSlots());
+  const Plan first = Prepare(pool, {Route(1, 300)});
+  Done(pool, first);
+  const Stats before = pool.stats();
+  Plan untouched;
+  untouched.id = 777;
+  ExpertRoute zero = Route(2, 300);
+  zero.source[1].bytes = 0;
+  zero.encoded_bytes = 200;
+  ExpertRoute sum = Route(2, 300);
+  sum.source = {SourceRange{0, 0, 1ull << 63}, SourceRange{0, 0, 1ull << 63},
+                SourceRange{0, 0, 1}};
+  sum.encoded_bytes = 1;
+  ExpertRoute moved = Route(1, 300);
+  moved.source[2].offset += 3;
+  const ExpertRoute resized = Route(1, 150);
+  for (const ExpertRoute& bad : {zero, sum, moved, resized}) {
+    Expect(pool.Prepare(std::vector{bad}, false, &untouched) ==
+               PlanError::kBadRange,
+           "bad or conflicting metadata refused");
+  }
+  Expect(untouched.id == 777 && SameStats(before, pool.stats()),
+         "refusals change neither the plan nor any counter");
+  const Plan next = Prepare(pool, {Route(2, 300)});
+  Expect(next.id == first.id + 1, "refusals consume no plan id");
+  Done(pool, next);
+
+  constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+  const Plan edge = Prepare(pool, {Route(3, 300, kMax - 1, Phase::kPrefill),
+                                   Route(4, 300, kMax, Phase::kPrefill)});
+  Done(pool, edge);
+  const Plan wide = Prepare(pool, {Route(5, 300, 0, Phase::kPrefill),
+                                   Route(6, 300, kMax, Phase::kPrefill)});
+  Expect(wide.leases.size() + wide.deferred.size() == 2,
+         "steps spanning the whole range plan without overflow");
+  Done(pool, wide);
+}
+
+}  // namespace
+
+int main() {
+  TestDuplicateRoutesDedupe();
+  TestPinnedSlotsRefuseThenRetry();
+  TestStageReadThrough();
+  TestSizeClasses();
+  TestCoalescing();
+  TestRefusals();
+  TestScanResistance();
+  TestOptionalNeverEvicts();
+  TestHeldResidentHits(true);
+  TestHeldResidentHits(false);
+  TestStageCancelAndExhaustion();
+  TestConcurrentStageDedupe(true);
+  TestConcurrentStageDedupe(false);
+  TestNoMergeAcrossShards();
+  TestReadSplit();
+  TestSplitNearMaxRead();
+  TestMoreNegatives();
+  std::cout << "expert_stream_test: PASS\n";
+  return 0;
+}
