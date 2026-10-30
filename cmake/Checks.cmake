@@ -65,6 +65,7 @@ list(APPEND gufo_pr_tests
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
   "qwen38_flash_next\\.config" "qwen38_flash_next\\.mtp_sampling"
+  "qwen38_flash_next\\.tokenizer_diff"
   "qwen38_flash_next\\.rope_scaling" "qwen38_flash_next\\.continuation_layout"
   "qwen38_flash_next\\.kv_cache" "qwen38_flash_next\\.target_probe"
   "qwen38_flash_next\\.continuation_identity"
