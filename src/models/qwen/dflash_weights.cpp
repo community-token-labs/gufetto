@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/checked_arithmetic.hpp"
+
 namespace gufo::speculative {
 namespace {
 
@@ -287,14 +289,42 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
     df_cfg.target_layer_ids.push_back(normalized);
   }
 
+  // Every expected tensor size below derives from metadata. Refuse widths
+  // that wrap before any of them is compared with a tensor.
   const std::size_t hidden = config.hidden_size;
   const std::size_t intermediate = config.intermediate_size;
-  const std::size_t attention = config.AttentionSize();
-  const std::size_t kv =
-      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
   const std::size_t groups = hidden / df_cfg.conv_group_size;
-  const std::size_t dynamic_coefficients =
-      std::size_t{2} * df_cfg.conv_kernel_size * groups;
+  const auto attention_width = core::CheckedUint32(
+      core::CheckedMul(config.num_attention_heads, config.head_dim));
+  const auto kv_width = core::CheckedUint32(
+      core::CheckedMul(config.num_key_value_heads, config.head_dim));
+  const auto fc_elements =
+      core::CheckedProduct({hidden, df_cfg.target_layer_ids.size(), hidden});
+  const auto conv_base_elements =
+      core::CheckedProduct({hidden, df_cfg.conv_kernel_size, 2});
+  const auto dynamic_coefficients =
+      core::CheckedProduct({2, df_cfg.conv_kernel_size, groups});
+  const auto conv_projection_elements =
+      dynamic_coefficients.has_value()
+          ? core::CheckedMul(*dynamic_coefficients, hidden)
+          : std::nullopt;
+  const char* overflowing =
+      !attention_width.has_value() ? "dflash.attention.head_count * key_length"
+      : !kv_width.has_value()    ? "dflash.attention.head_count_kv * key_length"
+      : !fc_elements.has_value() ? "fc.weight (target_layers * hidden^2)"
+      : !conv_base_elements.has_value()
+          ? "conv_base (hidden * conv_kernel_size * 2)"
+      : !conv_projection_elements.has_value()
+          ? "conv_proj.weight (dynamic coefficients * "
+            "hidden)"
+          : nullptr;
+  if (overflowing != nullptr) {
+    SetError(error_msg,
+             "DFlash-2 GGUF metadata overflows " + std::string(overflowing));
+    return std::nullopt;
+  }
+  const std::size_t attention = *attention_width;
+  const std::size_t kv = *kv_width;
 
   // DFlash-2 uses the target model's embedding and output head. Private copies
   // are accepted but not required.
@@ -338,8 +368,7 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
     return std::nullopt;
   }
 
-  const std::size_t encoder_input = df_cfg.target_layer_ids.size() * hidden;
-  if (!BindRequiredTensor(reader, "fc.weight", hidden * encoder_input, true,
+  if (!BindRequiredTensor(reader, "fc.weight", *fc_elements, true,
                           weights.fc_projection, error_msg) ||
       !BindRequiredTensor(reader, "enc.output_norm.weight", hidden, false,
                           weights.fc_norm, error_msg) ||
@@ -393,16 +422,16 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
                             hidden * intermediate, true, transformer.ffn_down,
                             error_msg) ||
         !BindRequiredTensor(reader, layer_prefix + "attn_conv_base",
-                            hidden * df_cfg.conv_kernel_size * 2U, false,
+                            *conv_base_elements, false,
                             layer.attention_conv_base, error_msg) ||
         !BindRequiredTensor(reader, layer_prefix + "attn_conv_proj.weight",
-                            dynamic_coefficients * hidden, true,
+                            *conv_projection_elements, true,
                             layer.attention_conv_projection, error_msg) ||
         !BindRequiredTensor(reader, layer_prefix + "ffn_conv_base",
-                            hidden * df_cfg.conv_kernel_size * 2U, false,
-                            layer.ffn_conv_base, error_msg) ||
+                            *conv_base_elements, false, layer.ffn_conv_base,
+                            error_msg) ||
         !BindRequiredTensor(reader, layer_prefix + "ffn_conv_proj.weight",
-                            dynamic_coefficients * hidden, true,
+                            *conv_projection_elements, true,
                             layer.ffn_conv_projection, error_msg)) {
       return std::nullopt;
     }

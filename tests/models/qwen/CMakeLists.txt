@@ -39,6 +39,9 @@ target_compile_definitions(qwen_chat_template_test PRIVATE
 add_qwen_cpu_test(qwen_cpu_oracles_test
   tests/models/qwen/cpu/oracles_test.cpp
   "cpu;models;qwen;oracles")
+add_qwen_cpu_test(qwen_dflash_weights_test
+  tests/models/qwen/cpu/dflash_weights_test.cpp
+  "cpu;models;qwen;dflash;model_config")
 add_qwen_cpu_test(qwen_forward_test
   tests/models/qwen/cpu/forward_test.cpp
   "cpu;models;qwen;forward;reference")
