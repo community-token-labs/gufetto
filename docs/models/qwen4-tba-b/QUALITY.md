@@ -1,11 +1,12 @@
-# Qwen 4 Plus benchmarks
+# Qwen 4 (larger variants, TBA) quality
 
 **Not yet released / no measurements.** This is a readiness placeholder,
 not a claim of Gufo support or confirmed architecture/weight availability.
 
-No speed, latency, memory, or MTP acceptance measurements exist for this
-release. Retain the standard speed benchmark and per-request/phase timing;
-compare matched stacks/settings/cache histories, never averaged-away regressions.
+No numerical quality, rendered-template, long-context, tool-use, or cache
+qualification has been performed for this release. Missing weights or skipped
+tests are not passes. Retain independent reference outputs and affected-mode
+correctness evidence before claiming support.
 
 Every future number must name its stack: **host HIP/ROCr vs Nix ROCm 10.1**,
 host/GPU, Gufo commit and binary hash, compiler/dependency versions, model

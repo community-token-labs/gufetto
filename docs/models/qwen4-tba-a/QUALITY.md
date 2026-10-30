@@ -1,4 +1,4 @@
-# Qwen 4 Plus quality
+# Qwen 4 (larger variants, TBA) quality
 
 **Not yet released / no measurements.** This is a readiness placeholder,
 not a claim of Gufo support or confirmed architecture/weight availability.

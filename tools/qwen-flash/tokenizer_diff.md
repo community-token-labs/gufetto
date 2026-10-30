@@ -17,7 +17,11 @@ python3 tools/qwen-flash/tokenizer_diff.py 'OWNER/REPO@REVISION' --allow-network
 ```
 
 The revision is resolved to an immutable HF commit first and recorded in output.
-Only the three named metadata files are fetched (32 MiB per file limit, timeout).
+Only the three named metadata files are fetched (32 MiB per file, 60-second
+overall deadline per download, HTTPS-only HF/approved-CDN redirects).
+HF LFS SHA256 / X-Linked-ETag is verified when available; otherwise a usable
+file ETag is checked (SHA256 or Git-blob SHA1). Xet storage-object ETags are not
+mistaken for raw file hashes when HF supplies the authoritative checksum.
 No login, token, Transformers, remote code, model instantiation or disk cache.
 Read-only network is optional and disabled unless `--allow-network` is supplied.
 
@@ -47,7 +51,9 @@ provenance, not semantic equality criteria.
 
 Controls come from added tokens in either JSON, plus control-looking vocabulary
 entries (including think/tool markers). Conflicting IDs across these sources are
-an input error. `control_changes` lists additions, removals and ID changes,
+an input error. Named special/normalized/lstrip/rstrip/single_word flag changes
+are included in `control_changes`. JSON rejects duplicate keys and NaN/Infinity;
+decoder IDs must be canonical unsigned ASCII decimals. `control_changes` lists additions, removals and ID changes,
 annotated with membership in `src/models/qwen/control_tokens.hpp`. The header
 owns **spellings, not IDs**: the pinned reference owns expected IDs. Existing
 reference controls outside that shared framing catalogue are not automatically
