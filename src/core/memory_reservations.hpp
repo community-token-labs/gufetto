@@ -1,6 +1,8 @@
 #ifndef GUFO_CORE_MEMORY_RESERVATIONS_HPP_
 #define GUFO_CORE_MEMORY_RESERVATIONS_HPP_
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -8,7 +10,87 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/core/memory_budget.hpp"
+
 namespace gufo::core {
+
+struct MemoryLanes {
+  std::size_t host{}, device{};
+};
+struct ReservationObservation {
+  std::size_t host_available{}, device_available{};
+  std::size_t cgroup_available = std::numeric_limits<std::size_t>::max();
+  std::size_t host_reserve{}, device_reserve{};
+};
+// Validated credits for this owner's incremental backing, not gross
+// allocations. cgroup is credit substantiated for every constraint used in
+// cgroup_available.
+struct ReservationMaterialization {
+  std::size_t host{}, device{}, cgroup{};
+};
+struct NamedCacheBudgetOptions {
+  std::size_t requested{}, ledger_limit{}, ordinary_pending{}, staging{},
+      pinned{};
+  bool automatic{};
+};
+struct NamedCacheBudget {
+  std::size_t before_debit{}, after_debit{}, physical_ceiling{}, bytes{};
+};
+
+// RAM-enabled policy only. requested already includes the existing AUTO cap.
+// Other owners affect pending but NEVER this owner's debit or materialization.
+// Caller validates backing/observation attribution; this function proves only
+// arithmetic. Physical availability is never reconstructed from policy credit.
+[[nodiscard]] inline NamedCacheBudget ResolveNamedCacheBudget(
+    ReservationObservation sample, ReservationMaterialization materialized,
+    MemoryLanes pending, std::size_t debit, NamedCacheBudgetOptions options) {
+  if (std::max({materialized.host, materialized.device, materialized.cgroup}) >
+      debit)
+    throw std::invalid_argument("named materialization exceeds its envelope");
+  const auto subtract = [](std::size_t a, std::size_t b) {
+    return a > b ? a - b : 0;
+  };
+  const auto host = std::min(sample.host_available, sample.cgroup_available);
+  const MemoryLanes physical{
+      subtract(host, sample.host_reserve),
+      subtract(sample.device_available, sample.device_reserve)};
+  const auto policy_host = std::min(
+      AddMemoryBytes(sample.host_available, materialized.host),
+      sample.cgroup_available == std::numeric_limits<std::size_t>::max()
+          ? sample.cgroup_available
+          : AddMemoryBytes(sample.cgroup_available, materialized.cgroup));
+  const auto policy_ceiling = std::min(
+      subtract(policy_host, sample.host_reserve),
+      subtract(AddMemoryBytes(sample.device_available, materialized.device),
+               sample.device_reserve));
+  const auto protected_policy =
+      ProtectCacheHeadroom(std::min(policy_host / 2, policy_ceiling),
+                           policy_ceiling, options.ordinary_pending);
+  if (options.staging > protected_policy.ceiling)
+    throw std::invalid_argument(
+        "cache staging exceeds capacity after execution reservations");
+  const auto automatic =
+      AddMemoryBytes(protected_policy.automatic, options.pinned / 2);
+  const auto ceiling = AddMemoryBytes(protected_policy.ceiling, options.pinned);
+  const auto maximum = subtract(ceiling, options.staging);
+  auto candidate = std::min(options.requested, maximum);
+  if (options.automatic)
+    candidate = std::min(candidate, automatic);
+  const auto limit = std::min({AddMemoryBytes(candidate, options.pinned),
+                               maximum, options.ledger_limit});
+  const auto before = std::min(candidate, subtract(limit, options.pinned));
+  if (debit > before)
+    throw std::invalid_argument(
+        "named reservations exceed cache policy budget");
+  const auto fixed = AddMemoryBytes(options.ordinary_pending, options.staging);
+  const auto host_pending = AddMemoryBytes(fixed, pending.host);
+  const auto device_pending = AddMemoryBytes(fixed, pending.device);
+  if (host_pending > physical.host || device_pending > physical.device)
+    throw std::invalid_argument("named reservations exceed physical capacity");
+  const auto actual =
+      std::min(physical.host - host_pending, physical.device - device_pending);
+  return {before, before - debit, actual, std::min(before - debit, actual)};
+}
 
 inline constexpr char kSecondComponentBackendError[] =
     "a second component backend on the same Model is not supported "
