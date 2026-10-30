@@ -9,6 +9,9 @@
 #include <type_traits>
 #include <variant>
 
+#include "src/core/text_sampling_defaults.hpp"
+#include "src/models/qwen/architecture.hpp"
+
 namespace qfn = gufo::models::qwen38_flash_next;
 
 namespace {
@@ -16,6 +19,35 @@ namespace {
 void Require(bool condition, const char* message) {
   if (!condition)
     throw std::runtime_error(message);
+}
+
+void CheckArchitectureDecisions() {
+  using gufo::models::qwen::IsQwen4Family;
+  using gufo::sampling::TextModelPreset;
+  using gufo::sampling::TextPreset;
+  for (const std::string_view arch :
+       {"", "unknown", "qwen2", "qwen3", "qwen3next", "deepseek4", "qwen4exp",
+        "qwen4", "Qwen4exp", "qwen4exp ", "qwen4exp-next", "xqwen4exp"}) {
+    // Independent legacy decision, shared by pinned-prefix and YaRN gates.
+    const bool legacy = arch == "qwen4exp";
+    Require(IsQwen4Family(arch) == legacy, "architecture gate changed");
+    gufo::core::ModelConfig config;
+    config.architecture = std::string(arch);
+    const auto expected = arch == "deepseek4"
+                              ? TextModelPreset::kDeepSeekV4Flash
+                          : legacy ? TextModelPreset::kQwen38
+                                   : TextModelPreset::kUnspecified;
+    Require(TextPreset(config) == expected, "sampling architecture changed");
+    config.num_layers = 64;
+    config.hidden_size = 5120;
+    config.vocab_size = 248320;
+    Require(TextPreset(config) == (arch == "deepseek4"
+                                       ? TextModelPreset::kDeepSeekV4Flash
+                                       : TextModelPreset::kQwen38),
+            "legacy shape fallback changed");
+  }
+  Require(!IsQwen4Family(std::string_view{"qwen4exp\0", 9}),
+          "embedded null accepted");
 }
 
 void CheckSidecarCompatibility() {
@@ -265,6 +297,7 @@ void CheckScaledContext() {
 }  // namespace
 
 int main() {
+  CheckArchitectureDecisions();
   CheckSidecarCompatibility();
   CheckMalformedMetadata();
   CheckScaledContext();
