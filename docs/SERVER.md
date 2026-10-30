@@ -669,6 +669,7 @@ exactness failures remain intact; causal classification is a separate report.
 | --- | --- | --- |
 | `POST` | `/v1/embeddings` | EmbeddingGemma 2 serving is configured with `gufo serve embedding`.  A text server answers 501, and other servers answer 404 |
 | `POST` | `/embeddings`, `/embedding` | llama.cpp's non-OpenAI embeddings form, on the same `gufo serve embedding` process; other servers answer 404 |
+| `POST` | `/v1/rerank`, `/v1/reranking`, `/rerank`, `/reranking` | llama.cpp's rerank form; see [Reranking](#reranking).  No server loads a reranker model yet, so every server answers 503 `reranker_not_loaded` |
 | `POST` | `/v1/audio/transcriptions` | An STT implementation is compiled and loaded |
 | `POST` | `/v1/audio/speech` | A TTS implementation is compiled and loaded |
 | `POST` | `/v1/images/generations` | Qwen-Image-2.1 image serving is configured |
@@ -881,6 +882,51 @@ Typed items follow llama.cpp's form: `{"content":[{"type":"image_url","image_url
 - `embd_normalize` is accepted only as `2`, the Euclidean default that every EmbeddingGemma 2 vector already has; other values return 400 `unsupported_embd_normalize`.  As in llama.cpp, `encoding_format` is validated but the vectors are always floats.  `dimensions`, `prompt_name`, `truncate` and `user` behave as on `/v1/embeddings`.  Token arrays and per-token (`--pooling none`) output stay unsupported, and other members return 400 `unsupported_field`.
 
 **Task prefixes.** EmbeddingGemma 2 was trained with short task prefixes, and by default the server does not add them, so clients must.  Queries use `task: search result | query: {text}`, and documents use `title: none | text: {text}`, or `title: {title} | text: {text}` when a title is known.  Omitting the prefixes still works but lowers retrieval quality.  Embed a query and its documents with matching conventions.  A client that cannot change its input can send `"prompt_name"` with a name from the checkpoint's `config_sentence_transformers.json` `prompts` (for example `query` or `document`), and `--default-prompt-name NAME` applies one to requests that name none.  As the model card advises, the default skips inputs without text, so images and audio alone embed unprefixed; a requested `prompt_name` prefixes every input, as in sentence-transformers.  An empty `prompt_name` applies none, even with a default.  An unknown name returns 400 `invalid_prompt_name`, and an unknown `--default-prompt-name` fails startup.  `usage` counts the prompt's tokens.
+
+## Reranking
+
+`POST /v1/rerank` scores documents against a query, in the request and response forms of llama-server's rerank endpoint.  `/v1/reranking`, `/rerank` and `/reranking` are its aliases.  No `gufo serve` mode loads a reranker model yet, so every server answers these routes with 503 `reranker_not_loaded` ("no reranker model is loaded on this server") instead of 404 or 501.  `reranker_not_loaded` is a permanent configuration state of the process, not a transient failure: retrying the same server never succeeds. Clients should check that error code and fall back or report it, rather than retry on the 503 status. A loading or lost reranker uses the other 503 codes below. The contract below is what a loaded reranker serves; it is tested against a CPU fake scorer.
+
+The member that carries the documents selects the form, as in llama.cpp.  `documents` selects the Jina and Cohere form:
+
+```json
+{
+  "model": "qwen3-reranker-0.6b",
+  "query": "how do I cook rice?",
+  "documents": ["Rinse the rice, then simmer it covered.",
+                {"text": "A python is a large snake."}],
+  "top_n": 1,
+  "return_documents": true
+}
+```
+
+```json
+{
+  "model": "qwen3-reranker-0.6b",
+  "object": "list",
+  "usage": {"prompt_tokens": 61, "total_tokens": 61},
+  "results": [
+    {"index": 0, "relevance_score": 0.982,
+     "document": {"text": "Rinse the rice, then simmer it covered."}}
+  ]
+}
+```
+
+`texts` selects the Text Embeddings Inference form, whose response is a bare array of `{"index", "score"}` items, with `"text"` added when `return_text` is `true`:
+
+```json
+[{"index": 0, "score": 0.982, "text": "Rinse the rice, then simmer it covered."}]
+```
+
+- `query` is a required, nonempty string.  An empty query returns 400 `empty_query`.
+- `documents` holds 1 to 1000 strings or `{"text": string}` objects, and `texts` holds 1 to 1000 strings.  Exactly one of them is required: neither returns 400 `missing_documents`, and both return 400 `conflicting_documents`.  Image documents, which llama.cpp accepts for multimodal rerankers, return 400 `unsupported_input`.  Empty document strings are scored.
+- `model` is optional.  When present it must equal the served model ID, or the request returns 404 `model_not_found`.  The response names the served model.
+- `top_n` is optional, a non-negative integer that keeps the best results.  It defaults to every document, and a value larger than the document count keeps them all.  Other values return 400 `invalid_top_n`.  Every document is scored, and `usage` counts them all, whatever `top_n` is.
+- `return_documents` belongs to the `documents` form and `return_text` to the `texts` form.  Both are booleans and default to `false`.  Sending one with the other form returns 400 `unsupported_field`.
+- Results are sorted by descending score.  Equal scores keep request order.  The score is the probability, in [0, 1], that the document is relevant.  `usage.prompt_tokens` sums the tokens of every scored query/document pair, including the model's prompt template.
+- Members that are `null` count as absent.  The server rejects other members, such as Cohere's `rank_fields` and `max_tokens_per_doc`, with 400 `unsupported_field`.
+- Errors use the standard error object.  Other 400 codes are `parse_error`, `invalid_request_body`, `missing_query`, `empty_documents`, `too_many_documents`, `invalid_parameter_type` and `context_length_exceeded`, which names the first pair that does not fit the model's context window.  `GET` and other methods return 405 `method_not_allowed`.  A client disconnect returns 499 `cancelled`.  A failed scoring pass, or a score outside [0, 1], returns 500 `rerank_failed`.  A reranker that is loading returns 503 `reranker_service_unavailable`, and a GPU failure returns 503 `device_lost` and shuts the server down as described under [Lifecycle and limits](#lifecycle-and-limits).  The usual authentication, `--max-request-bytes`, and request logging apply.
+- Successful responses carry `X-Gufo-Schema: gufo.rerank-api.v1` and `X-Gufo-Rerank-Backend`.
 
 ## Internal Request Model
 

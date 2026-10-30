@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -26,6 +27,7 @@
 #include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/rerank_api.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/platform/env.hpp"
@@ -3768,6 +3770,92 @@ void TestEmbeddingService() {
   }
 }
 
+/// One score per document; `lost` turns every request into a device loss.
+class FakeRerankScorer final : public gufo::server::RerankScorer {
+public:
+  [[nodiscard]] bool ready() const noexcept override { return true; }
+  [[nodiscard]] bool device_lost() const noexcept override { return lost_; }
+  [[nodiscard]] std::string model_id() const override { return "rerank-test"; }
+  [[nodiscard]] std::string backend_name() const override { return "cpu-fake"; }
+  [[nodiscard]] std::size_t max_pair_tokens() const override { return 64; }
+  gufo::server::RerankStatus Score(const std::string&,
+                                   const std::vector<std::string>& documents,
+                                   const std::function<bool()>&,
+                                   gufo::server::RerankScores* scores,
+                                   std::string*) override {
+    if (lose_device) {
+      lost_ = true;
+      return gufo::server::RerankStatus::kDeviceLost;
+    }
+    for (std::size_t i = 0; i < documents.size(); ++i) {
+      scores->scores.push_back(1.0 / static_cast<double>(i + 1));
+      scores->token_counts.push_back(4);
+    }
+    return gufo::server::RerankStatus::kOk;
+  }
+  bool lose_device{false};
+
+private:
+  std::atomic<bool> lost_{false};
+};
+
+void TestRerankRoutes() {
+  const std::string request = R"({"query":"q","documents":["a","b"]})";
+  {
+    // A text server without a reranker names the missing model on every
+    // llama.cpp alias.
+    RunningServer text;
+    for (const char* path :
+         {"/v1/rerank", "/v1/reranking", "/rerank", "/reranking"}) {
+      const auto response = text.Post(path, request);
+      ExpectStatus(response, 503);
+      assert(response.find("\"code\":\"reranker_not_loaded\"") !=
+             std::string::npos);
+    }
+  }
+  {
+    // So does a server with no text backend, instead of 404.
+    HttpServer server("127.0.0.1", 0, nullptr);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    const auto response =
+        EmbeddingPost(server.port(), request, {}, "/v1/rerank");
+    ExpectStatus(response, 503);
+    assert(response.find("reranker_not_loaded") != std::string::npos);
+    server.stop();
+    worker.join();
+  }
+  {
+    auto scorer = std::make_shared<FakeRerankScorer>();
+    std::atomic<int> hook_calls{0};
+    HttpServer server(
+        "127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
+        {.api_key = "test-secret", .on_device_lost = [&] { ++hook_calls; }},
+        nullptr, nullptr, scorer);
+    std::string error;
+    assert(server.start(&error));
+    std::jthread worker([&] { server.run(false); });
+    const int port = server.port();
+    const std::string auth = "Authorization: Bearer test-secret\r\n";
+    ExpectStatus(EmbeddingPost(port, request, {}, "/v1/rerank"), 401);
+    const auto ranked = EmbeddingPost(port, request, auth, "/v1/rerank");
+    ExpectStatus(ranked, 200);
+    assert(ranked.find("\"results\":[{\"index\":0,\"relevance_score\":1},"
+                       "{\"index\":1,\"relevance_score\":0.5}]") !=
+           std::string::npos);
+    assert(ranked.find("\"prompt_tokens\":8") != std::string::npos);
+    scorer->lose_device = true;
+    ExpectStatus(EmbeddingPost(port, request, auth, "/v1/rerank"), 503);
+    assert(hook_calls.load() == 1);
+    ExpectStatus(SendParts("127.0.0.1", port,
+                           {"GET /health HTTP/1.1\r\n" + auth + "\r\n"}),
+                 503);
+    server.stop();
+    worker.join();
+  }
+}
+
 void TestCacheLookupOptIn() {
   const std::string input =
       R"({"model":"test","messages":[{"role":"user","content":"private-lookup-sentinel"}]})";
@@ -3928,5 +4016,6 @@ int main(int argc, char** argv) {
   TestDeferredStreamHeaders();
   TestAdmittedStreamHeaders();
   TestEmbeddingService();
+  TestRerankRoutes();
   std::cout << "HTTP transport checks passed.\n";
 }
