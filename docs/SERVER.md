@@ -1271,7 +1271,10 @@ Existing usage accounting is unchanged.
 
 Collection adds vocabulary transfers and CPU reduction only when requested.
 Metadata counts toward streaming buffer limits but not `--max-output-bytes`,
-which bounds generated text; `max_tokens` bounds its size. Prompt logprobs,
+which bounds generated text; `max_tokens` bounds its size. A model runner that
+cannot score a requested token fails the request with HTTP 501
+`logprobs_unavailable`, naming the model and decode mode, before publishing
+that token; it never omits the metadata silently. Prompt logprobs,
 full-vocabulary output and token-ID extensions are not supported. For example:
 
 ```json

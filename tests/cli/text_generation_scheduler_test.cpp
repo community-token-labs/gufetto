@@ -226,6 +226,7 @@ struct FakeControl {
   std::vector<std::string> output_pieces;
   std::uint32_t max_context{128};
   std::optional<std::size_t> stop_after;
+  bool withhold_logprobs{false};
   std::optional<std::size_t> eos_after;
   std::function<void()> snapshot_callback;
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
@@ -471,10 +472,11 @@ public:
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
     }
-    auto probabilities = sampler.config().logprobs
-                             ? std::optional(gufo::sampling::TokenLogprobs{
-                                   {*fake.frontier, -0.25}, {}})
-                             : std::nullopt;
+    auto probabilities =
+        sampler.config().logprobs && !control_->withhold_logprobs
+            ? std::optional(
+                  gufo::sampling::TokenLogprobs{{*fake.frontier, -0.25}, {}})
+            : std::nullopt;
     if (control_->stop_after && fake.decode_count >= *control_->stop_after)
       return {.stop = true, .logprobs = probabilities};
     if (control_->eos_after && fake.decode_count >= *control_->eos_after &&
@@ -3916,6 +3918,47 @@ void TestTokenLogprobs() {
   }
 }
 
+// A runner that cannot score requested logprobs fails explicitly, naming the
+// model and decode mode, before any text; it never omits them silently.
+void TestUnavailableLogprobsFail() {
+  for (const bool multi : {false, true}) {
+    for (const bool stream : {false, true}) {
+      auto control = std::make_shared<FakeControl>();
+      control->multi_token_decode = multi;
+      control->withhold_logprobs = true;
+      auto scheduler = MakeScheduler(control, 1);
+      gufo::sampling::SamplingConfig config;
+      config.logprobs = 0;
+      std::size_t delivered = 0;
+      std::optional<TextGenerationError> failure;
+      try {
+        scheduler->Submit({1, 10, 11}, 4, config, {}, stream)
+            .Wait([&](const gufo::server::TokenPiece&) {
+              ++delivered;
+              return true;
+            });
+      } catch (const TextGenerationError& error) {
+        failure = error;
+      }
+      Expect(failure &&
+                 failure->code() ==
+                     TextGenerationErrorCode::kLogprobsUnavailable &&
+                 failure->http_status() == 501 && !failure->retryable(),
+             "unavailable logprobs fail explicitly");
+      const std::string message = failure ? failure->what() : "";
+      Expect(message.find("scheduler-fake") != std::string::npos &&
+                 message.find(multi ? "multi-token" : "single-token") !=
+                     std::string::npos,
+             "the failure names the model and decode mode");
+      Expect(delivered == 0, "no text is published without its logprobs");
+      Expect(scheduler->Submit({2, 20, 21}, 2, gufo::sampling::SamplingConfig{})
+                     .Wait()
+                     .tokens.size() == 2,
+             "requests without logprobs still decode on that runner");
+    }
+  }
+}
+
 std::filesystem::path attribution_path;
 void RemoveAttributionTrace() {
   std::error_code error;
@@ -4008,6 +4051,7 @@ int main(int argc, char** argv) {
 #endif
   TestPromptResourceAdmissionMakesProgress();
   TestTokenLogprobs();
+  TestUnavailableLogprobsFail();
   TestPublicationWaitUsesRecentSubstantialPrefill();
 #if defined(GUFO_ENABLE_PREFILL_PREREQUISITES)
   TestAdaptiveFrozenCohortSurvivesFragmentationAndArrivals();

@@ -1595,6 +1595,19 @@ struct TextGenerationScheduler::Impl {
                           "text generation output byte limit exceeded")));
       return false;
     }
+    // Requested logprobs are a contract: a runner that cannot score a token
+    // fails the request before its text is published, never omits them.
+    if (request->sampling.logprobs && !selection.logprobs) {
+      CompleteFailure(
+          request,
+          std::make_exception_ptr(TextGenerationError(
+              TextGenerationErrorCode::kLogprobsUnavailable,
+              "logprobs are unavailable for model '" +
+                  runner_pool->runner().Descriptor().model_id + "' in " +
+                  (multi_token_decode ? "multi-token" : "single-token") +
+                  " decode mode")));
+      return false;
+    }
     request->generated_output_bytes += selection.piece.size();
     const auto* logprobs = RetainLogprobs(request, selection.logprobs);
     request->result.tokens.push_back(selection.token);
