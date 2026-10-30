@@ -453,11 +453,14 @@ void CheckAppendSnapshotOracle(
       restored.RestoreSnapshot(*snapshot);
       restored.ConfigureVision(full, encoder);
       int cancellation_checks = 0;
+      EvictIdleOutputs(encoder);
       restored.SetCancellationCheck([&] { return ++cancellation_checks >= 5; });
       bool vision_cancelled = false;
       try {
         (void)restored.ForwardPromptBatch(tokens.subspan(count), count);
       } catch (const std::runtime_error& error) {
+        std::cerr << "append_cancel image=" << image
+                  << " stage=cold-encoder error=" << error.what() << '\n';
         vision_cancelled =
             std::string_view(error.what()) == "vision encoding cancelled";
       }
@@ -481,6 +484,8 @@ void CheckAppendSnapshotOracle(
       try {
         (void)restored.ForwardPromptBatch(tokens.subspan(count), count);
       } catch (const std::runtime_error& error) {
+        std::cerr << "append_cancel image=" << image
+                  << " stage=warm-text error=" << error.what() << '\n';
         cancelled = std::string_view(error.what()) == "Qwen prefill cancelled";
       }
       Require(cancelled && cancellation_checks == 5,
