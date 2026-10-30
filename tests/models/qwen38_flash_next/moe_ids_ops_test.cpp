@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "src/core/hip/moe/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace {
 

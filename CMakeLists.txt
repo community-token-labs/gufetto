@@ -173,6 +173,11 @@ if (ENGINE_ENABLE_HIP)
   add_subdirectory(src/models/deepseek_v4_flash)
 endif()
 
+# Shared MoE kernels (routing, epilogue, quantized routed experts).
+if (ENGINE_ENABLE_HIP)
+  add_subdirectory(src/core/hip/moe)
+endif()
+
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 

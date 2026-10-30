@@ -12,9 +12,9 @@
 #include <string>
 #include <vector>
 
+#include "src/core/hip/moe/mmq/qfn_mmq.h"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
 #include "tests/models/qwen38_flash_next/packed_mtp_reference.hpp"
 

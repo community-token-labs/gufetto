@@ -11,9 +11,9 @@
 #include <utility>
 
 #include "src/core/hip/managed_alloc.hpp"
+#include "src/core/hip/moe/mmq/qfn_mmq.h"
 #include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #ifdef GUFO_ENABLE_NPU
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 #endif

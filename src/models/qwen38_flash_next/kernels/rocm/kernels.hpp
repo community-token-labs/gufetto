@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/hip/moe/routing.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/kv_cache.hpp"
@@ -18,6 +19,15 @@
 /// launch is asynchronous on `stream`. Weights referenced here are device
 /// pointers in their GGUF encoding.
 namespace gufo::models::qwen38_flash_next::rocm {
+
+// Expert routing and the MoE epilogue live in the shared MoE leaf.
+using ::gufo::hip::moe::ExpertCounts;
+using ::gufo::hip::moe::MoeEpilogue;
+using ::gufo::hip::moe::MoeEpilogueVec4;
+using ::gufo::hip::moe::MoeEpilogueVec4F16;
+using ::gufo::hip::moe::RoutedCompact;
+using ::gufo::hip::moe::RoutedCompactRows;
+using ::gufo::hip::moe::RouterTopK;
 
 /// Stable per-prefix rollback addresses. Growing the depth does not move
 /// existing buffers or invalidate graphs captured for a smaller batch.
@@ -266,17 +276,6 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      hipStream_t stream, std::uint32_t checkpoint_tokens = 0,
                      hipStream_t z_stream = nullptr,
                      hipEvent_t z_start = nullptr);
-
-/// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
-/// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,
-/// experts) entries, -1 for padding) with every bucket padded to 16 rows
-/// (`pad_bounds`, experts + 1 entries) from the per-expert `counts`.
-std::size_t RoutedCompactRows(std::size_t slots, std::size_t n_experts);
-void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
-                   std::int32_t* pad_bounds, std::int32_t* cursors,
-                   std::int32_t* rows_token, std::int32_t* rows_slot,
-                   std::uint32_t n_tokens, std::uint32_t k,
-                   std::uint32_t n_experts, hipStream_t stream);
 
 /// Routed expert GEMM on the F16 WMMA cores over F16 activation rows
 /// `x` ([rows][k]): the weights are dequantized to F16 after the LDS read
@@ -549,37 +548,6 @@ bool WmmaCausalAttention(const float* q, const float* gate, const void* k_cache,
                          std::uint32_t d, std::uint32_t ratio,
                          hipStream_t stream, bool last_only = false,
                          KvCacheType cache_type = KvCacheType::kF16);
-
-/// counts[e] = number of (token, slot) pairs routed to expert e.
-void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
-                  std::uint32_t n_tokens, std::uint32_t n_experts,
-                  std::uint32_t k, hipStream_t stream);
-
-/// Softmax over `n_experts` logits per token (rows `stride` apart), top-k
-/// selection, renormalized weights. ids [t][k] int32, weights [t][k] f32.
-void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
-                float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
-                std::uint32_t k, hipStream_t stream);
-
-/// out[t][i] = sum_s weights[t][s] * expert_out[t*k + s][i]
-///           + sigmoid(gate[t * gate_stride]) * shared[t][i].
-void MoeEpilogue(const float* expert_out, const float* weights,
-                 const float* shared, const float* gate,
-                 std::uint32_t gate_stride, float* out, std::uint32_t n_tokens,
-                 std::uint32_t k, std::uint32_t dim, hipStream_t stream);
-/// Same contract, four adjacent lanes per thread (`dim % 4 == 0`, else the
-/// scalar kernel runs).
-void MoeEpilogueVec4(const float* expert_out, const float* weights,
-                     const float* shared, const float* gate,
-                     std::uint32_t gate_stride, float* out,
-                     std::uint32_t n_tokens, std::uint32_t k, std::uint32_t dim,
-                     hipStream_t stream);
-/// MoeEpilogueVec4 over F16 expert rows.
-void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
-                        const float* shared, const float* gate,
-                        std::uint32_t gate_stride, float* out,
-                        std::uint32_t n_tokens, std::uint32_t k,
-                        std::uint32_t dim, hipStream_t stream);
 
 /// dst[t] = *row < 0 ? alt[t] : base[*row + t] (rows of `width` floats).
 void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
