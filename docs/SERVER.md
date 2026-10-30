@@ -117,29 +117,6 @@ Use `--cache-ram-bytes off` if RAM checkpoints are not needed, or free memory/re
 context or sessions. An explicitly tiny RAM-cache cap must also be increased if
 caching is needed.
 
-#### Full-logits diagnostic startup contract
-
-The `--full-logits-api` provider integration is startup-only; capacity support
-alone does not enable the endpoint. Its checked fixed claim is persistent storage
-plus the larger startup/request phase, protected for the process lifetime. There
-is no resident-memory add-back or release on timeout, send, backend detach or
-uncertain cleanup. Existing native drain and unsafe-resource retention still apply.
-The claim excludes the documented ordinary HTTP/session/library memory gap.
-
-Only one diagnostic Model may be activated per process. Loading another reports:
-`full-logits diagnostics can be activated only once per process; restart Gufo to load another diagnostic Model`.
-Rebinding the same already-approved Model is allowed. First activation after any
-serving-cache admission reports:
-`full-logits diagnostics must be activated before cache admission; restart Gufo with --full-logits-api`.
-Restart is required even after healthy diagnostic Model teardown. With diagnostics
-never enabled, the claim is zero and admission follows the ordinary path.
-With images, eager pins and diagnostics, the pin cushion can over-deduct by up to
-the diagnostic persistent bytes (safe, by design). If the diagnostic claim exceeds
-the native snapshot ceiling, startup refuses rather than disabling snapshots:
-`--full-logits-api needs E bytes; snapshot ceiling is X bytes; lower --context or --sessions, free memory, or restart without --full-logits-api`
-(where E and X are byte counts). This applies to AUTO and explicit RAM-cache
-limits; raising `--cache-ram-bytes` does not raise the physical snapshot ceiling.
-
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
 otherwise inherit the effective thinking preset. Null request values inherit
