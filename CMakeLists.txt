@@ -416,6 +416,7 @@ add_library(gufo_http STATIC
   src/cli/serve/asr_service.cpp
   src/cli/serve/embeddings_api.cpp
   src/cli/serve/embedding_service.cpp
+  src/cli/serve/rerank_api.cpp
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
@@ -704,6 +705,13 @@ if (BUILD_TESTING)
   add_test(NAME trace_test COMMAND trace_test)
   set_tests_properties(trace_test PROPERTIES LABELS "cpu;server;trace")
   endif()
+
+  # POST /v1/rerank against a CPU fake scorer: no model, device or socket.
+  add_executable(rerank_api_test
+    tests/cli/rerank_api_test.cpp src/cli/serve/rerank_api.cpp)
+  target_link_libraries(rerank_api_test PRIVATE gufo_core)
+  add_test(NAME rerank_api_test COMMAND rerank_api_test)
+  set_tests_properties(rerank_api_test PROPERTIES LABELS "cpu;server;api")
 
   # These HTTP/WebSocket suites drive raw POSIX sockets or fork() directly.
   if (NOT WIN32)
