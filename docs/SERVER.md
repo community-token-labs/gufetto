@@ -134,9 +134,11 @@ serving-cache admission reports:
 Restart is required even after healthy diagnostic Model teardown. With diagnostics
 never enabled, the claim is zero and admission follows the ordinary path.
 With images, eager pins and diagnostics, the pin cushion can over-deduct by up to
-its persistent bytes (safe, by design). If the diagnostic claim exceeds the native
-snapshot ceiling, snapshots are disabled with one ERROR log per serving cache;
-serving continues with live-state reuse only.
+the diagnostic persistent bytes (safe, by design). If the diagnostic claim exceeds
+the native snapshot ceiling, startup refuses rather than disabling snapshots:
+`--full-logits-api needs E bytes; snapshot ceiling is X bytes; lower --context or --sessions, free memory, or restart without --full-logits-api`
+(where E and X are byte counts). This applies to AUTO and explicit RAM-cache
+limits; raising `--cache-ram-bytes` does not raise the physical snapshot ceiling.
 
 Text sampling follows each model's recommended defaults in `serve`, `prompt`
 and `chat`. Explicit request values override explicit server options, which
