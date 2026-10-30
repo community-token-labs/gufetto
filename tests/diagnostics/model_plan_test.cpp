@@ -13,6 +13,7 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "tests/diagnostics/recovery_bounds.hpp"
+#include "tests/diagnostics/rss_slope.hpp"
 
 namespace {
 const std::string header =
@@ -316,6 +317,38 @@ int main() {
   static_assert(kRecoveryInconclusiveExit != 0 &&
                 kRecoveryInconclusiveExit != 1 &&
                 kRecoveryInconclusiveExit != 77);
+  using RssVerdict = RssDiscriminatorResult::Verdict;
+  const auto linear = [](std::uint64_t slope) {
+    std::vector<std::uint64_t> rows;
+    for (std::uint64_t i = 0; i < 20; ++i)
+      rows.push_back((1ULL << 50) + i * slope);
+    return rows;
+  };
+  auto rss = ClassifyRssAnon(linear(64 * 1024));
+  assert(rss.verdict == RssVerdict::kPass &&
+         rss.slope_bytes_per_cycle == 64 * 1024);
+  assert(ClassifyRssAnon(linear(64 * 1024 + 1)).verdict ==
+         RssVerdict::kBetween);
+  assert(ClassifyRssAnon(linear(256 * 1024)).verdict == RssVerdict::kBetween);
+  assert(ClassifyRssAnon(linear(256 * 1024 + 1)).verdict == RssVerdict::kFail);
+  auto endpoints = linear(0);
+  endpoints.back() += 2 * 1024 * 1024;
+  assert(ClassifyRssAnon(endpoints).verdict == RssVerdict::kPass);
+  ++endpoints.back();
+  assert(ClassifyRssAnon(endpoints).verdict == RssVerdict::kBetween);
+  auto ignored = linear(0);
+  std::fill(ignored.begin(), ignored.begin() + 5, maximum);
+  assert(ClassifyRssAnon(ignored).verdict == RssVerdict::kPass);
+  auto decreasing = linear(64 * 1024);
+  std::reverse(decreasing.begin(), decreasing.end());
+  assert(ClassifyRssAnon(decreasing).growth_bytes == 0);
+  bool incomplete_rejected = false;
+  try {
+    (void)ClassifyRssAnon(std::vector<std::uint64_t>(19));
+  } catch (const std::invalid_argument&) {
+    incomplete_rejected = true;
+  }
+  assert(incomplete_rejected);
   Fixture fixture;
   const auto unbudgeted = header + "\n" + Row() + "\n";
   auto report = fixture.Run(unbudgeted);

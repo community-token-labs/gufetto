@@ -6,9 +6,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
@@ -16,6 +18,7 @@
 #include "src/core/platform/mapped_file.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "tests/diagnostics/recovery_bounds.hpp"
+#include "tests/diagnostics/rss_slope.hpp"
 
 using namespace gufo;
 using namespace gufo::server;
@@ -184,9 +187,93 @@ RecoverySample FullCycle(const char* path, bool check_recovery = true) {
   }
   return Sample();
 }
+struct RssParts {
+  std::uint64_t total = 0, anon = 0, file = 0, shmem = 0;
+};
+RssParts SampleRssParts() {
+  std::ifstream status("/proc/self/status");
+  RssParts result;
+  unsigned fields = 0;
+  std::string key, rest;
+  while (status >> key) {
+    std::uint64_t kib = 0;
+    auto read = [&](std::uint64_t& value, unsigned flag) {
+      Require(bool(status >> kib), "unavailable split RSS sample");
+      value = kib * 1024;
+      fields |= flag;
+    };
+    if (key == "VmRSS:")
+      read(result.total, 1);
+    else if (key == "RssAnon:")
+      read(result.anon, 2);
+    else if (key == "RssFile:")
+      read(result.file, 4);
+    else if (key == "RssShmem:")
+      read(result.shmem, 8);
+    std::getline(status, rest);
+  }
+  Require(fields == 15, "missing /proc/self/status RSS categories");
+  return result;
+}
+int RunRssDiscriminator(const char* path) {
+  std::vector<std::uint64_t> measured;
+  measured.reserve(20);
+  const auto started = std::chrono::steady_clock::now();
+  const auto cycle = [&](const char* phase, int index, bool check = true) {
+    const auto begin = std::chrono::steady_clock::now();
+    const auto recovered = FullCycle(path, check);
+    // Model is unloaded; FullCycle synchronized before this exact point.
+    const auto rss = SampleRssParts();
+    std::cout << "rss_cycle=" << index << " phase=" << phase
+              << " rss_total=" << rss.total << " rss_anon=" << rss.anon
+              << " rss_file=" << rss.file << " rss_shmem=" << rss.shmem
+              << " heap=" << recovered.heap << " threads=" << recovered.threads
+              << " wall_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - begin)
+                     .count()
+              << '\n'
+              << std::flush;
+    return rss.anon;
+  };
+  cycle("prime", 0, false);
+  for (int i = 0; i < 3; ++i)
+    cycle("warm", i);
+  for (int i = 0; i < 20; ++i)
+    measured.push_back(cycle("measured", i));
+  const auto result = ClassifyRssAnon(measured);
+  std::cout << std::setprecision(18)
+            << "rss_window=last15 measured_cycles=20 slope_bytes_per_cycle="
+            << result.slope_bytes_per_cycle
+            << " growth_bytes=" << result.growth_bytes
+            << " rss_file=advisory total_wall_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - started)
+                   .count()
+            << '\n';
+  using Verdict = RssDiscriminatorResult::Verdict;
+  if (result.verdict == Verdict::kFail) {
+    std::cout << "FAIL: RssAnon slope > 256 KiB/cycle; CPU ASan/LSan "
+                 "investigation before more host time\n";
+    return 1;
+  }
+  if (result.verdict == Verdict::kBetween) {
+    std::cout << "BETWEEN: bounded, not leak-free; low-priority follow-up\n";
+    return 4;
+  }
+  std::cout << "PASS: last15 RssAnon slope <= 64 KiB/cycle AND growth <= 2 "
+               "MiB; RssFile advisory\n";
+  return 0;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  const bool discriminator =
+      argc == 2 && std::string_view(argv[1]) == "--rss-discriminator";
+  if (argc != 1 && !discriminator) {
+    std::cerr << "ERROR: unknown native test arguments\n";
+    return 2;
+  }
   const char* path = std::getenv("GUFO_ADMISSION_MODEL");
   if (!path || !*path || !std::filesystem::exists("/proc/self/task")) {
     std::cout << "SKIP: set GUFO_ADMISSION_MODEL to the pinned Flash-Next GGUF "
@@ -195,6 +282,8 @@ int main() {
   }
   try {
     Hip(hipFree(nullptr));
+    if (discriminator)
+      return RunRssDiscriminator(path);
     const auto cold = Sample();
     Print("cold_runtime_only", cold);
     const auto started = std::chrono::steady_clock::now();
@@ -256,6 +345,6 @@ int main() {
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "ERROR: " << error.what() << '\n';
-    return 1;
+    return discriminator ? 2 : 1;
   }
 }
