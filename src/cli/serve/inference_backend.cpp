@@ -26,6 +26,7 @@
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/measured_admission.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -3491,9 +3492,19 @@ struct InferenceBackend::Impl {
 #endif
 };
 
-InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
+InferenceBackend::InferenceBackend(StartupMode mode)
+    : impl_(std::make_unique<Impl>()), startup_mode_(mode) {}
 
 InferenceBackend::~InferenceBackend() = default;
+
+bool InferenceBackend::scheduler_started() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state && bool(state->scheduler);
+#else
+  return false;
+#endif
+}
 
 bool InferenceBackend::load(
     const std::string& model_path, std::string* error,
@@ -3506,6 +3517,7 @@ bool InferenceBackend::load(
     models::qwen38_flash_next::KvCacheType kv_cache_type, bool enable_vision,
     std::uint32_t vision_max_tokens_per_slot,
     std::optional<std::uint32_t> vision_pool_tokens) {
+  capacity_refused_ = false;
   if (vision_pool_tokens == 0) {
     SetError(error, "vision-pool-tokens must be positive");
     return false;
@@ -3525,6 +3537,11 @@ bool InferenceBackend::load(
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   const auto architecture =
       reader->GetMetadataString("general.architecture").value_or("");
+  if (startup_mode_ == StartupMode::kAdmissionOnly &&
+      architecture != "qwen4exp") {
+    SetError(error, "measured admission-only requires Flash-Next (qwen4exp)");
+    return false;
+  }
   if (!enable_vision)
     Logger::Info("loader", "event=vision_disabled architecture=" +
                                std::string(architecture) +
@@ -3778,6 +3795,10 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextDiskCacheConfig disk_cache_config,
                             TextRunnerRamCacheOptions ram_cache_config,
                             std::uint32_t vision_max_tokens_per_slot) {
+  if (startup_mode_ == StartupMode::kAdmissionOnly) {
+    SetError(error, "admission-only requires a measured Flash-Next provider");
+    return false;
+  }
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -3931,6 +3952,10 @@ bool InferenceBackend::load(
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
     TextRunnerRamCacheOptions ram_cache_config) {
+  if (startup_mode_ == StartupMode::kAdmissionOnly) {
+    SetError(error, "admission-only requires a measured Flash-Next provider");
+    return false;
+  }
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
@@ -4027,6 +4052,7 @@ bool InferenceBackend::load(
     TextSpeculativeConfig speculative_config,
     TextDiskCacheConfig disk_cache_config,
     TextRunnerRamCacheOptions ram_cache_config) {
+  capacity_refused_ = false;
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -4113,13 +4139,18 @@ bool InferenceBackend::load(
     runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        runner_pool, prefill_policy, scheduler_policy);
+    if (startup_mode_ == StartupMode::kServe)
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          runner_pool, prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
     }
     return true;
+  } catch (const admission::CapacityRefusal& exception) {
+    capacity_refused_ = true;
+    SetError(error, exception.what());
+    return false;
   } catch (const std::exception& exception) {
     SetError(error, exception.what());
     return false;
@@ -4153,7 +4184,8 @@ std::vector<std::string> InferenceBackend::model_ids() const {
 bool InferenceBackend::ready() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
-  return state != nullptr && state->runner_pool->usable_capacity() != 0;
+  return state != nullptr && state->scheduler &&
+         state->runner_pool->usable_capacity() != 0;
 #else
   return false;
 #endif
@@ -4162,7 +4194,8 @@ bool InferenceBackend::ready() const {
 bool InferenceBackend::device_lost() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
-  return state != nullptr && state->scheduler->device_lost();
+  return state != nullptr && state->scheduler &&
+         state->scheduler->device_lost();
 #else
   return false;
 #endif

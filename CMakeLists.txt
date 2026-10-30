@@ -434,6 +434,7 @@ target_link_libraries(gufo_http PUBLIC gufo_checkpoint_transfer gufo_logging guf
 
 add_executable(gufo
   src/cli/main.cpp
+  src/cli/diagnose/model_admission.cpp
   src/cli/banner.cpp
   src/cli/eval/eval.cpp
   src/cli/transcribe/transcribe.cpp
@@ -1063,6 +1064,16 @@ if (BUILD_TESTING)
   set_tests_properties(prof_test PROPERTIES
     LABELS "cpu;tools;profiling")
 
+  if (ENGINE_ENABLE_HIP)
+    add_executable(admission_native_test EXCLUDE_FROM_ALL
+      tests/diagnostics/admission_native_test.cpp
+      src/cli/serve/inference_backend.cpp src/cli/serve/text_model_runner.cpp
+      src/cli/serve/text_generation_scheduler.cpp src/cli/serve/component_text_cache.cpp
+      src/cli/serve/continuation_cache.cpp src/cli/serve/continuation_disk_store.cpp)
+    target_link_libraries(admission_native_test PRIVATE gufo_cache_fake gufo_cache_hip
+      gufo_diagnostics gufo_llm_cli gufo_http gufo_deepseek_v4_flash)
+  endif()
+
   add_executable(model_plan_test tests/diagnostics/model_plan_test.cpp)
   target_link_libraries(model_plan_test PRIVATE gufo_diagnostics)
   add_test(NAME model_plan_test COMMAND model_plan_test)
@@ -1070,6 +1081,9 @@ if (BUILD_TESTING)
   add_test(NAME model_plan_cli_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/model_plan_cli_test.py $<TARGET_FILE:gufo>)
   set_tests_properties(model_plan_cli_test PROPERTIES LABELS "cpu;diagnostics")
+  add_test(NAME model_admission_cli_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/model_admission_cli_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(model_admission_cli_test PROPERTIES LABELS "cpu;diagnostics")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
   target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)

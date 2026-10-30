@@ -69,7 +69,14 @@ public:
   using TextGenerationBackend::complete;
   using TextGenerationBackend::start_chat;
 
-  InferenceBackend();
+  // Admission-only objects expose startup observations, never generation.
+  // They own the real pool but are not ready() serving backends.
+  enum class StartupMode { kServe, kAdmissionOnly };
+  explicit InferenceBackend(StartupMode mode = StartupMode::kServe);
+  [[nodiscard]] bool measured_capacity_refused() const {
+    return capacity_refused_;
+  }
+  [[nodiscard]] bool scheduler_started() const;
   ~InferenceBackend() override;
 
   InferenceBackend(const InferenceBackend&) = delete;
@@ -213,6 +220,8 @@ public:
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  StartupMode startup_mode_;
+  bool capacity_refused_ = false;
 };
 
 }  // namespace gufo::server
