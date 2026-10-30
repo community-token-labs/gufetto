@@ -18,13 +18,16 @@ Adapted code includes:
 - hipCUB: Duane Merrill, NVIDIA CORPORATION and AMD (BSD-3-Clause).
 - Flash-Next GDN row reuse and SSM stride optimization: adapted from
   mikealanni/gufo f450218743bc, Copyright (c) 2026 gufo contributors (MIT).
-- Gemma 4 config contract (src/models/gemma4/config.{hpp,cpp}) and its tests
+- Gemma 4 config and weight-binding contracts
+  (src/models/gemma4/{config,weights}.{hpp,cpp}) and their tests
   (tests/models/gemma4/{config_test.cpp,gguf_builder.hpp,check.hpp}): adapted
   from gufo-org/gufo PR #426 (franzmoca/gufo feat/gemma 25ba634f6cc4),
   Copyright (c) 2026 gufo contributors (MIT). config.cpp rejects scalar zero
   per-layer values (the donor divided by a zero KV head count) and drafter
-  expert metadata; config_test.cpp drops the weights cases and adds drafter
-  and zero-value cases.
+  expert metadata. weights.cpp accepts only the 26B-A4B artifact's formats
+  per role, rejects unmapped tensors and binds from headers alone, reading
+  scalar payloads in ReadHostValues. config_test.cpp adds drafter, zero-value,
+  format and unmapped-tensor cases.
 
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp
