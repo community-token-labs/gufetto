@@ -69,6 +69,7 @@ class FakeBackend final : public TextGenerationBackend {
 public:
   struct Call {
     std::string prompt;
+    std::vector<gufo::tokenization::TokenId> prompt_ids;
     gufo::server::ChatRequest chat;
     std::size_t max_tokens = 0;
     gufo::sampling::SamplingConfig sampling;
@@ -228,7 +229,9 @@ public:
                .client_id = std::string(client_id),
                .stop_sequences = stop_sequences,
                .trace_request = gufo::server::Trace::CurrentRequest()};
+      last_.prompt_ids.assign(prompt.begin(), prompt.end());
       result.text = output_;
+      result.tokens.assign(output_.begin(), output_.end());
     }
     result.prompt_tokens = 10;
     result.cached_prompt_tokens = 8;
@@ -258,6 +261,20 @@ public:
           gufo::server::TextGenerationErrorCode::kDeviceLost,
           gufo::server::kDeviceLostMessage);
     }
+    return result;
+  }
+  Result complete_tokens(const std::vector<gufo::tokenization::TokenId>& prompt,
+                         std::size_t limit,
+                         const gufo::sampling::SamplingConfig& sampling,
+                         const CancellationCheck& cancel,
+                         const TokenCallback& token, std::string_view client_id,
+                         const std::vector<std::string>& stop_sequences,
+                         bool cache_prompt, bool cache_persist) override {
+    ValidatePromptTokens(prompt, 256);
+    auto result = complete("", limit, sampling, cancel, token, client_id,
+                           stop_sequences, cache_prompt, cache_persist);
+    const std::lock_guard lock(mutex_);
+    last_.prompt_ids = prompt;
     return result;
   }
   Result chat(const gufo::server::ChatRequest& request, std::size_t limit,
