@@ -48,12 +48,30 @@ struct Device {
 // fails an unbuffered read it cannot lock in memory.
 std::atomic<bool> fail_direct_reads{false};
 std::atomic<int> failed_direct_reads{0};
+// While positive, each O_DIRECT read first succeeds with a shorter, still
+// page-aligned count; the read after the last one fails like the above.
+std::atomic<int> short_direct_reads{0};
+std::atomic<int> served_short_reads{0};
+// While set, every read fails with EIO, buffered descriptors included.
+std::atomic<bool> fail_all_reads{false};
+std::atomic<int> failed_all_reads{0};
 
 using Pread = ssize_t (*)(int, void*, size_t, off_t);
 
 ssize_t FaultingPread(Pread next, int fd, void* buffer, size_t size,
                       off_t offset) {
-  if (fail_direct_reads && (::fcntl(fd, F_GETFL) & O_DIRECT) != 0) {
+  if (fail_all_reads) {
+    ++failed_all_reads;
+    errno = EIO;
+    return -1;
+  }
+  const bool direct = (::fcntl(fd, F_GETFL) & O_DIRECT) != 0;
+  if (direct && size > 8192 && short_direct_reads > 0) {
+    --short_direct_reads;
+    ++served_short_reads;
+    return next(fd, buffer, (size / 2) & ~static_cast<size_t>(4095), offset);
+  }
+  if (fail_direct_reads && direct) {
     ++failed_direct_reads;
     errno = ENOMEM;
     return -1;
@@ -212,6 +230,63 @@ int main() {
   } else {
     std::puts("PASS: failed unbuffered reads fall back to buffered reads");
   }
+
+  // A direct read that makes progress and then fails must not leak its
+  // partial prefix or offset into the buffered retry: the fallback restarts at
+  // the task offset and still supplies exactly the shard bytes.
+  Require(hipMemset(device.data, 0, expected.size()) == hipSuccess &&
+              hipDeviceSynchronize() == hipSuccess,
+          "clear the destination again");
+  failed_direct_reads = 0;
+  served_short_reads = 0;
+  short_direct_reads = 1;
+  fail_direct_reads = true;
+  upload = WeightUpload::Create(std::span(regions).first(1), &error);
+  Require(upload != nullptr, error);
+  Require(
+      upload->Copy(first.shard, first.offset, first.size,
+                   static_cast<char*>(device.data) + first.destination, &error),
+      error);
+  Require(upload->Finish(&error), error);
+  fail_direct_reads = false;
+  short_direct_reads = 0;
+  upload.reset();
+  Require(hipMemcpy(fallback.data(),
+                    static_cast<char*>(device.data) + first.destination,
+                    fallback.size(), hipMemcpyDeviceToHost) == hipSuccess,
+          "download partial-read fallback bytes");
+  Require(std::equal(fallback.begin(), fallback.end(),
+                     expected.begin() + first.destination),
+          "a short direct read followed by a failure still yields exact bytes");
+  Require(hipMemcpy(fallback.data(),
+                    static_cast<char*>(device.data) + first.destination -
+                        guard,
+                    guard, hipMemcpyDeviceToHost) == hipSuccess &&
+              std::all_of(fallback.begin(), fallback.begin() + guard,
+                          [](std::uint8_t b) { return b == 0; }),
+          "the fallback writes nothing before its destination");
+  if (served_short_reads == 0 || failed_direct_reads == 0) {
+    std::puts("SKIP: this filesystem refused unbuffered opens (partial read)");
+  } else {
+    std::puts("PASS: a partial unbuffered read then failure falls back");
+  }
+
+  // When the buffered retry fails too, the load fails with that error rather
+  // than uploading the unread staging bytes.
+  failed_all_reads = 0;
+  upload = WeightUpload::Create(std::span(regions).first(1), &error);
+  Require(upload != nullptr, error);
+  fail_all_reads = true;
+  Require(upload->Copy(first.shard, first.offset, first.size,
+                       static_cast<char*>(device.data) + first.destination,
+                       &error),
+          error);
+  const bool finished = upload->Finish(&error);
+  fail_all_reads = false;
+  Require(!finished, "a failed buffered retry fails the upload");
+  Require(failed_all_reads > 0, "the buffered retry was attempted and failed");
+  upload.reset();
+  std::puts("PASS: a failed buffered retry reports failure");
 #endif
   for (const auto& region : regions)
     gufo::platform::CloseFile(region.file_descriptor);
