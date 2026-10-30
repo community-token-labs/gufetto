@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -11,6 +12,18 @@
 #include "src/core/startup_admission.hpp"
 
 namespace gufo::server {
+
+// E is immutable after startup sealing. OFF leaves arithmetic/messages
+// unchanged.
+inline void RequireDiagnosticMemoryFits(std::size_t bytes,
+                                        std::size_t ceiling) {
+  if (bytes > ceiling)
+    throw std::invalid_argument(
+        "--full-logits-api needs " + std::to_string(bytes) +
+        " bytes; snapshot ceiling is " + std::to_string(ceiling) +
+        " bytes; lower --context or --sessions, free memory, or "
+        "restart without --full-logits-api");
+}
 
 // One startup-only text diagnostic activation. E is persistent + maximum phase,
 // including sizeof(DiagnosticMemoryClaim). It never decreases, even after
