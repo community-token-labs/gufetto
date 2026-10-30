@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "src/models/qwen38_flash_next/attention_geometry.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_q8_load.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
@@ -8250,9 +8251,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   std::uint32_t budget, std::uint32_t mask_words,
                   std::uint32_t max_blocks, hipStream_t stream,
                   std::uint32_t live_blocks) {
-  if (heads != kSelectHeads || dim != kSelectDim) {
-    return;
-  }
+  if (!IsSupportedIndexerGeometry(heads, dim, ratio))
+    throw std::invalid_argument(kIndexerGeometryError);
   // Graph grids are sized by max_blocks so a captured decode graph replays
   // at any position; blocks past the live range return at once. An eager
   // launch passes its live range, sparing the empty workgroups.
@@ -8278,15 +8278,14 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
                hipStream_t stream, std::uint32_t* lists, std::uint32_t* counts,
                std::uint32_t list_capacity, KvCacheType cache_type) {
+  if (!IsSupportedAttentionGeometry(heads, kv_heads, d, ratio))
+    throw std::invalid_argument(kAttentionGeometryError);
   if (!IsKnownKvCacheType(cache_type))
     throw std::invalid_argument(
         "unknown Flash-Next attention KV representation");
   if (KvIsRotated(cache_type) && (heads != 24 || kv_heads != 2 || d != 256))
     throw std::invalid_argument(
         "invalid rotated Flash-Next attention geometry");
-  if (d != 256) {
-    return;  // the kernel is written for the model's 256-wide heads
-  }
   const std::uint32_t z = partials != nullptr ? std::max(splits, 1u) : 1u;
   if (ratio != 4 || mask == nullptr || lists == nullptr || counts == nullptr ||
       list_capacity == 0) {
@@ -8304,9 +8303,6 @@ void Attention(const float* q, const void* k_cache, const void* v_cache,
   // Query heads sharing a KV head share each block's K/V loads. Two per
   // block keep enough blocks in flight for one or two rows; four suit wider
   // verification batches (measured at d32K/d128K).
-  if ((heads / kv_heads) % 4 != 0) {
-    return;
-  }
   const auto launch = [&](auto kernel, std::uint32_t group) {
     hipLaunchKernelGGL(kernel, dim3(heads / group, n_tokens, z), dim3(kThreads),
                        0, stream, q, k_cache, v_cache, mask, mask_words, out,

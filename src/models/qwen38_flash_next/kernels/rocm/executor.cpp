@@ -27,6 +27,7 @@
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/platform/pages.hpp"
+#include "src/models/qwen38_flash_next/attention_geometry.hpp"
 #include "src/models/qwen38_flash_next/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kv_producer.hpp"
@@ -1045,6 +1046,17 @@ Executor::~Executor() {
 std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                                            NgramTable* ngram, Options options,
                                            std::string* error_msg) {
+  const Config& c = model.config();
+  if (!IsSupportedAttentionGeometry(c.num_heads, c.num_kv_heads, c.head_dim,
+                                    c.compress_ratio)) {
+    AssignError(error_msg, kAttentionGeometryError);
+    return nullptr;
+  }
+  if (!IsSupportedIndexerGeometry(c.indexer_heads, c.indexer_head_dim,
+                                  c.compress_ratio)) {
+    AssignError(error_msg, kIndexerGeometryError);
+    return nullptr;
+  }
   std::unique_ptr<Executor> e(new Executor());
   e->model_ = &model;
   e->ngram_ = ngram;
@@ -1082,7 +1094,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     AssignError(error_msg, "hipblasCreate failed");
     return nullptr;
   }
-  const Config& c = model.config();
   if (!IsKnownKvCacheType(options.kv_cache_type) ||
       (KvIsRotated(options.kv_cache_type) &&
        (c.head_dim != 256 || c.rotary_dim != 64 || c.num_heads != 24 ||
