@@ -15,7 +15,7 @@ set(gufo_pr_targets
   cache_retention_test
   cache_model_capabilities_test
   arg_parser_test json_test json_constraint_test gguf_reader_test gguf_identity_test
-  heap_placement_test startup_admission_test
+  heap_placement_test startup_admission_test diagnostic_memory_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test
   logit_sampler_test ggml_dequant_test
@@ -61,6 +61,9 @@ list(REMOVE_ITEM gufo_pr_tests
   qwen38_flash_next_kv_cache_test qwen38_flash_next_target_probe_test
   ds4_sampling_test ds4_chat_template_test ds4_cli_test)
 list(APPEND gufo_pr_tests
+  http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
+  text_model_runner_test_diagnostic_refusal_auto
+  text_model_runner_test_diagnostic_refusal_explicit
   "qwen38_flash_next\\.npu_contracts"
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
@@ -89,7 +92,8 @@ if (WIN32)
   set(gufo_pr_linux_only
     gguf_reader_test gguf_identity_test platform_publish_test
     platform_prefault_test trace_test http_server_signals_test
-    http_server_test audio_websocket_test continuation_disk_store_test
+    http_server_test http_server_test_diagnostic_memory
+    audio_websocket_test continuation_disk_store_test
     component_text_cache_test ${gufo_component_text_cache_tests}
     eval_http_client_test cache_disk_faults_test
     cache_boundary_test cache_adapter_test cache_slot_test cache_disk_test

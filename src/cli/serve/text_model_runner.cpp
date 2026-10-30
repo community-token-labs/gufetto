@@ -15,6 +15,7 @@
 #include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/continuation_disk_store.hpp"
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 #include "src/core/perf_trace.hpp"
@@ -257,6 +258,7 @@ std::optional<std::size_t> PerStateReservationBytes(
 
 ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
                                std::size_t state_count) {
+  const auto diagnostic = DiagnosticMemoryClaim::Process().SealStartup();
   if (runner == nullptr) {
     throw std::invalid_argument("text model runner must not be null");
   }
@@ -295,6 +297,8 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
   }
 
   auto resources = runner->ResourceClaim();
+  resources.shared_execution_bytes =
+      core::AddMemoryBytes(resources.shared_execution_bytes, diagnostic);
   const auto per_state_reservation = PerStateReservationBytes(resources);
   if (runner->UsesMeasuredStartupAdmission() && !runner->UsesComponentCache())
     throw std::logic_error("measured startup requires a component cache");
@@ -544,12 +548,27 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
       .capacity_bytes =
           [validated, options] {
             const auto resources = validated->runner->ResourceClaim();
-            const auto automatic =
+            auto automatic =
                 resources.retained_snapshot_capacity_bytes.value_or(0);
+            auto ceiling =
+                resources.retained_snapshot_ceiling_bytes.value_or(automatic);
+            if (const auto diagnostic =
+                    DiagnosticMemoryClaim::Process().Snapshot().bytes) {
+              if (diagnostic > ceiling) {
+                throw std::invalid_argument(
+                    "--full-logits-api needs " + std::to_string(diagnostic) +
+                    " bytes; snapshot ceiling is " + std::to_string(ceiling) +
+                    " bytes; lower --context or --sessions, free memory, or "
+                    "restart without --full-logits-api");
+              }
+              const auto protected_memory =
+                  core::ProtectCacheHeadroom(automatic, ceiling, diagnostic);
+              automatic = protected_memory.automatic;
+              ceiling = protected_memory.ceiling;
+            }
             validated->snapshot_automatic_bytes = std::min(
                 TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
-            validated->snapshot_max_bytes =
-                resources.retained_snapshot_ceiling_bytes.value_or(automatic);
+            validated->snapshot_max_bytes = ceiling;
             if (options.capacity_bytes == 0)
               return validated->snapshot_automatic_bytes;
             // An explicit limit is the operator's choice to trade headroom
@@ -558,6 +577,8 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                             validated->snapshot_max_bytes);
           },
       .on_event = EmitSnapshotEvent,
+      .require_capacity =
+          DiagnosticMemoryClaim::Process().Snapshot().bytes != 0,
   };
 }
 

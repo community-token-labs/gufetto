@@ -153,6 +153,8 @@ public:
     SnapshotRestore restore;
     SnapshotCapacity capacity_bytes;
     SnapshotEventSink on_event;
+    // Required admission may not degrade to an optional zero-byte cache.
+    bool require_capacity{false};
   };
 
   class Lease {
@@ -256,7 +258,7 @@ public:
   /// Snapshot records are separate from execution slots. A zero record count
   /// defaults to capacity; the byte budget bounds retained/in-flight payloads.
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
-                    SnapshotSupport snapshot_support = {},
+                    SnapshotSupport snapshot_support = {{}, {}, {}, false},
                     std::size_t snapshot_capacity = 0,
                     bool publish_lookup = true);
   ~ContinuationCache();
