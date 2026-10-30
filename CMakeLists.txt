@@ -701,6 +701,8 @@ if (BUILD_TESTING)
   add_executable(http_server_test tests/cli/http_server_test.cpp)
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
+  add_test(NAME http_server_test_diagnostic_memory COMMAND http_server_test --diagnostic-memory)
+  set_tests_properties(http_server_test_diagnostic_memory PROPERTIES LABELS "cpu;server;http;memory" TIMEOUT 30)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
 
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
@@ -814,6 +816,7 @@ if (BUILD_TESTING)
     lookup
     pins
     lifecycle
+    diagnostic_memory
     reuse
     disk
     ram)
@@ -847,6 +850,11 @@ if (BUILD_TESTING)
   set_tests_properties(qfn_kv_ingress_validation_test PROPERTIES
     LABELS "cpu;server;cache;qwen38_flash_next")
 
+  add_executable(diagnostic_memory_test tests/cli/diagnostic_memory_test.cpp)
+  target_link_libraries(diagnostic_memory_test PRIVATE gufo_logging gufo_platform)
+  add_test(NAME diagnostic_memory_test COMMAND diagnostic_memory_test)
+  set_tests_properties(diagnostic_memory_test PROPERTIES LABELS "cpu;server;memory")
+
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp
     src/cli/serve/continuation_cache.cpp
@@ -855,6 +863,14 @@ if (BUILD_TESTING)
   src/cli/serve/text_model_runner.cpp)
   target_link_libraries(text_model_runner_test PRIVATE gufo_checkpoint_transfer gufo_logging gufo_core gufo_cache)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
+  add_test(NAME text_model_runner_test_diagnostic_memory COMMAND text_model_runner_test --diagnostic-memory)
+  set_tests_properties(text_model_runner_test_diagnostic_memory PROPERTIES LABELS "cpu;server;runner;memory")
+  foreach(mode auto explicit)
+    add_test(NAME text_model_runner_test_diagnostic_refusal_${mode}
+      COMMAND text_model_runner_test --diagnostic-refusal-${mode})
+    set_tests_properties(text_model_runner_test_diagnostic_refusal_${mode} PROPERTIES
+      WILL_FAIL TRUE LABELS "cpu;server;runner;memory")
+  endforeach()
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
 

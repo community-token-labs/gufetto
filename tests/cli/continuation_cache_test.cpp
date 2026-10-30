@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -53,6 +54,37 @@ struct FakeSnapshot final : gufo::server::ContinuationSnapshot {
   std::size_t payload_bytes;
   const gufo::server::ContinuationState* owner;
 };
+
+void TestRequiredCapacityFailurePropagates() {
+  using gufo::server::ContinuationCache;
+  std::vector<std::size_t> invalidations(1);
+  // Default construction is intentional: ordinary/OFF callers must retain
+  // the historical catch-and-disable behavior without opting into a policy.
+  for (const bool required : {false, true}) {
+    ContinuationCache::SnapshotSupport support;
+    support.restore = [](auto&, const auto&) {};
+    support.capacity_bytes = []() -> std::size_t {
+      throw std::invalid_argument("required snapshot capacity refusal");
+    };
+    if (required)
+      support.require_capacity = true;
+    bool refused = false;
+    try {
+      ContinuationCache cache(
+          1, [&] { return std::make_unique<FakeState>(0, &invalidations); },
+          std::move(support));
+      Expect(cache.snapshot_capacity_bytes() == 0,
+             "ordinary capacity failure keeps historical zero-budget fallback");
+    } catch (const std::invalid_argument& error) {
+      refused = true;
+      Expect(std::string_view(error.what()) ==
+                 "required snapshot capacity refusal",
+             "required capacity exception propagates unchanged");
+    }
+    Expect(refused == required,
+           "only required capacity failure refuses startup");
+  }
+}
 
 void TestBorrowedSnapshotPrefersAvailableOwner() {
   using Tokens = std::vector<gufo::server::ContinuationToken>;
@@ -1814,6 +1846,7 @@ void TestLookupPublicationRaceStress() {
 }  // namespace
 
 int main() {
+  TestRequiredCapacityFailurePropagates();
   TestLookupRetainsCheckpointsWithAllSlotsBusy();
   TestLookupIdleSnapshotParityAndFreshness();
   TestLookupDoesNotWaitForSelectionOrRestore();
