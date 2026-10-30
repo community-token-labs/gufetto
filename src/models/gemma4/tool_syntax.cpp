@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 namespace gufo::models::gemma4 {
@@ -12,6 +13,7 @@ namespace {
 
 constexpr std::string_view kQuote = "<|\"|>";
 constexpr std::size_t kMaxDepth = 64;
+constexpr std::int64_t kMaxExactInteger = std::int64_t{1} << 53;
 
 struct Parser {
   std::string_view text;
@@ -75,8 +77,9 @@ struct Parser {
     return true;
   }
 
-  /// A bare scalar ends at the next structural delimiter.
-  json::Value Bare() {
+  /// A bare scalar ends at the next structural delimiter. False when it is
+  /// an integer that a double cannot hold exactly.
+  bool Bare(json::Value* out) {
     const std::size_t start = pos;
     while (pos < text.size() && text[pos] != ',' && text[pos] != '}' &&
            text[pos] != ']') {
@@ -87,23 +90,41 @@ struct Parser {
            std::isspace(static_cast<unsigned char>(raw.back())) != 0) {
       raw.remove_suffix(1);
     }
-    if (raw == "true") {
-      return json::Value(true);
-    }
-    if (raw == "false") {
-      return json::Value(false);
+    if (raw == "true" || raw == "false") {
+      *out = json::Value(raw == "true");
+      return true;
     }
     if (raw == "null") {
-      return json::Value(nullptr);
+      *out = json::Value(nullptr);
+      return true;
     }
     double number = 0.0;
     const auto [end, ec] =
         std::from_chars(raw.data(), raw.data() + raw.size(), number);
     if (ec == std::errc{} && end == raw.data() + raw.size() && !raw.empty() &&
         std::isfinite(number)) {
-      return json::Value(number);
+      // gufo::json keeps numbers as doubles, exact for integers up to 2^53;
+      // the literal is compared exactly, since the double has rounded.
+      const std::string_view digits =
+          raw.starts_with('-') ? raw.substr(1) : raw;
+      std::int64_t integer = 0;
+      const bool is_integer =
+          !digits.empty() &&
+          digits.find_first_not_of("0123456789") == std::string_view::npos;
+      const auto exact =
+          std::from_chars(raw.data(), raw.data() + raw.size(), integer);
+      if (is_integer &&
+          (exact.ec != std::errc{} || integer > kMaxExactInteger ||
+           integer < -kMaxExactInteger)) {
+        pos = start;
+        return Fail("integer " + std::string(raw) +
+                    " exceeds 2^53 and cannot be held exactly");
+      }
+      *out = json::Value(number);
+      return true;
     }
-    return json::Value(std::string(raw));
+    *out = json::Value(std::string(raw));
+    return true;
   }
 
   bool Value(json::Value* out, std::size_t depth) {
@@ -147,8 +168,7 @@ struct Parser {
         }
       }
     }
-    *out = Bare();
-    return true;
+    return Bare(out);
   }
 
   bool Object(json::Value* out, std::size_t depth) {
@@ -169,11 +189,14 @@ struct Parser {
       if (!Consume(":")) {
         return Fail("expected ':'");
       }
+      if (out->find(key) != nullptr) {
+        return Fail("duplicate key " + key);
+      }
       json::Value value;
       if (!Value(&value, depth)) {
         return false;
       }
-      (*out)[key] = std::move(value);
+      out->append_member(std::move(key), std::move(value));
       SkipSpace();
       if (Consume("}")) {
         return true;

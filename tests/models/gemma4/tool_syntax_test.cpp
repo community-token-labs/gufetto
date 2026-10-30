@@ -69,6 +69,29 @@ void CheckRejections() {
     deep += "[";
   }
   Require(!g4::ParseToolCall(deep).has_value(), "unbounded nesting accepted");
+
+  // A repeated key is rejected at every depth, never silently overwritten.
+  for (const char* body : {"call:f{a:1,a:2}", "call:f{o:{k:1,k:2}}",
+                           "call:f{<|\"|>a<|\"|>:1,a:2}"}) {
+    std::string error;
+    Require(!g4::ParseToolCall(body, &error) &&
+                error.find("duplicate key") != std::string::npos,
+            std::string("duplicate key accepted: ") + body);
+  }
+  // Integers beyond 2^53 do not survive gufo::json's doubles: rejected, not
+  // rounded. 2^53 itself and non-integer literals still parse as numbers.
+  for (const char* body :
+       {"call:f{id:9007199254740993}", "call:f{ids:[-9007199254740993]}"}) {
+    std::string error;
+    Require(!g4::ParseToolCall(body, &error) &&
+                error.find("exceeds 2^53") != std::string::npos,
+            std::string("inexact integer accepted: ") + body);
+  }
+  Require(ParseToJson("call:f{a:9007199254740992,b:-9007199254740992,c:1e300,"
+                      "d:2.5}") ==
+              R"({"a":9007199254740992,"b":-9007199254740992,"c":1e+300,)"
+              R"("d":2.5})",
+          "exact integers and decimals parse");
 }
 
 /// Settled arguments of `body`, then the open string (if any) after a `|`.
@@ -103,8 +126,11 @@ void CheckPartial() {
   Require(Partial("call:f{o:{k:[1,2],s:<|\"|>}") == "f{}" &&
               Partial("call:f{o:{k:[1,2]}}") == R"(f{"o":{"k":[1,2]}})",
           "containers settle whole");
-  Require(Partial("call:f{a:1,a:2}") == R"(f{"a":1})",
-          "a repeated key ends the settled members");
+  // The partial parse stops exactly where the complete parse fails.
+  Require(Partial("call:f{a:1,a:2}") == R"(f{"a":1})" &&
+              Partial("call:f{a:1,o:{k:1,k:2},b:2}") == R"(f{"a":1})" &&
+              Partial("call:f{a:1,id:9007199254740993,b:2}") == R"(f{"a":1})",
+          "a member the complete parse rejects ends the settled members");
   Require(
       Partial("call:f{<|\"|>quoted key<|\"|>:<|\"|>v") == "f{}|quoted key=v",
       "quoted key");

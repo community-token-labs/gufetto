@@ -20,6 +20,10 @@ struct ToolCall {
 /// template renders: `<|"|>`-delimited strings, numbers, true/false/null,
 /// `{…}` objects with bare or `<|"|>`-quoted keys, and `[…]` arrays. A bare
 /// value that is not a JSON literal is kept as a string.
+///
+/// Rejected: a key repeated within one object, and an integer literal beyond
+/// ±2^53, which gufo::json (doubles) cannot hold exactly. The name is not
+/// checked against the declared tools; callers must do that.
 [[nodiscard]] std::optional<ToolCall> ParseToolCall(
     std::string_view body, std::string* error_msg = nullptr);
 
@@ -35,8 +39,9 @@ struct PartialToolCall {
 };
 
 /// Parses an unfinished call body, such as one still being generated. Empty
-/// until `call:NAME{` has arrived. A malformed or repeated member ends the
-/// result before it: the complete parse decides that call.
+/// until `call:NAME{` has arrived. A member the complete parse would reject
+/// (malformed, repeated at any depth, or an inexact integer) ends the result
+/// before it, so the two parsers agree on every member they both report.
 [[nodiscard]] std::optional<PartialToolCall> ParsePartialToolCall(
     std::string_view body);
 

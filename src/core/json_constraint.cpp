@@ -135,19 +135,23 @@ const json::Value* JsonConstraint::ResolveReference(
   return target;
 }
 
+// The spelling of compiled values. kGemma4 is the Gemma 4 call-argument
+// syntax: the same schema semantics with the spelling its chat template uses.
+// An enum, not a bool, so it cannot bind to a neighbouring flag.
+enum class ValueSyntax : std::uint8_t { kJson, kGemma4 };
+
 class JsonConstraintCompiler {
 public:
   using Sequence = JsonConstraint::Sequence;
   using Rule = JsonConstraint::Rule;
-  // `gemma` compiles values in the Gemma 4 call-argument syntax instead of
-  // JSON: the same schema semantics with the spelling its chat template uses.
   explicit JsonConstraintCompiler(const json::Value& schema, bool strict,
-                                  bool tool = false, bool gemma = false,
+                                  bool tool = false,
+                                  ValueSyntax syntax = ValueSyntax::kJson,
                                   bool open_response_objects = false)
       : schema_(schema),
         strict_(strict),
         open_objects_(tool && !strict),
-        gemma_(gemma),
+        gemma_(syntax == ValueSyntax::kGemma4),
         open_response_objects_(open_response_objects) {
     // Literal bytes occupy the first 256 terminal classes.
     for (unsigned i = 0; i < 256; ++i) {
@@ -1834,9 +1838,9 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::Compile(
     if (const auto found = cache.find(key); found != cache.end())
       return found->second;
   }
-  auto grammar =
-      JsonConstraintCompiler(schema, strict, false, false, open_objects)
-          .Compile(false);
+  auto grammar = JsonConstraintCompiler(schema, strict, false,
+                                        ValueSyntax::kJson, open_objects)
+                     .Compile(false);
   const std::lock_guard lock(mutex);
   if (cache.size() >= 16)
     cache.erase(cache.begin());
@@ -1920,8 +1924,9 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
     grammar = OpenToolParameters(format);
   } else if (grammar && format == ToolFormat::kGemma4) {
     try {
-      grammar = JsonConstraintCompiler(normalized, strict, true, true)
-                    .Compile(false, best_effort);
+      grammar =
+          JsonConstraintCompiler(normalized, strict, true, ValueSyntax::kGemma4)
+              .Compile(false, best_effort);
     } catch (const std::invalid_argument&) {
       if (strict)
         throw;
@@ -1972,7 +1977,8 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
   if (format == ToolFormat::kGemma4) {
     static const auto gemma = [] {
       const auto schema = json::Value::object();
-      return JsonConstraintCompiler(schema, false, true, true).Compile(true);
+      return JsonConstraintCompiler(schema, false, true, ValueSyntax::kGemma4)
+          .Compile(true);
     }();
     return gemma;
   }
