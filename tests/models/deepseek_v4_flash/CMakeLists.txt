@@ -16,6 +16,12 @@ target_compile_definitions(ds4_chat_template_test PRIVATE
 add_test(NAME ds4.template COMMAND ds4_chat_template_test)
 set_tests_properties(ds4.template PROPERTIES LABELS "cpu;ds4;tokenization")
 
+add_executable(ds4_tokenizer_stop_test tokenizer_stop_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/deepseek_v4_flash/runtime/tokenizer.cpp)
+target_link_libraries(ds4_tokenizer_stop_test PRIVATE gufo_core)
+add_test(NAME ds4.tokenizer_stop COMMAND ds4_tokenizer_stop_test)
+set_tests_properties(ds4.tokenizer_stop PROPERTIES LABELS "cpu;ds4;tokenization")
+
 add_executable(ds4_cli_test cli_test.cpp)
 target_link_libraries(ds4_cli_test PRIVATE gufo_llm_cli)
 add_test(NAME ds4.cli COMMAND ds4_cli_test)
