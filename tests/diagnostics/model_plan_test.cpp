@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -288,6 +289,33 @@ int main() {
   assert(!recovery.Contains({999, 100, 4}));
   assert(!recovery.Contains({1000, 103, 4}));
   assert(!recovery.Contains({1000, 100, 5}));
+  const RecoveryBounds pages({{1000, 100, 4}, {1004, 102, 4}}, 16);
+  assert(pages.Contains({984, 118, 4}));  // Inclusive preregistered slack.
+  assert(!pages.Contains({983, 118, 4}));
+  assert(!pages.Contains({984, 119, 4}));
+  assert(!pages.Contains({1000, 100, 5}));  // No thread-count allowance.
+  assert(pages.OutsideCount({{983, 100, 4}, {1000, 100, 4}, {1000, 119, 4}}) ==
+         2);  // Retain/count all results, not just the first band miss.
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  const RecoveryBounds edges({{0, maximum, 4}}, 16);
+  assert(edges.Contains({maximum, maximum, 4}));
+  const RecoveryBounds extreme({{maximum, 0, 4}}, 16);
+  assert(!extreme.Contains({0, maximum, 4}));
+  bool empty_rejected = false;
+  try {
+    const RecoveryBounds empty({});
+  } catch (const std::invalid_argument&) {
+    empty_rejected = true;
+  }
+  assert(empty_rejected);
+  const RecoveryTrend growth({{100, 10, 4}, {99, 11, 4}, {98, 11, 4}});
+  assert(growth.rss_monotonic_growth && growth.heap_monotonic_loss);
+  const RecoveryTrend jitter({{100, 10, 4}, {99, 12, 4}, {101, 11, 4}});
+  assert(!jitter.rss_monotonic_growth && !jitter.heap_monotonic_loss);
+  assert(!RecoveryTrend({{100, 10, 4}, {100, 10, 4}}).rss_monotonic_growth);
+  static_assert(kRecoveryInconclusiveExit != 0 &&
+                kRecoveryInconclusiveExit != 1 &&
+                kRecoveryInconclusiveExit != 77);
   Fixture fixture;
   const auto unbudgeted = header + "\n" + Row() + "\n";
   auto report = fixture.Run(unbudgeted);
