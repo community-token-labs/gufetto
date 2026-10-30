@@ -306,7 +306,7 @@ class VerifyServerTest(unittest.TestCase):
 
     def test_malformed_key_is_rejected_without_echo(self):
         for key in (KEY + "\nX-Injected: 1", "two words", "café",
-                    'quote"key', "back\\slash", "a=b", "=", "%41"):
+                    "tab\tkey", "del\x7fkey"):
             with self.subTest(key=key):
                 with serve(FakeServer()) as url:
                     done = run_script(["--base-url", url, "--json"],
@@ -317,20 +317,24 @@ class VerifyServerTest(unittest.TestCase):
                 self.assertNotIn(key, done.stdout + done.stderr)
                 self.assertNotIn("Traceback", done.stderr)
 
-    def test_token68_keys_are_accepted(self):
-        for key in ("abc", "A-Z.a_z~0+9/", "dG9rZW4=", "dG9r=="):
+    def test_printable_ascii_keys_are_accepted(self):
+        for key in ("abc", "A-Z.a_z~0+9/", "dG9rZW4=", 'quote"key',
+                    "back\\slash", "a=b", "=", "%41", "!#$&'()*,:;<>?@[]^`{|}"):
             with self.subTest(key=key):
-                self.assertTrue(VERIFY.valid_token68(key))
+                self.assertTrue(VERIFY.valid_key(key))
 
     def test_long_key_echoed_by_server_never_leaks(self):
-        key = ("Ab0-._~+/" * 28)[:250]
-        # JSON may escape "/" as "\/"; the script must still find the key.
-        escaped = key.replace("/", "\\/")
+        for key in (("Ab0-._~+/" * 28)[:250],
+                    ('Ab0"\\{}<>%/=' * 25)[:250]):
+            with self.subTest(key=key[:12]):
+                self.check_echoed_key(key)
 
+    def check_echoed_key(self, key: str):
         def echo_error(handler):
-            handler.send(401, ('{"error": {"code": "invalid_api_key", '
-                               '"message": "bad key ' + escaped +
-                               '"}}').encode())
+            # JSON may escape "/" as "\/"; the script must still find the key.
+            body = json.dumps({"error": {"code": "invalid_api_key",
+                                         "message": "bad key " + key}})
+            handler.send(401, body.replace("/", "\\/").encode())
 
         def echo_chat(handler):
             handler.send(200, chat_body(content="key " + key + " ready"))
@@ -353,7 +357,38 @@ class VerifyServerTest(unittest.TestCase):
                         self.assert_single_object(done.stdout)
                     if name == "content":
                         self.assertEqual(done.returncode, 0, output)
-                        self.assertIn("<redacted>", output)
+                        shown = json.loads(done.stdout)["content"] \
+                            if mode else done.stdout
+                        self.assertIn(VERIFY.REDACTED, shown)
+
+    def test_scrub_is_single_pass_and_covers_integers(self):
+        state = FakeServer(chat=chat_body(content="key ted ready"))
+        with serve(state) as url:
+            status, out, _ = run_main(["--base-url", url, "--json"],
+                                      {"GUFO_API_KEY": "ted"})
+        self.assertEqual(status, 0, out)
+        self.assertEqual(json.loads(out)["content"],
+                         f"key {VERIFY.REDACTED} ready")
+        self.assertEqual(VERIFY.scrub(VERIFY.scrub("a ted", "ted"), "ted"),
+                         f"a {VERIFY.REDACTED}")
+        state = FakeServer(chat=chat_body(
+            usage={"prompt_tokens": 12345, "completion_tokens": 2}))
+        with serve(state) as url:
+            status, out, _ = run_main(["--base-url", url, "--json"],
+                                      {"GUFO_API_KEY": "12345"})
+        self.assertEqual(status, 1, out)
+        self.assertNotIn("12345", out)
+        self.assertEqual(VERIFY.scrub({"n": 12345, "b": True}, "12345"),
+                         {"n": VERIFY.REDACTED, "b": True})
+
+    def test_help_and_abbreviations(self):
+        done = run_script(["-h", "--json"])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.startswith("usage:"))
+        for argv in (["--js"], ["--base", "http://127.0.0.1:1", "--json"]):
+            with self.subTest(argv=argv):
+                done = run_script(argv)
+                self.assertEqual(done.returncode, 2, done.stdout)
 
     def test_json_is_always_one_object(self):
         for argv, env, status in (

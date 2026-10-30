@@ -97,5 +97,14 @@ reports the loaded `context_length` and input modalities. `--wait` keeps
 polling while the server answers 503 `loading`. Exit status is 0 on pass,
 1 on a failed check and 2 on a usage error; failures print the server's
 error code with a hint. With `--json` every outcome, usage errors included,
-prints one result object. Malformed responses, timeouts and transport
-errors become plain failures without tracebacks.
+prints one result object; `-h`/`--help` still prints plain help and exits 0.
+Malformed responses, timeouts and transport errors become plain failures
+without tracebacks.
+
+The script accepts keys of printable ASCII (0x21-0x7e). The server accepts
+any single-line key, so a key containing spaces or non-ASCII UTF-8 works
+with `gufo serve` but is rejected here; choose a printable ASCII key to use
+both. Every string or integer decoded from a response is scrubbed of the
+literal key, shown as `•••`, before it is truncated or printed. A server
+echoing the key in another encoding, such as base64 or percent-encoding, is
+out of scope.

@@ -5,6 +5,11 @@ Standard library only. It lists `/v1/models`, sends one non-streaming
 `/v1/chat/completions` request and explains failures with the server's own
 error codes. The bearer key, when needed, is read from an environment variable
 and never printed. Exit status: 0 pass, 1 check failed, 2 usage error.
+
+Every string (and integer) decoded from a response is scrubbed of the literal
+key before it is truncated or printed. Keys the server echoes in another
+encoding, such as base64 or percent-encoding, are out of scope: only a hostile
+server would do that, and it already received the key.
 """
 
 from __future__ import annotations
@@ -23,6 +28,9 @@ import urllib.request
 from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+# Non-ASCII, so it can never contain a valid (printable ASCII) key and a
+# second scrub pass leaves it unchanged.
+REDACTED = "\u2022\u2022\u2022"
 PROMPT = "Reply with the single word: ready"
 
 # Hints keyed by the server's error `code`, or by HTTP status as a fallback.
@@ -78,9 +86,9 @@ def is_numeric_loopback(host: str) -> bool:
         return False
 
 
-def valid_token68(value: str) -> bool:
-    """RFC 7235 token68: letters, digits, - . _ ~ + /, then optional =."""
-    return re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", value) is not None
+def valid_key(value: str) -> bool:
+    """Printable ASCII without spaces or control characters (0x21-0x7e)."""
+    return re.fullmatch(r"[\x21-\x7e]+", value) is not None
 
 
 def scrub(value: Any, secret: str | None) -> Any:
@@ -88,7 +96,9 @@ def scrub(value: Any, secret: str | None) -> Any:
     if not secret:
         return value
     if isinstance(value, str):
-        return value.replace(secret, "<redacted>")
+        return value.replace(secret, REDACTED)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return REDACTED if str(value) == secret else value
     if isinstance(value, list):
         return [scrub(item, secret) for item in value]
     if isinstance(value, dict):
@@ -294,7 +304,7 @@ def chat(client: Client, model: str, max_tokens: int,
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = Parser(description=__doc__.splitlines()[0])
+    parser = Parser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
                         help="server root, without /v1 (default: %(default)s)")
     parser.add_argument("--model",
@@ -322,7 +332,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="send the key over plain HTTP to a host that is "
                              "not 127.0.0.1 or ::1")
     parser.add_argument("--json", action="store_true",
-                        help="print one JSON result object")
+                        help="print one JSON result object for every check "
+                             "or usage error; -h/--help still prints plain "
+                             "help and exits 0")
     args = parser.parse_args(argv)
     try:
         url = urllib.parse.urlsplit(args.base_url)
@@ -351,11 +363,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     key = os.environ.get(args.api_key_env) or None
-    if key is not None and not valid_token68(key):
+    if key is not None and not valid_key(key):
         raise CheckError(
             f"the value of {args.api_key_env} is not a valid bearer token",
-            "use only letters, digits and - . _ ~ + /, optionally ending "
-            "in =")
+            "use printable ASCII without spaces or line breaks")
     if key and args.scheme == "http" and not is_numeric_loopback(args.host) \
             and not args.allow_cleartext_key:
         raise CheckError(
@@ -388,6 +399,9 @@ def report(as_json: bool, ok: bool, fields: dict[str, Any],
 
 def main(argv: list[str] | None = None) -> int:
     raw = sys.argv[1:] if argv is None else argv
+    if hasattr(sys.stdout, "reconfigure"):
+        # The redaction mark is non-ASCII; never fail on a narrow terminal.
+        sys.stdout.reconfigure(errors="backslashreplace")
     as_json = "--json" in raw
     try:
         args = parse_args(raw)
