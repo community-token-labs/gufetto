@@ -555,13 +555,11 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
             if (const auto diagnostic =
                     DiagnosticMemoryClaim::Process().Snapshot().bytes) {
               if (diagnostic > ceiling) {
-                Logger::Error(
-                    "cache",
-                    "event=diagnostic_snapshots_disabled claim_bytes=" +
-                        std::to_string(diagnostic) +
-                        " ceiling_bytes=" + std::to_string(ceiling) +
-                        " reason=diagnostic_claim_exceeds_ceiling");
-                return std::size_t{0};
+                throw std::invalid_argument(
+                    "--full-logits-api needs " + std::to_string(diagnostic) +
+                    " bytes; snapshot ceiling is " + std::to_string(ceiling) +
+                    " bytes; lower --context or --sessions, free memory, or "
+                    "restart without --full-logits-api");
               }
               const auto protected_memory =
                   core::ProtectCacheHeadroom(automatic, ceiling, diagnostic);
@@ -579,6 +577,8 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                             validated->snapshot_max_bytes);
           },
       .on_event = EmitSnapshotEvent,
+      .require_capacity =
+          DiagnosticMemoryClaim::Process().Snapshot().bytes != 0,
   };
 }
 
