@@ -20,7 +20,8 @@ At that revision:
 - `tools/server/server-task.cpp:256–291` serializes each candidate's **ID** and
   natural-log `logprob` inside `top_logprobs` when post-sampling probabilities
   are off. The adapter requests pre-sampling top-k, greedy temperature0,
-  top_k1, neutral penalties and ignores EOS for a fixed requested count.
+  top_k1 and neutral penalties. Both engines stop naturally at EOS within the
+  registered `n_predict` budget; **ignore_eos is deliberately omitted**.
 
 **Current Gufo cannot perform the equivalent live request.** At the readiness
 base, `src/cli/serve/http_server.cpp:1381–1384` requires a nonempty **string** on
@@ -67,10 +68,17 @@ python3 tools/qwen-flash/token_parity.py \
   --prompts prompts.json --gufo-recorded gufo-recorded.json \
   --llama-url http://127.0.0.1:8080 --llama-config llama-config.json \
   --tokens 64 --horizon 32 --margin 0.02 --top-k 5 > token-parity.json
+
+# Once Gufo's separate numeric-prompt API lands (same native transport):
+python3 tools/qwen-flash/token_parity.py \
+  --prompts prompts.json --gufo-url http://127.0.0.1:8081 \
+  --gufo-config gufo-config.json --llama-url http://127.0.0.1:8080 \
+  --llama-config llama-config.json --tokens 64 --horizon 32 --margin 0.02 \
+  > token-parity.json
 ```
 
 `--llama-url` is the server base (optional `/v1` suffix), **not** the completion
-route. Each live request sends the exact same numeric array recorded for Gufo,
+route. Each live request sends the exact same numeric array registered for both sides,
 never visits a tokenizer/chat endpoint, does not retry, and disables prompt
 cache. Numeric arrays are essential: no inferred BOS, templates or text pass.
 A live Gufo URL uses exactly the same numeric-prompt protocol; rejection or
@@ -102,6 +110,7 @@ repeated digest characters below are placeholders, **not real provenance**):
     "generated_token_ids":[123,456],
     "text":"Actual returned continuation, not reconstructed IDs",
     "max_tokens":2,
+    "stop_type":"limit",
     "sampling":{"temperature":0,"top_k":1,"top_p":1,"min_p":0,"repeat_penalty":1,"frequency_penalty":0,"presence_penalty":0,"seed":0},
     "top_logprobs":[
       [{"id":123,"logprob":-0.5},{"id":789,"logprob":-0.51}],
@@ -122,6 +131,30 @@ all emitted IDs, continuation text, request settings and live raw responses.
 Config/flags are operator declarations, **not runtime attestation**; separately
 verify loaded mode, binary/model hashes, disabled drafts and actual flags.
 
+### Natural EOS and stop normalization
+
+The pinned native llama server serializes `stop_type` as eos/limit/word
+(`server-task.cpp:241–247,332–346`). It appends the EOG token to generated IDs
+before detecting EOS (`server-context.cpp:2143–2144,2255`). On an EOS response
+only, the adapter strips llama's trailing EOG ID from comparison, retaining it
+as `terminal_eog_id` and preserving the original raw IDs. Gufo's compatible
+`tokens` **excludes** terminal EOG; never strip a Gufo ordinary output token.
+
+Normalize `stop_type` or booleans `stopped_eos`, `stopped_limit` /
+`stopped_length`, and `stopped_word` to eos/limit/word; everything else is other.
+`stopping_word` is retained. Missing/unrecognized stop reason means UNKNOWN
+for that request, never a match/pass; contradictory recognized reasons are
+invalid input. Cancellation has no EOS implication.
+
+An EOS-vs-token decision is a divergence at the shorter normalized length;
+if the emitted IDs match but stop reasons differ, the divergence is at len.
+The near-tie rule applies at that boundary, but without an **actually captured**
+EOG/other winner ID and top-k on both sides it stays UNKNOWN. An optional
+`terminal_eog_id` in a Gufo recording must come from independent actual capture,
+not a guessed EOS or retokenized text. At a limit boundary there may be no next
+token observation; do not fabricate one. Natural EOS before the token budget
+is valid, not a truncated fixed-count failure.
+
 ## Diagnostics and acceptance boundary
 
 For **each prompt** output includes:
@@ -138,10 +171,13 @@ For **each prompt** output includes:
    Truncated top-k that omits the other winner gives UNKNOWN unless a large
    observed top1/top2 gap already proves NO. Missing Gufo top-k is UNKNOWN,
    never evidence of a near-tie or a pass.
-4. Same-index agreement over the **fixed horizon** (default32 of64 generated
-   tokens). Missing positions count as nonagreement; incomplete/oversized
-   fixed-count captures cannot count as a match. Post-divergence same-index
-   agreement is descriptive only: histories have diverged.
+4. Same-index agreement over up to the **registered short horizon** (default32
+   within a64-token budget), with denominator `min(horizon, common emitted
+   length)` explicitly reported. Zero denominator gives null, not100%.
+   EOS differences are separately reported divergences, not hidden by a short
+   denominator. Limit stops before the requested count or captures beyond the
+   budget are incomplete/UNKNOWN. Post-divergence same-index agreement is
+   descriptive only: histories have diverged.
 5. Full continuation text on both sides for **human coherence review**.
 
 **Acceptance rule:** a qualification PASS requires divergent decisions to be
@@ -155,10 +191,10 @@ Exit codes:
 
 | Code | Meaning |
 |---|---|
-| 0 | Exact fixed-count numerical sequence match; **human review still required**, not a quality PASS |
+| 0 | Matching bounded numerical sequence and recognized stop reason; **human review still required**, not a quality PASS |
 | 1 | First divergence demonstrably not a near-tie in at least one engine |
 | 2 | Invalid/mismatched provenance/input, request failure, or blocked live capability |
-| 3 | UNKNOWN/degraded/incomplete, or first split near-tie pending human review |
+| 3 | UNKNOWN/degraded/incomplete stop/capture, or first split near-tie pending human review |
 
 All results retain the margin, units, horizon and top-k request. Do not collapse
 2/3 into success in an acceptance recipe. In particular today's Gufo cannot
