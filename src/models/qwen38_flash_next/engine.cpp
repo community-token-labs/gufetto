@@ -663,7 +663,7 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   // chooses to draft. Retain that depth and its verifier graphs across restore.
   if (next_drafts != 0)
     next_drafts = std::min<std::uint32_t>(remaining ? remaining - 1 : 0,
-                                         model_->options_.max_draft_tokens);
+                                          model_->options_.max_draft_tokens);
   bool restored = false;
   try {
     restored = model_->executor_->RestoreSnapshot(
