@@ -117,7 +117,15 @@ namespace {
  * block goes to the next one that fits (added if needed, at least twice the
  * last), so an arena can start small: the MTP and DFlash2 streams only quantize
  * a few rows. Blocks live as long as the pool: captured graphs bake in their
- * addresses and replay them after the arena has grown. */
+ * addresses and replay them after the arena has grown.
+ *
+ * Capture contract: growth calls hipDeviceSynchronize and hipMalloc, which are
+ * not legal inside stream capture, and nothing here checks for capture. A
+ * caller must run each graph key eagerly on the same stream with the same
+ * shapes before capturing it, so every block that capture needs already
+ * exists; capture must never be the first user of a larger shape. Graphs must
+ * be destroyed before qfn_mmq_release_stream frees the blocks they point at.
+ * Calls on one stream must be serialized by the host. */
 struct qfn_stack_pool : public ggml_hip_pool {
     static constexpr size_t kFirstBlockBytes = (size_t) 16 << 20;
 

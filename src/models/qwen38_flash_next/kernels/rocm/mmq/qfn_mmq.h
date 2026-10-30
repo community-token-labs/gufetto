@@ -6,6 +6,9 @@
 extern "C" {
 int qfn_mmq_init(int device);
 
+// Each stream owns a scratch arena that grows on demand. Warm every shape eagerly on its stream
+// before capturing it into a graph: growth during capture is not supported. Destroy graphs that
+// captured from a stream before releasing it.
 // Frees the scratch arena of a stream about to be destroyed (waits for its queued work).
 void qfn_mmq_release_stream(hipStream_t stream);
 
