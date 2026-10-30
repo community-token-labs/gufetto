@@ -1402,7 +1402,8 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
           "IDs");
   }
   const auto* return_tokens = body.find("return_tokens");
-  if (return_tokens != nullptr && !return_tokens->is_bool())
+  if (return_tokens != nullptr && !return_tokens->is_null() &&
+      !return_tokens->is_bool())
     return InvalidCompatibilityRequest("'return_tokens' must be a boolean");
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
@@ -1433,7 +1434,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
                        cache_prompt, cache_persist);
 
   json::Value resp = json::Value::object();
-  if (return_tokens != nullptr) {
+  if (return_tokens != nullptr && !return_tokens->is_null()) {
     resp["tokens"] = json::Value::array();
     if (return_tokens->as_bool())
       for (const auto id : res.tokens)
