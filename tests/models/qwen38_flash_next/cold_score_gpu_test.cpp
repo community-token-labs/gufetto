@@ -56,20 +56,28 @@ std::vector<float> Capture(const std::shared_ptr<server::TextRunnerPool>& pool,
 }
 Value Difference(std::span<const float> candidate,
                  std::span<const float> reference) {
-  Require(candidate.size() == reference.size(), "comparison shape mismatch");
+  Require(!reference.empty() && candidate.size() == reference.size(),
+          "comparison shape mismatch");
   double absolute = 0, relative = 0;
+  std::size_t relative_index = 0;
   for (std::size_t i = 0; i < reference.size(); ++i) {
     Require(std::isfinite(candidate[i]) && std::isfinite(reference[i]),
             "nonfinite native logits");
     const double delta = std::abs(double(candidate[i]) - reference[i]);
     absolute = std::max(absolute, delta);
     // Explicit denominator floor, not a numerical acceptance threshold.
-    relative = std::max(
-        relative, delta / std::max(std::abs(double(reference[i])), 1e-30));
+    const auto ratio = delta / std::max(std::abs(double(reference[i])), 1e-30);
+    if (ratio > relative) {
+      relative = ratio;
+      relative_index = i;
+    }
   }
   auto out = Value::object();
   out["max_abs"] = absolute;
   out["max_rel"] = relative;
+  out["max_rel_index"] = relative_index;
+  out["max_rel_reference"] = reference[relative_index];
+  out["max_rel_candidate"] = candidate[relative_index];
   out["relative_denominator_floor"] = 1e-30;
   out["byte_equal"] = Equal(candidate, reference);
   out["argmax_equal"] =
@@ -126,23 +134,26 @@ std::vector<float> Boundary(const std::shared_ptr<qfn::Model>& model,
           "nonfinite native boundary rows");
   return output;
 }
-Value RunCapture(const std::shared_ptr<qfn::Model>& model) {
+bool RunCapture(const std::shared_ptr<qfn::Model>& model, Value& out) {
   const auto short_input = Input(*model, 17);
-  const auto reference =
-      Ordinary(model, short_input);  // Separate session lifetime.
-  std::vector<float> multi;
+  const auto reference = Ordinary(model, short_input);
+  bool single_equal;
   {
     auto pool = Pool(model);
     const auto single = Capture(pool, short_input, 1);
-    Require(Equal(single, reference),
-            "single-row capture differs from ordinary frontier");
-    multi = Capture(pool, short_input, 8);
+    single_equal = Equal(single, reference);
+    out["last_row_equal"] = single_equal;
+    out["single_row_difference"] = Difference(single, reference);
+    const auto multi = Capture(pool, short_input, 8);
+    out["l5"] =
+        Difference(std::span(multi).last(model->VocabSize()), reference);
   }
-  auto out = Value::object();
-  out["last_row_equal"] = true;
-  out["l5"] = Difference(std::span(multi).last(model->VocabSize()), reference);
-  // L5 is measured, not a silently invented tolerance/bit-identity claim.
+  // Comparisons do not fail fast: keep L5/cancel/boundary evidence in ONE run.
+  std::cout << "{\"stage\":\"cell\",\"cell\":\"frontier\",\"data\":"
+            << out.dump() << "}\n"
+            << std::flush;
   const auto input = Input(*model, model->PrefillThroughCapacity() + 4);
+  bool recovery_equal;
   {
     auto pool = Pool(model);
     const auto baseline = Capture(pool, input, 8);
@@ -160,34 +171,40 @@ Value RunCapture(const std::shared_ptr<qfn::Model>& model) {
       cancelled =
           std::string_view(e.what()).find("cancel") != std::string_view::npos;
     }
-    Require(cancelled && control->passes == 1 && control->checks == 4 &&
-                pool->usable_capacity() == 1,
-            "did not cancel inside the next pass and safely drain/reset");
-    Require(Equal(Capture(pool, input, 8), baseline),
-            "post-cancel scoring differs");
-    out["cancel_recovery_equal"] = true;
     out["cancel_completed_passes"] = control->passes;
     out["cancel_native_checks"] = control->checks;
+    Require(pool->usable_capacity() == 1,
+            "unsafe cancellation cleanup; remaining cells skipped");
+    const auto recovered = Capture(pool, input, 8);
+    recovery_equal = cancelled && control->passes == 1 &&
+                     control->checks == 4 && Equal(recovered, baseline);
+    out["cancel_recovery_equal"] = recovery_equal;
+    out["recovery_difference"] = Difference(recovered, baseline);
   }
+  std::cout << "{\"stage\":\"cell\",\"cell\":\"cancel\",\"data\":" << out.dump()
+            << "}\n"
+            << std::flush;
   std::vector<std::uint32_t> ends, first_ends, last_ends;
   const auto across = Boundary(model, input, 8, ends);
   const auto first =
       Boundary(model, std::span(input).first(input.size() - 4), 4, first_ends);
   const auto last = Boundary(model, input, 4, last_ends);
   const auto half = std::size_t{4} * model->VocabSize();
-  Require(ends.size() == 3 && ends[1] == input.size() - 4 &&
-              first_ends.size() == 2 && last_ends == ends,
-          "suffix did not cross the registered pass boundary");
-  Require(Equal(std::span(across).first(half), first) &&
-              Equal(std::span(across).last(half), last),
-          "captured rows are misplaced across the pass boundary");
-  out["pass_boundary_equal"] = true;
+  out["boundary_first_difference"] =
+      Difference(std::span(across).first(half), first);
+  out["boundary_last_difference"] =
+      Difference(std::span(across).last(half), last);
+  const bool boundary_equal = ends.size() == 3 && ends[1] == input.size() - 4 &&
+                              first_ends.size() == 2 && last_ends == ends &&
+                              Equal(std::span(across).first(half), first) &&
+                              Equal(std::span(across).last(half), last);
+  out["pass_boundary_equal"] = boundary_equal;
   auto ledger = Value::array();
   for (auto end : ends)
     ledger.push_back(end);
   out["boundary_pass_ends"] = std::move(ledger);
   out["vocab_size"] = model->VocabSize();
-  return out;
+  return single_equal && recovery_equal && boundary_equal;
 }
 }  // namespace
 int main(int argc, char** argv) {
@@ -210,6 +227,12 @@ int main(int argc, char** argv) {
     return 2;
   std::cout << "{\"stage\":\"readiness\",\"mode\":\"" << mode << "\"}\n"
             << std::flush;
+  auto result = Value::object();
+  result["schema"] = "gufo-full-logits-core-native-v1";
+  result["mode"] = mode;
+  result["status"] = "pass";
+  result["cleanup_safe"] = false;
+  int exit_code = 0;
   try {
     qfn::ModelOptions options;
     options.max_context = kContext;
@@ -223,10 +246,6 @@ int main(int argc, char** argv) {
     std::string error;
     auto model = qfn::Model::Load(path, options, &error);
     Require(bool(model), error);
-    auto result = Value::object();
-    result["schema"] = "gufo-full-logits-core-native-v1";
-    result["mode"] = mode;
-    result["status"] = "pass";
     if (mode == "off") {
       const auto& geometry = model->LogitCapacity();
       Require(
@@ -242,7 +261,11 @@ int main(int argc, char** argv) {
       result["max_logit_rows"] = geometry.max_logit_rows;
       result["max_speculative"] = geometry.max_speculative;
     } else if (mode == "capture") {
-      result["capture"] = RunCapture(model);
+      result["capture"] = Value::object();
+      if (!RunCapture(model, result["capture"])) {
+        result["status"] = "fail";
+        exit_code = 1;
+      }
     } else {
       const auto bytes =
           server::DiagnosticMemoryClaim::Process().Snapshot().bytes;
@@ -275,10 +298,15 @@ int main(int argc, char** argv) {
       std::cerr << expected << '\n';
       return 42;  // Refusal must propagate to a nonzero startup/driver exit.
     }
+    result["cleanup_safe"] = true;
     result["complete"] = true;
     std::cout << result.dump() << '\n' << std::flush;
-    return 0;
+    return exit_code;
   } catch (const std::exception& e) {
+    result["status"] = "fail";
+    result["complete"] = false;
+    result["error"] = e.what();
+    std::cout << result.dump() << '\n' << std::flush;
     std::cerr << "full-logits native test INVALID: " << e.what() << '\n'
               << std::flush;
     return 1;

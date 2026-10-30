@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import cold_score_gpu_test as wrapper
@@ -29,7 +30,7 @@ class Contract(unittest.TestCase):
                       l5=dict(max_abs=1e-5, max_rel=2e-4, byte_equal=False, argmax_equal=True)))
         self.assertEqual(self.run_record('capture', fields), 0)
         fields['capture']['l5']['max_abs'] = float('nan')
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             self.run_record('capture', fields)
 
     def test_refusal_requires_exact_message_and_nonzero(self):
@@ -47,15 +48,30 @@ class Contract(unittest.TestCase):
                 if valid:
                     self.assertEqual(wrapper.main(), 0)
                 else:
-                    with self.assertRaises(AssertionError):
+                    with self.assertRaises(ValueError):
                         wrapper.main()
+
+    def test_native_serving_build_sources(self):
+        # CPU source-list regression guard only, not proof of HIP linking.
+        root = Path(__file__).resolve().parents[3]
+        for relative, target in (
+            ('tests/models/deepseek_v4_flash/CMakeLists.txt', 'ds4_serving_test'),
+            ('tests/models/qwen27b/CMakeLists.txt', 'qwen_serving_test_support'),
+            ('tests/models/qwen38_flash_next/CMakeLists.txt', 'qwen38_flash_next_session_test'),
+        ):
+            source = (root / relative).read_text()
+            marker = ('add_library(' if target.endswith('_support') else 'add_executable(') + target
+            begin = source.index(marker)
+            body = source[begin:source.index(')', begin)]
+            self.assertIn('/src/cli/serve/inference_backend.cpp', body)
+            self.assertIn('/src/cli/serve/cold_score.cpp', body)
 
     def test_incomplete(self):
         run = subprocess.CompletedProcess([], 0, '{"stage":"readiness"}\n', '')
         with patch.object(sys, 'argv', ['wrapper', '--binary', 'unused', '--mode', 'capture']), \
              patch.object(wrapper.subprocess, 'run', return_value=run), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 wrapper.main()
 
 

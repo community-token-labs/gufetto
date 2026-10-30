@@ -105,8 +105,11 @@ void Reject(F run) {
   assert(rejected);
 }
 }  // namespace
-int main(int argc, char**) {
-  const bool pending_discard = argc == 2;
+int main(int argc, char** argv) {
+  const bool pending_discard =
+      argc == 2 && std::string_view(argv[1]) == "--pending-discard";
+  if (argc != 1 && !pending_discard)
+    return 2;
   std::string error;
   const auto bytes = ColdScoreControlBytes() +
                      ComponentTextCache::DiagnosticRequestBytes() +

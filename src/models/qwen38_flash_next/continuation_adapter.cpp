@@ -922,8 +922,11 @@ void ContinuationAdapter::BeginDiagnostic(
     cache::Slot& slot, std::span<const std::int32_t> input, std::uint32_t rows,
     std::span<float> output, bool& started, std::function<bool()> cancelled) {
   auto& state = As(slot);
-  // Immutable IDs/output shape were checked once by the cold-score owner.
-  if (input.size() > context_ || rows > model_->executor_->max_logit_rows() ||
+  // IDs were checked by the owner; retain cheap shape guards at the D2H
+  // boundary.
+  if (!rows || rows > input.size() || input.size() > context_ ||
+      rows > model_->executor_->max_logit_rows() ||
+      output.size() != std::size_t{rows} * model_->VocabSize() ||
       !DiagnosticReady(slot))
     throw std::logic_error(
         "diagnostic slot is not healthy, empty and quiescent");

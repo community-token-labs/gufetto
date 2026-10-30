@@ -98,7 +98,8 @@ if (ENGINE_ENABLE_HIP)
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/cold_score_gpu_test.py"
         --binary $<TARGET_FILE:qwen38_flash_next_cold_score_gpu_test> --mode ${mode})
     set_tests_properties(qwen38_flash_next.cold_score_gpu_${mode} PROPERTIES
-      LABELS "qwen38_flash_next;hip;gpu;gfx1151;full_logits" TIMEOUT 900 SKIP_RETURN_CODE 77)
+      LABELS "qwen38_flash_next;hip;gpu;gfx1151;full_logits" TIMEOUT 900 SKIP_RETURN_CODE 77
+      RESOURCE_LOCK qwen38_flash_next_model)
   endforeach()
   add_qwen38_flash_next_test(kv_rotation_ops gufo_qwen38_flash_next "hip;gpu;gfx1151")
   target_sources(qwen38_flash_next_kv_rotation_ops_test PRIVATE
@@ -136,6 +137,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/component_text_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/cold_score.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
   target_link_libraries(qwen38_flash_next_session_test PRIVATE gufo_logging
     gufo_qwen38_flash_next gufo_deepseek_v4_flash gufo_cache_hip
