@@ -34,6 +34,7 @@
 #include "src/core/memory_budget.hpp"
 #include "src/core/reclaimable_memory.hpp"
 #include "src/core/sampling.hpp"
+#include "src/models/qwen/architecture.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -3529,7 +3530,8 @@ bool InferenceBackend::load(
     Logger::Info("loader", "event=vision_disabled architecture=" +
                                std::string(architecture) +
                                " supports_images=false");
-  if (ram_cache_config.pinned_prefix.enabled() && architecture != "qwen4exp") {
+  if (ram_cache_config.pinned_prefix.enabled() &&
+      !models::qwen::IsQwen4PreviewArch(architecture)) {
     SetError(error,
              "Pinned prefixes require Qwen3.8-Flash-Next (GGUF architecture "
              "qwen4exp); this model is unsupported");
@@ -3538,18 +3540,18 @@ bool InferenceBackend::load(
   if (!cli::ValidateKvCacheTypeForArchitecture(kv_cache_type, architecture,
                                                error))
     return false;
-  if (enable_yarn && architecture != "qwen4exp") {
+  if (enable_yarn && !models::qwen::IsQwen4PreviewArch(architecture)) {
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
   // Read once, reused below to derive YaRN from --context for qwen4exp.
   const std::uint32_t qwen4exp_native_context =
-      architecture == "qwen4exp"
+      models::qwen::IsQwen4PreviewArch(architecture)
           ? reader->GetMetadataUint32("qwen4exp.context_length").value_or(0)
           : 0;
   if (max_context == 0) {
     const std::uint64_t native =
-        architecture == "qwen4exp"
+        models::qwen::IsQwen4PreviewArch(architecture)
             ? qwen4exp_native_context
             : reader
                   ->GetMetadataUint64(std::string(architecture) +
@@ -3565,7 +3567,7 @@ bool InferenceBackend::load(
   // Static YaRN changes every request, so a context above Flash-Next's
   // native one needs --enable-yarn. Checked before any weights load.
   std::optional<models::qwen38_flash_next::RopeScaling> rope_scaling;
-  if (architecture == "qwen4exp" &&
+  if (models::qwen::IsQwen4PreviewArch(architecture) &&
       !models::qwen38_flash_next::ResolveRopeScaling(
           max_context, qwen4exp_native_context, enable_yarn, &rope_scaling,
           error)) {
@@ -3627,7 +3629,8 @@ bool InferenceBackend::load(
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  if (models::qwen::IsQwen4PreviewArch(
+          reader->GetMetadataString("general.architecture").value_or(""))) {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,

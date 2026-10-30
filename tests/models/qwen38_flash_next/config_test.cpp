@@ -9,6 +9,9 @@
 #include <type_traits>
 #include <variant>
 
+#include "src/core/text_sampling_defaults.hpp"
+#include "src/models/qwen/architecture.hpp"
+
 namespace qfn = gufo::models::qwen38_flash_next;
 
 namespace {
@@ -16,6 +19,35 @@ namespace {
 void Require(bool condition, const char* message) {
   if (!condition)
     throw std::runtime_error(message);
+}
+
+void CheckArchitectureDecisions() {
+  using gufo::models::qwen::IsQwen4PreviewArch;
+  using gufo::sampling::TextModelPreset;
+  using gufo::sampling::TextPreset;
+  for (const std::string_view arch :
+       {"", "unknown", "qwen2", "qwen3", "qwen3next", "deepseek4", "qwen4exp",
+        "qwen4", "Qwen4exp", "qwen4exp ", "qwen4exp-next", "xqwen4exp"}) {
+    // Independent legacy decision, shared by pinned-prefix and YaRN gates.
+    const bool legacy = arch == "qwen4exp";
+    Require(IsQwen4PreviewArch(arch) == legacy, "architecture gate changed");
+    gufo::core::ModelConfig config;
+    config.architecture = std::string(arch);
+    const auto expected = arch == "deepseek4"
+                              ? TextModelPreset::kDeepSeekV4Flash
+                          : legacy ? TextModelPreset::kQwen38
+                                   : TextModelPreset::kUnspecified;
+    Require(TextPreset(config) == expected, "sampling architecture changed");
+    config.num_layers = 64;
+    config.hidden_size = 5120;
+    config.vocab_size = 248320;
+    Require(TextPreset(config) == (arch == "deepseek4"
+                                       ? TextModelPreset::kDeepSeekV4Flash
+                                       : TextModelPreset::kQwen38),
+            "legacy shape fallback changed");
+  }
+  Require(!IsQwen4PreviewArch(std::string_view{"qwen4exp\0", 9}),
+          "embedded null accepted");
 }
 
 void CheckSidecarCompatibility() {
@@ -70,7 +102,8 @@ using Value =
 using Metadata = std::map<std::string, Value>;
 
 // Minimal metadata-only GGUF: no model or GPU is needed to test the loader.
-std::optional<qfn::Config> Parse(const Metadata& fields, bool trunk = true) {
+std::optional<qfn::Config> Parse(const Metadata& fields, bool trunk = true,
+                                 std::string* error_out = nullptr) {
   std::vector<std::uint8_t> bytes;
   const auto pod = [&]<class T>(T value) {
     const auto begin = bytes.size();
@@ -119,6 +152,8 @@ std::optional<qfn::Config> Parse(const Metadata& fields, bool trunk = true) {
   assert(reader && error.empty());
   const auto result = qfn::Config::FromGguf(*reader, trunk, &error);
   assert(result.has_value() == error.empty());
+  if (error_out != nullptr)
+    *error_out = error;
   return result;
 }
 
@@ -243,6 +278,54 @@ void CheckMalformedMetadata() {
   assert(draft && trunk && draft->MtpMatches(*trunk));
 }
 
+void CheckFutureShapeRefusals() {
+  const auto refuse = [](const Metadata& fields, const char* expected) {
+    std::string error;
+    Require(!Parse(fields, true, &error), "unsupported fixture accepted");
+    Require(error == expected, "loader refusal diagnostic changed");
+  };
+  for (const std::string arch :
+       {"", "unknown", "qwen4", "Qwen4exp", "qwen4exp ", "qwen4exp-next"}) {
+    auto fields = ValidMetadata();
+    fields["general.architecture"] = arch;
+    refuse(fields, "GGUF architecture is not qwen4exp");
+  }
+  auto missing_arch = ValidMetadata();
+  missing_arch.erase("general.architecture");
+  refuse(missing_arch, "GGUF architecture is not qwen4exp");
+
+  // Hypothetical probes, not predictions of release metadata or parameter
+  // counts. Keep all unrelated preview fields valid to isolate each gate.
+  auto dense27b = ValidMetadata();
+  dense27b["qwen4exp.block_count"] = std::uint32_t{64};
+  dense27b["qwen4exp.embedding_length"] = std::uint32_t{5120};
+  dense27b["qwen4exp.expert_count"] = std::uint32_t{0};
+  dense27b["qwen4exp.expert_used_count"] = std::uint32_t{0};
+  dense27b["qwen4exp.expert_feed_forward_length"] = std::uint32_t{0};
+  dense27b["qwen4exp.expert_shared_feed_forward_length"] = std::uint32_t{0};
+  std::vector<std::uint64_t> ratios(64);
+  for (std::size_t i = 3; i < ratios.size(); i += 4)
+    ratios[i] = 4;
+  dense27b["qwen4exp.attention.compress_ratios"] = ratios;
+  refuse(dense27b, "qwen4exp metadata describes an unsupported shape");
+
+  auto larger_moe = ValidMetadata();
+  larger_moe["qwen4exp.expert_count"] = std::uint32_t{1024};
+  larger_moe["qwen4exp.expert_used_count"] = std::uint32_t{16};
+  larger_moe["qwen4exp.expert_feed_forward_length"] = std::uint32_t{1280};
+  larger_moe["qwen4exp.expert_shared_feed_forward_length"] =
+      std::uint32_t{1280};
+  refuse(larger_moe, "unsupported Qwen3.8-Flash-Next kernel geometry");
+
+  // The fixed 48-layer geometry check currently precedes the interval rule.
+  auto partial_interval = ValidMetadata();
+  partial_interval["qwen4exp.block_count"] = std::uint32_t{47};
+  std::get<std::vector<std::uint64_t>>(
+      partial_interval["qwen4exp.attention.compress_ratios"])
+      .resize(47);
+  refuse(partial_interval, "unsupported Qwen3.8-Flash-Next kernel geometry");
+}
+
 void CheckScaledContext() {
   qfn::Config c;
   c.context_length = 262144;
@@ -265,8 +348,10 @@ void CheckScaledContext() {
 }  // namespace
 
 int main() {
+  CheckArchitectureDecisions();
   CheckSidecarCompatibility();
   CheckMalformedMetadata();
+  CheckFutureShapeRefusals();
   CheckScaledContext();
   std::cout << "Flash-Next metadata checks passed.\n";
 }
