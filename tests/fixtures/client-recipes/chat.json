@@ -1,0 +1,42 @@
+{
+  "provenance": "Synthetic CPU fake-backend route input, not a client capture or model acceptance run.",
+  "endpoint": "/v1/chat/completions",
+  "backend_output": "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"note.txt\"}}</tool_call>",
+  "request": {
+    "model": "test",
+    "stream": true,
+    "cache_prompt": true,
+    "cache_persist": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Read note.txt"
+      }
+    ],
+    "max_tokens": 256,
+    "reasoning_effort": "none",
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ]
+  }
+}

@@ -630,6 +630,7 @@ struct ComponentTextCache::Impl {
         diagnostic_bytes);
     const auto fits = [&](std::size_t remaining,
                           std::size_t first_slot_bytes = 0) {
+      RequireDiagnosticMemoryFits(diagnostic_bytes, capacity.Capacity());
       // Pending slot counters are independent of the shared counters: shared
       // materialization may lower the latter during construction.
       std::size_t required = core::AddMemoryBytes(
@@ -875,6 +876,7 @@ struct ComponentTextCache::Impl {
                                 std::to_string(headroom.automatic) +
                                 " unprotected_ceiling_bytes=" +
                                 std::to_string(headroom.ceiling));
+      RequireDiagnosticMemoryFits(diagnostic_bytes, headroom.ceiling);
       headroom = core::ProtectCacheHeadroom(
           headroom.automatic, headroom.ceiling, pending_execution);
       if (ledger.Limits().staging_bytes > headroom.ceiling)
