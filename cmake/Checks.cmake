@@ -76,7 +76,7 @@ list(APPEND gufo_pr_tests
   pd_attribution_scheduler_test pd_attribution_analyzer_test
   perf_trace_disabled_test perf_trace_phase_limit_test
   pinned_prefix_harness_test cache_lookup_harness_test
-  cache_lookup_classify_harness_test
+  cache_lookup_classify_harness_test token_parity_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
   gufo_version gufo_help model_plan_cli_test serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test

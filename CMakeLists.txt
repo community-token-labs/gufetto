@@ -1034,7 +1034,7 @@ if (BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_runner.py)
   set_tests_properties(functional_runner_test PROPERTIES LABELS "cpu;server;functional")
-  foreach(name IN ITEMS pinned_prefix cache_lookup cache_lookup_classify)
+  foreach(name IN ITEMS pinned_prefix cache_lookup cache_lookup_classify token_parity)
     add_test(NAME ${name}_harness_test
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_${name}.py)
