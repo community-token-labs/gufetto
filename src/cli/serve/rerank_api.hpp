@@ -37,12 +37,24 @@ enum class RerankStatus {
 /// A loaded reranker model. The HTTP layer validates requests and shapes
 /// responses; implementations only score query/document pairs. Tests use a
 /// CPU fake.
+///
+/// Concurrency: `HttpServer` runs each connection on its own thread and calls
+/// every member, `Score` included, from those threads at once, without a
+/// lock. Implementations must be thread-safe. One that drives a single device
+/// serializes internally, as `EmbeddingService` does: concurrent `Score` calls
+/// queue in arrival order, and each polls its own `is_cancelled` while it
+/// waits. The other members are called concurrently too and must not block
+/// behind a running `Score`.
 class RerankScorer {
 public:
   virtual ~RerankScorer() = default;
 
   [[nodiscard]] virtual bool ready() const noexcept = 0;
-  /// True once any request reported `RerankStatus::kDeviceLost`.
+  /// True once any request reported `RerankStatus::kDeviceLost`, and true
+  /// from then on: the flag is sticky and never clears. It is published
+  /// atomically (for example a `std::atomic<bool>` stored before `Score`
+  /// returns `kDeviceLost`), so another thread that reads it after that return
+  /// sees true. The server polls it around every request.
   [[nodiscard]] virtual bool device_lost() const noexcept { return false; }
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual std::string backend_name() const = 0;

@@ -2,6 +2,7 @@
 // device, and no socket. The test calls the HTTP handler directly.
 #include "src/cli/serve/rerank_api.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdlib>
 #include <functional>
@@ -35,7 +36,9 @@ void Check(bool condition, const std::string& message) {
 }
 
 /// Scores a document by the share of query bytes it contains, so ranking is
-/// deterministic. A few document spellings trigger each scorer status.
+/// deterministic. A pair costs one token per byte plus 3, and pairs over
+/// `max_pair_tokens()` are refused as a real model's context would. A few
+/// document spellings trigger the other scorer statuses.
 class FakeScorer final : public RerankScorer {
 public:
   [[nodiscard]] bool ready() const noexcept override { return ready_; }
@@ -55,7 +58,7 @@ public:
       const std::string& document = documents[i];
       if (is_cancelled && is_cancelled())
         return RerankStatus::kCancelled;
-      if (document == "TOOLONG") {
+      if (query.size() + document.size() + 3U > max_pair_tokens()) {
         scores->failed_index = i;
         return RerankStatus::kInputTooLong;
       }
@@ -85,7 +88,7 @@ public:
   }
 
   bool ready_{true};
-  bool lost_{false};
+  std::atomic<bool> lost_{false};
   bool short_batch{false};
   int calls{0};
   std::string last_query;
@@ -288,14 +291,68 @@ void TestValidation() {
   Check(nulls.status == 200, "null members are absent: " + nulls.body);
 }
 
+void TestBoundaries() {
+  FakeScorer scorer;
+  // The JSON parser refuses duplicate members, at the top level and inside a
+  // document object, before any field is read.
+  ExpectError(&scorer, R"({"query":"a","query":"b","documents":["a"]})", 400,
+              "parse_error");
+  ExpectError(&scorer, R"({"query":"q","documents":[{"text":"a","text":"b"}]})",
+              400, "parse_error");
+  Check(scorer.calls == 0, "duplicate members never reach the scorer");
+
+  // Exactly 1000 documents is the largest accepted request.
+  std::string most = R"({"query":"q","documents":[)";
+  for (int i = 0; i < 1000; ++i)
+    most += i == 0 ? "\"a\"" : ",\"a\"";
+  most += "]}";
+  const HttpResponse full = Post(&scorer, most);
+  Check(full.status == 200 && scorer.last_documents.size() == 1000 &&
+            json::parse(full.body).find("results")->size() == 1000,
+        "1000 documents are scored");
+
+  // Empty document strings are scored, as llama.cpp does.
+  const HttpResponse empty =
+      Post(&scorer, R"({"query":"ab","documents":["","ab",{"text":""}]})");
+  Check(empty.status == 200 &&
+            scorer.last_documents == std::vector<std::string>{"", "ab", ""},
+        "empty documents reach the scorer: " + empty.body);
+  const json::Value empty_body = json::parse(empty.body);
+  const auto& ranked = empty_body.find("results")->items();
+  Check(ranked.size() == 3 && ranked[0].member_size("index", 9) == 1 &&
+            ranked[1].member_double("relevance_score", -1) == 0.0,
+        "empty documents score like any other: " + empty.body);
+
+  // top_n above the document count clamps to every document.
+  const HttpResponse clamped =
+      Post(&scorer, R"({"query":"q","documents":["a","q"],"top_n":10})");
+  Check(clamped.status == 200 &&
+            json::parse(clamped.body).find("results")->size() == 2,
+        "top_n clamps to the document count: " + clamped.body);
+}
+
 void TestScorerFailures() {
   FakeScorer scorer;
-  ExpectError(&scorer, R"({"query":"q","documents":["a","TOOLONG"]})", 400,
-              "context_length_exceeded");
+  // 3 + 50 + 9 = 62 tokens fit; 3 + 50 + 12 = 65 do not.
+  const std::string fits(9, 'd');
+  const std::string over(12, 'd');
+  const std::string query(50, 'q');
   const HttpResponse too_long =
-      Post(&scorer, R"({"query":"q","documents":["a","TOOLONG"]})");
-  Check(too_long.body.find("index 1 exceed the 64-token") != std::string::npos,
+      Post(&scorer, R"({"query":")" + query + R"(","documents":[")" + fits +
+                        R"(",")" + over + R"("]})");
+  Check(too_long.status == 400 &&
+            ErrorCode(too_long) == "context_length_exceeded" &&
+            too_long.body.find("index 1 exceed the 64-token") !=
+                std::string::npos,
         "the error names the pair and the limit: " + too_long.body);
+  // A query too long for any document fails at the first pair.
+  const HttpResponse long_query =
+      Post(&scorer, R"({"query":")" + std::string(70, 'q') +
+                        R"(","documents":["a","b"]})");
+  Check(long_query.status == 400 &&
+            ErrorCode(long_query) == "context_length_exceeded" &&
+            long_query.body.find("index 0 exceed") != std::string::npos,
+        "an oversized query is refused: " + long_query.body);
   ExpectError(&scorer, R"({"query":"q","documents":["BROKEN"]})", 500,
               "rerank_failed");
   Check(Post(&scorer, R"({"query":"q","documents":["BROKEN"]})")
@@ -332,6 +389,7 @@ int main() {
   TestJinaShape();
   TestTeiShape();
   TestValidation();
+  TestBoundaries();
   TestScorerFailures();
   std::cout << "PASS rerank_api_test\n";
   return 0;

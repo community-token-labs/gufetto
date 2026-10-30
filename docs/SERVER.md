@@ -885,7 +885,7 @@ Typed items follow llama.cpp's form: `{"content":[{"type":"image_url","image_url
 
 ## Reranking
 
-`POST /v1/rerank` scores documents against a query, in the request and response forms of llama-server's rerank endpoint.  `/v1/reranking`, `/rerank` and `/reranking` are its aliases.  No `gufo serve` mode loads a reranker model yet, so every server answers these routes with 503 `reranker_not_loaded` ("no reranker model is loaded on this server") instead of 404 or 501.  The contract below is what a loaded reranker serves; it is tested against a CPU fake scorer.
+`POST /v1/rerank` scores documents against a query, in the request and response forms of llama-server's rerank endpoint.  `/v1/reranking`, `/rerank` and `/reranking` are its aliases.  No `gufo serve` mode loads a reranker model yet, so every server answers these routes with 503 `reranker_not_loaded` ("no reranker model is loaded on this server") instead of 404 or 501.  `reranker_not_loaded` is a permanent configuration state of the process, not a transient failure: retrying the same server never succeeds. Clients should check that error code and fall back or report it, rather than retry on the 503 status. A loading or lost reranker uses the other 503 codes below. The contract below is what a loaded reranker serves; it is tested against a CPU fake scorer.
 
 The member that carries the documents selects the form, as in llama.cpp.  `documents` selects the Jina and Cohere form:
 
