@@ -26,6 +26,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/qwen/architecture.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
@@ -875,7 +876,8 @@ int RunDeepSeekBenchmark(
 }
 
 bool IsQwen38FlashNext(const core::GgufReader& reader) {
-  return reader.GetMetadataString("general.architecture") == "qwen4exp";
+  return models::qwen::IsQwen4Family(
+      reader.GetMetadataString("general.architecture").value_or(""));
 }
 
 int RunQwen38FlashNextBenchmark(
