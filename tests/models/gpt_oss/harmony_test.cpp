@@ -270,6 +270,39 @@ void TestParseCompletions(const json::Value& goldens) {
          "text between messages is invalid");
   Expect(!gpt_oss::ParseHarmonyCompletion("<|start|>user<|message|>x").valid,
          "a missing channel is invalid");
+  // Recipients never bypass channel or name validation.
+  for (const std::string_view bad : {
+           "<|channel|>bogus to=functions.f<|message|>{}<|call|>",
+           "<|channel|>commentary to=functions.f<|channel|>bogus"
+           "<|message|>{}<|call|>",
+           " to=functions.f<|message|>{}<|call|>",
+           "<|channel|>commentary to=<|message|>{}<|call|>",
+           "<|channel|>commentary to= <|constrain|>json<|message|>{}<|call|>",
+           "<|channel|>commentary to=functions.<|message|>{}<|call|>",
+           "<|channel|>commentary to=functions<|message|>{}<|call|>",
+           "<|channel|>commentary to=.f<|message|>{}<|call|>",
+           "<|channel|>commentary to=functions..f<|message|>{}<|call|>",
+           "<|channel|>commentary to=functions.f(x)<|message|>{}<|call|>",
+           "<|channel|>final to=functions.f<|message|>{}<|call|>",
+       }) {
+    const auto parsed = gpt_oss::ParseHarmonyCompletion(bad);
+    Expect(!parsed.valid && parsed.tool_calls.empty(),
+           "malformed recipient or channel is rejected");
+  }
+  {
+    // Stray commentary prefixes stay accepted in front of a call.
+    const auto parsed = gpt_oss::ParseHarmonyCompletion(
+        "<|channel|>commentary to=assistant<|channel|>commentary "
+        "to=functions.get-weather_2 <|constrain|>json<|message|>{}<|call|>");
+    Expect(parsed.valid && parsed.complete, "stray prefix before a call");
+    ExpectCall(parsed, 0, "get-weather_2", "{}");
+  }
+  {
+    const auto parsed = gpt_oss::ParseHarmonyCompletion(
+        "<|channel|>analysis to=python<|message|>print(1)<|call|>");
+    Expect(parsed.valid && parsed.dropped_messages == 1,
+           "a namespace-free built-in recipient is dropped, not called");
+  }
 
   // Round trip: the rendered history of a tool call parses back.
   const std::string rendered =

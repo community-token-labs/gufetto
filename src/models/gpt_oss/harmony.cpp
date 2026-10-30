@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <exception>
 #include <string>
 
@@ -331,6 +332,32 @@ std::string_view TakeWord(std::string_view& text) {
   return word;
 }
 
+bool KnownChannel(std::string_view channel) {
+  return channel == "analysis" || channel == "commentary" || channel == "final";
+}
+
+// `name` or `namespace.name[.more]`: non-empty segments of [A-Za-z0-9_-].
+bool ValidRecipient(std::string_view recipient) {
+  if (recipient.empty() || recipient == kToolsNamespace) {
+    return false;  // no recipient, or a function namespace without a name
+  }
+  std::size_t segment = 0;
+  for (const char c : recipient) {
+    if (c == '.') {
+      if (segment == 0) {
+        return false;
+      }
+      segment = 0;
+    } else if (std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_' ||
+               c == '-') {
+      ++segment;
+    } else {
+      return false;
+    }
+  }
+  return segment != 0;
+}
+
 Header ParseHeader(std::string_view text) {
   constexpr std::string_view kRecipient = " to=";
   Header header;
@@ -338,6 +365,10 @@ Header ParseHeader(std::string_view text) {
     if (text.starts_with(kRecipient)) {
       text.remove_prefix(kRecipient.size());
       const std::string_view recipient = TakeWord(text);
+      if (!ValidRecipient(recipient)) {
+        header.valid = false;
+        return header;
+      }
       // A stray ` to=assistant` addresses the user-facing stream.
       if (recipient != "assistant") {
         header.recipient = recipient;
@@ -346,6 +377,10 @@ Header ParseHeader(std::string_view text) {
       text.remove_prefix(kChannel.size());
       // Later channels win: gpt-oss sometimes prefixes a stray commentary.
       header.channel = TakeWord(text);
+      if (!KnownChannel(header.channel)) {
+        header.valid = false;
+        return header;
+      }
     } else if (text.starts_with(' ') || text.starts_with(kConstrain)) {
       text.remove_prefix(text.starts_with(' ') ? 1 : kConstrain.size());
       if (text.starts_with(kConstrain)) {
@@ -360,7 +395,9 @@ Header ParseHeader(std::string_view text) {
       return header;
     }
   }
-  header.valid = !header.channel.empty();
+  // Calls go to the commentary channel, or analysis for built-in tools.
+  header.valid = !header.channel.empty() &&
+                 (header.recipient.empty() || header.channel != "final");
   return header;
 }
 
