@@ -1002,11 +1002,14 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               try {
                 const auto result = generation->Wait(
                     [&](const TokenPiece& piece) {
-                      if (logprobs && piece.logprobs)
+                      // Offsets follow the selected token, not the visible
+                      // text a stop sequence may still be holding back.
+                      if (logprobs && piece.logprobs) {
                         pending_logprobs = CompletionLogprobs(
                             std::span(piece.logprobs, 1), text_offset);
+                        text_offset += CompletionOffsetAdvance(*piece.logprobs);
+                      }
                       const auto text = decoder.Push(piece.text, false);
-                      text_offset += UnicodeLength(text);
                       connected = write_chunk(text, {});
                       return connected;
                     },

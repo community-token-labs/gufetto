@@ -164,6 +164,12 @@ inline std::size_t UnicodeLength(std::string_view text) {
   });
 }
 
+/// Completions `text_offset` advances by each selected token's spelling, so
+/// streamed and buffered offsets agree even while stop filtering holds text.
+inline std::size_t CompletionOffsetAdvance(const DecodedLogprobs& token) {
+  return UnicodeLength(token.entries.at(0).token);
+}
+
 inline json::Value CompletionLogprobs(std::span<const DecodedLogprobs> tokens,
                                       std::size_t offset = 0) {
   auto result = json::Value::object();
@@ -175,7 +181,7 @@ inline json::Value CompletionLogprobs(std::span<const DecodedLogprobs> tokens,
     result["tokens"].push_back(selected.token);
     result["token_logprobs"].push_back(std::max(selected.logprob, -9999.0));
     result["text_offset"].push_back(offset);
-    offset += UnicodeLength(selected.token);
+    offset += CompletionOffsetAdvance(token);
     auto top = json::Value::object();
     for (const auto& entry : token.entries)
       top[entry.token] = std::max(entry.logprob, -9999.0);

@@ -23,6 +23,7 @@
 #include "src/cli/serve/checkpoint_transfer.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/platform/net.hpp"
 
@@ -233,6 +234,8 @@ public:
       result.text = output_;
       result.tokens.assign(output_.begin(), output_.end());
     }
+    if (!scripted_tokens.empty())
+      return CompleteScripted(limit, sampling, token, stop_sequences);
     result.prompt_tokens = 10;
     result.cached_prompt_tokens = 8;
     result.cache_hit = true;
@@ -269,6 +272,51 @@ public:
       throw gufo::server::TextGenerationError(
           gufo::server::TextGenerationErrorCode::kDeviceLost,
           gufo::server::kDeviceLostMessage);
+    }
+    return result;
+  }
+  // Selected token spellings published as the scheduler does: each record is
+  // retained before stop filtering, and a held prefix flushes on completion.
+  std::vector<std::string> scripted_tokens;
+  Result CompleteScripted(std::size_t limit,
+                          const gufo::sampling::SamplingConfig& sampling,
+                          const TokenCallback& token,
+                          const std::vector<std::string>& stop_sequences) {
+    Result result;
+    result.prompt_tokens = 10;
+    result.finish_reason = FinishReason::kStop;
+    result.logprobs.reserve(scripted_tokens.size());
+    gufo::server::StopSequenceFilter filter(stop_sequences);
+    for (const auto& spelling : scripted_tokens) {
+      ++result.completion_tokens;
+      if (result.completion_tokens == limit)
+        result.finish_reason = FinishReason::kLength;
+      const gufo::server::DecodedLogprobs* record = nullptr;
+      if (sampling.logprobs) {
+        gufo::server::DecodedLogprobs probabilities;
+        probabilities.entries.push_back(
+            {static_cast<gufo::sampling::TokenId>(result.completion_tokens),
+             spelling, -1.0});
+        result.logprobs.push_back(std::move(probabilities));
+        record = &result.logprobs.back();
+      }
+      const auto piece = filter.enabled() ? filter.Push(spelling) : spelling;
+      result.text += piece;
+      if (token && (!piece.empty() || !filter.enabled() || record))
+        (void)token(gufo::server::TokenPiece(piece, record));
+      if (filter.stopped()) {
+        result.finish_reason = FinishReason::kStopSequence;
+        result.stop_sequence = filter.matched_sequence();
+        break;
+      }
+      if (result.completion_tokens == limit)
+        break;
+    }
+    if (filter.enabled()) {
+      const auto tail = filter.Finish();
+      result.text += tail;
+      if (token && !tail.empty())
+        (void)token(gufo::server::TokenPiece(tail));
     }
     return result;
   }

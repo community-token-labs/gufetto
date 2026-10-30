@@ -3435,6 +3435,67 @@ void TestRawCompletionLogprobs() {
       200);
 }
 
+// Streamed and buffered Completions agree on every token's text_offset while
+// a stop sequence holds, splits, or flushes text at the token limit.
+void TestCompletionLogprobOffsetsWithStops() {
+  RunningServer server;
+  struct Case {
+    std::vector<std::string> tokens;
+    std::size_t max_tokens;
+    std::string text;
+    std::string offsets;
+  };
+  for (const auto& [tokens, max_tokens, text, offsets] : {
+           // An unsuccessful stop prefix is held, then released with "x".
+           Case{{"S", "x"}, 8, "Sx", "[0,1]"},
+           // A successful stop split across tokens still scores each token.
+           Case{{"a", "ST", "OP", "z"}, 8, "a", "[0,1,3]"},
+           // A held prefix is flushed when the token limit ends generation.
+           Case{{"a", "S"}, 2, "aS", "[0,1]"},
+       }) {
+    server.backend->scripted_tokens = tokens;
+    const std::string request =
+        R"({"prompt":"hello","stop":"STOP","logprobs":0,"max_tokens":)" +
+        std::to_string(max_tokens);
+    const auto buffered_response =
+        server.Post("/v1/completions", request + "}");
+    ExpectStatus(buffered_response, 200);
+    const auto buffered = gufo::json::parse(
+        buffered_response.substr(buffered_response.find("\r\n\r\n") + 4));
+    const auto& choice = buffered.find("choices")->items().front();
+    assert(choice.member_str("text") == text);
+    const auto& expected = *choice.find("logprobs");
+    assert(expected.find("text_offset")->dump() == offsets);
+
+    const auto body = ChunkedBody(
+        server.Post("/v1/completions", request + R"(,"stream":true})"));
+    std::string streamed_text;
+    auto streamed_offsets = gufo::json::Value::array();
+    auto streamed_tokens = gufo::json::Value::array();
+    for (std::size_t at = body.find("data: "); at != std::string::npos;
+         at = body.find("data: ", at + 6)) {
+      const auto data = body.substr(at + 6, body.find('\n', at) - at - 6);
+      if (data == "[DONE]")
+        continue;
+      const auto event = gufo::json::parse(data);
+      for (const auto& item : event.find("choices")->items()) {
+        streamed_text += item.member_str("text");
+        const auto* probabilities = item.find("logprobs");
+        if (probabilities == nullptr || probabilities->is_null())
+          continue;
+        for (const auto& value : probabilities->find("text_offset")->items())
+          streamed_offsets.push_back(value);
+        for (const auto& value : probabilities->find("tokens")->items())
+          streamed_tokens.push_back(value);
+      }
+    }
+    assert(streamed_text == text);
+    assert(streamed_offsets.dump() == offsets);
+    assert(streamed_tokens.dump() == expected.find("tokens")->dump());
+  }
+  server.backend->scripted_tokens.clear();
+}
+
 void TestRawCompletionPromptProgress() {
   RunningServer server;
   server.backend->progress = {
@@ -3805,6 +3866,7 @@ int main(int argc, char** argv) {
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
   TestRawCompletionLogprobs();
+  TestCompletionLogprobOffsetsWithStops();
   TestResponsesLogprobsOptions();
   TestRawCompletionPromptProgress();
   TestRawCompletionCachePrompt();
