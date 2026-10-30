@@ -34,6 +34,7 @@ set(gufo_pr_targets
   qwen_vision_memory_budget_test
   qwen_vision_output_pool_test
   qwen27b_continuation_layout_test
+  qwen38_flash_next_attention_geometry_test
   qwen38_flash_next_npu_contracts_test
   qwen38_flash_next_kv_cache_test
   qwen38_flash_next_config_test qwen38_flash_next_mtp_sampling_test
@@ -52,6 +53,7 @@ set(gufo_pr_targets
   vision_ref_math_test)
 set(gufo_pr_tests ${gufo_pr_targets})
 list(REMOVE_ITEM gufo_pr_tests
+  qwen38_flash_next_attention_geometry_test
   qwen38_flash_next_npu_contracts_test
   component_text_cache_test
   qwen38_flash_next_kv_cache_test
@@ -65,6 +67,7 @@ list(APPEND gufo_pr_tests
   http_server_test_diagnostic_memory text_model_runner_test_diagnostic_memory
   text_model_runner_test_diagnostic_refusal_auto
   text_model_runner_test_diagnostic_refusal_explicit
+  "qwen38_flash_next\\.attention_geometry"
   "qwen38_flash_next\\.npu_contracts"
   ${gufo_component_text_cache_tests}
   "qwen38_flash_next\\.kv_cache"
