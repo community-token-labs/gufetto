@@ -3,11 +3,16 @@
 
 import contextlib
 import copy
+import hashlib
+from http.client import IncompleteRead
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -117,7 +122,7 @@ class TokenizerDiffTest(unittest.TestCase):
         revision = "a" * 40
         urls = []
 
-        def fetch(url, optional=False):
+        def fetch(url, optional=False, expected_sha=None):
             urls.append(url)
             if "/api/" in url:
                 return json.dumps({"sha": revision}).encode()
@@ -129,6 +134,89 @@ class TokenizerDiffTest(unittest.TestCase):
         self.assertEqual(len(urls), 4)
         self.assertEqual([url.rsplit("/", 1)[1] for url in urls[1:]], list(DIFF.FILES))
         self.assertTrue(all(f"/resolve/{revision}/" in url for url in urls[1:]))
+
+    def test_unexpected_exception_is_invalid_not_review(self):
+        for error in (RecursionError("nested JSON"), IncompleteRead(b"partial")):
+            with patch.object(DIFF, "load_source", side_effect=error):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(DIFF.main(["unused"]), 2)
+
+    def test_strict_json_and_decoder_id(self):
+        for data in ('{"x":NaN}', '{"x":Infinity}', '{"x":1,"x":2}'):
+            with self.assertRaises(ValueError):
+                DIFF.parse_json(data)
+        for token_id in ("+1_01", " 101", "0101", "-1", "١٠١"):
+            raw = fixture()
+            config = json.loads(raw["tokenizer_config.json"])
+            config["added_tokens_decoder"] = {token_id: {"content": "<|im_end|>"}}
+            raw["tokenizer_config.json"] = json.dumps(config).encode()
+            with self.assertRaisesRegex(ValueError, "canonical decimal"):
+                DIFF.snapshot(raw, {})
+
+    def test_named_control_flag_changes(self):
+        self.change("tokenizer.json", lambda d: d["added_tokens"][0].update(special=False, lstrip=True))
+        change = self.report()["control_changes"][0]
+        self.assertEqual(change["key"], "<|im_start|>")
+        self.assertEqual([item["key"] for item in change["flag_changes"]],
+                         ["tokenizer.json/lstrip", "tokenizer.json/special"])
+
+    def test_network_url_and_repo_restrictions(self):
+        for url in ("http://huggingface.co/file", "https://example.org/file",
+                    "https://huggingface.co.evil.invalid/file", "https://user@huggingface.co/file"):
+            with self.assertRaises(ValueError):
+                DIFF.validate_url(url)
+        with patch.object(DIFF, "fetch") as fetch:
+            with self.assertRaises(ValueError):
+                DIFF.load_source("../..@main", True)
+            fetch.assert_not_called()
+        handler = DIFF.urllib.request.build_opener
+        # Redirect destinations pass the same validator as initial requests.
+        DIFF.validate_url("https://cdn-lfs.hf.co/file")
+
+    def test_real_fetch_size_checksum_404_truncation_and_deadline(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/missing":
+                    self.send_error(404)
+                    return
+                if self.path == "/slow":
+                    time.sleep(.05)
+                body = b"metadata"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body) + (1 if self.path == "/truncated" else 0)))
+                self.send_header("ETag", '"' + hashlib.sha256(body).hexdigest() + '"')
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
+
+            def log_message(self, *_):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                # Only this test bypasses HTTPS host validation to exercise real
+                # urllib reads against loopback; production rejects this URL.
+                with patch.object(DIFF, "validate_url"):
+                    self.assertEqual(DIFF.fetch(base + "/ok"), b"metadata")
+                    self.assertIsNone(DIFF.fetch(base + "/missing", optional=True))
+                    with self.assertRaises(ValueError):
+                        DIFF.fetch(base + "/truncated")
+                    with self.assertRaisesRegex(ValueError, "checksum"):
+                        DIFF.fetch(base + "/ok", expected_sha="0" * 64)
+                    with patch.object(DIFF, "MAX_BYTES", 2):
+                        with self.assertRaisesRegex(ValueError, "exceeds"):
+                            DIFF.fetch(base + "/ok")
+                    with patch.object(DIFF, "DOWNLOAD_SECONDS", .01):
+                        with self.assertRaises((TimeoutError, OSError)):
+                            DIFF.fetch(base + "/slow")
+            finally:
+                server.shutdown()
+                thread.join()
 
     def test_invalid_added_tokens(self):
         self.change("tokenizer.json", lambda d: d.update(added_tokens=[None]))

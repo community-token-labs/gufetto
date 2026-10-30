@@ -876,7 +876,7 @@ int RunDeepSeekBenchmark(
 }
 
 bool IsQwen38FlashNext(const core::GgufReader& reader) {
-  return models::qwen::IsQwen4Family(
+  return models::qwen::IsQwen4PreviewArch(
       reader.GetMetadataString("general.architecture").value_or(""));
 }
 

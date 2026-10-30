@@ -22,7 +22,7 @@ void Require(bool condition, const char* message) {
 }
 
 void CheckArchitectureDecisions() {
-  using gufo::models::qwen::IsQwen4Family;
+  using gufo::models::qwen::IsQwen4PreviewArch;
   using gufo::sampling::TextModelPreset;
   using gufo::sampling::TextPreset;
   for (const std::string_view arch :
@@ -30,7 +30,7 @@ void CheckArchitectureDecisions() {
         "qwen4", "Qwen4exp", "qwen4exp ", "qwen4exp-next", "xqwen4exp"}) {
     // Independent legacy decision, shared by pinned-prefix and YaRN gates.
     const bool legacy = arch == "qwen4exp";
-    Require(IsQwen4Family(arch) == legacy, "architecture gate changed");
+    Require(IsQwen4PreviewArch(arch) == legacy, "architecture gate changed");
     gufo::core::ModelConfig config;
     config.architecture = std::string(arch);
     const auto expected = arch == "deepseek4"
@@ -46,7 +46,7 @@ void CheckArchitectureDecisions() {
                                        : TextModelPreset::kQwen38),
             "legacy shape fallback changed");
   }
-  Require(!IsQwen4Family(std::string_view{"qwen4exp\0", 9}),
+  Require(!IsQwen4PreviewArch(std::string_view{"qwen4exp\0", 9}),
           "embedded null accepted");
 }
 
@@ -309,7 +309,7 @@ void CheckFutureShapeRefusals() {
   dense27b["qwen4exp.attention.compress_ratios"] = ratios;
   refuse(dense27b, "qwen4exp metadata describes an unsupported shape");
 
-  auto larger_moe = dense27b;
+  auto larger_moe = ValidMetadata();
   larger_moe["qwen4exp.expert_count"] = std::uint32_t{1024};
   larger_moe["qwen4exp.expert_used_count"] = std::uint32_t{16};
   larger_moe["qwen4exp.expert_feed_forward_length"] = std::uint32_t{1280};

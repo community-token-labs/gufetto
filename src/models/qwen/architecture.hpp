@@ -5,10 +5,13 @@
 
 namespace gufo::models::qwen {
 
+inline constexpr std::string_view kQwen4PreviewArchitecture = "qwen4exp";
+
 // Only the currently supported preview architecture. Future release names
 // require explicit qualification; this is not a prefix or marketing-name test.
-inline constexpr bool IsQwen4Family(std::string_view architecture) noexcept {
-  return architecture == "qwen4exp";
+inline constexpr bool IsQwen4PreviewArch(
+    std::string_view architecture) noexcept {
+  return architecture == kQwen4PreviewArchitecture;
 }
 
 }  // namespace gufo::models::qwen

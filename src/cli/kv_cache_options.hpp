@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/models/qwen/architecture.hpp"
 #include "src/models/qwen38_flash_next/kv_cache.hpp"
 
 namespace gufo::cli {
@@ -70,7 +71,8 @@ inline bool ValidateKvCacheTypeForArchitecture(
     return false;
   }
   if (models::qwen38_flash_next::IsKnownKvCacheType(type) &&
-      (type == KvCacheType::kF16 || architecture == "qwen4exp"))
+      (type == KvCacheType::kF16 ||
+       models::qwen::IsQwen4PreviewArch(architecture)))
     return true;
   if (error)
     *error =

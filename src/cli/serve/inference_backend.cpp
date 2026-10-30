@@ -24,6 +24,7 @@
 #include "src/cli/kv_cache_options.hpp"
 #include "src/cli/serve/cache_lookup_support.hpp"
 #include "src/cli/serve/component_text_cache.hpp"
+#include "src/cli/serve/diagnostic_memory.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -1020,8 +1021,10 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
           backing->execution_liability = core::AddMemoryBytes(
               native->InitialPendingExecutionBytes(), shared_pending());
           if (memory) {
-            const auto protected_bytes = core::AddMemoryBytes(
-                backing->execution_liability, ledger.Limits().staging_bytes);
+            const auto protected_bytes =
+                DiagnosticMemoryClaim::Process().PendingBytes(
+                    core::AddMemoryBytes(backing->execution_liability,
+                                         ledger.Limits().staging_bytes));
             const auto headroom = [protected_bytes] {
               std::size_t free = 0, total = 0;
               if (hipMemGetInfo(&free, &total) != hipSuccess ||
@@ -1070,10 +1073,12 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                             protect_execution, memory](std::size_t budget) {
     if (protect_execution && !backing->frozen)
       throw std::logic_error("backing requires frozen execution reservations");
-    const auto protected_bytes =
+    const auto diagnostic = DiagnosticMemoryClaim::Process().Snapshot().bytes;
+    const bool protect_memory = protect_execution || diagnostic != 0;
+    const auto protected_bytes = DiagnosticMemoryClaim::Process().PendingBytes(
         protect_execution ? core::AddMemoryBytes(backing->execution_liability,
                                                  ledger.Limits().staging_bytes)
-                          : 0;
+                          : 0);
     const auto plan = static_cast<AdapterType*>(adapter)->BackingPlan(budget);
     if (plan.size() != 1)
       throw std::invalid_argument("insufficient component backing budget");
@@ -1104,7 +1109,7 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                 allocation.metadata_bytes,
             allocation.block_bytes, allocation.metadata_bytes, segment,
             [limited = std::make_shared<Limited>(), protected_bytes,
-             protect_execution, memory](std::size_t bytes) {
+             protect_memory, memory](std::size_t bytes) {
               // The transactional ticket below replaces the legacy snapshot
               // precheck on reclaim-enabled routes.
               if (memory)
@@ -1123,13 +1128,13 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
               std::size_t heap_free = 0, heap_total = 0;
               const bool heap_fits =
                   hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
-                  (protect_execution
+                  (protect_memory
                        ? heap_free >= hip::kDispatchReserve &&
                              core::FitsMemoryBudget(
                                  heap_free - hip::kDispatchReserve, bytes,
                                  protected_bytes)
                        : hip::HeapFitsAboveReserve(heap_free, bytes));
-              if ((protect_execution
+              if ((protect_memory
                        ? core::FitsMemoryBudget(ceiling, bytes, protected_bytes)
                        : ceiling >= bytes) &&
                   heap_fits) {
@@ -1144,7 +1149,7 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
                         std::string(heap_fits ? "host_reserve "
                                               : "device_heap_reserve ") +
                         "segment_bytes=" + std::to_string(bytes) +
-                        (protect_execution
+                        (protect_memory
                              ? " protected_execution_and_staging_bytes=" +
                                    std::to_string(protected_bytes)
                              : "") +
@@ -3526,7 +3531,7 @@ bool InferenceBackend::load(
                                std::string(architecture) +
                                " supports_images=false");
   if (ram_cache_config.pinned_prefix.enabled() &&
-      !models::qwen::IsQwen4Family(architecture)) {
+      !models::qwen::IsQwen4PreviewArch(architecture)) {
     SetError(error,
              "Pinned prefixes require Qwen3.8-Flash-Next (GGUF architecture "
              "qwen4exp); this model is unsupported");
@@ -3535,18 +3540,18 @@ bool InferenceBackend::load(
   if (!cli::ValidateKvCacheTypeForArchitecture(kv_cache_type, architecture,
                                                error))
     return false;
-  if (enable_yarn && !models::qwen::IsQwen4Family(architecture)) {
+  if (enable_yarn && !models::qwen::IsQwen4PreviewArch(architecture)) {
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
   // Read once, reused below to derive YaRN from --context for qwen4exp.
   const std::uint32_t qwen4exp_native_context =
-      models::qwen::IsQwen4Family(architecture)
+      models::qwen::IsQwen4PreviewArch(architecture)
           ? reader->GetMetadataUint32("qwen4exp.context_length").value_or(0)
           : 0;
   if (max_context == 0) {
     const std::uint64_t native =
-        models::qwen::IsQwen4Family(architecture)
+        models::qwen::IsQwen4PreviewArch(architecture)
             ? qwen4exp_native_context
             : reader
                   ->GetMetadataUint64(std::string(architecture) +
@@ -3562,7 +3567,7 @@ bool InferenceBackend::load(
   // Static YaRN changes every request, so a context above Flash-Next's
   // native one needs --enable-yarn. Checked before any weights load.
   std::optional<models::qwen38_flash_next::RopeScaling> rope_scaling;
-  if (models::qwen::IsQwen4Family(architecture) &&
+  if (models::qwen::IsQwen4PreviewArch(architecture) &&
       !models::qwen38_flash_next::ResolveRopeScaling(
           max_context, qwen4exp_native_context, enable_yarn, &rope_scaling,
           error)) {
@@ -3624,7 +3629,7 @@ bool InferenceBackend::load(
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
-  if (models::qwen::IsQwen4Family(
+  if (models::qwen::IsQwen4PreviewArch(
           reader->GetMetadataString("general.architecture").value_or(""))) {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {

@@ -1,9 +1,9 @@
-# Qwen 4 Max
+# Qwen 4 (larger variants, TBA)
 
 **Not yet released / no measurements.** This is a readiness placeholder,
 not a claim of Gufo support or confirmed architecture/weight availability.
 
-Official metadata and lead approval of an exact validated profile are required
+Official metadata and qualification of an exact validated profile are required
 before enabling a new shape. The `qwen4exp` preview path is not evidence that
 this release will load or produce correct output.
 
@@ -11,7 +11,8 @@ Start with the [tokenizer metadata diff](../../../tools/qwen-flash/tokenizer_dif
 then qualify the real config/tensors, rendered chat bytes, AR, any real MTP,
 and continuation/cache behavior. Do not download weights as part of CPU checks.
 
-See [quality](QUALITY.md) and [benchmarks](BENCHMARKS.md).
+See [quality](QUALITY.md), [benchmarks](BENCHMARKS.md), and
+[experiments](EXPERIMENTS.md).
 
 Every future number must name its stack: **host HIP/ROCr vs Nix ROCm 10.1**,
 host/GPU, Gufo commit and binary hash, compiler/dependency versions, model
