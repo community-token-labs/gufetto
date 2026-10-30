@@ -117,6 +117,19 @@ std::optional<LowerBound> LocalEvidence(const std::filesystem::path& path,
 
 }  // namespace
 
+std::string DescribeModelLowerBound(const std::filesystem::path& model,
+                                    std::size_t context) {
+  std::string error;
+  const auto bound = LocalEvidence(model, context, error);
+  if (!bound)
+    return "metadata lower bound unavailable: " + error;
+  return "one-session lower bound: weights_bytes=" +
+         std::to_string(bound->weights) +
+         " kv_bytes=" + std::to_string(bound->kv) +
+         "; not counted: "
+         "vision/draft/private-state/arena/workspace/cache/persistence";
+}
+
 ModelPlanReport PlanModels(const std::filesystem::path& manifest) {
   std::ifstream input(manifest, std::ios::binary);
   if (!input)

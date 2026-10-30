@@ -33,6 +33,8 @@ void PrintDiagnoseHelp(std::string_view program_name) {
       << "Run non-interactive system, hardware, and benchmark diagnostics for "
          "Strix Halo.\n\n"
       << "Options:\n"
+      << "  --plan --model <path>        Measured startup (no server); "
+         "--no-gpu for CPU fallback\n"
       << "  --plan <manifest>            Read-only pinned TSV artifact and "
          "memory plan\n"
       << "  --json                       Emit structured JSON output "
@@ -203,6 +205,7 @@ int RunDiagnose(std::span<const char* const> args) {
   bool fingerprint_mode = false;
   std::string validate_artifact_path;
   std::string plan_path;
+  bool cpu_plan = false;
   std::string benchmark_name;
   std::string backends_csv = "cpu,hip";
   std::uint32_t warmup = 3;
@@ -227,6 +230,12 @@ int RunDiagnose(std::span<const char* const> args) {
   }
 
   for (std::size_t i = start_idx; i < args.size(); ++i) {
+    if (std::string_view(args[i]) == "--model" ||
+        std::string_view(args[i]).starts_with("--model="))
+      return RunModelAdmission(args.subspan(start_idx));
+  }
+
+  for (std::size_t i = start_idx; i < args.size(); ++i) {
     const std::string_view arg = args[i];
     if (arg == "--plan" || arg.starts_with("--plan=")) {
       if (arg == "--plan") {
@@ -243,6 +252,8 @@ int RunDiagnose(std::span<const char* const> args) {
         std::cerr << "Error: --plan requires a manifest path\n";
         return 2;
       }
+    } else if (arg == "--no-gpu") {
+      cpu_plan = true;
     } else if (arg == "--json") {
       json_mode = true;
     } else if (arg == "--fingerprint") {
@@ -342,6 +353,10 @@ int RunDiagnose(std::span<const char* const> args) {
     }
   }
 
+  if (cpu_plan && plan_path.empty()) {
+    std::cerr << "Error: --no-gpu requires --plan\n";
+    return 2;
+  }
   if (section != "all" && section != "inventory" && section != "platform" &&
       section != "gpu") {
     std::cerr << "Error: unknown diagnostic section '" << section << "'\n";
