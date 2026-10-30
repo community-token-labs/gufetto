@@ -6,6 +6,7 @@
 
 #include "src/models/deepseek_v4_flash/cache_capabilities.hpp"
 #include "src/models/embedding_gemma2/cache_capabilities.hpp"
+#include "src/models/gpt_oss/cache_capabilities.hpp"
 #include "src/models/minimax_h3/cache_capabilities.hpp"
 #include "src/models/qwen/cache_capabilities.hpp"
 #include "src/models/qwen38_flash_next/cache_capabilities.hpp"
@@ -25,6 +26,7 @@ inline constexpr std::array kModelCapabilityRecords{
            gufo::models::deepseek_v4_flash::kCacheCapabilities},
     Record{"embedding_gemma2",
            gufo::models::embedding_gemma2::kCacheCapabilities},
+    Record{"gpt_oss", gufo::models::gpt_oss::kCacheCapabilities},
     Record{"minimax_h3", gufo::minimax_h3::kCacheCapabilities},
     Record{"qwen", gufo::models::qwen::kCacheCapabilities},
     Record{"qwen38_flash_next",

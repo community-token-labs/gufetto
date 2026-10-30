@@ -216,6 +216,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
     case core::GgmlType::kIQ3_S:
       block_bytes = sizeof(block_iq3_s);
       break;
+    case core::GgmlType::kMXFP4:
+      block_bytes = sizeof(block_mxfp4);
+      break;
     default:
       return 0;
   }
@@ -634,6 +637,40 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k) {
       dst[(b * 256) + i] = Iq4XsValue(blocks[b], i);
     }
   }
+}
+
+float E8m0ToFp32Half(std::uint8_t e) noexcept {
+  // 0x00200000 and 0x00400000 are the subnormals 2^-128 and 2^-127; larger
+  // exponents are normal with biased exponent e - 1.
+  const std::uint32_t bits =
+      e < 2 ? 0x00200000U << e : static_cast<std::uint32_t>(e - 1) << 23U;
+  float value = 0.0F;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+void DequantizeMXFP4(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_mxfp4*>(src);
+  const std::size_t nb = k / 32;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = E8m0ToFp32Half(blocks[b].e);
+    for (std::size_t j = 0; j < 16; ++j) {
+      const std::uint8_t packed = blocks[b].qs[j];
+      dst[(b * 32) + j] = static_cast<float>(kValuesMxfp4[packed & 0x0FU]) * d;
+      dst[(b * 32) + j + 16] =
+          static_cast<float>(kValuesMxfp4[packed >> 4U]) * d;
+    }
+  }
+}
+
+bool ValidMxfp4Scales(const void* src, std::size_t k) noexcept {
+  const auto* blocks = static_cast<const block_mxfp4*>(src);
+  for (std::size_t b = 0; b < k / 32; ++b) {
+    if (blocks[b].e == 0xFFU) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k) {

@@ -356,6 +356,9 @@ target_include_directories(gufo_expert_stream PUBLIC ${CMAKE_SOURCE_DIR})
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
 
+# gpt-oss — model-private Harmony chat format.
+add_subdirectory(src/models/gpt_oss)
+
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_deepseek_v4_flash PUBLIC gufo_core)
@@ -587,6 +590,7 @@ if (BUILD_TESTING)
   gufo_qwen_image_21_register_tests()
 
   add_subdirectory(tests/models/embedding_gemma2)
+  add_subdirectory(tests/models/gpt_oss)
 
   add_test(NAME gufo_version COMMAND gufo --version)
   set_tests_properties(gufo_version PROPERTIES
@@ -1229,6 +1233,11 @@ if (BUILD_TESTING)
 
   add_test(NAME ggml_dequant_test COMMAND ggml_dequant_test)
   set_tests_properties(ggml_dequant_test PROPERTIES LABELS "cpu;core;quant")
+
+  add_executable(mxfp4_dequant_test tests/core/mxfp4_dequant_test.cpp)
+  target_link_libraries(mxfp4_dequant_test PRIVATE gufo_core)
+  add_test(NAME mxfp4_dequant_test COMMAND mxfp4_dequant_test)
+  set_tests_properties(mxfp4_dequant_test PROPERTIES LABELS "cpu;core;quant")
 
   add_executable(ggml_gemm_parity_test tests/core/ggml_gemm_parity_test.cpp)
   target_link_libraries(ggml_gemm_parity_test PRIVATE gufo_core)

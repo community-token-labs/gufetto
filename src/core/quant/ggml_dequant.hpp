@@ -96,6 +96,14 @@ struct block_iq3_s {
   std::uint8_t signs[32];
   std::uint8_t scales[4];
 };
+
+// MXFP4 (OCP microscaling): one E8M0 power-of-two exponent and 32 packed E2M1
+// nibbles (QK=32). Low nibbles give the first 16 elements, high nibbles the
+// second 16, as in Q4_0.
+struct block_mxfp4 {
+  std::uint8_t e;
+  std::uint8_t qs[16];
+};
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_K) == 144, "block_q4_K must be 144 bytes");
@@ -107,10 +115,21 @@ static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_mxfp4) == 17, "block_mxfp4 must be 17 bytes");
 
 /// Non-linear 4-bit codebook shared by IQ4_NL and IQ4_XS.
 inline constexpr std::int8_t kValuesIq4Nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+/// E2M1 values doubled to integers. Nibble 8 is negative zero and decodes to
+/// +0; the block scale is halved to compensate (see E8m0ToFp32Half).
+inline constexpr std::int8_t kValuesMxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+/// Half of the E8M0 scale 2^(e-127), i.e. 2^(e-128). Exponents 0 and 1 give
+/// the subnormals 2^-128 and 2^-127. 0xFF (NaN in the OCP spec) decodes to
+/// 2^127 here, as in ggml; loaders reject it with ValidMxfp4Scales.
+[[nodiscard]] float E8m0ToFp32Half(std::uint8_t e) noexcept;
 
 /// Returns the logical elements represented by one supported quant block, or
 /// zero for dense and unsupported storage types.
@@ -124,6 +143,7 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
     case core::GgmlType::kQ8_1:
     case core::GgmlType::kQ8_0:
     case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kMXFP4:
       return 32;
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
@@ -194,6 +214,12 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ3_S to float
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
+
+// Dequantize row of MXFP4 to float
+void DequantizeMXFP4(const void* src, float* dst, std::size_t k);
+
+/// False when any of the `k / 32` blocks carries the reserved 0xFF exponent.
+[[nodiscard]] bool ValidMxfp4Scales(const void* src, std::size_t k) noexcept;
 
 // Compute dot product of IQ4_NL quantized row with FP32 vector
 float DotProductIQ4_NL(const void* row_data, std::span<const float> vec,

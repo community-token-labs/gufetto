@@ -19,7 +19,7 @@ set(gufo_pr_targets
   heap_placement_test startup_admission_test diagnostic_memory_test model_plan_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
   platform_fs_test
-  logit_sampler_test ggml_dequant_test
+  logit_sampler_test ggml_dequant_test mxfp4_dequant_test
   quote_tracker_test
   openai_chat_test http_server_test http_server_signals_test trace_test
   audio_websocket_test
@@ -47,6 +47,7 @@ set(gufo_pr_targets
   embedding_gemma2_config_test embedding_gemma2_embeddings_api_test
   embedding_gemma2_image_processor_test
   embedding_gemma2_batch_scheduler_test
+  gpt_oss_harmony_test
   qwen3_tts_config_test qwen3_tts_audio_api_test
   qwen_image_21_test
   video_api_test minimax_h3_sampling_test minimax_h3_runtime_test

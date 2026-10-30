@@ -410,6 +410,37 @@ void TestVisionExclusionValidation() {
          "Error mentions vision rejection");
 }
 
+void TestMxfp4Tensors() {
+  // gpt-oss stores expert weights as MXFP4 (ggml type 39): 17-byte blocks of
+  // 32 elements. A misaligned row width is still rejected.
+  {
+    GgufBuilder builder;
+    builder.AddMetadataString("general.architecture", "gpt-oss");
+    builder.AddTensor("blk.0.ffn_up_exps.weight", {2880, 4, 2},
+                      gufo::core::GgmlType::kMXFP4, 0);
+    auto binary = builder.Build(512);
+    std::string err;
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+    Expect(reader != nullptr, "MXFP4 reader opens: " + err);
+    const auto* tensor = reader->FindTensor("blk.0.ffn_up_exps.weight");
+    Expect(tensor != nullptr && tensor->size_bytes == 1530U * 8U,
+           "MXFP4 tensor bytes are 17 per 32 elements");
+    Expect(reader->GetQuantizationLabel() == "MXFP4", "MXFP4 label");
+  }
+  {
+    GgufBuilder builder;
+    builder.AddMetadataString("general.architecture", "gpt-oss");
+    builder.AddTensor("blk.0.ffn_up_exps.weight", {48, 2},
+                      gufo::core::GgmlType::kMXFP4, 0);
+    auto binary = builder.Build(512);
+    std::string err;
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+    Expect(reader == nullptr, "misaligned MXFP4 rows are rejected");
+  }
+}
+
 void TestQuantizationLabel() {
   // The label the benchmark table prints, derived from the tensor table rather
   // than from `general.file_type`: the Unsloth UD-Q8_K_XL artifact records
@@ -685,6 +716,7 @@ int main() {
   TestSplitGgufDiscovery();
   TestVisionExclusionValidation();
   TestQuantizationLabel();
+  TestMxfp4Tensors();
   TestMalformedGgufRejection();
   TestHostileHeaders();
   std::cout << "All GgufReader tests passed successfully!\n";
