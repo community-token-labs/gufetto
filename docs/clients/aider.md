@@ -11,8 +11,8 @@ aider --model openai/gufo-local
 ```
 
 Use the `openai/` prefix exactly; the model ID after it must be served by Gufo.
-This sends bearer auth; switching to an Anthropic SDK's `x-api-key` alone
-would fail. Use a disposable repo, not personal project/auth configuration.
+This sends bearer auth. Use a disposable repo, not personal project/auth
+configuration.
 
 For loaded `C=32768`, `O=4096`, example private
 `.aider.model.metadata.json` (input allowance reserves output space):

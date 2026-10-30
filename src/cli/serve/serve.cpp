@@ -233,9 +233,26 @@ struct ServerLogOptions {
   std::optional<server::LogLevel> level;
 };
 
-// Verbosity help text. `gufo serve --help` lists these options by hand while
-// every modality help registers them through the parser, so both readings share
-// one source for the wording.
+/// Who may call the server. `--api-key` and `--api-key-file` supply the key
+/// on the command line or from a file the process list does not show; with
+/// neither, `GUFO_API_KEY` supplies it. The sources are resolved, and the
+/// conflict between the two options reported, where the server is prepared.
+struct ServerAccessOptions {
+  std::string api_key;
+  std::string api_key_file;
+  std::vector<std::string> cors_origins;
+};
+
+// Access and verbosity help text. `gufo serve --help` lists these options by
+// hand while every modality help registers them through the parser, so both
+// readings share one source for the wording.
+constexpr std::string_view kApiKeyHelp =
+    "Require this key as Authorization: Bearer or x-api-key (default: "
+    "GUFO_API_KEY)";
+constexpr std::string_view kApiKeyFileHelp =
+    "Read the API key from the first line of this file";
+constexpr std::string_view kCorsOriginHelp =
+    "Allow only this browser origin; repeat for more (default: any)";
 constexpr std::string_view kLogLevelHelp =
     "Log verbosity: error, warn, info or debug (default: info)";
 constexpr std::string_view kVerboseHelp = "Shorthand for --log-level=debug";
@@ -265,8 +282,8 @@ void AddCacheRamOption(gufo::cli::ArgParser& parser,
 void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
                       std::size_t* max_connections,
-                      std::size_t* max_request_body_bytes, std::string* api_key,
-                      ServerLogOptions* log) {
+                      std::size_t* max_request_body_bytes,
+                      ServerAccessOptions* access, ServerLogOptions* log) {
   parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
   parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
   if (session_count != nullptr)
@@ -279,7 +296,22 @@ void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
   parser.AddOption("", "--max-request-bytes", "N",
                    "Maximum HTTP request body bytes", "Server",
                    max_request_body_bytes);
-  parser.AddOption("", "--api-key", "KEY", "API key", "Server", api_key);
+  parser.AddOption("", "--api-key", "KEY", kApiKeyHelp, "Server",
+                   &access->api_key);
+  parser.AddOption("", "--api-key-file", "PATH", kApiKeyFileHelp, "Server",
+                   &access->api_key_file);
+  parser.AddCustomOption("", "--cors-origin", "ORIGIN", kCorsOriginHelp,
+                         "Server",
+                         [access](std::string_view flag, std::string_view value,
+                                  std::string* error) {
+                           auto origin = server::ParseCorsOrigin(value, error);
+                           if (!origin.has_value()) {
+                             *error = std::string(flag) + ": " + *error;
+                             return false;
+                           }
+                           access->cors_origins.push_back(std::move(*origin));
+                           return true;
+                         });
   parser.AddCustomOption(
       "", "--log-level", "LEVEL", kLogLevelHelp, "Logging",
       [log](std::string_view flag, std::string_view value, std::string* error) {
@@ -303,7 +335,7 @@ struct ServerOptionHelpTargets {
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
+  ServerAccessOptions access;
   ServerLogOptions log;
 };
 
@@ -313,7 +345,7 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
   AddServerOptions(parser, &targets->host, &targets->port,
                    include_sessions ? &targets->session_count : nullptr,
                    &targets->max_connections, &targets->max_request_body_bytes,
-                   &targets->api_key, &targets->log);
+                   &targets->access, &targets->log);
 }
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
@@ -935,7 +967,11 @@ void PrintServeHelp(std::string_view program_name,
       << "      --max-request-bytes <N>\n"
       << "                         Maximum HTTP request body bytes (default: "
          "8388608)\n"
-      << "      --api-key <KEY>    Require Bearer authorization for requests\n"
+      << "      --api-key <KEY>    " << kApiKeyHelp << "\n"
+      << "      --api-key-file <PATH>\n"
+      << "                         " << kApiKeyFileHelp << "\n"
+      << "      --cors-origin <ORIGIN>\n"
+      << "                         " << kCorsOriginHelp << "\n"
       << "\nLogging:\n"
       << "      --log-level <LEVEL>\n"
       << "                         " << kLogLevelHelp << "\n"
@@ -993,7 +1029,7 @@ int RunServe(std::span<const char* const> args) {
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
       static_cast<std::size_t>(8) * 1024 * 1024;
-  std::string api_key;
+  ServerAccessOptions access;
   ServerLogOptions log_options;
 
   bool cache_lookup_api = false;
@@ -1007,7 +1043,7 @@ int RunServe(std::span<const char* const> args) {
                                       bool include_sessions = true) {
     AddServerOptions(
         parser, &host, &port, include_sessions ? &session_count : nullptr,
-        &max_connections, &max_request_body_bytes, &api_key, &log_options);
+        &max_connections, &max_request_body_bytes, &access, &log_options);
   };
   add_server_options(server_parser);
   std::string subcommand = "llm";
@@ -1061,6 +1097,26 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: server limits must be positive\n";
       return false;
     }
+    if (!access.api_key_file.empty()) {
+      if (!access.api_key.empty()) {
+        std::cerr << "Error: --api-key and --api-key-file cannot combine\n";
+        return false;
+      }
+      auto key = ReadTextFile(access.api_key_file);
+      // The first line is the key, so a final newline or later lines cannot
+      // change it.
+      if (key.has_value())
+        key->resize(std::min(key->find_first_of("\r\n"), key->size()));
+      if (!key.has_value() || key->empty()) {
+        std::cerr << "Error: --api-key-file must name a readable file whose "
+                     "first line is the key\n";
+        return false;
+      }
+      access.api_key = std::move(*key);
+    } else if (const char* env_key = std::getenv("GUFO_API_KEY");
+               access.api_key.empty() && env_key != nullptr) {
+      access.api_key = env_key;
+    }
     // Arm verbosity here: this runs after every server option is parsed and
     // before the first loader, cache or HTTP line is written, so one call sets
     // the level for all modalities. `-v/--verbose` is shorthand for
@@ -1103,7 +1159,11 @@ int RunServe(std::span<const char* const> args) {
         "event=options host=" + host + " port=" + std::to_string(port) +
         " max_connections=" + std::to_string(max_connections) +
         " max_request_bytes=" + std::to_string(max_request_body_bytes) +
-        " api_key=" + (api_key.empty() ? "unset" : "set") +
+        " api_key=" + (access.api_key.empty() ? "unset" : "set") +
+        " cors_origins=" +
+        (access.cors_origins.empty()
+             ? std::string("any")
+             : std::to_string(access.cors_origins.size())) +
         " log_level=" + std::string(server::LogLevelName(resolved));
     server::Logger::Debug("server", options_line);
     return true;
@@ -1827,7 +1887,7 @@ int RunServe(std::span<const char* const> args) {
     // The disk snapshot tier is walked during load, which can take minutes.
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
     // so supervisors see a loading server rather than a refused connection.
-    server::LoadingResponder loading(host, port);
+    server::LoadingResponder loading(host, port, access.cors_origins);
     const bool load_ok = backend->load(
         model, &err, max_context, session_count,
         server::TextPrefillPolicy{
@@ -1940,7 +2000,8 @@ int RunServe(std::span<const char* const> args) {
       server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
-          .api_key = std::move(api_key),
+          .api_key = std::move(access.api_key),
+          .cors_origins = access.cors_origins,
           .on_device_lost =
               [] {
                 device_lost.store(true);

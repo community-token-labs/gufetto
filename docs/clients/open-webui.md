@@ -18,8 +18,10 @@ If WebUI runs in a container, `127.0.0.1` refers to that container, not Gufo.
 Use a host-only bridge for a colocated container, or a reverse proxy with TLS
 for LAN access: HTTP bearer keys otherwise travel in cleartext. Do not casually
 bind an unauthenticated Gufo to all interfaces. Gufo has one
-shared bearer credential, not per-WebUI-user isolation. Anthropic `x-api-key`
-alone would fail.
+shared credential, not per-WebUI-user isolation. The WebUI backend calls Gufo
+without a browser `Origin`; if browsers call Gufo directly (direct
+connections), restrict them with `--cors-origin <WebUI origin>`. See
+[authentication](../SERVER.md#authentication-and-exposure).
 
 ## Reasoning, cache and tools
 

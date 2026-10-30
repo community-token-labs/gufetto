@@ -12,7 +12,8 @@ from pathlib import Path
 def main():
     binary = sys.argv[1]
     env = {key: value for key, value in os.environ.items()
-           if key not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
+           if key not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT",
+                          "GUFO_API_KEY"}}
 
     def check(args, status, message):
         result = subprocess.run([binary, *args], env=env, text=True,
@@ -236,6 +237,35 @@ def main():
     keyed = run(load + ["-v", "--api-key", "super-secret-value"])
     assert "api_key=set" in keyed.stderr
     assert "super-secret-value" not in keyed.stderr
+    assert "api_key=unset" in run(load + ["-v"]).stderr
+    # The key can stay out of the process list: from a file's first line, or
+    # from GUFO_API_KEY when no option names it.
+    with tempfile.TemporaryDirectory() as directory:
+        key_file = Path(directory) / "key"
+        key_file.write_text("fake-file-key\nignored second line\n")
+        from_file = run(load + ["-v", "--api-key-file", str(key_file)])
+        assert from_file.returncode == 1, from_file.stderr
+        assert "api_key=set" in from_file.stderr
+        assert "fake-file-key" not in from_file.stderr
+        check(load + ["--api-key", "x", "--api-key-file", str(key_file)], 2,
+              "--api-key and --api-key-file cannot combine")
+        for content in ("", "\n", "\r\nfake-key\n"):
+            key_file.write_text(content)
+            check(load + ["--api-key-file", str(key_file)], 2,
+                  "--api-key-file must name a readable file")
+        check(load + ["--api-key-file", str(Path(directory) / "missing")], 2,
+              "--api-key-file must name a readable file")
+    from_env = subprocess.run(
+        [binary, *load, "-v"], env={**env, "GUFO_API_KEY": "fake-env-key"},
+        text=True, capture_output=True, timeout=10)
+    assert "api_key=set" in from_env.stderr
+    assert "fake-env-key" not in from_env.stderr
+    origins = run(load + ["-v", "--cors-origin", "http://webui.lan:3000",
+                          "--cors-origin", "https://chat.test"])
+    assert "cors_origins=2" in origins.stderr, origins.stderr
+    assert "cors_origins=any" in run(load + ["-v"]).stderr
+    for bad in ("*", "webui.lan", "http://webui.lan/"):
+        check(load + ["--cors-origin", bad], 2, "--cors-origin: CORS origin")
     # Structured output is prepared automatically, without a separate option.
     assert "--prepare-structured-output" not in help_text
     check(["serve", "llm", "--model", "missing.gguf",

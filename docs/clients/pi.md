@@ -52,9 +52,9 @@ means no-retention privacy.
 
 Use a separate model/profile with `api:openai-responses` for Responses.
 It must replay full history and `store:false`, without previous-response
-state or hosted tools. Anthropic mode is not the default recipe: its SDK may
-send `x-api-key`; authenticated Gufo requires bearer, explicitly configured
-and checked on the wire. No guaranteed signature/Anthropic TTL semantics.
+state or hosted tools. Anthropic mode is not the default recipe; Gufo accepts
+its SDK's `x-api-key` as well as bearer, but check the wire: a request sending
+both must send the key in both. No guaranteed signature/Anthropic TTL semantics.
 
 ## Qualification slot
 

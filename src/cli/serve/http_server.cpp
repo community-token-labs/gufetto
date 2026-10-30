@@ -233,32 +233,104 @@ std::string CredentialHash(std::string_view value) {
       reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
 }
 
+// `Authorization: Bearer <key>` (OpenAI clients) and `x-api-key: <key>`
+// (Anthropic clients) carry the same key. Every credential a request presents
+// must match it: a valid header never excuses a wrong or non-Bearer other one,
+// and a repeated header is refused rather than resolved.
 bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
   if (key_hash.empty()) {
     return true;
   }
-  std::string_view credential;
-  bool found = false;
+  std::optional<std::string_view> authorization;
+  std::optional<std::string_view> api_key;
   for (const auto& [name, value] : request.headers) {
-    if (ToLower(name) == "authorization") {
-      if (found) {
-        return false;
-      }
-      found = true;
-      credential = value;
+    const auto lowered = ToLower(name);
+    auto* slot = lowered == "authorization" ? &authorization
+                 : lowered == "x-api-key"   ? &api_key
+                                            : nullptr;
+    if (slot == nullptr) {
+      continue;
     }
+    if (slot->has_value()) {
+      return false;
+    }
+    *slot = value;
   }
-  const auto space = credential.find(' ');
-  if (space == std::string_view::npos ||
-      ToLower(credential.substr(0, space)) != "bearer") {
+  if (!authorization.has_value() && !api_key.has_value()) {
     return false;
   }
-  credential.remove_prefix(space + 1);
-  while (credential.starts_with(' ')) {
-    credential.remove_prefix(1);
-  }
   // Comparing digests does not disclose matching prefixes of the API key.
-  return CredentialHash(credential) == key_hash;
+  if (authorization.has_value()) {
+    std::string_view credential = *authorization;
+    const auto space = credential.find(' ');
+    if (space == std::string_view::npos ||
+        ToLower(credential.substr(0, space)) != "bearer") {
+      return false;
+    }
+    credential.remove_prefix(space + 1);
+    while (credential.starts_with(' ')) {
+      credential.remove_prefix(1);
+    }
+    if (CredentialHash(credential) != key_hash) {
+      return false;
+    }
+  }
+  return !api_key.has_value() || CredentialHash(*api_key) == key_hash;
+}
+
+// The configured origin a request's single `Origin` header names, or null.
+// The configured spelling is echoed, never the client's bytes.
+const std::string* AllowedOrigin(const std::vector<std::string>& allowed,
+                                 const HttpRequest& request) {
+  const std::string* match = nullptr;
+  bool seen = false;
+  for (const auto& [name, value] : request.headers) {
+    if (ToLower(name) != "origin") {
+      continue;
+    }
+    if (seen) {
+      return nullptr;
+    }
+    seen = true;
+    const auto lowered = ToLower(value);
+    const auto found = std::ranges::find(allowed, lowered);
+    match = found == allowed.end() ? nullptr : &*found;
+  }
+  return match;
+}
+
+// A browser request from an origin outside a configured allowlist. Requests
+// without `Origin` (curl, SDKs) are not browser cross-origin calls.
+bool OriginRefused(const std::vector<std::string>& allowed,
+                   const HttpRequest& request) {
+  if (allowed.empty()) {
+    return false;
+  }
+  const bool has_origin = std::ranges::any_of(
+      request.headers,
+      [](const auto& header) { return ToLower(header.first) == "origin"; });
+  return has_origin && AllowedOrigin(allowed, request) == nullptr;
+}
+
+// CORS response headers. `Access-Control-Allow-Credentials` is never sent, so
+// browsers do not attach cookies; clients send the API key explicitly.
+std::string CorsHead(const std::vector<std::string>& allowed,
+                     const std::string* origin) {
+  std::string out;
+  if (allowed.empty()) {
+    out = "Access-Control-Allow-Origin: *\r\n";
+  } else {
+    out = "Vary: Origin\r\n";
+    if (origin == nullptr) {
+      return out;
+    }
+    out += "Access-Control-Allow-Origin: " + *origin + "\r\n";
+  }
+  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  out +=
+      "Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Key, "
+      "Range\r\n";
+  return out;
 }
 
 bool HasHeader(const HttpResponse& response, std::string_view name) {
@@ -304,7 +376,8 @@ bool IsEventStream(const HttpResponse& response) {
 }
 
 std::string BuildResponseHead(const HttpResponse& resp,
-                              std::optional<std::size_t> content_length) {
+                              std::optional<std::size_t> content_length,
+                              std::string_view cors) {
   std::string out;
   out.reserve(256);
   out += "HTTP/1.1 ";
@@ -318,9 +391,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
   if (content_length.has_value()) {
     out += "Content-Length: " + std::to_string(*content_length) + "\r\n";
   }
-  out += "Access-Control-Allow-Origin: *\r\n";
-  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
-  out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
+  out += cors;
   for (const auto& [name, value] : resp.headers) {
     out += name;
     out += ": ";
@@ -333,8 +404,8 @@ std::string BuildResponseHead(const HttpResponse& resp,
   return out;
 }
 
-std::string BuildResponse(const HttpResponse& resp) {
-  std::string out = BuildResponseHead(resp, resp.body.size());
+std::string BuildResponse(const HttpResponse& resp, std::string_view cors) {
+  std::string out = BuildResponseHead(resp, resp.body.size(), cors);
   out += resp.body;
   return out;
 }
@@ -1776,7 +1847,9 @@ std::string PeerAddress(int client_fd) {
 
 }  // namespace
 
-LoadingResponder::LoadingResponder(const std::string& host, int port) {
+LoadingResponder::LoadingResponder(const std::string& host, int port,
+                                   std::vector<std::string> cors_origins)
+    : cors_origins_(std::move(cors_origins)) {
   net::EnsureSocketRuntimeStarted();
   sockaddr_storage addr{};
   net::SocklenT addr_length = 0;
@@ -1823,7 +1896,8 @@ void LoadingResponder::serve() {
   HttpResponse loading = Err(503, "Service Unavailable", "Loading model",
                              "unavailable_error", "loading");
   loading.headers.emplace_back("Retry-After", "1");
-  const std::string reply = BuildResponse(loading);
+  const std::string reply =
+      BuildResponse(loading, CorsHead(cors_origins_, nullptr));
   // One connection at a time is enough for probes. Read the request head
   // before replying, and after replying read what the client still sends (a
   // request body) until it closes: closing with unread data resets the
@@ -1868,6 +1942,32 @@ void LoadingResponder::serve() {
     }
     net::CloseSocket(client_fd);
   }
+}
+
+std::optional<std::string> ParseCorsOrigin(std::string_view origin,
+                                           std::string* error) {
+  std::string lowered = ToLower(origin);
+  const auto scheme_end = lowered.find("://");
+  const std::string_view scheme =
+      std::string_view(lowered).substr(0, scheme_end);
+  const std::string_view authority =
+      scheme_end == std::string::npos
+          ? std::string_view()
+          : std::string_view(lowered).substr(scheme_end + 3);
+  const bool valid_authority =
+      !authority.empty() && authority.front() != ':' &&
+      std::ranges::all_of(authority, [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 ||
+               std::string_view("-.:[]").find(c) != std::string_view::npos;
+      });
+  if ((scheme != "http" && scheme != "https") || !valid_authority) {
+    *error =
+        "CORS origin must be http://HOST[:PORT] or https://HOST[:PORT] "
+        "without a path: '" +
+        std::string(origin) + "'";
+    return std::nullopt;
+  }
+  return lowered;
 }
 
 bool IsListenAddress(const std::string& host) {
@@ -2149,7 +2249,9 @@ void HttpServer::run(bool handle_signals) {
           Err(503, "Service Unavailable", "connection limit reached",
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
-      (void)SendAll(client_fd, BuildResponse(response));
+      (void)SendAll(
+          client_fd,
+          BuildResponse(response, CorsHead(options_.cors_origins, nullptr)));
       net::CloseSocket(client_fd);
     }
   }
@@ -2347,6 +2449,10 @@ void HttpServer::handle_connection(int client_fd,
   if (auto peer = PeerAddress(client_fd); !peer.empty())
     req.client_id = std::move(peer);
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
+  const auto cors_head = [&] {
+    return CorsHead(options_.cors_origins,
+                    AllowedOrigin(options_.cors_origins, req));
+  };
   // Set for routes `--trace` records; `traced_stream` collects the body bytes
   // a streaming reply delivered.
   bool traced = false;
@@ -2550,6 +2656,9 @@ void HttpServer::handle_connection(int client_fd,
     } else if (!ok) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
+    } else if (OriginRefused(options_.cors_origins, req)) {
+      resp = Err(403, "Forbidden", "origin is not allowed", "permission_error",
+                 "origin_not_allowed");
     } else if (req.method == "OPTIONS") {
       resp = {.status = 204, .reason = "No Content"};
     } else {
@@ -2567,7 +2676,8 @@ void HttpServer::handle_connection(int client_fd,
     bool connected = true;
     if (resp.websocket) {
       response_started = true;
-      connected = SendAll(client_fd, BuildResponseHead(resp, std::nullopt));
+      connected = SendAll(client_fd,
+                          BuildResponseHead(resp, std::nullopt, cors_head()));
       if (connected) {
         WebSocket socket(client_fd, std::move(req.body));
         resp.websocket(socket);
@@ -2576,7 +2686,7 @@ void HttpServer::handle_connection(int client_fd,
       const bool chunked = http11 && !HasHeader(resp, "content-length");
       if (chunked)
         resp.headers.emplace_back("Transfer-Encoding", "chunked");
-      const auto head = BuildResponseHead(resp, std::nullopt);
+      const auto head = BuildResponseHead(resp, std::nullopt, cors_head());
       if (!resp.defer_stream_headers) {
         response_started = true;
         connected = SendAll(client_fd, head);
@@ -2650,7 +2760,7 @@ void HttpServer::handle_connection(int client_fd,
           connected = SendAll(client_fd, "0\r\n\r\n");
       }
     } else {
-      const auto payload = BuildResponse(resp);
+      const auto payload = BuildResponse(resp, cors_head());
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
@@ -2705,7 +2815,7 @@ void HttpServer::handle_connection(int client_fd,
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
-      (void)SendAll(client_fd, BuildResponse(resp));
+      (void)SendAll(client_fd, BuildResponse(resp, cors_head()));
     response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
@@ -2724,7 +2834,7 @@ void HttpServer::handle_connection(int client_fd,
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
-      (void)SendAll(client_fd, BuildResponse(resp));
+      (void)SendAll(client_fd, BuildResponse(resp, cors_head()));
     response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
@@ -2740,7 +2850,7 @@ void HttpServer::handle_connection(int client_fd,
                        response_started ? "stream_error" : "failed");
     trace_failure(resp);
     if (!response_started)
-      (void)SendAll(client_fd, BuildResponse(resp));
+      (void)SendAll(client_fd, BuildResponse(resp, cors_head()));
     response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.

@@ -1344,7 +1344,8 @@ Return an OpenAI-style error object:
 Use appropriate HTTP status codes:
 
 - `400` invalid request or unsupported field
-- `401` missing or invalid configured bearer token
+- `401` missing or invalid configured API key
+- `403` request `Origin` outside the `--cors-origin` allowlist (`origin_not_allowed`)
 - `404` unknown model or endpoint object
 - `409` incompatible session state
 - `413` request or prompt too large
@@ -1358,11 +1359,26 @@ length finish reason when either limit is reached.
 
 ## Authentication and Exposure
 
-The server binds to `127.0.0.1` by default. Set `--api-key` to require:
+The server binds to `127.0.0.1` by default. Configure a key to require
+either header on every request:
 
 ```text
 Authorization: Bearer <local-token>
+x-api-key: <local-token>
 ```
+
+OpenAI clients send the first, Anthropic SDKs the second. Every credential
+header a request carries must name the key: a request with both is accepted
+only when both match, so a valid `x-api-key` never excuses a wrong or
+non-Bearer `Authorization`, and a repeated header is refused. Keys are compared
+by SHA-256 digest. Supply the key in one of three ways:
+
+- `--api-key KEY`: on the command line, visible in the process list
+  (`ps`, `/proc/*/cmdline`).
+- `--api-key-file PATH`: the file's first line, without its line ending. Keep
+  the file private (`chmod 600`). It cannot combine with `--api-key`.
+- `GUFO_API_KEY`: used when neither option is given; an empty value means no
+  key. Only the same user (and root) can read a process's environment.
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
@@ -1376,8 +1392,27 @@ Request bodies, prompts, generated text and credentials are not logged.
 Tool definitions and generated tool calls are treated as data. `gufo`
 never executes tools, shell commands, URLs, or generated code.
 
-The HTTP transport currently uses a wildcard CORS origin and the same listener
-and API key for inference and metrics.
+By default every response carries `Access-Control-Allow-Origin: *`, so any
+web page can call the server from a browser that holds the key. To serve a
+browser client on another origin (for example Open WebUI's direct connections)
+and nothing else, list each origin with `--cors-origin`, repeated as needed:
+
+```sh
+gufo serve --host 192.168.1.20 --api-key-file ~/.config/gufo/key \
+  --cors-origin http://webui.lan:3000 --cors-origin https://chat.example \
+  llm --model "$MODEL"
+```
+
+An origin is `http://HOST[:PORT]` or `https://HOST[:PORT]` as the browser
+sends it: no path, trailing slash or wildcard; matching ignores case. With an
+allowlist, responses carry `Vary: Origin`; a listed origin is echoed in
+`Access-Control-Allow-Origin` for preflights and replies, and a request whose
+`Origin` is not listed (including `null` or a repeated `Origin`) is refused
+with 403 `origin_not_allowed` before authentication, without CORS headers.
+Requests without `Origin`, such as curl and SDK clients, are unaffected.
+`Access-Control-Allow-Credentials` is never sent: browsers attach no cookies,
+and the client must send the key itself. The same listener and API key serve
+inference and metrics.
 
 `gufo eval` and `tools/serving/gufo-serving-bench.py` send `OPENAI_API_KEY`
 as the bearer credential when it is set.
