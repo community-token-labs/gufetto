@@ -4351,6 +4351,30 @@ InferenceBackend::Result InferenceBackend::complete(
 #endif
 }
 
+InferenceBackend::Result InferenceBackend::complete_tokens(
+    const std::vector<tokenization::TokenId>& prompt, std::size_t max_tokens,
+    const sampling::SamplingConfig& sampling_config,
+    const CancellationCheck& is_cancelled, const TokenCallback& on_token,
+    std::string_view client_id, const std::vector<std::string>& stop_sequences,
+    bool cache_prompt, bool cache_persist) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto request_start = Clock::now();
+  const auto state = impl_->Snapshot();
+  if (state == nullptr)
+    throw std::invalid_argument("no text model is loaded");
+  ValidatePromptTokens(prompt, state->scheduler->runner().VocabularySize());
+  return impl_->GenerateScheduled(
+      state, {prompt.begin(), prompt.end()}, request_start, max_tokens,
+      sampling_config, is_cancelled, on_token, std::string(client_id), {},
+      cache_prompt, 0, stop_sequences, InitialOutputState::kContent,
+      cache_persist);
+#else
+  return TextGenerationBackend::complete_tokens(
+      prompt, max_tokens, sampling_config, is_cancelled, on_token, client_id,
+      stop_sequences, cache_prompt, cache_persist);
+#endif
+}
+
 InferenceBackend::Result InferenceBackend::chat(
     const ChatRequest& request, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,

@@ -1380,10 +1380,30 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
 
   const auto* input = body.find("prompt");
-  if (input == nullptr || !input->is_string() || input->str().empty()) {
+  if (input == nullptr ||
+      (!input->is_array() && (!input->is_string() || input->str().empty()))) {
     return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
   }
-  const std::string prompt = input->str();
+  std::vector<tokenization::TokenId> prompt_tokens;
+  if (input->is_array()) {
+    for (const auto& value : input->items()) {
+      const double id = value.as_double(-1);
+      if (!value.is_number() || !std::isfinite(id) || id < 0 ||
+          std::floor(id) != id ||
+          id > std::numeric_limits<tokenization::TokenId>::max())
+        throw std::invalid_argument(
+            "'prompt' must be a nonempty array of in-vocabulary integer token "
+            "IDs");
+      prompt_tokens.push_back(static_cast<tokenization::TokenId>(id));
+    }
+    if (prompt_tokens.empty())
+      throw std::invalid_argument(
+          "'prompt' must be a nonempty array of in-vocabulary integer token "
+          "IDs");
+  }
+  const auto* return_tokens = body.find("return_tokens");
+  if (return_tokens != nullptr && !return_tokens->is_bool())
+    return InvalidCompatibilityRequest("'return_tokens' must be a boolean");
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -1404,10 +1424,21 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
 
   const auto res =
-      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt, cache_persist);
+      input->is_array()
+          ? b.complete_tokens(prompt_tokens, max_tokens, sampling_config,
+                              req.is_cancelled, {}, req.client_id,
+                              stop_sequences, cache_prompt, cache_persist)
+          : b.complete(input->str(), max_tokens, sampling_config,
+                       req.is_cancelled, {}, req.client_id, stop_sequences,
+                       cache_prompt, cache_persist);
 
   json::Value resp = json::Value::object();
+  if (return_tokens != nullptr) {
+    resp["tokens"] = json::Value::array();
+    if (return_tokens->as_bool())
+      for (const auto id : res.tokens)
+        resp["tokens"].push_back(static_cast<std::uint64_t>(id));
+  }
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
   resp["stop"] = true;
   const bool limited =
