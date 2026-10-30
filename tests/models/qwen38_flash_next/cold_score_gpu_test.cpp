@@ -171,8 +171,10 @@ bool RunCapture(const std::shared_ptr<qfn::Model>& model, Value& out) {
       cancelled =
           std::string_view(e.what()).find("cancel") != std::string_view::npos;
     }
-    out["cancel_completed_passes"] = control->passes;
-    out["cancel_native_checks"] = control->checks;
+    out["cancel_completed_passes"] =
+        static_cast<unsigned long long>(control->passes);
+    out["cancel_native_checks"] =
+        static_cast<unsigned long long>(control->checks);
     Require(pool->usable_capacity() == 1,
             "unsafe cancellation cleanup; remaining cells skipped");
     const auto recovered = Capture(pool, input, 8);
@@ -201,9 +203,9 @@ bool RunCapture(const std::shared_ptr<qfn::Model>& model, Value& out) {
   out["pass_boundary_equal"] = boundary_equal;
   auto ledger = Value::array();
   for (auto end : ends)
-    ledger.push_back(end);
+    ledger.push_back(static_cast<unsigned long long>(end));
   out["boundary_pass_ends"] = std::move(ledger);
-  out["vocab_size"] = model->VocabSize();
+  out["vocab_size"] = static_cast<unsigned long long>(model->VocabSize());
   return single_equal && recovery_equal && boundary_equal;
 }
 }  // namespace
@@ -258,8 +260,10 @@ int main(int argc, char** argv) {
           "OFF geometry or claim changed");
       (void)Ordinary(model, Input(*model, 17));
       result["off_geometry_equal"] = true;
-      result["max_logit_rows"] = geometry.max_logit_rows;
-      result["max_speculative"] = geometry.max_speculative;
+      result["max_logit_rows"] =
+          static_cast<unsigned long long>(geometry.max_logit_rows);
+      result["max_speculative"] =
+          static_cast<unsigned long long>(geometry.max_speculative);
     } else if (mode == "capture") {
       result["capture"] = Value::object();
       if (!RunCapture(model, result["capture"])) {
