@@ -996,7 +996,44 @@ The other compatibility routes are deliberately limited:
 | --- | --- | --- |
 | `/v1/completions` | One prompt string, buffered or SSE completion | `max_tokens` |
 | `/v1/messages` | Text, image, thinking and tool blocks, optional text system instructions and custom tools; buffered or SSE | `max_tokens` |
-| `/completion` | One prompt string, non-streaming completion | `n_predict` |
+| `/completion` | One prompt string or integer token-ID array, non-streaming completion | `n_predict` |
+
+For llama.cpp-style `/completion`, `prompt: [104, 105]` supplies the exact
+model-vocabulary IDs: Gufo neither adds BOS nor decodes/re-tokenizes them.
+Arrays must be nonempty and contain only nonnegative integers below the loaded
+model's vocabulary size (including valid special-token IDs). Empty, mixed,
+nested, fractional and out-of-range arrays return HTTP 400 with error code
+`invalid_prompt` and message
+`'prompt' must be a nonempty array of in-vocabulary integer token IDs`.
+Mixed string/token arrays, string arrays and batched prompts are not supported.
+
+Set `return_tokens: true` to return generated IDs in `tokens`, for either
+prompt form; `return_tokens: false` returns `tokens: []`. This implements the
+numeric-prompt and raw-output subset of llama.cpp commit
+`6d5ac3c8d5aae1831edf17c2d5cda11abe025bb3`
+(`tools/server/README.md`, `server-task.cpp`, `server-context.cpp`).
+**Compatibility exception:** when `return_tokens` is absent, Gufo omits
+`tokens` rather than returning llama.cpp's empty array, preserving existing
+string-prompt response bytes. `return_tokens` must be a boolean.
+
+Both prompt forms use the same token-prefix cache and stop-sequence processing.
+`cache_prompt: false` bypasses prefix reuse for this request; it does not disable
+retention of the resulting prefix. `cache_persist: false` separately disables
+request-driven persistence. IDs are generated model tokens, not a re-tokenization
+of visible `content`; stop processing can remove text from `content`.
+**EOG subset exception:** `tokens` excludes a terminal end-of-generation token,
+unlike llama.cpp, which includes it. Existing response flags distinguish the
+stop reason: `stopped_eos` for EOG, `stopped_limit` / `stopped_length` for the
+generation limit, and `stopped_word` plus `stopping_word` for a matched stop
+sequence. A cancellation is not reported as EOG.
+`ignore_eos` remains unsupported (HTTP 400) on `/completion`: llama.cpp implements
+it by suppressing all EOG tokens, not merely continuing after EOS.
+The neutral sampling values `temperature: 0`, `top_k: 1`, `top_p: 1`,
+`min_p: 0`, `repeat_penalty: 1`, `frequency_penalty: 0`,
+`presence_penalty: 0` and `seed: 0` are accepted.
+`n_probs` and `post_sampling_probs` remain ignored: no probability distributions
+are returned. `logprobs` and `top_logprobs` remain rejected, not partially
+implemented. Probability output is outside this compatibility subset.
 
 All four routes validate the loaded model, positive integer limits and shared
 sampling controls. `/completion` rejects streaming; all reject multiple
