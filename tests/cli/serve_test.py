@@ -6,13 +6,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
 def main():
     binary = sys.argv[1]
     env = {key: value for key, value in os.environ.items()
-           if key not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT"}}
+           if key not in {"HOST", "PORT", "GUFO_HOST", "GUFO_PORT",
+                          "GUFO_API_KEY"}}
 
     def check(args, status, message):
         result = subprocess.run([binary, *args], env=env, text=True,
@@ -236,6 +238,74 @@ def main():
     keyed = run(load + ["-v", "--api-key", "super-secret-value"])
     assert "api_key=set" in keyed.stderr
     assert "super-secret-value" not in keyed.stderr
+    assert "api_key=unset" in run(load + ["-v"]).stderr
+    # The key can stay out of the process list in a file. GUFO_API_KEY is
+    # the clients' variable: the server ignores it and it never conflicts.
+    keyed_env = {**env, "GUFO_API_KEY": "fake-env-key"}
+
+    def run_env(args, environment):
+        return subprocess.run([binary, *args], env=environment, text=True,
+                              capture_output=True, timeout=10)
+
+    with tempfile.TemporaryDirectory() as directory:
+        key_file = Path(directory) / "key"
+        for content in ("fake-file-key\n", "fake-file-key\r\n",
+                        "fake-file-key"):
+            key_file.write_bytes(content.encode())
+            key_file.chmod(0o600)
+            from_file = run(load + ["-v", "--api-key-file", str(key_file)])
+            assert from_file.returncode == 1, from_file.stderr
+            assert "api_key=set" in from_file.stderr
+            assert "fake-file-key" not in from_file.stderr
+            assert "api_key_file_readable" not in from_file.stderr
+        # Group- or world-readable files warn but still load.
+        for mode in (0o640, 0o604):
+            key_file.chmod(mode)
+            readable = run(load + ["-v", "--api-key-file", str(key_file)])
+            assert readable.returncode == 1, readable.stderr
+            assert "event=api_key_file_readable mode=0" + oct(mode)[2:] in \
+                readable.stderr, readable.stderr
+            assert "api_key=set" in readable.stderr
+        key_file.chmod(0o600)
+        check(load + ["--api-key", "x", "--api-key-file", str(key_file)], 2,
+              "the API key has more than one source (--api-key, "
+              "--api-key-file); use exactly one")
+        with_env = run_env(load + ["-v", "--api-key-file", str(key_file)],
+                           keyed_env)
+        assert with_env.returncode == 1, with_env.stderr
+        assert "api_key=set" in with_env.stderr
+        # Exactly one line ending is trimmed: an empty key, a second line or
+        # a doubled newline is refused rather than silently reshaped.
+        for content, reason in (("", "holds an empty key"),
+                                ("\n", "holds an empty key"),
+                                ("\r\n", "holds an empty key"),
+                                ("fake-key\n\n", "single line"),
+                                ("fake-key\nsecond\n", "single line"),
+                                ("fake-key\r", "single line"),
+                                ("k" * 4097, "larger than 4096 bytes")):
+            key_file.write_bytes(content.encode())
+            check(load + ["--api-key-file", str(key_file)], 2, reason)
+        check(load + ["--api-key-file", directory], 2, "not a regular file")
+        # A FIFO without a writer is refused at once; a blocking open would
+        # hang startup until the timeout.
+        fifo = Path(directory) / "fifo"
+        os.mkfifo(fifo, 0o600)
+        started = time.monotonic()
+        result = subprocess.run([binary, *load, "--api-key-file", str(fifo)],
+                                env=env, text=True, capture_output=True,
+                                timeout=5)
+        assert result.returncode == 2, result.stderr
+        assert "not a regular file" in result.stderr, result.stderr
+        assert time.monotonic() - started < 5
+        check(load + ["--api-key-file", str(Path(directory) / "missing")], 2,
+              "cannot be opened")
+    assert "api_key=unset" in run_env(load + ["-v"], keyed_env).stderr
+    origins = run(load + ["-v", "--cors-origin", "http://webui.lan:3000",
+                          "--cors-origin", "https://chat.test"])
+    assert "cors_origins=2" in origins.stderr, origins.stderr
+    assert "cors_origins=any" in run(load + ["-v"]).stderr
+    for bad in ("*", "webui.lan", "http://webui.lan/"):
+        check(load + ["--cors-origin", bad], 2, "--cors-origin: CORS origin")
     # Structured output is prepared automatically, without a separate option.
     assert "--prepare-structured-output" not in help_text
     check(["serve", "llm", "--model", "missing.gguf",

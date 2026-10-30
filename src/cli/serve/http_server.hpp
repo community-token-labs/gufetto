@@ -2,12 +2,15 @@
 #define GUFO_SERVER_HTTP_SERVER_HPP_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -97,7 +100,16 @@ using Handler =
 struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
+  /// When set, requests must present it as `Authorization: Bearer <key>` or
+  /// `x-api-key: <key>`. Every credential header a request carries must match:
+  /// a request with both headers is refused unless both name the key.
   std::string api_key;
+  /// Browser origins allowed to call the API, each normalized by
+  /// `ParseCorsOrigin`. Empty answers every origin with
+  /// `Access-Control-Allow-Origin: *`. Otherwise a listed origin is echoed with
+  /// `Vary: Origin`, and a request whose `Origin` is not listed is refused
+  /// with 403 `origin_not_allowed`. Credentials are never allowed by CORS.
+  std::vector<std::string> cors_origins;
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
   /// Called once, on the listener or a request thread, when the text backend,
   /// the embedding service or the reranker reports a lost device. Health,
@@ -112,6 +124,11 @@ struct HttpServerOptions {
 /// True for a numeric IPv4 or IPv6 literal `HttpServer` can bind. Host names
 /// are not resolved; IPv6 link-local literals may carry a `%<interface>` scope.
 bool IsListenAddress(const std::string& host);
+
+/// Lower-cased `scheme://host[:port]` for an `http` or `https` origin, as a
+/// browser sends it in `Origin`. Paths, wildcards and credentials are errors.
+std::optional<std::string> ParseCorsOrigin(std::string_view origin,
+                                           std::string* error);
 
 /// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.
 class HttpServer {
@@ -164,7 +181,7 @@ private:
   std::shared_ptr<EmbeddingService> embeddings_;
   std::shared_ptr<RerankScorer> reranker_;
   HttpServerOptions options_;
-  std::string api_key_hash_;
+  std::optional<std::array<std::uint8_t, 32>> api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> device_lost_reported_{false};
@@ -184,7 +201,8 @@ private:
 /// socket so `HttpServer::start` can bind the same address.
 class LoadingResponder {
 public:
-  LoadingResponder(const std::string& host, int port);
+  LoadingResponder(const std::string& host, int port,
+                   std::vector<std::string> cors_origins = {});
   ~LoadingResponder();
 
   LoadingResponder(const LoadingResponder&) = delete;
@@ -203,6 +221,7 @@ public:
 private:
   void serve();
 
+  std::vector<std::string> cors_origins_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::thread thread_;

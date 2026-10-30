@@ -163,3 +163,60 @@ throughput separately. Run baseline and candidate close together; add
 repetitions only when noise or a suspected regression requires them.
 Record hardware/software identities and the exact timed scope. Use
 [profiling tools](PERFORMANCE.md) to explain a gain before retaining it.
+
+## Admission-only native recovery gate
+
+Repeated in-process admission cycles show bounded RSS movement from allocator retention and runtime anonymous-mapping churn; no live heap growth (mallinfo2 uordblks flat). Serve admits once at startup and `diagnose --plan` is one-shot, so this does not affect normal use.
+
+On an explicitly allocated Linux GPU host, build **before loading models**:
+
+```sh
+cmake --build <gpu-test-build> --target admission_native_test --parallel 4
+ctest --test-dir <gpu-test-build> -N -L gpu -R '^admission_native$'
+# Model execution requires a separate native GO:
+GUFO_ADMISSION_MODEL=/path/to/pinned/Flash-Next-00001-of-00004.gguf \
+  ctest --test-dir <gpu-test-build> -L gpu -R '^admission_native$' --output-on-failure
+```
+
+The test is labelled `gpu;hip;gfx1151;diagnostics;allocation;external-model;slow`,
+with timeout 600 s and skip code 77 when its model environment is absent.
+A missing-model skip is **not** a recovery/quality pass. Its link dependencies
+explicitly include the Flash-Next model, cache/HIP cache, core, logging, LLM CLI,
+HTTP and DeepSeek libraries needed by the shared backend sources.
+
+Only this test binary defines `GUFO_ADMISSION_TESTING`. It decorates the actual
+loaded-model admission callbacks **after** the real adapter and model binding
+exist. It stages real requested slots/idle workers before injecting capacity
+refusal or exception, and stages real lower-context probe adapters/slots/workers
+before injecting exception or deadline expiry. It never substitutes a fake slot
+or adapter, fabricates a positive fit, or hunts for device OOM. It asserts typed
+refusal classification and that all bindings and worker threads unwind.
+
+One full real-model load/admit/fault/unload cycle primes runtime/kernel caches.
+THREE further warm full cycles provide post-unload heap/RSS/process-thread
+controls; TWO later full cycles are collected before deciding the recovery-band
+verdict. The band is the warm post-cycle range plus FOUR system pages for RSS
+and free-heap accounting (16 KiB on the pinned 4 KiB-page Linux host), with no
+thread allowance. This preregistered page-level slack covers small allocator/
+logger tails, not a measured leak allowance; it must not be widened on retry.
+Cold-to-prime drift, each cycle's wall time, total time and monotonic RSS-growth/
+heap-loss trends across all six cycles are printed. Test bookkeeping is reserved
+before collection. Structural/HIP/ownership failures still stop safely as ERROR
+(exit1); a band miss retains BOTH measured cycles and reports INCONCLUSIVE
+(exit3), not an ownership failure. PASS is exit0; missing-model SKIP is exit77.
+RSS and thread counts come from read-only `/proc/self`; unavailable measurement
+is not a pass. An in-band result does not establish leak freedom or workload
+qualification.
+
+Budget estimate, NOT native timing evidence: six model loads (prime + three
+controls + two measured), each with five fault cases, replace the former three
+loads/15 cases. Allow50 s per model load/unload,5 s per case (including up to
+32 GiB AUTO RAM commit at an assumed8 GiB/s for its touch), plus30 s total
+bookkeeping/sampling: `6*50 + 30*5 + 30 = 480 s`, leaving120 s under CTest's
+600 s timeout. The roughly104 GiB target requires about35 s of read time at an
+assumed3 GiB/s; the50 s load allowance leaves15 s for upload/teardown. These are
+planning assumptions, not measured lower bounds. The driver phase also allows
+up to135 s for its separate CLI/hash/load check:615 s projected <840 s owned
+wrapper <900 s loan. Retain actual per-cycle times on the first native run;
+if assumptions fail, stop/investigate and preregister split phases rather than
+extend ceilings or treat a timeout as a recovery/ownership verdict.

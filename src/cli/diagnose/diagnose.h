@@ -15,6 +15,7 @@ namespace gufo::cli {
 
 int RunDiagnose(std::span<const char* const> args);
 int RunProbe(std::span<const char* const> args);
+int RunModelAdmission(std::span<const char* const> args);
 
 }  // namespace gufo::cli
 

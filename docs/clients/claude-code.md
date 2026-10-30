@@ -8,7 +8,8 @@ compatibility recipe, not a substitute Claude service.
 Read the [common limits/auth contract](README.md) first.
 The official [gateway connection guide](https://code.claude.com/docs/en/llm-gateway-connect)
 distinguishes bearer `ANTHROPIC_AUTH_TOKEN` from `ANTHROPIC_API_KEY` (`x-api-key`).
-Use the bearer variable for Gufo's single key:
+Gufo accepts either for its single key; set only one, since a request sending
+both headers must send the key in both. This recipe uses the bearer variable:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080

@@ -82,7 +82,7 @@ list(APPEND gufo_pr_tests
   pinned_prefix_harness_test cache_lookup_harness_test
   cache_lookup_classify_harness_test token_parity_harness_test
   "ds4\\.sampling" "ds4\\.template" "ds4\\.cli"
-  gufo_version gufo_help model_plan_cli_test serve_cli_test eval_http_test functional_runner_test
+  gufo_version gufo_help model_plan_cli_test model_admission_cli_test serve_cli_test eval_http_test functional_runner_test
   cache_workloads_test cache_disk_faults_test
   cache_boundary_test
   kernel_resources_parser_test check_docs_test check_pr_title_test benchmark_card_test

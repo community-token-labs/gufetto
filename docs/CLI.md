@@ -254,7 +254,9 @@ DS4 capability questions through an already running OpenAI-compatible server.
 `transcribe` runs native Qwen3-ASR-1.7B speech recognition, and `diagnose` runs
 non-interactive system and hardware diagnostics. `gufo diagnose --plan models.tsv`
 prints a read-only pinned artifact and memory lower-bound report; see
-[model setup planning](MODEL-SETUP.md). It does not download or load a GPU model.
+[model setup planning](MODEL-SETUP.md). The manifest form does not load a GPU model;
+`diagnose --plan --model PATH` can measure real Flash-Next startup admission without
+a server, while `--no-gpu` selects the CPU fallback. No form downloads weights.
 
 All commands support `--help` and `--version`. Unknown options and invalid
 combinations return an error instead of being ignored.

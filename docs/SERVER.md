@@ -1468,7 +1468,8 @@ Return an OpenAI-style error object:
 Use appropriate HTTP status codes:
 
 - `400` invalid request or unsupported field
-- `401` missing or invalid configured bearer token
+- `401` missing or invalid configured API key
+- `403` request `Origin` outside the `--cors-origin` allowlist (`origin_not_allowed`)
 - `404` unknown model or endpoint object
 - `409` incompatible session state
 - `413` request or prompt too large
@@ -1482,11 +1483,32 @@ length finish reason when either limit is reached.
 
 ## Authentication and Exposure
 
-The server binds to `127.0.0.1` by default. Set `--api-key` to require:
+The server binds to `127.0.0.1` by default. Configure a key to require
+either header on every request:
 
 ```text
 Authorization: Bearer <local-token>
+x-api-key: <local-token>
 ```
+
+OpenAI clients send the first, Anthropic SDKs the second. Every credential
+header a request carries must name the key: a request with both is accepted
+only when both match, so a valid `x-api-key` never excuses a wrong or
+non-Bearer `Authorization`, and a repeated header is refused. Keys are compared
+by SHA-256 digest. Supply the key from exactly one option; naming both is a
+startup error, never a silent precedence:
+
+- `--api-key KEY`: on the command line, visible in the process list
+  (`ps`, `/proc/*/cmdline`).
+- `--api-key-file PATH`: the file's contents less exactly one trailing `\n` or
+  `\r\n`, at most 4096 bytes, on one line. An empty key is an error. Keep the
+  file private (`chmod 600`): a group- or world-readable file loads but logs
+  the warning `event=api_key_file_readable`. For containers, mount the key as
+  a file (for example a secret) and pass `--api-key-file`.
+
+The server reads no key from its environment. `GUFO_API_KEY` is only the
+client-side convention used by the [client recipes](clients/README.md), so
+exporting it for clients does not change the server.
 
 Authentication covers every route, including health, metrics, audio, and video.
 CORS preflight (`OPTIONS`) does not require credentials. Select the listen
@@ -1495,13 +1517,47 @@ name. `--host ::` is dual-stack: it accepts IPv6 clients and IPv4 clients, and
 an IPv4 client keeps its IPv4 address as its client ID. `--host ::1` accepts
 only IPv6 loopback clients. TLS termination belongs in a reverse proxy.
 
+**A server bound to a LAN address with no key can be driven by any web page.**
+The default `Access-Control-Allow-Origin: *` lets a page opened in any browser
+on the network send it requests and read the replies, with no credential to
+steal. Before binding beyond loopback, set a key with `--api-key-file` and/or
+restrict browsers with `--cors-origin`.
+
 Request bodies, prompts, generated text and credentials are not logged.
 
 Tool definitions and generated tool calls are treated as data. `gufo`
 never executes tools, shell commands, URLs, or generated code.
 
-The HTTP transport currently uses a wildcard CORS origin and the same listener
-and API key for inference and metrics.
+By default every response carries `Access-Control-Allow-Origin: *`, so any
+web page can call the server from a browser that holds the key. To serve a
+browser client on another origin (for example Open WebUI's direct connections)
+and nothing else, list each origin with `--cors-origin`, repeated as needed:
+
+```sh
+gufo serve --host 192.168.1.20 --api-key-file ~/.config/gufo/key \
+  --cors-origin http://webui.lan:3000 --cors-origin https://chat.example \
+  llm --model "$MODEL"
+```
+
+An origin is `http://HOST[:PORT]` or `https://HOST[:PORT]`, and the
+allowlist matches the `Origin` header exactly as the browser serializes it: no
+path, trailing slash, wildcard or trailing dot on the host, and international
+domain names in punycode (`xn--...`). Matching ignores case. Startup applies
+the browser's own rewrites: it drops the scheme's default port and leading
+zeros from a port, writes IPv6 the way browsers do (`[::ffff:192.0.2.1]`
+becomes `[::ffff:c000:201]`), and refuses an IPv4 address in a spelling
+browsers would rewrite, such as `127.1`, `0177.0.0.1` or `0x7f000001`, with a
+message naming the dotted-decimal form to list instead. With an
+allowlist, responses carry `Vary: Origin`; a listed origin is echoed in
+`Access-Control-Allow-Origin` for preflights and replies, and a request whose
+`Origin` is not listed (including `null` or a repeated `Origin`) is refused
+with 403 `origin_not_allowed` before authentication, without CORS headers.
+Requests without `Origin`, such as curl and SDK clients, are unaffected, but
+once an allowlist is set **every** browser origin that calls the server must be
+listed, including pages served by the same host on another port.
+`Access-Control-Allow-Credentials` is never sent: browsers attach no cookies,
+and the client must send the key itself. The same listener and API key serve
+inference and metrics.
 
 `gufo eval` and `tools/serving/gufo-serving-bench.py` send `OPENAI_API_KEY`
 as the bearer credential when it is set.

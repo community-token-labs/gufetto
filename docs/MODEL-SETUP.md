@@ -4,12 +4,59 @@
 gufo diagnose --plan /path/to/models.tsv
 ```
 
-This CPU-only command reads a pinned TSV, checks existing local artifacts, and
+The manifest form is CPU-only: it reads a pinned TSV, checks existing local artifacts, and
 prints the input verbatim with its SHA-256. It never downloads, tunes the host,
 allocates GPU memory, or writes a report/artifact. Redirect stdout yourself if
 needed. `--plan` cannot be combined with `--output`, `--json`, or another
 diagnostic mode. No network requests are made; source URLs are provenance, not
 instructions to fetch anything.
+
+## Measured local-model admission (GPU)
+
+```sh
+gufo diagnose --plan --model /path/to/target.gguf --context 32768 --sessions 4
+# Explicit metadata-only fallback, including on a GPU host:
+gufo diagnose --plan --model /path/to/target.gguf --context 32768 --no-gpu
+```
+
+The model form is separate from `--plan <manifest>`. For Flash-Next (`qwen4exp`)
+with an available HIP device, it uses the **same** model loader, runner pool,
+measured slot admission, bounded context search, backing and final guards as
+serve. It does not start an HTTP listener or generation scheduler. It loads real
+weights and allocates real execution/cache memory: it is not a cheap metadata
+query. Ordinary HIP initialization/runtime caches may be touched. It releases
+its owners before reporting:
+
+- `FIT: verified to fit: --context N`: the requested complete startup pool passed;
+- `DOES-NOT-FIT`: a measured requested-context refusal, with the existing bounded
+  recommendation when available (not a maximum);
+- `ERROR` (exit 2): a loader, HIP, validation or cleanup failure, never disguised
+  as a capacity refusal.
+
+`FIT` is **startup only**, not full-context workload, numerical-quality or speed
+qualification. Native allocation/recovery and parity qualification remain required.
+With no HIP device, `--no-gpu`, a CPU build or an unsupported measured provider,
+the model form emits `UNPROVEN` and the available CPU one-session lower bound.
+No native model is loaded in that fallback. Missing native context metadata also
+leaves the result UNPROVEN unless a usable `--context` is supplied. The printed
+`gguf_identity_sha256` is the existing memoised full-content GGUF identity of
+**all target shards**, not sidecars; see [identity trust boundaries](GGUF_IDENTITY.md).
+Memo hits still validate stat/header/index and bounded payload samples. This can
+write the ordinary identity memo cache; it does not modify model artifacts.
+
+Use serve's canonical options: `--context`, `--sessions`, `--kv-cache-type`,
+`--speculative mtp|off`, `--mtp-model`, `--draft-tokens`, `--mmproj`, `--no-vision`,
+`--enable-yarn`, vision limits, `--prefill-chunk`, and `--cache-ram-bytes`.
+Exit codes for the model form: FIT=0, UNPROVEN=0, DOES-NOT-FIT=1, ERROR=2.
+Owners are destroyed, then HIP synchronization/last-error checks must succeed
+before the release message can be printed. No null-scheduler generation backend
+is published in admission-only mode.
+
+KV parsing and RAM-cache parsing reuse serve's validators; the common loader
+validates model/mode/geometry. Defaults match serve (one session, native context,
+F16, no speculation, AUTO RAM cache). Persistence must be `--cache-disk off`;
+prefix-pin/write-capable options are rejected rather than silently ignored.
+`--plan <manifest> --no-gpu` retains the CPU report below, unchanged.
 
 ## Manifest
 

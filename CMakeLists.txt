@@ -439,6 +439,7 @@ target_link_libraries(gufo_http PUBLIC gufo_checkpoint_transfer gufo_logging guf
 
 add_executable(gufo
   src/cli/main.cpp
+  src/cli/diagnose/model_admission.cpp
   src/cli/banner.cpp
   src/cli/eval/eval.cpp
   src/cli/transcribe/transcribe.cpp
@@ -1080,6 +1081,29 @@ if (BUILD_TESTING)
   set_tests_properties(prof_test PROPERTIES
     LABELS "cpu;tools;profiling")
 
+  if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(native_memory_accounting_test tests/diagnostics/native_memory_accounting_test.cpp)
+    target_include_directories(native_memory_accounting_test PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_options(native_memory_accounting_test PRIVATE -UNDEBUG)
+    add_test(NAME native_memory_accounting_test COMMAND native_memory_accounting_test)
+    set_tests_properties(native_memory_accounting_test PROPERTIES LABELS "cpu;diagnostics")
+  endif()
+
+  if (ENGINE_ENABLE_HIP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(admission_native_test
+      tests/diagnostics/admission_native_test.cpp
+      src/cli/serve/inference_backend.cpp src/cli/serve/text_model_runner.cpp
+      src/cli/serve/text_generation_scheduler.cpp src/cli/serve/component_text_cache.cpp
+      src/cli/serve/continuation_cache.cpp src/cli/serve/continuation_disk_store.cpp)
+    target_compile_definitions(admission_native_test PRIVATE GUFO_ADMISSION_TESTING=1)
+    target_link_libraries(admission_native_test PRIVATE gufo_cache gufo_cache_hip
+      gufo_core gufo_logging gufo_qwen38_flash_next gufo_llm_cli gufo_http gufo_deepseek_v4_flash)
+    add_test(NAME admission_native COMMAND admission_native_test)
+    set_tests_properties(admission_native PROPERTIES
+      LABELS "gpu;hip;gfx1151;diagnostics;allocation;external-model;slow"
+      SKIP_RETURN_CODE 77 TIMEOUT 600)
+  endif()
+
   add_executable(model_plan_test tests/diagnostics/model_plan_test.cpp)
   target_link_libraries(model_plan_test PRIVATE gufo_diagnostics)
   add_test(NAME model_plan_test COMMAND model_plan_test)
@@ -1087,6 +1111,9 @@ if (BUILD_TESTING)
   add_test(NAME model_plan_cli_test COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/model_plan_cli_test.py $<TARGET_FILE:gufo>)
   set_tests_properties(model_plan_cli_test PROPERTIES LABELS "cpu;diagnostics")
+  add_test(NAME model_admission_cli_test COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/diagnostics/model_admission_cli_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(model_admission_cli_test PROPERTIES LABELS "cpu;diagnostics")
 
   add_executable(gpu_queues_test tests/diagnostics/gpu_queues_test.cpp)
   target_link_libraries(gpu_queues_test PRIVATE gufo_diagnostics gufo_platform)
