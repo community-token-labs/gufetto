@@ -31,21 +31,28 @@ struct RenderedPrompt {
   /// without one. Everything before it is the stable conversation prefix.
   std::size_t generation_prompt_offset{0};
   /// Byte offset of the prefix the next request is expected to share: the
-  /// generation prompt, or, when the prompt ends with a user turn that
-  /// follows another user turn, the end of the turn before it. Agent clients
-  /// send per-turn context there and replace it on the next request.
+  /// generation prompt, or, when the prompt ends with a text-only user turn
+  /// after a tool result or another user turn, the end of the turn before
+  /// it. Agent clients send per-turn context there and replace it on the
+  /// next request. A tool result stays inside its model turn, which the next
+  /// request continues, so the boundary precedes that turn's closing marker.
   std::size_t stable_prefix_offset{0};
 };
 
 /// Compiled renderer of Unsloth's Gemma 4 chat template. The GGUF template
 /// is only accepted when its SHA-256 matches the qualified revision.
 ///
-/// This renders text conversations: system or developer instructions,
-/// user and assistant turns, thinking on or off, replayed reasoning after
-/// the last user turn, and the generation prompt. Tools, tool calls, tool
-/// results and media are rejected until their renderer lands. Message
-/// content arrives as one string, so a system message's content-part list
-/// (which the template joins with spaces) is not representable here.
+/// It renders system or developer instructions, user and assistant turns,
+/// thinking on or off, replayed reasoning, tool declarations, tool calls
+/// (arguments as a mapping, as llama.cpp passes them) and OpenAI `tool`
+/// results, and the generation prompt. Media is rejected until the vision
+/// topics land.
+///
+/// Known approximations of the Jinja source: message content arrives as one
+/// string, so content-part lists are not representable; gufo::json keeps
+/// numbers as doubles, so an integral number prints as a Python int (Python
+/// would print 5.0 for a float literal) and integers beyond 2^53 lose
+/// precision.
 class ChatTemplate {
 public:
   [[nodiscard]] static constexpr std::string_view

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Render the Gemma 4 text-template goldens with the GGUF's own Jinja source.
+"""Render the Gemma 4 chat-template goldens with the GGUF's own Jinja source.
 
 Reads tokenizer.chat_template from the target GGUF's metadata (never tensor
 data), checks its SHA-256 against the qualified Unsloth revision, and renders
-tests/models/gemma4/fixtures/template_text_cases.json the way Hugging Face
+tests/models/gemma4/fixtures/template_cases.json the way Hugging Face
 transformers does: a sandboxed Jinja2 environment with trim_blocks,
-lstrip_blocks and the loopcontrols extension, bos_token "<bos>". The template
-text itself is not written anywhere.
+lstrip_blocks and the loopcontrols extension, bos_token "<bos>". Tool calls
+are passed in OpenAI form with their arguments as a mapping, as llama.cpp
+passes them to this template; an empty id is omitted. The template text
+itself is not written anywhere.
 
     PYTHON_WITH_JINJA2 -I tools/gemma4/template_goldens.py --model TARGET.gguf \\
         --manifest MANIFEST.json
@@ -36,6 +38,22 @@ def raise_exception(message: str) -> None:
     raise jinja2.exceptions.TemplateError(message)
 
 
+def openai_messages(messages: list[dict]) -> list[dict]:
+    out = []
+    for message in messages:
+        converted = {k: v for k, v in message.items() if k != "tool_calls"}
+        if "tool_calls" in message:
+            converted["tool_calls"] = []
+            for call in message["tool_calls"]:
+                function = {"name": call["name"], "arguments": call["arguments"]}
+                entry = {"type": "function", "function": function}
+                if call.get("id"):
+                    entry["id"] = call["id"]
+                converted["tool_calls"].append(entry)
+        out.append(converted)
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", type=Path, required=True)
@@ -54,11 +72,12 @@ def main() -> int:
                                         extensions=["jinja2.ext.loopcontrols"])
     env.globals["raise_exception"] = raise_exception
     template = env.from_string(source.decode("utf-8"))
-    spec = json.loads((FIXTURES / "template_text_cases.json").read_text())
+    spec = json.loads((FIXTURES / "template_cases.json").read_text())
     rendered = {}
     for name, case in spec["cases"].items():
         text = template.render(
-            messages=case["messages"],
+            messages=openai_messages(case["messages"]),
+            tools=[spec["tools"][t] for t in case.get("tools", [])] or None,
             add_generation_prompt=case.get("add_generation_prompt", True),
             enable_thinking=case.get("enable_thinking", False),
             preserve_thinking=case.get("preserve_thinking", False),
@@ -66,7 +85,7 @@ def main() -> int:
         rendered[name] = {"text": text,
                           "sha256": hashlib.sha256(text.encode()).hexdigest()}
 
-    (FIXTURES / "template_text_goldens.json").write_text(json.dumps({
+    (FIXTURES / "template_goldens.json").write_text(json.dumps({
         "schema": "gufo.gemma4-template-goldens.v1",
         "generator": "tools/gemma4/template_goldens.py",
         "renderer": (f"jinja2 {version('jinja2')} (markupsafe "
