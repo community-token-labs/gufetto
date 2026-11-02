@@ -240,6 +240,6 @@ qualification for four real registrations on one host. That result does not
 qualify this rebased build, every template, lazy mode or arbitrary workloads.
 A changed build/runtime requires recapture and requalification. The original
 single-pin production failure and later candidate-024 failure remain recorded.
-See [the historical qualification ledger](http://git.home.arpa/JCFrags/gufo/src/commit/7b360b41136a4134855659d001051e6f4c8fdc82/docs/STRIX-QUALIFICATION.md) for immutable evidence,
+See the historical qualification ledger (private `gufo` record `docs/STRIX-QUALIFICATION.md` at `7b360b41`, not published) for immutable evidence,
 new-build gaps and the inherited file-verification risk. Registration files and
 model/cache backing files must not be rewritten in place while serving.
