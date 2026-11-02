@@ -86,7 +86,7 @@
     },
     "speed_values_source": "Coordinator rounded summary; raw variance not transferred",
     "decision": "Statistical quality tie; no meaningful speed cost or gain; keep smaller IQ4 option",
-    "report": "http://git.home.arpa/JCFrags/gufo-agent-concurrency/src/commit/d9549bf61687b646fbbf92ee1719f991764d3bc4/docs/ple-final-decision-20261027.md"
+    "report": "private gufo-agent-concurrency docs/ple-final-decision-20261027.md at d9549bf6 (not published)"
   },
   "q8_ple_reader": "PERMANENTLY_PARKED_NOT_A_FOLLOW_ON_TASK"
 }
