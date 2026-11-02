@@ -15,6 +15,65 @@ maintainers. It keeps upstream's MIT [license](LICENSE) and
 and toolchain (mostly ROCm/HIP 7.2.4); treat them as evidence for those
 conditions, not guarantees.
 
+## Contributing
+
+Gufetto is meant to be carried forward by the community: people **and** AI
+agents. Pick an item from [docs/COMMUNITY-HANDOFF.md](docs/COMMUNITY-HANDOFF.md)
+or bring your own model, fix or kernel, open an issue or discussion, and send a
+pull request. Agent-written changes are welcome on the same terms as human
+ones: show the CPU checks, and for GPU or speed changes, a native Strix Halo
+run (see [docs/TESTING.md](docs/TESTING.md)).
+
+## What Gufetto adds to Gufo
+
+Upstream base: Gufo v0.26.0 + #849 (`81ff13c3`). Details and limits are in
+[FORK.md](FORK.md) and the linked docs.
+
+**KV cache and memory**
+- Experimental q8 KV storage for Qwen3.8 Flash-Next (plain and Hadamard-rotated), plus opt-in rotated q4 and K=q8/V=q4 modes. F16 stays the default.
+- Startup memory measurement that refuses early, with a clear reason, instead of failing mid-load; a verified-to-fit context size.
+- Faster validation when restoring q4/q8 KV.
+
+**Prompt cache**
+- Opt-in persistent SSD cache that survives restarts, with bounded, fsync'd writes.
+- Persistent pinned prefixes (e.g. long system prompts) and predicted system-prompt checkpoints in RAM.
+- RAM eviction ranked by measured recovery cost; exact sharing of in-progress prefixes.
+- A read-only cache lookup API and portable checkpoint export/import.
+- Cache miss reasons, exact cache-token traces and capture-refusal reporting.
+
+**Speed**
+- Exact q8 prefill, decode and MTP-verification optimizations.
+- Query-local sparse attention in prefill.
+
+**Server and API**
+- `x-api-key` support, API key from a file, and a CORS allowlist for LAN use.
+- llama.cpp-compatible token-ID prompts on `/completion`.
+- A llama.cpp-compatible rerank API (endpoint and contract; no model runtime yet).
+- `/metrics` with cache tiers, miss reasons and speed histograms.
+- Opt-in serving and phase traces for performance diagnosis.
+
+**Vision**
+- A shared image pool, reclaimable image memory claims and Flash-Next vision defaults.
+- An independent F32/F64 vision reference and a numerics harness for vision attention.
+
+**Diagnostics and safety**
+- `gufo diagnose` measures whether a model fits on the GPU through the real admission path.
+- Fails loudly on unsupported Flash-Next attention geometry and on fatal device-to-host transfer errors.
+- GGUF identity checks that probe file content instead of trusting file metadata.
+- A CPU Q5_1 dequantization fix (it previously aborted).
+
+**Tools and docs**
+- Tested client recipes for Claude Code, OpenCode, Cline, Aider, Open WebUI and Pi ([docs/clients](docs/clients/README.md)), plus benchmark cards.
+- Offline prompt-scoring and matched-KL quality tools (adapted from upstream #697).
+- A Qwen 4 day-0 emitted-token comparator and offline tokenizer checks.
+
+**Experimental, off by default**
+- XDNA2 NPU projection offload.
+- An expert-streaming policy for DeepSeek V4.1 (not yet wired in).
+
+**Upstream fixes carried early**
+- YaRN/MTP fix (#854), Q8_0 prefill scratch sizing (#777), input token count (#860) and context-overflow diagnostics (#269).
+
 This fork adds experimental q8 KV storage for Qwen3.8 Flash-Next on AMD Strix Halo (gfx1151). **F16 remains the default.** q8 offers long-context memory headroom, not guaranteed faster inference or identical output.
 
 ## Build from source
