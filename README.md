@@ -1,4 +1,19 @@
-# Gufo fork
+# Gufetto
+
+Gufetto ("owlet") is a community fork of [Gufo](https://github.com/gufo-org/gufo),
+the local LLM inference engine for AMD Strix Halo (`gfx1151`), published by
+[Community Token Labs](https://github.com/community-token-labs). It was built
+largely by AI coding agents working against measured correctness and speed
+gates on two Strix Halo machines. Upstream supplies the engine and the
+model/API foundation; [FORK.md](FORK.md) lists what this fork adds, and
+[docs/COMMUNITY-HANDOFF.md](docs/COMMUNITY-HANDOFF.md) lists unfinished work
+that anyone is welcome to pick up.
+
+Gufetto is not an official Gufo release and is not endorsed by the Gufo
+maintainers. It keeps upstream's MIT [license](LICENSE) and
+[notices](NOTICE). Measurements in these docs were taken on our own hardware
+and toolchain (mostly ROCm/HIP 7.2.4); treat them as evidence for those
+conditions, not guarantees.
 
 This fork adds experimental q8 KV storage for Qwen3.8 Flash-Next on AMD Strix Halo (gfx1151). **F16 remains the default.** q8 offers long-context memory headroom, not guaranteed faster inference or identical output.
 
