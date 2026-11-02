@@ -200,4 +200,4 @@ CPU tests cover disabled collection, scope restoration, integer/bitset
 serialization and concurrent whole-line append. The integrated GPU event path,
 sampled graph/eager numerical replay and enabled/disabled overhead need fresh
 GPU qualification. Instrumented timings must not be presented as uninstrumented
-production measurements. See [the historical qualification ledger](http://git.home.arpa/JCFrags/gufo/src/commit/7b360b41136a4134855659d001051e6f4c8fdc82/docs/STRIX-QUALIFICATION.md).
+production measurements. See the historical qualification ledger (private `gufo` record `docs/STRIX-QUALIFICATION.md` at `7b360b41`, not published).
