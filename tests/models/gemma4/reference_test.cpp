@@ -7,8 +7,9 @@
 // the logits by 5.5); the renormalizing denominator alone is not, since the
 // following RMSNorm cancels a uniform scale.
 //
-// TODO(G4-12, nimo): compare the reference with the device runtime on the
-// real 26B-A4B artifact; this host test only pins the operator semantics.
+// TODO(G4-12, needs Strix Halo hardware): compare the reference with the
+// device runtime on the real 26B-A4B artifact; this host test only pins the
+// operator semantics.
 
 #include "src/models/gemma4/reference.hpp"
 
