@@ -24,4 +24,4 @@ split geometries, not universal scalar-decode/prefill equality or superiority
 to an FP32 teacher. Source-label quality proxies were mixed and some SDK timing
 phases remained inconclusive. Fresh GPU qualification is required after rebasing
 or rebuilding. See the immutable fix report in
-[the historical qualification ledger](http://git.home.arpa/JCFrags/gufo/src/commit/7b360b41136a4134855659d001051e6f4c8fdc82/docs/STRIX-QUALIFICATION.md).
+the historical qualification ledger (private `gufo` record `docs/STRIX-QUALIFICATION.md` at `7b360b41`, not published).
