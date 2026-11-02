@@ -16,7 +16,7 @@ prefill chunk4096, RAM cache **4294967296 bytes**, thinking off, temperature0,
 F16 KV and YaRN off. **No pinned prefixes; deployment pin behaviour not measured.**
 This is not the production200000-context/11329267712-byte/pinned-prefix profile,
 not production-container ELF equivalence or, by itself, stable/public qualification.
-Historical channel approval is recorded in [the archived STRIX-STATUS](http://git.home.arpa/JCFrags/gufo/src/commit/7b360b41136a4134855659d001051e6f4c8fdc82/docs/STRIX-STATUS.md); it is not approval of this c92 topic port.
+Historical channel approval is recorded in the archived STRIX-STATUS (private `gufo` record `docs/STRIX-STATUS.md` at `7b360b41`, not published); it is not approval of this c92 topic port.
 
 The ordinary Gufo `tools/serving/gufo-serving-bench.py` performed the measurement;
 no custom map/registry monitoring was used. The client workspace revision95089ca9
