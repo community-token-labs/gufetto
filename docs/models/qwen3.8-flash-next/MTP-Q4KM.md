@@ -24,7 +24,7 @@ Owner-supplied artifact identity (not a local payload verification):
 - The existing target and its shared **Q8_0 vocabulary head remain unchanged**.
 
 The coordinator reports completed SHA-256 verification on Nimo-1 at
-`/home/connorb/gac/mtp-unsloth-766911a6/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`
+`<host model dir>/mtp-unsloth-766911a6/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`
 (mode `0444`). This is a coordinator receipt, not local payload verification.
 The pinned URL is
 `https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf`. The editing agent downloaded/read no model bytes and

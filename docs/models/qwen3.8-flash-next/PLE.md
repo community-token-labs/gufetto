@@ -14,7 +14,7 @@ needed. These are internal results, not public release qualification.
 
 ## Measured comparison and decision
 
-[Immutable internal report](http://git.home.arpa/JCFrags/gufo-agent-concurrency/src/commit/d9549bf61687b646fbbf92ee1719f991764d3bc4/docs/ple-final-decision-20261027.md)
+Immutable internal report (private `gufo-agent-concurrency` record `docs/ple-final-decision-20261027.md` at `d9549bf6`, not published)
 records source `337eaed6`, native ELF `f21c0020`, the same plain `q8_0` KV
 policy, AR/MTP-off, S4/context 200000, matched body tensors and auxiliaries.
 Quality scored 144 matched rows across 18 histories, at actual prefixes
