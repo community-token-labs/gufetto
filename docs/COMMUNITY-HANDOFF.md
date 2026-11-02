@@ -18,7 +18,7 @@ format check passed. "Native" means a run on Strix Halo (`gfx1151`) hardware.
 | `intake/pr-882-mtp-early-stop` | Upstream #882: stop MTP drafting early | Ported; a review suspects a slowdown on the cache-restore path | Three-way timing: `main` vs the port vs the port plus a one-line restore fix |
 | `intake/pr-858-loader-buffered-retry-on-467c` | Upstream #858: buffered retry in the weight loader | CPU proven | Native load + greedy-output smoke. The last attempt failed in our harness (it compared a log line whose text varies), not in the change |
 | `intake/pr-740-qfn-mmq-arena-growth-on-467c` | Upstream #740: let the Flash-Next MMQ arena grow | CPU proven | Find a Flash-Next workload that grows past the 256 MiB arena (none of ours did), then correctness and per-request timing |
-| `intake/pr-874-27b-verify-gemm` | Upstream #874 for Qwen3.5-27B | Native build stage passed | Candidate build, then the 27B correctness and timing phases |
+| `intake/pr-874-27b-verify-gemm` | Upstream #874: Qwen3.8-27B verification GEMM tuning | Native build stage passed | Candidate build, then the 27B correctness and timing phases |
 
 ## Our own fixes and features
 
@@ -32,19 +32,19 @@ format check passed. "Native" means a run on Strix Halo (`gfx1151`) hardware.
 
 ## Gemma 4 (26B-A4B)
 
-`topic/gemma4-g401-config` through `topic/gemma4-g406-reference` form a stack;
-`topic/gemma4-g406-reference` contains all of it. Every layer was reviewed:
+`topic/gemma4-g406-reference` holds the whole reviewed stack, one commit per
+layer (G4-01 to G4-06). Every layer was reviewed:
 
 - **G4-01–G4-03:** model config, weight inventory and tokenizer (checked
   against llama.cpp's Gemma 4 tokenizer).
-- **G4-04a/b:** chat template and tool declarations, with 25 Jinja2-rendered
+- **G4-04a/b:** chat template and tool declarations, with 40 Jinja2-rendered
   goldens.
 - **G4-05:** tool-call parsing and the Gemma 4 tool grammar. It rejects
   duplicate keys and integers beyond ±2^53, and keeps `-0`.
 - **G4-06:** a scalar FP32 CPU reference judged by an independent float64
   numpy port of llama.cpp's Gemma 4 graph (`tools/gemma4/reference_oracle.py`).
-  The max logit difference is 3.9e-6 against a 1e-4 tolerance, and routing and
-  attention mutations are caught.
+  Logits must match within a 1e-4 tolerance, and routing and attention
+  mutations are caught.
 
 Next: the GPU runtime (G4-07 onward), then a KL gate against the G4-06
 reference on the real model file. The stack has one adjacent-line merge
@@ -63,8 +63,13 @@ These were paused to keep scope narrow, not because they failed:
 
 ## How we worked
 
-Changes landed only after one independent review by a model family different
-from the author's, plus CPU checks. Changes touching GPU code or speed also
+Our docs and commit messages mention `nimo-1` and `nimo-2` (our two Strix Halo
+machines), "receipts" (private run records) and "coordinators" (the agents
+that scheduled the machines). None of those records are needed to build or run
+Gufetto.
+
+
+Changes landed only after one independent review plus CPU checks. Changes touching GPU code or speed also
 needed a native run. Timing claims are per request and per phase, at 5% and
 10 ms, never averaged, and noisy results stay "inconclusive". CLAUDE.md and
 docs/TESTING.md describe the checks. Measurements used ROCm/HIP 7.2.4; the

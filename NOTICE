@@ -18,6 +18,14 @@ Adapted code includes:
 - hipCUB: Duane Merrill, NVIDIA CORPORATION and AMD (BSD-3-Clause).
 - Flash-Next GDN row reuse and SSM stride optimization: adapted from
   mikealanni/gufo f450218743bc, Copyright (c) 2026 gufo contributors (MIT).
+- Q5_1 dequantization in src/core/quant/ggml_dequant.{hpp,cpp}: adapted from
+  gufo-org/gufo PR #426 (franzmoca/gufo feat/gemma 25ba634f6cc4),
+  Copyright (c) 2026 gufo contributors (MIT).
+- Expert-stream policy (src/core/expert_stream/policy.hpp): adapted from
+  franzmoca/gufo feat/ds41 110594c9, Copyright (c) 2026 gufo contributors (MIT).
+- Prompt-scoring and matched-history quality tools (tools/quality/): adapted
+  from jabata, gufo-org/gufo PR #697 (c1ab796010ba), Copyright (c) 2026 gufo
+  contributors (MIT).
 
 Strix Halo optimization inspiration also came from these MIT-licensed projects:
 - LaurentZuijdwijk/llama.cpp: https://github.com/LaurentZuijdwijk/llama.cpp

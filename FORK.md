@@ -32,7 +32,7 @@ q8 KV is fork-only: upstream #855 was closed without merging.
 
 Parked `fork-maintenance` and the independent `agent-cache-r1`,
 `q8-checkpoint-pages-r1`, `q8-rotation-route-r1` work are **not included**.
-Their preserved branches remain available for separate admission.
+Their branches are kept privately and are not published with this fork.
 
 ## Defaults and limits
 
